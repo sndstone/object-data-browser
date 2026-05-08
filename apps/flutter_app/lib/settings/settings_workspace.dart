@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 import '../app/version_details.dart';
 import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
+import 'profile_import_picker.dart';
+import 'version_details_catalog.dart';
 
 class SettingsWorkspace extends StatelessWidget {
   const SettingsWorkspace({
@@ -19,6 +21,12 @@ class SettingsWorkspace extends StatelessWidget {
   Widget build(BuildContext context) {
     final settings = controller.settings;
     final phone = MediaQuery.sizeOf(context).width < 700;
+    final isAndroid = Platform.isAndroid;
+    final dependencyVersions = visibleDependencyVersions(isAndroid: isAndroid);
+    final bundledComponentVersions = visibleBundledComponentVersions(
+      isAndroid: isAndroid,
+      engines: controller.engines,
+    );
 
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -93,12 +101,25 @@ class SettingsWorkspace extends StatelessWidget {
                 OutlinedButton.icon(
                   onPressed: () async {
                     final picked = await FilePicker.platform.pickFiles(
-                      type: FileType.custom,
-                      allowedExtensions: const ['json'],
+                      type: profileImportPickerType(
+                        isAndroid: Platform.isAndroid,
+                      ),
+                      allowedExtensions: profileImportAllowedExtensions(
+                        isAndroid: Platform.isAndroid,
+                      ),
                       dialogTitle: 'Import profiles',
                     );
-                    final path = picked?.files.single.path;
+                    final file = picked?.files.single;
+                    final path = file?.path;
                     if (path == null) {
+                      return;
+                    }
+                    if (file != null && !isJsonProfileImportSelection(file)) {
+                      controller.showBannerMessage(
+                        'Select a JSON profile export file.',
+                        category: 'Profiles',
+                        source: 'profiles',
+                      );
                       return;
                     }
                     await controller.importProfilesFromPath(path);
@@ -256,14 +277,14 @@ class SettingsWorkspace extends StatelessWidget {
               contentPadding: EdgeInsets.zero,
               title: Text('UI scale: ${settings.uiScalePercent}%'),
               subtitle: const Text(
-                'Smaller values fit more controls onscreen. 70% is the default density for fresh installs.',
+                'Smaller values fit more controls onscreen. Below 80% also reduces padding and element sizing. 75% is the default.',
               ),
             ),
             Slider(
-              min: 70,
+              min: 60,
               max: 110,
-              divisions: 8,
-              value: settings.uiScalePercent.toDouble().clamp(70, 110),
+              divisions: 10,
+              value: settings.uiScalePercent.toDouble().clamp(60, 110),
               label: '${settings.uiScalePercent}%',
               onChanged: (value) {
                 controller.updateSettings(
@@ -467,11 +488,12 @@ class SettingsWorkspace extends StatelessWidget {
             ),
             const ListTile(
               contentPadding: EdgeInsets.zero,
-              title: Text('Debug/event logging'),
+              title: Text('Diagnostic logging'),
               subtitle: Text(
-                'API logging captures the full engine request envelope plus the returned response payload, with credentials and object data redacted. Debug logging adds broader trace detail in Event Log for troubleshooting.',
+                'API logging records redacted request and response envelopes. Debug logging adds broader trace details in Event Log.',
               ),
             ),
+            const SizedBox(height: 12),
             _numberField(
               label: 'Default presign expiration (minutes)',
               initialValue: settings.defaultPresignMinutes,
@@ -492,11 +514,11 @@ class SettingsWorkspace extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             Text(
-              'Flutter dependencies',
+              isAndroid ? 'Android app dependencies' : 'Flutter dependencies',
               style: Theme.of(context).textTheme.titleMedium,
             ),
             const SizedBox(height: 8),
-            ...kFlutterDependencyVersions.entries.map(
+            ...dependencyVersions.entries.map(
               (entry) => ListTile(
                 dense: true,
                 contentPadding: EdgeInsets.zero,
@@ -504,20 +526,22 @@ class SettingsWorkspace extends StatelessWidget {
                 trailing: Text(entry.value),
               ),
             ),
-            const Divider(height: 24),
-            Text(
-              'Bundled engines',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            const SizedBox(height: 8),
-            ...kBundledEngineVersions.entries.map(
-              (entry) => ListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                title: Text(entry.key),
-                trailing: Text(entry.value),
+            if (bundledComponentVersions.isNotEmpty) ...[
+              const Divider(height: 24),
+              Text(
+                isAndroid ? 'Android engines' : 'Bundled engines',
+                style: Theme.of(context).textTheme.titleMedium,
               ),
-            ),
+              const SizedBox(height: 8),
+              ...bundledComponentVersions.entries.map(
+                (entry) => ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(entry.key),
+                  trailing: Text(entry.value),
+                ),
+              ),
+            ],
           ],
         ),
       ],
@@ -535,13 +559,11 @@ class SettingsWorkspace extends StatelessWidget {
       padding: const EdgeInsets.only(bottom: 16),
       child: Container(
         decoration: BoxDecoration(
-          color: phone
-              ? theme.colorScheme.surface.withValues(alpha: 0.84)
-              : theme.cardTheme.color,
-          borderRadius: BorderRadius.circular(28),
+          color: phone ? theme.colorScheme.surface : theme.cardTheme.color,
+          borderRadius: BorderRadius.circular(8),
           border: Border.all(color: theme.colorScheme.outlineVariant),
         ),
-        padding: const EdgeInsets.all(18),
+        padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -561,18 +583,10 @@ class SettingsWorkspace extends StatelessWidget {
   }) {
     final theme = Theme.of(context);
     return Container(
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(30),
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            theme.colorScheme.surface,
-            theme.colorScheme.primaryContainer.withValues(alpha: 0.42),
-            theme.colorScheme.secondaryContainer.withValues(alpha: 0.24),
-          ],
-        ),
+        borderRadius: BorderRadius.circular(8),
+        color: theme.colorScheme.surface,
         border: Border.all(color: theme.colorScheme.outlineVariant),
       ),
       child: Column(
@@ -874,13 +888,13 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
               Icon(_expanded ? Icons.expand_less : Icons.expand_more),
             ],
           ),
-          childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+          childrenPadding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
           children: [
             TextField(
               controller: _nameController,
               decoration: const InputDecoration(labelText: 'Profile name'),
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 12),
             DropdownButtonFormField<EndpointProfileType>(
               initialValue: _endpointType,
               decoration: const InputDecoration(labelText: 'Endpoint type'),
@@ -900,7 +914,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 }
               },
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 12),
             if (_endpointType == EndpointProfileType.s3Compatible) ...[
               TextField(
                 controller: _endpointController,
@@ -910,7 +924,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                       'Paste a full URL or just a host:port. The scheme is added automatically when missing.',
                 ),
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: 12),
               SwitchListTile(
                 value: _useHttps,
                 onChanged: _setUseHttps,
@@ -951,7 +965,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 },
               ),
             ],
-            const SizedBox(height: 8),
+            const SizedBox(height: 12),
             if (_normalizedEndpointPreview.isNotEmpty)
               ListTile(
                 contentPadding: EdgeInsets.zero,
@@ -966,7 +980,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 subtitle: Text(_normalizedEndpointPreview),
               ),
             if (_normalizedEndpointPreview.isNotEmpty)
-              const SizedBox(height: 8),
+              const SizedBox(height: 12),
             phone
                 ? Column(
                     children: [
@@ -1004,7 +1018,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                       ),
                     ],
                   ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 12),
             TextField(
               controller: _sessionTokenController,
               decoration: const InputDecoration(

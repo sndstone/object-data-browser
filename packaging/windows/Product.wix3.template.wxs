@@ -1,28 +1,28 @@
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product
       Id="*"
-      Name="S3 Browser Crossplat"
+      Name="Object Data Browser"
       Language="1033"
       Version="{{VERSION}}"
-      Manufacturer="S3 Browser Crossplat"
+      Manufacturer="Object Data Browser"
       UpgradeCode="A9D78739-1FB3-4514-9A77-91BDB25CFC39">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />
-    <MajorUpgrade DowngradeErrorMessage="A newer version of S3 Browser Crossplat is already installed." />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Object Data Browser is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="ProgramFiles64Folder">
-        <Directory Id="INSTALLFOLDER" Name="S3 Browser Crossplat">
+        <Directory Id="INSTALLFOLDER" Name="Object Data Browser">
 {{DIRECTORY_TREE}}
         </Directory>
       </Directory>
       <Directory Id="ProgramMenuFolder">
-        <Directory Id="ProgramMenuDir" Name="S3 Browser Crossplat" />
+        <Directory Id="ProgramMenuDir" Name="Object Data Browser" />
       </Directory>
       <Directory Id="DesktopFolder" />
     </Directory>
 
-    <Feature Id="MainFeature" Title="S3 Browser Crossplat" Level="1">
+    <Feature Id="MainFeature" Title="Object Data Browser" Level="1">
       <ComponentGroupRef Id="AppFiles" />
       <ComponentGroupRef Id="ShortcutComponents" />
     </Feature>
@@ -39,19 +39,19 @@
       <Component Id="ApplicationShortcutComponent" Directory="ProgramMenuDir" Guid="*">
         <Shortcut
             Id="ApplicationStartMenuShortcut"
-            Name="S3 Browser Crossplat"
+            Name="Object Data Browser"
             Target="[INSTALLFOLDER]s3_browser_crossplat.exe"
             WorkingDirectory="INSTALLFOLDER" />
         <RemoveFolder Id="ProgramMenuDir" On="uninstall" />
-        <RegistryValue Root="HKCU" Key="Software\S3BrowserCrossplat" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        <RegistryValue Root="HKCU" Key="Software\ObjectDataBrowser" Name="installed" Type="integer" Value="1" KeyPath="yes" />
       </Component>
       <Component Id="DesktopShortcutComponent" Directory="DesktopFolder" Guid="*">
         <Shortcut
             Id="ApplicationDesktopShortcut"
-            Name="S3 Browser Crossplat"
+            Name="Object Data Browser"
             Target="[INSTALLFOLDER]s3_browser_crossplat.exe"
             WorkingDirectory="INSTALLFOLDER" />
-        <RegistryValue Root="HKCU" Key="Software\S3BrowserCrossplat" Name="desktop" Type="integer" Value="1" KeyPath="yes" />
+        <RegistryValue Root="HKCU" Key="Software\ObjectDataBrowser" Name="desktop" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </ComponentGroup>
   </Fragment>

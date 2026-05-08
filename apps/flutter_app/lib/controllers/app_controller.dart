@@ -165,26 +165,27 @@ class AppController extends ChangeNotifier {
       bucketName: '',
       prefix: '',
       workloadType: 'mixed',
-      deleteMode: 'single',
-      objectSizes: const [4096, 65536, 1048576],
-      concurrentThreads: initialSettings.transferConcurrency,
+      deleteMode: 'multi-object-post',
+      objectSizes: const [65536, 1048576, 8388608],
+      concurrentThreads: math.max(initialSettings.transferConcurrency * 8, 64),
       testMode: 'duration',
-      operationCount: 1000,
-      durationSeconds: 120,
-      validateChecksum: true,
+      operationCount: 50000,
+      durationSeconds: 60,
+      validateChecksum: false,
       checksumAlgorithm: 'crc32c',
       randomData: true,
-      inMemoryData: false,
-      objectCount: 500,
+      inMemoryData: true,
+      objectCount: 4096,
       connectTimeoutSeconds: initialSettings.connectTimeoutSeconds,
       readTimeoutSeconds: initialSettings.readTimeoutSeconds,
-      maxAttempts: initialSettings.safeRetries,
-      maxPoolConnections: initialSettings.maxPoolConnections,
+      maxAttempts: math.max(1, initialSettings.safeRetries - 1),
+      maxPoolConnections: math.max(initialSettings.maxPoolConnections * 2, 512),
       dataCacheMb: initialSettings.benchmarkDataCacheMb,
       csvOutputPath: '${initialSettings.tempPath}/benchmark-results.csv',
       jsonOutputPath: '${initialSettings.tempPath}/benchmark-results.json',
       logFilePath: initialSettings.benchmarkLogPath,
       debugMode: initialSettings.benchmarkDebugMode,
+      reducedLogging: true,
     );
     if (engineService is TransferJobSinkRegistrant) {
       (engineService as TransferJobSinkRegistrant)
@@ -203,6 +204,7 @@ class AppController extends ChangeNotifier {
   bool _benchmarkLifecycleActionInFlight = false;
   bool _initializeStarted = false;
   bool _engineLogSinkAttached = false;
+  bool _listingCancelled = false;
 
   WorkspaceTab activeTab = WorkspaceTab.browser;
   BrowserInspectorTab inspectorTab = BrowserInspectorTab.bucketInfo;
@@ -236,8 +238,10 @@ class AppController extends ChangeNotifier {
   static const int objectPageSize = 1000;
   int objectPage = 1;
   bool showAllObjects = false;
+  bool listAllKeys = false;
   bool loading = false;
   String? bannerMessage;
+  String? bannerTaskId;
   VersionBrowserOptions versionBrowserOptions = const VersionBrowserOptions();
   late TestDataToolConfig testDataConfig;
   late DeleteAllToolConfig deleteAllConfig;
@@ -253,8 +257,21 @@ class AppController extends ChangeNotifier {
     lastStatus: 'Idle',
   );
   String? selectedBenchmarkRunId;
+  String? selectedTaskId;
+  BrowserTaskView taskView = BrowserTaskView.running;
 
   bool isBusy(String actionKey) => _busyActions.contains(actionKey);
+
+  bool get hasBusyActions => _busyActions.isNotEmpty;
+
+  /// Requests cancellation of any in-progress listing loop.
+  /// The loop will stop after the current page completes and partial results
+  /// will be displayed immediately.
+  void cancelListing() {
+    _listingCancelled = true;
+    _markListingTasksCancelling();
+    notifyListeners();
+  }
 
   Future<void> initialize() async {
     if (_initializeStarted) {
@@ -331,6 +348,7 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> setEngine(String engineId) async {
+    final shouldRefreshBrowserData = activeTab == WorkspaceTab.browser;
     await _runBusy(
       'set-engine',
       'Switching backend engine to ${_engineLabel(engineId)}...',
@@ -344,8 +362,10 @@ class AppController extends ChangeNotifier {
           message: 'Selected engine $engineId.',
           source: 'engine',
         );
-        await refreshCapabilities();
-        if (selectedProfile != null) {
+        if (shouldRefreshBrowserData) {
+          await refreshCapabilities();
+        }
+        if (shouldRefreshBrowserData && selectedProfile != null) {
           await refreshBuckets();
         }
         await _persistState();
@@ -417,6 +437,7 @@ class AppController extends ChangeNotifier {
     await _runBusy('refresh-buckets', 'Listing buckets for ${profile.name}...',
         () async {
       await _guard('Buckets', () async {
+        _listingCancelled = false;
         final previousBucketName = selectedBucket?.name;
         _addEvent(
           level: 'INFO',
@@ -426,10 +447,18 @@ class AppController extends ChangeNotifier {
           profileId: profile.id,
           source: 'bucket-browser',
         );
+        if (_listingCancelled) return;
         buckets = await _engineService.listBuckets(
           engineId: activeEngineId,
           profile: profile,
         );
+        if (_listingCancelled) {
+          _appendBusyTaskLine(
+            'refresh-buckets',
+            'Bucket listing cancelled by user after the current request completed.',
+          );
+          return;
+        }
         selectedBucket = previousBucketName == null
             ? (buckets.isEmpty ? null : buckets.first)
             : (_bucketByName(previousBucketName) ??
@@ -476,13 +505,15 @@ class AppController extends ChangeNotifier {
     });
   }
 
-  Future<void> refreshObjects({String? prefix}) async {
+  Future<void> refreshObjects({String? prefix, bool listAll = false}) async {
     final profile = selectedProfile;
     final bucket = selectedBucket;
     if (profile == null || bucket == null) {
       objects = const [];
       versions = const [];
       versionCursor = const ListCursor(value: null, hasMore: false);
+      objectCursor = const ListCursor(value: null, hasMore: false);
+      listAllKeys = false;
       selectedObject = null;
       selectedObjectDetails = null;
       notifyListeners();
@@ -490,25 +521,37 @@ class AppController extends ChangeNotifier {
     }
     final nextPrefix = prefix ?? currentPrefix;
     final previousSelectionKey = selectedObject?.key;
-    await _runBusy('refresh-objects',
-        'Listing objects for ${bucket.name}${nextPrefix.isEmpty ? '' : ' at $nextPrefix'}...',
+    await _runBusy(
+        'refresh-objects',
+        listAll
+            ? 'Listing all objects for ${bucket.name}${nextPrefix.isEmpty ? '' : ' at $nextPrefix'}...'
+            : 'Listing up to $objectPageSize objects for ${bucket.name}${nextPrefix.isEmpty ? '' : ' at $nextPrefix'}...',
         () async {
       await _guard('Objects', () async {
         currentPrefix = nextPrefix;
+        listAllKeys = listAll;
         _syncObjectFilterWithPrefix();
         _addEvent(
           level: 'INFO',
           category: 'Objects',
           message:
-              'Listing objects for bucket ${bucket.name} with prefix "$currentPrefix" using $activeEngineId.',
+              '${listAll ? 'Listing all objects' : 'Listing the first $objectPageSize objects'} for bucket ${bucket.name} with prefix "$currentPrefix" using $activeEngineId.',
           includeSelectionContext: true,
           objectKey: previousSelectionKey,
           source: 'object-browser',
         );
+        _listingCancelled = false;
         final allItems = <ObjectEntry>[];
         var cursor = const ListCursor(value: null, hasMore: false);
         var pageNumber = 0;
         while (true) {
+          if (_listingCancelled) {
+            _appendBusyTaskLine(
+              'refresh-objects',
+              'Listing cancelled by user after $pageNumber page(s). Showing ${allItems.length} partial results.',
+            );
+            break;
+          }
           final objectResult = await _engineService.listObjects(
             engineId: activeEngineId,
             profile: profile,
@@ -522,9 +565,16 @@ class AppController extends ChangeNotifier {
           cursor = objectResult.cursor;
           _appendBusyTaskLine(
             'refresh-objects',
-            'Fetched page $pageNumber with ${objectResult.items.length} object(s).',
+            'Fetched page $pageNumber with ${objectResult.items.length} objects.',
           );
           if (!objectResult.cursor.hasMore) {
+            break;
+          }
+          if (!listAll) {
+            _appendBusyTaskLine(
+              'refresh-objects',
+              'More objects are available. Use List all to continue listing this bucket.',
+            );
             break;
           }
         }
@@ -535,6 +585,7 @@ class AppController extends ChangeNotifier {
             ? null
             : _objectByKey(previousSelectionKey);
         if (objects.isEmpty) {
+          bannerMessage = 'No objects found in ${bucket.name}.';
           _addEvent(
             level: 'INFO',
             category: 'Objects',
@@ -543,11 +594,15 @@ class AppController extends ChangeNotifier {
             source: 'object-browser',
           );
         } else {
+          bannerMessage = objectCursor.hasMore
+              ? 'Listed first ${objects.length} objects in ${bucket.name}.'
+              : 'Listed ${objects.length} objects in ${bucket.name}.';
           _addEvent(
             level: 'INFO',
             category: 'Objects',
-            message:
-                'Object listing returned ${objects.length} item(s) across $pageNumber page(s).',
+            message: objectCursor.hasMore
+                ? 'Object listing returned the first ${objects.length} items across $pageNumber page(s); more pages are available.'
+                : 'Object listing returned ${objects.length} items across $pageNumber page(s).',
             includeSelectionContext: true,
             source: 'object-browser',
           );
@@ -555,6 +610,76 @@ class AppController extends ChangeNotifier {
         await _loadSelectionArtifacts();
       });
     });
+  }
+
+  Future<void> listAllObjectsForCurrentBucket() async {
+    final profile = selectedProfile;
+    final bucket = selectedBucket;
+    if (profile == null || bucket == null) {
+      return;
+    }
+    if (!objectCursor.hasMore) {
+      listAllKeys = true;
+      notifyListeners();
+      return;
+    }
+    final previousSelectionKey = selectedObject?.key;
+    await _runBusy(
+      'refresh-objects',
+      'Listing all objects for ${bucket.name}${currentPrefix.isEmpty ? '' : ' at $currentPrefix'}...',
+      () async {
+        await _guard('Objects', () async {
+          _listingCancelled = false;
+          listAllKeys = true;
+          final allItems = objects.toList();
+          var cursor = objectCursor;
+          var pageNumber = (allItems.length / objectPageSize).ceil();
+          while (cursor.hasMore) {
+            if (_listingCancelled) {
+              _appendBusyTaskLine(
+                'refresh-objects',
+                'Listing cancelled by user after $pageNumber page(s). Showing ${allItems.length} partial results.',
+              );
+              break;
+            }
+            final objectResult = await _engineService.listObjects(
+              engineId: activeEngineId,
+              profile: profile,
+              bucketName: bucket.name,
+              prefix: currentPrefix,
+              flat: flatView,
+              cursor: cursor,
+            );
+            pageNumber += 1;
+            allItems.addAll(objectResult.items);
+            cursor = objectResult.cursor;
+            _appendBusyTaskLine(
+              'refresh-objects',
+              'Fetched page $pageNumber with ${objectResult.items.length} objects.',
+            );
+          }
+          objects = allItems;
+          objectCursor = cursor;
+          _resetObjectPagination();
+          selectedObject = previousSelectionKey == null
+              ? null
+              : _objectByKey(previousSelectionKey);
+          bannerMessage = cursor.hasMore
+              ? 'Listed ${objects.length} objects in ${bucket.name}. More are available.'
+              : 'Listed all ${objects.length} objects in ${bucket.name}.';
+          _addEvent(
+            level: 'INFO',
+            category: 'Objects',
+            message: cursor.hasMore
+                ? 'Object listing stopped with ${objects.length} items loaded and more pages available.'
+                : 'Object listing loaded all ${objects.length} items across $pageNumber page(s).',
+            includeSelectionContext: true,
+            source: 'object-browser',
+          );
+          await _loadSelectionArtifacts();
+        });
+      },
+    );
   }
 
   Future<void> setSelectedBucket(BucketSummary bucket) async {
@@ -804,7 +929,7 @@ class AppController extends ChangeNotifier {
 
   void showAllObjectsNow() {
     showAllObjects = true;
-    bannerMessage = 'Showing all ${visibleObjects.length} filtered object(s).';
+    bannerMessage = 'Showing all ${visibleObjects.length} loaded objects.';
     _addEvent(
       level: 'INFO',
       category: 'Objects',
@@ -868,12 +993,12 @@ class AppController extends ChangeNotifier {
           bucketName: bucket.name,
           keys: [object.key],
         );
-        bannerMessage = 'Deleted ${result.successCount} object(s).';
+        bannerMessage = 'Deleted ${result.successCount} objects.';
         _addEvent(
           level: 'INFO',
           category: 'Objects',
           message:
-              'Delete request for ${object.key} completed with ${result.successCount} success(es) and ${result.failureCount} failure(s).',
+              'Delete request for ${object.key} completed with ${result.successCount} successes and ${result.failureCount} failures.',
           includeSelectionContext: true,
           objectKey: object.key,
           source: 'object-browser',
@@ -904,12 +1029,13 @@ class AppController extends ChangeNotifier {
         );
         transferJobs = [job, ...transferJobs];
         _trackTransferJob(job);
-        bannerMessage = 'Started upload job ${job.id}.';
+        bannerTaskId = job.id;
+        bannerMessage = _transferBannerMessage(job);
         _addEvent(
           level: 'INFO',
           category: 'Transfers',
           message:
-              'Started upload job ${job.id} for ${filePaths.length} file(s) into ${bucket.name}.',
+              'Started upload job ${job.id} for ${filePaths.length} files into ${bucket.name}.',
           includeSelectionContext: true,
           source: 'task-tray',
         );
@@ -937,7 +1063,8 @@ class AppController extends ChangeNotifier {
         );
         transferJobs = [job, ...transferJobs];
         _trackTransferJob(job);
-        bannerMessage = 'Started download job ${job.id}.';
+        bannerTaskId = job.id;
+        bannerMessage = _transferBannerMessage(job);
         final destinationLabel =
             Platform.isAndroid ? 'Downloads' : settings.downloadPath;
         _addEvent(
@@ -1034,6 +1161,26 @@ class AppController extends ChangeNotifier {
       source: 'task-tray',
     );
     notifyListeners();
+  }
+
+  Future<void> cancelTask(BrowserTaskRecord task) async {
+    if (task.kind == BrowserTaskKind.transfer) {
+      await cancelTransfer(task.id);
+      return;
+    }
+    if (task.kind == BrowserTaskKind.tool) {
+      await cancelToolTask(task);
+      return;
+    }
+    if (task.kind == BrowserTaskKind.benchmark) {
+      if (benchmarkRun?.id == task.id && task.isRunningLike) {
+        await stopBenchmark();
+      }
+      return;
+    }
+    if (task.actionKey != null && _isListingActionKey(task.actionKey!)) {
+      cancelListing();
+    }
   }
 
   Future<void> generateSelectedPresignedUrl() async {
@@ -1211,32 +1358,75 @@ class AppController extends ChangeNotifier {
       notifyListeners();
       return;
     }
-    await _guard('Benchmark', () async {
-      final run = await _engineService.startBenchmark(
-        config: benchmarkDraft.copyWith(
-          profileId: profile.id,
-          engineId: activeEngineId,
-        ),
-        profile: profile,
-      );
-      benchmarkRun = run;
-      selectedBenchmarkRunId = run.id;
-      benchmarkHistory = [
-        run,
-        ...benchmarkHistory.where((item) => item.id != run.id)
-      ];
-      _trackBenchmarkRun(run, profileId: profile.id);
-      bannerMessage = 'Started benchmark ${run.id}.';
-      _addEvent(
-        level: 'INFO',
-        category: 'Benchmark',
-        message:
-            'Started benchmark ${run.id} with engine $activeEngineId against profile ${profile.name}.',
-        includeSelectionContext: true,
-        source: 'task-tray',
-      );
-      notifyListeners();
-    });
+    if (isBusy('benchmark-start')) {
+      return;
+    }
+
+    final optimisticId = 'pending-${DateTime.now().millisecondsSinceEpoch}';
+    final optimisticConfig = benchmarkDraft.copyWith(
+      profileId: profile.id,
+      engineId: activeEngineId,
+    );
+    final optimisticRun = BenchmarkRun(
+      id: optimisticId,
+      config: optimisticConfig,
+      status: 'starting',
+      processedCount: 0,
+      startedAt: DateTime.now(),
+      averageLatencyMs: 0,
+      throughputOpsPerSecond: 0,
+      liveLog: const <String>[],
+    );
+    benchmarkRun = optimisticRun;
+    selectedBenchmarkRunId = optimisticId;
+    benchmarkHistory = [
+      optimisticRun,
+      ...benchmarkHistory.where((item) => item.id != optimisticId),
+    ];
+    notifyListeners();
+
+    await _runBusy(
+      'benchmark-start',
+      'Starting benchmark…',
+      () async {
+        await _guard('Benchmark', () async {
+          final run = await _engineService.startBenchmark(
+            config: optimisticConfig,
+            profile: profile,
+          );
+          benchmarkRun = run;
+          selectedBenchmarkRunId = run.id;
+          benchmarkHistory = [
+            run,
+            ...benchmarkHistory.where(
+              (item) => item.id != run.id && item.id != optimisticId,
+            )
+          ];
+          _trackBenchmarkRun(run, profileId: profile.id);
+          bannerMessage = 'Started benchmark ${run.id}.';
+          _addEvent(
+            level: 'INFO',
+            category: 'Benchmark',
+            message:
+                'Started benchmark ${run.id} with engine $activeEngineId against profile ${profile.name}.',
+            includeSelectionContext: true,
+            source: 'task-tray',
+          );
+          notifyListeners();
+        });
+        if (benchmarkRun?.id == optimisticId) {
+          benchmarkRun = null;
+          benchmarkHistory = benchmarkHistory
+              .where((item) => item.id != optimisticId)
+              .toList();
+          if (selectedBenchmarkRunId == optimisticId) {
+            selectedBenchmarkRunId = null;
+          }
+          notifyListeners();
+        }
+      },
+      trackTask: false,
+    );
   }
 
   Future<void> pollBenchmark() async {
@@ -1276,6 +1466,16 @@ class AppController extends ChangeNotifier {
     if (run == null) {
       return;
     }
+    benchmarkRun = run.copyWith(
+      status: 'pausing',
+      liveLog: [...run.liveLog, 'Pause requested...'],
+    );
+    benchmarkHistory = [
+      benchmarkRun!,
+      ...benchmarkHistory.where((item) => item.id != benchmarkRun!.id),
+    ];
+    bannerMessage = 'Pausing benchmark ${run.id}...';
+    notifyListeners();
     _benchmarkLifecycleActionInFlight = true;
     try {
       await _engineService.pauseBenchmark(run.id);
@@ -1303,6 +1503,16 @@ class AppController extends ChangeNotifier {
     if (run == null) {
       return;
     }
+    benchmarkRun = run.copyWith(
+      status: 'resuming',
+      liveLog: [...run.liveLog, 'Resume requested...'],
+    );
+    benchmarkHistory = [
+      benchmarkRun!,
+      ...benchmarkHistory.where((item) => item.id != benchmarkRun!.id),
+    ];
+    bannerMessage = 'Resuming benchmark ${run.id}...';
+    notifyListeners();
     _benchmarkLifecycleActionInFlight = true;
     try {
       await _engineService.resumeBenchmark(run.id);
@@ -1330,6 +1540,16 @@ class AppController extends ChangeNotifier {
     if (run == null) {
       return;
     }
+    benchmarkRun = run.copyWith(
+      status: 'stopping',
+      liveLog: [...run.liveLog, 'Stop requested...'],
+    );
+    benchmarkHistory = [
+      benchmarkRun!,
+      ...benchmarkHistory.where((item) => item.id != benchmarkRun!.id),
+    ];
+    bannerMessage = 'Stopping benchmark ${run.id}...';
+    notifyListeners();
     _benchmarkLifecycleActionInFlight = true;
     try {
       await _engineService.stopBenchmark(run.id);
@@ -1698,7 +1918,7 @@ class AppController extends ChangeNotifier {
     _addEvent(
       level: 'INFO',
       category: 'Profiles',
-      message: 'Exported ${profiles.length} profile(s) to ${file.path}.',
+      message: 'Exported ${profiles.length} profiles to ${file.path}.',
       source: 'profiles',
     );
     notifyListeners();
@@ -1731,11 +1951,11 @@ class AppController extends ChangeNotifier {
         ? null
         : profiles.firstWhere((profile) => profile.id == nextSelectedId);
     await _persistState();
-    bannerMessage = 'Imported ${importedProfiles.length} profile(s).';
+    bannerMessage = 'Imported ${importedProfiles.length} profiles.';
     _addEvent(
       level: 'INFO',
       category: 'Profiles',
-      message: 'Imported ${importedProfiles.length} profile(s) from $path.',
+      message: 'Imported ${importedProfiles.length} profiles from $path.',
       source: 'profiles',
     );
     if (selectedProfile != null) {
@@ -1752,6 +1972,7 @@ class AppController extends ChangeNotifier {
     String source = 'app',
   }) {
     bannerMessage = message;
+    bannerTaskId = null;
     _addEvent(
       level: 'INFO',
       category: category,
@@ -1840,6 +2061,7 @@ class AppController extends ChangeNotifier {
 
   void clearBanner() {
     bannerMessage = null;
+    bannerTaskId = null;
     notifyListeners();
   }
 
@@ -1982,6 +2204,49 @@ class AppController extends ChangeNotifier {
     }
   }
 
+  void setTaskView(BrowserTaskView view) {
+    if (taskView == view) {
+      return;
+    }
+    taskView = view;
+    notifyListeners();
+  }
+
+  void selectTask(String taskId) {
+    selectedTaskId = taskId;
+    notifyListeners();
+  }
+
+  void openBannerTask() {
+    final taskId = bannerTaskId;
+    if (taskId == null) {
+      return;
+    }
+    final task = _taskById(taskId);
+    if (task == null) {
+      return;
+    }
+    selectedTaskId = task.id;
+    taskView = task.isRunningLike
+        ? BrowserTaskView.running
+        : task.isFailedLike
+            ? BrowserTaskView.failed
+            : BrowserTaskView.all;
+    activeTab = WorkspaceTab.tasks;
+    _addEvent(
+      level: 'INFO',
+      category: 'Navigation',
+      message: 'Opened task ${task.label}.',
+      source: 'task-tray',
+    );
+    notifyListeners();
+  }
+
+  BrowserTaskRecord? get bannerTask {
+    final taskId = bannerTaskId;
+    return taskId == null ? null : _taskById(taskId);
+  }
+
   String get benchmarkExportSummary {
     final run = selectedBenchmarkRun;
     if (run == null) {
@@ -2037,13 +2302,33 @@ class AppController extends ChangeNotifier {
     final breakdown = ['PUT', 'GET', 'DELETE']
         .where((operation) => operations.containsKey(operation))
         .map((operation) => '$operation ${operations[operation]}')
-        .join(' • ');
+        .join(' - ');
     return switch (run.status) {
       'completed' => 'Completed workload: $breakdown',
       'stopped' => 'Stopped after: $breakdown',
       'paused' => 'Paused with: $breakdown',
       _ => 'Current workload: $breakdown',
     };
+  }
+
+  /// Wall-clock throughput cross-check: processedCount ÷ elapsed seconds.
+  /// This is a conservative measurement that may be lower than the engine-
+  /// reported value because it includes connection warm-up and queuing time.
+  double wallClockThroughputForRun(BenchmarkRun run) {
+    final elapsedMs = run.activeElapsedSeconds != null
+        ? run.activeElapsedSeconds! * 1000.0
+        : DateTime.now().difference(run.startedAt).inMilliseconds.toDouble();
+    if (elapsedMs <= 0) return 0;
+    return run.processedCount / (elapsedMs / 1000.0);
+  }
+
+  /// Estimated data throughput in MiB/s based on engine ops/s and average
+  /// configured object size.
+  double estimatedMibsForRun(BenchmarkRun run) {
+    if (run.config.objectSizes.isEmpty) return 0;
+    final avgBytes = run.config.objectSizes.reduce((a, b) => a + b) /
+        run.config.objectSizes.length;
+    return (run.throughputOpsPerSecond * avgBytes) / (1024 * 1024);
   }
 
   void selectBenchmarkRun(String runId) {
@@ -2081,7 +2366,7 @@ class AppController extends ChangeNotifier {
         level: 'INFO',
         category: 'Versions',
         message:
-            'Loaded ${versions.length} version entry(ies) for bucket ${bucket.name}.',
+            'Loaded ${versions.length} version entries for bucket ${bucket.name}.',
         includeSelectionContext: true,
         source: 'version-browser',
       );
@@ -2098,7 +2383,7 @@ class AppController extends ChangeNotifier {
       level: 'INFO',
       category: 'Objects',
       message:
-          'Loaded ${versions.length} version entry(ies) and object details for ${object.key}.',
+          'Loaded ${versions.length} version entries and object details for ${object.key}.',
       includeSelectionContext: true,
       objectKey: object.key,
       source: 'events-and-debug',
@@ -2146,6 +2431,7 @@ class AppController extends ChangeNotifier {
     _busyActions.add(actionKey);
     _busyTaskIds[actionKey] = taskId;
     bannerMessage = busyMessage;
+    bannerTaskId = trackTask ? taskId : null;
     if (trackTask) {
       _upsertTask(
         BrowserTaskRecord(
@@ -2159,6 +2445,8 @@ class AppController extends ChangeNotifier {
           bucketName: selectedBucket?.name,
           outputLines: <String>[busyMessage],
           workspaceTab: activeTab,
+          actionKey: actionKey,
+          canCancel: _isListingActionKey(actionKey),
         ),
       );
     }
@@ -2178,17 +2466,26 @@ class AppController extends ChangeNotifier {
           uncaughtError != null || _guardErrorSequence != guardMarker;
       final currentTask = trackTask ? _taskById(taskId) : null;
       if (currentTask != null) {
-        final summary =
-            failed ? (bannerMessage ?? 'Action failed.') : 'Completed.';
+        final cancelled = _isListingActionKey(actionKey) && _listingCancelled;
+        final summary = cancelled
+            ? 'Cancelled.'
+            : failed
+                ? (bannerMessage ?? 'Action failed.')
+                : 'Completed.';
         _upsertTask(
           currentTask.copyWith(
-            status: failed ? 'failed' : 'completed',
+            status: cancelled
+                ? 'cancelled'
+                : failed
+                    ? 'failed'
+                    : 'completed',
             completedAt: DateTime.now(),
             progress: 1,
             outputLines: <String>[
               ...currentTask.outputLines,
               summary,
             ],
+            canCancel: false,
           ),
         );
       }
@@ -2216,6 +2513,37 @@ class AppController extends ChangeNotifier {
       ),
     );
     notifyListeners();
+  }
+
+  bool _isListingActionKey(String actionKey) {
+    return actionKey == 'refresh-buckets' || actionKey == 'refresh-objects';
+  }
+
+  void _markListingTasksCancelling() {
+    final updated = <BrowserTaskRecord>[];
+    var changed = false;
+    for (final task in browserTasks) {
+      if (task.isRunningLike &&
+          task.actionKey != null &&
+          _isListingActionKey(task.actionKey!)) {
+        updated.add(
+          task.copyWith(
+            status: 'cancelling',
+            canCancel: false,
+            outputLines: <String>[
+              ...task.outputLines,
+              'Cancellation requested. Waiting for the current listing request to finish.',
+            ],
+          ),
+        );
+        changed = true;
+      } else {
+        updated.add(task);
+      }
+    }
+    if (changed) {
+      browserTasks = updated;
+    }
   }
 
   Future<File> _writeJsonExport({
@@ -2593,14 +2921,14 @@ class AppController extends ChangeNotifier {
             hasMore = page.cursor.hasMore;
           }
           bannerMessage = failures.isEmpty
-              ? 'Copied $copiedCount object(s) to $trimmedDestination.'
-              : 'Copied $copiedCount object(s) to $trimmedDestination with ${failures.length} failure(s).';
+              ? 'Copied $copiedCount objects to $trimmedDestination.'
+              : 'Copied $copiedCount objects to $trimmedDestination with ${failures.length} failures.';
           _addEvent(
             level: failures.isEmpty ? 'INFO' : 'WARN',
             category: 'Buckets',
             message: failures.isEmpty
-                ? 'Copied $copiedCount object(s) from $sourceBucketName to $trimmedDestination.'
-                : 'Copied $copiedCount object(s) from $sourceBucketName to $trimmedDestination with failures: ${failures.join(' | ')}',
+                ? 'Copied $copiedCount objects from $sourceBucketName to $trimmedDestination.'
+                : 'Copied $copiedCount objects from $sourceBucketName to $trimmedDestination with failures: ${failures.join(' | ')}',
             profileId: profile.id,
             bucketName: sourceBucketName,
             source: 'bucket-admin',
@@ -2736,10 +3064,31 @@ class AppController extends ChangeNotifier {
         canCancel: job.canCancel,
       ),
     );
+    if (bannerTaskId == job.id) {
+      bannerMessage = _transferBannerMessage(job);
+    }
     notifyListeners();
   }
 
+  String _transferBannerMessage(TransferJob job) {
+    final percent = (job.progress.clamp(0, 1) * 100).round();
+    final direction = job.direction == 'download' ? 'Download' : 'Upload';
+    if (job.status == 'completed') {
+      return '$direction complete - 100%';
+    }
+    if (job.status == 'failed') {
+      return '$direction failed - $percent%';
+    }
+    if (job.status == 'paused') {
+      return '$direction paused - $percent%';
+    }
+    return '$direction in progress - $percent%';
+  }
+
   void _handleTransferJobUpdate(TransferJob job) {
+    if (_busyActions.contains(job.direction)) {
+      bannerTaskId = job.id;
+    }
     _replaceTransfer(job);
     _trackTransferJob(job);
   }
@@ -2760,6 +3109,9 @@ class AppController extends ChangeNotifier {
         bucketName: run.config.bucketName,
         outputLines: run.liveLog,
         workspaceTab: WorkspaceTab.benchmark,
+        canCancel: run.status == 'running' ||
+            run.status == 'paused' ||
+            run.status == 'starting',
       ),
     );
   }
@@ -2911,6 +3263,9 @@ class AppController extends ChangeNotifier {
     final operationsByType = _syntheticBenchmarkOperations(
       run.processedCount,
       run.config.workloadType,
+      readPercent: run.config.readPercent,
+      writePercent: run.config.writePercent,
+      deletePercent: run.config.deletePercent,
     );
     final throughputBase = run.throughputOpsPerSecond == 0
         ? run.config.concurrentThreads * 120
@@ -3201,10 +3556,40 @@ class AppController extends ChangeNotifier {
 
   Map<String, int> _syntheticBenchmarkOperations(
     int processedCount,
-    String workloadType,
-  ) {
+    String workloadType, {
+    int readPercent = 34,
+    int writePercent = 33,
+    int deletePercent = 33,
+  }) {
     if (processedCount <= 0) {
-      return const <String, int>{'PUT': 0, 'GET': 0, 'DELETE': 0, 'POST': 0};
+      return const <String, int>{'PUT': 0, 'GET': 0, 'DELETE': 0};
+    }
+    // Pure workload types.
+    if (workloadType == 'write-only') {
+      return <String, int>{'PUT': processedCount};
+    }
+    if (workloadType == 'read-only') {
+      return <String, int>{'GET': processedCount};
+    }
+    // Custom percentage mix.
+    if (workloadType == 'custom') {
+      final operations = <String, int>{};
+      var assigned = 0;
+      if (writePercent > 0) {
+        final puts = (processedCount * writePercent / 100).floor();
+        operations['PUT'] = puts;
+        assigned += puts;
+      }
+      if (readPercent > 0) {
+        final gets = (processedCount * readPercent / 100).floor();
+        operations['GET'] = gets;
+        assigned += gets;
+      }
+      if (deletePercent > 0) {
+        // Give the remainder to DELETE so total always equals processedCount.
+        operations['DELETE'] = processedCount - assigned;
+      }
+      return operations;
     }
     final ratios = switch (workloadType) {
       'write-heavy' => const <String, int>{

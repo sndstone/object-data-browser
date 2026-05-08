@@ -16,12 +16,48 @@ $ScriptPath = $MyInvocation.MyCommand.Path
 $RootDir = Split-Path -Parent (Split-Path -Parent $ScriptPath)
 $ToolCacheDir = Join-Path $RootDir ".tmp\toolchains"
 
+function Invoke-RequiredScript {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptPath,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [object[]]$Arguments
+    )
+
+    try {
+        & $ScriptPath @Arguments
+    } catch {
+        Write-Host $_ -ForegroundColor Red
+        Exit-Build 1
+    }
+
+    if (-not $?) {
+        Exit-Build 1
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        Exit-Build $LASTEXITCODE
+    }
+}
+
 function Get-WindowsSystemPath {
     $SystemRoot = if ($env:SystemRoot) { $env:SystemRoot } else { "C:\Windows" }
-    return @(
+    $PathEntries = @(
         (Join-Path $SystemRoot "System32"),
         $SystemRoot
-    ) -join ";"
+    )
+
+    foreach ($GitCandidate in @(
+        "C:\Program Files\Git\cmd",
+        "C:\Program Files\Git\bin",
+        "C:\Program Files (x86)\Git\cmd"
+    )) {
+        if (Test-Path (Join-Path $GitCandidate "git.exe")) {
+            $PathEntries += $GitCandidate
+        }
+    }
+
+    return ($PathEntries | Select-Object -Unique) -join ";"
 }
 
 function Exit-Build {
@@ -82,7 +118,8 @@ function Get-BuildProcessArguments {
         "-ExecutionPolicy", "Bypass",
         "-File", $ScriptPath,
         "-Platform", $Platform,
-        "-Arch", $Arch
+        "-Arch", $Arch,
+        "-KeepShellOpen"   # always pause in the elevated window so errors are readable
     )
 
     if ($Platform -eq "windows") {
@@ -97,10 +134,6 @@ function Get-BuildProcessArguments {
     if ($Help) {
         $ArgumentList += "-Help"
     }
-    if (-not $ArgumentList.Contains("-KeepShellOpen")) {
-        $ArgumentList += "-KeepShellOpen"
-    }
-
     return $ArgumentList
 }
 
@@ -118,8 +151,9 @@ function Ensure-WindowsSymlinkSupport {
     }
 
     if (-not (Test-IsAdministrator)) {
-        Write-Host "Symlink support is unavailable in the current session. Relaunching the Windows build with elevation..."
-        Write-Host "The elevated PowerShell window will stay open when the build ends so you can review the output."
+        Write-Host "Symlink support is unavailable in the current session."
+        Write-Host "Relaunching the Windows build in an elevated PowerShell window so Flutter can create plugin symlinks."
+        Write-Host "Accept the UAC prompt to continue. If you cancel it, the build will stop before the desktop app is fully produced."
         try {
             $ElevatedProcess = Start-Process `
                 -FilePath "powershell.exe" `
@@ -248,11 +282,13 @@ $ToolsDir = Resolve-ToolsDir -TargetPath $ToolCacheDir
 
 $env:CARGO_HOME = Join-Path $ToolsDir "cargo"
 $env:RUSTUP_HOME = Join-Path $ToolsDir "rustup"
+$env:PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC"
 $env:PATH = "$(Get-WindowsSystemPath);$(Join-Path $ToolsDir 'flutter\bin');$(Join-Path $ToolsDir 'go\bin');$(Join-Path $ToolsDir 'java\bin');$(Join-Path $ToolsDir 'cargo\bin');$(Join-Path $ToolsDir 'wix');$(Join-Path $ToolsDir 'wix\bin');$(Join-Path $ToolsDir 'android-sdk\cmdline-tools\latest\bin');$(Join-Path $ToolsDir 'android-sdk\platform-tools');$env:PATH"
 $env:JAVA_HOME = Join-Path $ToolsDir "java"
 $env:ANDROID_SDK_ROOT = Join-Path $ToolsDir "android-sdk"
 $env:ANDROID_HOME = $env:ANDROID_SDK_ROOT
 $FlutterDir = Join-Path $RootDir "apps\flutter_app"
+$FlutterCmd = Join-Path $ToolsDir "flutter\bin\flutter.bat"
 $LogDir = Join-Path $RootDir ".tmp\logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $AnalyzeLog = Join-Path $LogDir "flutter-analyze-$Platform-$Arch.log"
@@ -288,6 +324,10 @@ $ShortFlutterDir = New-ShortJunction `
     -LinkPath (Join-Path $ToolsDir "app") `
     -TargetPath $FlutterDir
 
+if ($Platform -eq "windows") {
+    Write-Host "Using short project path $ShortFlutterDir to avoid Windows MAX_PATH issues during Flutter and MSBuild steps."
+}
+
 function Ensure-FlutterProject {
     param(
         [string[]]$Platforms
@@ -311,32 +351,73 @@ function Ensure-FlutterProject {
         $PlatformList = $Platforms -join ","
         Write-Host "Creating missing Flutter platform scaffolding: $PlatformList"
         Push-Location $FlutterDir
-        & flutter create `
-            --project-name s3_browser_crossplat `
-            --org com.example.s3browser `
-            --platforms $PlatformList `
-            .
+        $null = & cmd.exe /c ('"' + $FlutterCmd + '" create --project-name s3_browser_crossplat --org com.example.s3browser --platforms ' + $PlatformList + ' .')
         Pop-Location
+    }
+}
+
+function Invoke-Flutter {
+    param(
+        [string]$Arguments,
+        [string]$LogPath,
+        [switch]$Append
+    )
+
+    $CommandLine = '"' + $FlutterCmd + '" ' + $Arguments
+    if ($LogPath) {
+        # Stream to console in real time AND capture to log file simultaneously.
+        $LogPathEscaped = $LogPath.Replace('"', '""')
+        if ($Append) {
+            & cmd.exe /c ($CommandLine + ' 2>&1') | Tee-Object -FilePath $LogPath -Append
+        } else {
+            & cmd.exe /c ($CommandLine + ' 2>&1') | Tee-Object -FilePath $LogPath
+        }
+    } else {
+        & cmd.exe /c ($CommandLine + ' 2>&1')
     }
 }
 
 function Ensure-AndroidBuildEnvironment {
     $AndroidRoot = Join-Path $ToolsDir "android-sdk"
     $AndroidLocalProperties = Join-Path $FlutterDir "android\local.properties"
+    $GradlePropertiesPath = Join-Path $FlutterDir "android\gradle.properties"
     $FlutterSdk = Join-Path $ToolsDir "flutter"
+    $JavaHome = Join-Path $ToolsDir "java"
 
     if (-not (Test-Path (Join-Path $AndroidRoot "cmdline-tools\latest\bin\sdkmanager.bat"))) {
         throw "Android SDK command-line tools were not found at $AndroidRoot. Rerun .\scripts\bootstrap.ps1 -Components flutter,java,android."
     }
 
-    & flutter config --android-sdk $AndroidRoot | Out-Null
+    Invoke-Flutter -Arguments ('config --android-sdk "' + $AndroidRoot + '"')
 
     $AndroidRootEscaped = $AndroidRoot.Replace('\', '\\')
     $FlutterSdkEscaped = $FlutterSdk.Replace('\', '\\')
+    $JavaHomeEscaped = $JavaHome.Replace('\', '\\')
     Set-Content -Path $AndroidLocalProperties -Value @(
         "sdk.dir=$AndroidRootEscaped"
         "flutter.sdk=$FlutterSdkEscaped"
     )
+
+    if (Test-Path $GradlePropertiesPath) {
+        $GradleProperties = Get-Content -Path $GradlePropertiesPath
+        $UpdatedGradleProperties = New-Object System.Collections.Generic.List[string]
+        $JavaHomeWritten = $false
+
+        foreach ($Line in $GradleProperties) {
+            if ($Line -like "org.gradle.java.home=*") {
+                $UpdatedGradleProperties.Add("org.gradle.java.home=$JavaHomeEscaped")
+                $JavaHomeWritten = $true
+            } else {
+                $UpdatedGradleProperties.Add($Line)
+            }
+        }
+
+        if (-not $JavaHomeWritten) {
+            $UpdatedGradleProperties.Add("org.gradle.java.home=$JavaHomeEscaped")
+        }
+
+        Set-Content -Path $GradlePropertiesPath -Value $UpdatedGradleProperties
+    }
 }
 
 function Stop-StaleWindowsBuildProcesses {
@@ -344,7 +425,7 @@ function Stop-StaleWindowsBuildProcesses {
 
     $Processes = Get-Process -Name "s3_browser_crossplat" -ErrorAction SilentlyContinue
     foreach ($Process in $Processes) {
-        Write-Host "Stopping running S3 Browser Crossplat process (PID $($Process.Id))"
+        Write-Host "Stopping running Object Data Browser process (PID $($Process.Id))"
         Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
         $Stopped = $true
     }
@@ -380,6 +461,14 @@ function Remove-PathWithRetries {
     return -not (Test-Path $Path)
 }
 
+function Set-ArtifactTimestamp {
+    param([string]$Path)
+
+    if (Test-Path $Path) {
+        (Get-Item $Path).LastWriteTime = Get-Date
+    }
+}
+
 Push-Location $ShortFlutterDir
 if ($Platform -eq "windows") {
     Stop-StaleWindowsBuildProcesses
@@ -389,12 +478,17 @@ if ($Platform -eq "windows") {
         Write-Host "Unable to fully remove existing build directory before flutter clean. Continuing with Flutter cleanup."
     }
     Ensure-FlutterProject -Platforms @("windows")
-    & flutter clean
+    Invoke-Flutter -Arguments "clean"
 } elseif ($Platform -eq "android") {
+    $AndroidBuildDir = Join-Path $FlutterDir "build\app"
+    if (-not (Remove-PathWithRetries -Path $AndroidBuildDir)) {
+        Write-Host "Unable to fully remove existing Android build directory before flutter clean. Continuing with Flutter cleanup."
+    }
     Ensure-FlutterProject -Platforms @("android")
+    Invoke-Flutter -Arguments "clean"
     Ensure-AndroidBuildEnvironment
 }
-& flutter pub get
+Invoke-Flutter -Arguments "pub get"
 if ($LASTEXITCODE -ne 0) {
     Pop-Location
     Exit-Build $LASTEXITCODE
@@ -402,9 +496,14 @@ if ($LASTEXITCODE -ne 0) {
 
 if ($Platform -eq "windows") {
     Write-Host "Running flutter analyze..."
-    & flutter analyze 2>&1 | Tee-Object -FilePath $AnalyzeLog
+    Invoke-Flutter -Arguments "analyze" -LogPath $AnalyzeLog
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "Analyze log written to $AnalyzeLog"
+        Write-Host ""
+        Write-Host "--- Analyze failures ($AnalyzeLog) ---" -ForegroundColor Yellow
+        if (Test-Path $AnalyzeLog) {
+            Get-Content $AnalyzeLog -Tail 40 | Write-Host
+        }
+        Write-Host "Analyze log written to $AnalyzeLog" -ForegroundColor Red
         Pop-Location
         Exit-Build $LASTEXITCODE
     }
@@ -425,52 +524,104 @@ if ($Platform -eq "windows") {
             [void](Remove-PathWithRetries -Path $Artifact)
         }
     }
-    & flutter build windows -v 2>&1 | Tee-Object -FilePath $BuildLog
+    Invoke-Flutter -Arguments "build windows -v" -LogPath $BuildLog
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "Build log written to $BuildLog"
+        Write-Host ""
+        Write-Host "--- Last 60 lines of build log ($BuildLog) ---" -ForegroundColor Yellow
+        if (Test-Path $BuildLog) {
+            Get-Content $BuildLog -Tail 60 | Write-Host
+        }
+        Write-Host "--- End of build log ---" -ForegroundColor Yellow
+        Write-Host "Build log written to $BuildLog" -ForegroundColor Red
         Pop-Location
         Exit-Build $LASTEXITCODE
     }
     Pop-Location
-    & (Join-Path $RootDir "scripts\stage-engines.ps1") `
-        -ReleaseDir (Join-Path $FlutterDir "build\windows\$Arch\runner\Release") `
-        -ToolsDir $ToolsDir `
-        -Arch $Arch
-    if ($LASTEXITCODE -ne 0) {
-        Exit-Build $LASTEXITCODE
+    $ReleaseDir = Join-Path $FlutterDir "build\windows\$Arch\runner\Release"
+
+    Write-Host "Staging engine binaries..."
+    $StageEnginesArgs = @{
+        ReleaseDir = $ReleaseDir
+        ToolsDir   = $ToolsDir
+        Arch       = $Arch
+    }
+    try {
+        & (Join-Path $RootDir "scripts\stage-engines.ps1") @StageEnginesArgs
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "stage-engines.ps1 failed with exit code $LASTEXITCODE." -ForegroundColor Red
+            Exit-Build $LASTEXITCODE
+        }
+    } catch {
+        Write-Host "stage-engines.ps1 error: $_" -ForegroundColor Red
+        Exit-Build 1
+    }
+
+    $EngineManifestPath = Join-Path $ReleaseDir "engines\manifest.json"
+    if (-not (Test-Path $EngineManifestPath)) {
+        Write-Host "Engine staging completed without writing $EngineManifestPath." -ForegroundColor Red
+        Exit-Build 1
     }
     if ($Installer -eq "msi") {
-        & (Join-Path $RootDir "scripts\package-windows.ps1") -Arch $Arch
-        Exit-Build $LASTEXITCODE
+        Write-Host "Building MSI installer..."
+        $PackageArgs = @{ Arch = $Arch }
+        try {
+            & (Join-Path $RootDir "scripts\package-windows.ps1") @PackageArgs
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "package-windows.ps1 failed with exit code $LASTEXITCODE." -ForegroundColor Red
+                Exit-Build $LASTEXITCODE
+            }
+        } catch {
+            Write-Host "package-windows.ps1 error: $_" -ForegroundColor Red
+            Exit-Build 1
+        }
+        Exit-Build 0
     }
+    Write-Host "Windows desktop app staged at $ReleaseDir"
+    Write-Host "Engine manifest staged at $EngineManifestPath"
     Exit-Build 0
 } elseif ($Platform -eq "android") {
     Write-Host "Building Android APK (arm64, sideloadable release signed with the debug key)..."
-    & flutter build apk --release --target-platform android-arm64 --split-per-abi 2>&1 | Tee-Object -FilePath $BuildLog
+    Invoke-Flutter -Arguments "build apk --release --target-platform android-arm64 --split-per-abi" -LogPath $BuildLog
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Build log written to $BuildLog"
         Pop-Location
         Exit-Build $LASTEXITCODE
     }
     Write-Host "Building Android App Bundle (secondary artifact)..."
-    & flutter build appbundle --release --target-platform android-arm64 2>&1 | Tee-Object -FilePath $BuildLog -Append
-    if ($LASTEXITCODE -ne 0) {
+    $BundleDexDir = Join-Path $FlutterDir "build\app\intermediates\dex\release\minifyReleaseWithR8"
+    $BundleExitCode = 0
+    foreach ($Attempt in 1..2) {
+        Invoke-Flutter -Arguments "build appbundle --release --target-platform android-arm64" -LogPath $BuildLog -Append
+        $BundleExitCode = $LASTEXITCODE
+        if ($BundleExitCode -eq 0) {
+            break
+        }
+
+        if ($Attempt -eq 1) {
+            Write-Host "Android App Bundle build hit a locked dex intermediate. Clearing it and retrying once..."
+            [void](Remove-PathWithRetries -Path $BundleDexDir)
+            Start-Sleep -Seconds 2
+        }
+    }
+    if ($BundleExitCode -ne 0) {
         Write-Host "Build log written to $BuildLog"
         Pop-Location
-        Exit-Build $LASTEXITCODE
+        Exit-Build $BundleExitCode
     }
     $Version = Get-AppVersion
     $AndroidArtifactDir = Join-Path $RootDir "dist\android"
     $SourceApk = Join-Path $FlutterDir "build\app\outputs\flutter-apk\app-arm64-v8a-release.apk"
     $SourceAab = Join-Path $FlutterDir "build\app\outputs\bundle\release\app-release.aab"
-    $VersionedApk = Join-Path $AndroidArtifactDir "s3-browser-crossplat-android-$Version-arm64.apk"
-    $VersionedAab = Join-Path $AndroidArtifactDir "s3-browser-crossplat-android-$Version-arm64.aab"
+    $VersionedApk = Join-Path $AndroidArtifactDir "object-data-browser-android-$Version-arm64.apk"
+    $VersionedAab = Join-Path $AndroidArtifactDir "object-data-browser-android-$Version-arm64.aab"
     New-Item -ItemType Directory -Force -Path $AndroidArtifactDir | Out-Null
     if (Test-Path $SourceApk) {
         Copy-Item -Path $SourceApk -Destination $VersionedApk -Force
+        Set-ArtifactTimestamp -Path $VersionedApk
     }
     if (Test-Path $SourceAab) {
         Copy-Item -Path $SourceAab -Destination $VersionedAab -Force
+        Set-ArtifactTimestamp -Path $VersionedAab
     }
     Write-Host "Primary APK artifact: $VersionedApk"
     Write-Host "Secondary AAB artifact: $VersionedAab"

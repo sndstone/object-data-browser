@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.0.15 - 2026-05-08
+
+- Renamed the application and packaging metadata to Object Data Browser.
+- Updated release artifact names and documentation links for the object data pivot.
+- Kept existing S3 workflows while preparing the app identity for broader object data sources.
+
+## 2.0.14 - 2026-05-05
+
+- Redesigned the app shell with a dark storage navigation rail, compact header controls, and a quieter white workspace canvas.
+- Restyled bucket browsing, object listing, inspector panels, settings, tasks, tools, and event log surfaces around the new 0.2.14 design reference.
+- Bumped app metadata to 2.0.14.
+
+## 2.0.13 - 2026-05-05
+
+- Improved settings readability and spacing for diagnostics and endpoint profile editing.
+- Updated default UI scale to 75% and kept log text scale at 90%.
+- Bumped app metadata to 2.0.13.
+
 ## 2.0.12 - 2026-04-28
 
 - Added task/listing cancellation hooks so long bucket and object listings can stop cleanly and show partial results.
@@ -53,7 +71,7 @@
 
 ## 2.0.0 - 2026-03-08
 
-- Rebuilt the project as `S3 Browser Crossplat`, a Flutter-based cross-platform S3 browser targeting Windows, macOS, Linux, and Android.
+- Rebuilt the project as `Object Data Browser`, a Flutter-based cross-platform object data browser targeting Windows, macOS, Linux, and Android.
 - Added a desktop sidecar engine model with packaged Python, Go, Rust, and Java engines, with the Python engine implemented as the first real S3 backend.
 - Added Windows MSI packaging and engine staging so desktop releases bundle the app plus the engine sidecars under `engines/`.
 - Added a benchmark workspace, adaptive navigation shell, clustered settings, and an Event Log workspace with export support.
@@ -65,4 +83,4 @@
 
 ## 1.x
 
-- Legacy Python Tkinter S3 browser implementation before the `S3 Browser Crossplat` rewrite.
+- Legacy Python Tkinter object data browser implementation before the `Object Data Browser` rewrite.

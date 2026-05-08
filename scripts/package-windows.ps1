@@ -82,6 +82,46 @@ function Escape-Xml {
     return [System.Security.SecurityElement]::Escape($Value)
 }
 
+function Invoke-NativeTool {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments
+    )
+
+    $Process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -Wait -PassThru
+    return $Process.ExitCode
+}
+
+function Remove-ArtifactIfPresent {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) {
+        return
+    }
+
+    & cmd.exe /c "attrib -R `"$Path`" >nul 2>&1"
+    & cmd.exe /c "del /F /Q `"$Path`" >nul 2>&1"
+
+    if (Test-Path $Path) {
+        Remove-Item -Path $Path -Force -ErrorAction Stop
+    }
+}
+
+function Resolve-ArtifactOutputPath {
+    param([string]$PreferredPath)
+
+    try {
+        Remove-ArtifactIfPresent -Path $PreferredPath
+        return $PreferredPath
+    } catch {
+        $Directory = Split-Path -Parent $PreferredPath
+        $BaseName = [System.IO.Path]::GetFileNameWithoutExtension($PreferredPath)
+        $Extension = [System.IO.Path]::GetExtension($PreferredPath)
+        $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        return Join-Path $Directory "$BaseName-$Timestamp$Extension"
+    }
+}
+
 if (-not (Test-Path $AppReleaseDir)) {
     throw "Windows build output was not found at $AppReleaseDir. Run .\scripts\build.ps1 -Platform windows -Installer none first, or rerun the full Windows build."
 }
@@ -114,9 +154,28 @@ foreach ($EngineId in $ExpectedEngineIds) {
 $ToolsDir = Resolve-ToolsDir -TargetPath $ToolCacheDir
 $env:PATH = "$(Join-Path $ToolsDir 'wix');$(Join-Path $ToolsDir 'wix\bin');$env:PATH"
 
-$WixCli = Get-Command wix -ErrorAction SilentlyContinue
-$Candle = Get-Command candle -ErrorAction SilentlyContinue
-$Light = Get-Command light -ErrorAction SilentlyContinue
+$LocalWixCli = Join-Path $ToolCacheDir "wix\wix.exe"
+$LocalCandle = Join-Path $ToolCacheDir "wix\candle.exe"
+$LocalLight = Join-Path $ToolCacheDir "wix\light.exe"
+
+$WixCli = if (Test-Path $LocalWixCli) {
+    @{ Source = $LocalWixCli }
+} else {
+    Get-Command wix -ErrorAction SilentlyContinue
+}
+
+$Candle = if (Test-Path $LocalCandle) {
+    @{ Source = $LocalCandle }
+} else {
+    Get-Command candle -ErrorAction SilentlyContinue
+}
+
+$Light = if (Test-Path $LocalLight) {
+    @{ Source = $LocalLight }
+} else {
+    Get-Command light -ErrorAction SilentlyContinue
+}
+
 if ($null -eq $WixCli -and ($null -eq $Candle -or $null -eq $Light)) {
     throw "Neither WiX v4 CLI nor WiX v3 candle/light were found after bootstrap."
 }
@@ -129,7 +188,7 @@ if (Test-Path $PubspecPath) {
         $Version = $VersionMatch.Matches[0].Groups[1].Value
     }
 }
-$MsiPath = Join-Path $ArtifactDir "s3-browser-crossplat-windows-$Version-$Arch.msi"
+$MsiPath = Join-Path $ArtifactDir "object-data-browser-windows-$Version-$Arch.msi"
 
 $Files = Get-ChildItem -Path $AppReleaseDir -Recurse -File | Sort-Object FullName
 $DirectoryRels = New-Object System.Collections.Generic.HashSet[string]
@@ -222,20 +281,40 @@ $Generated = $Generated.Replace('{{COMPONENTS}}', $ComponentBlock)
 
 Set-Content -Path $GeneratedWxs -Value $Generated -Encoding UTF8
 New-Item -ItemType Directory -Force -Path $ArtifactDir | Out-Null
+$MsiPath = Resolve-ArtifactOutputPath -PreferredPath $MsiPath
+$WixPdbPath = [System.IO.Path]::ChangeExtension($MsiPath, ".wixpdb")
+Remove-ArtifactIfPresent -Path $WixPdbPath
 
 if ($null -ne $WixCli) {
-    & $WixCli.Source build $GeneratedWxs -arch $Arch -o $MsiPath
-    if ($LASTEXITCODE -ne 0) {
+    $ExitCode = Invoke-NativeTool -FilePath $WixCli.Source -Arguments @(
+        'build',
+        $GeneratedWxs,
+        '-arch',
+        $Arch,
+        '-o',
+        $MsiPath
+    )
+    if ($ExitCode -ne 0) {
         throw "WiX v4 build failed."
     }
 } else {
-    $WixObj = Join-Path $ArtifactDir "s3-browser-crossplat.wixobj"
-    & $Candle.Source -arch $Arch -out $WixObj $GeneratedWxs
-    if ($LASTEXITCODE -ne 0) {
+    $WixObj = Join-Path $ArtifactDir "object-data-browser.wixobj"
+    $CandleExitCode = Invoke-NativeTool -FilePath $Candle.Source -Arguments @(
+        '-arch',
+        $Arch,
+        '-out',
+        $WixObj,
+        $GeneratedWxs
+    )
+    if ($CandleExitCode -ne 0) {
         throw "WiX v3 candle compilation failed."
     }
-    & $Light.Source -out $MsiPath $WixObj
-    if ($LASTEXITCODE -ne 0) {
+    $LightExitCode = Invoke-NativeTool -FilePath $Light.Source -Arguments @(
+        '-out',
+        $MsiPath,
+        $WixObj
+    )
+    if ($LightExitCode -ne 0) {
         throw "WiX v3 light linking failed."
     }
 }

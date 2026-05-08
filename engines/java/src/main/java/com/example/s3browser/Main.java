@@ -1804,7 +1804,7 @@ public final class Main {
     }
 
     private static Path runtimeDir() throws IOException {
-        Path path = Path.of(System.getProperty("java.io.tmpdir"), "s3-browser-crossplat-java-engine");
+        Path path = Path.of(System.getProperty("java.io.tmpdir"), "object-data-browser-java-engine");
         Files.createDirectories(path);
         return path;
     }

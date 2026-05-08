@@ -42,13 +42,13 @@ fi
 STAGE_DIR="$ROOT_DIR/dist/linux/stage-$FORMAT-$ARCH"
 OUTPUT_DIR="$ROOT_DIR/dist/linux"
 rm -rf "$STAGE_DIR"
-mkdir -p "$STAGE_DIR/usr/lib/s3-browser-crossplat" "$STAGE_DIR/usr/bin" "$OUTPUT_DIR"
-cp -R "$APP_DIR"/. "$STAGE_DIR/usr/lib/s3-browser-crossplat/"
-cat >"$STAGE_DIR/usr/bin/s3-browser-crossplat" <<'EOF'
+mkdir -p "$STAGE_DIR/usr/lib/object-data-browser" "$STAGE_DIR/usr/bin" "$OUTPUT_DIR"
+cp -R "$APP_DIR"/. "$STAGE_DIR/usr/lib/object-data-browser/"
+cat >"$STAGE_DIR/usr/bin/object-data-browser" <<'EOF'
 #!/usr/bin/env bash
-exec /usr/lib/s3-browser-crossplat/s3_browser_crossplat "$@"
+exec /usr/lib/object-data-browser/s3_browser_crossplat "$@"
 EOF
-chmod +x "$STAGE_DIR/usr/bin/s3-browser-crossplat"
+chmod +x "$STAGE_DIR/usr/bin/object-data-browser"
 
 NATIVE_ARCH="$ARCH"
 case "$FORMAT-$ARCH" in

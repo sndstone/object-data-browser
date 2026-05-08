@@ -1693,7 +1693,7 @@ func cancelToolExecution(params map[string]interface{}) map[string]interface{} {
 }
 
 func runtimeDir() string {
-	path := filepath.Join(os.TempDir(), "s3-browser-crossplat-go-engine")
+	path := filepath.Join(os.TempDir(), "object-data-browser-go-engine")
 	_ = os.MkdirAll(path, 0o755)
 	return path
 }

@@ -841,6 +841,10 @@ class BenchmarkConfig {
     required this.jsonOutputPath,
     required this.logFilePath,
     required this.debugMode,
+    this.readPercent = 34,
+    this.writePercent = 33,
+    this.deletePercent = 33,
+    this.reducedLogging = false,
   });
 
   final String profileId;
@@ -869,6 +873,20 @@ class BenchmarkConfig {
   final String logFilePath;
   final bool debugMode;
 
+  /// Used only when [workloadType] == 'custom'. Percentage of GET operations.
+  final int readPercent;
+
+  /// Used only when [workloadType] == 'custom'. Percentage of PUT operations.
+  final int writePercent;
+
+  /// Used only when [workloadType] == 'custom'. Percentage of DELETE operations.
+  final int deletePercent;
+
+  /// When true, per-object request timing logs are suppressed for maximum
+  /// throughput. Summary stats are still recorded. Use as a last resort after
+  /// tuning Threads and Pool Connections first.
+  final bool reducedLogging;
+
   BenchmarkConfig copyWith({
     String? profileId,
     String? engineId,
@@ -895,6 +913,10 @@ class BenchmarkConfig {
     String? jsonOutputPath,
     String? logFilePath,
     bool? debugMode,
+    int? readPercent,
+    int? writePercent,
+    int? deletePercent,
+    bool? reducedLogging,
   }) {
     return BenchmarkConfig(
       profileId: profileId ?? this.profileId,
@@ -923,6 +945,10 @@ class BenchmarkConfig {
       jsonOutputPath: jsonOutputPath ?? this.jsonOutputPath,
       logFilePath: logFilePath ?? this.logFilePath,
       debugMode: debugMode ?? this.debugMode,
+      readPercent: readPercent ?? this.readPercent,
+      writePercent: writePercent ?? this.writePercent,
+      deletePercent: deletePercent ?? this.deletePercent,
+      reducedLogging: reducedLogging ?? this.reducedLogging,
     );
   }
 }
@@ -1128,6 +1154,7 @@ class BrowserTaskRecord {
     this.canResume = false,
     this.canCancel = false,
     this.workspaceTab,
+    this.actionKey,
   });
 
   final String id;
@@ -1154,6 +1181,7 @@ class BrowserTaskRecord {
   final bool canResume;
   final bool canCancel;
   final WorkspaceTab? workspaceTab;
+  final String? actionKey;
 
   BrowserTaskRecord copyWith({
     String? status,
@@ -1173,6 +1201,7 @@ class BrowserTaskRecord {
     bool? canResume,
     bool? canCancel,
     WorkspaceTab? workspaceTab,
+    String? actionKey,
   }) {
     return BrowserTaskRecord(
       id: id,
@@ -1199,6 +1228,7 @@ class BrowserTaskRecord {
       canResume: canResume ?? this.canResume,
       canCancel: canCancel ?? this.canCancel,
       workspaceTab: workspaceTab ?? this.workspaceTab,
+      actionKey: actionKey ?? this.actionKey,
     );
   }
 
@@ -1207,7 +1237,9 @@ class BrowserTaskRecord {
     return normalized == 'running' ||
         normalized == 'queued' ||
         normalized == 'active' ||
-        normalized == 'paused';
+        normalized == 'paused' ||
+        normalized == 'cancelling' ||
+        normalized == 'canceling';
   }
 
   bool get isFailedLike {
@@ -1317,7 +1349,7 @@ class AppSettings {
   }
 
   factory AppSettings.fromJson(Map<String, Object?> json) {
-    final uiScalePercent = (json['uiScalePercent'] as num?)?.toInt() ?? 80;
+    final uiScalePercent = (json['uiScalePercent'] as num?)?.toInt() ?? 75;
     return AppSettings(
       darkMode: json['darkMode'] as bool? ?? false,
       defaultEngineId: (json['defaultEngineId'] as String?) ?? 'python',
@@ -1355,9 +1387,7 @@ class AppSettings {
       browserInspectorSize:
           (json['browserInspectorSize'] as num?)?.toInt() ?? 360,
       uiScalePercent: uiScalePercent,
-      logTextScalePercent:
-          (json['logTextScalePercent'] as num?)?.toInt() ??
-              (uiScalePercent < 90 ? 90 : uiScalePercent),
+      logTextScalePercent: (json['logTextScalePercent'] as num?)?.toInt() ?? 90,
     );
   }
 

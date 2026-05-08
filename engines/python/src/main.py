@@ -1474,7 +1474,7 @@ def _cancel_tool_execution(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _runtime_dir() -> Path:
-    path = Path(tempfile.gettempdir()) / "s3-browser-crossplat-python-engine"
+    path = Path(tempfile.gettempdir()) / "object-data-browser-python-engine"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

@@ -3,9 +3,9 @@
 Expected artifacts:
 
 - Primary sideloadable APK, copied to:
-  `dist/android/s3-browser-crossplat-android-<version>-arm64.apk`
+  `dist/android/object-data-browser-android-<version>-arm64.apk`
 - Secondary Android App Bundle, copied to:
-  `dist/android/s3-browser-crossplat-android-<version>-arm64.aab`
+  `dist/android/object-data-browser-android-<version>-arm64.aab`
 
 Raw Flutter outputs remain under `build/app/outputs/...` during the build.
 

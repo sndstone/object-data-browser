@@ -1,4 +1,4 @@
-app: S3BrowserCrossplat
+app: ObjectDataBrowser
 ingredients:
   script:
     - mkdir -p AppDir/usr/bin

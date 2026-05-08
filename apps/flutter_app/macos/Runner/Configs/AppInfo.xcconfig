@@ -5,7 +5,7 @@
 // 'flutter create' template.
 
 // The application's name. By default this is also the title of the Flutter window.
-PRODUCT_NAME = s3_browser_crossplat
+PRODUCT_NAME = Object Data Browser
 
 // The application's bundle identifier
 PRODUCT_BUNDLE_IDENTIFIER = com.example.s3BrowserCrossplat

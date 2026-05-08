@@ -1,8 +1,8 @@
 name: s3_browser_crossplat
-description: Cross-platform S3 browser with pluggable backend engines.
+description: Cross-platform object data browser with pluggable backend engines.
 publish_to: "none"
 # GitHub Releases are published from this version value.
-version: 2.0.12+1
+version: 2.0.15+1
 
 environment:
   sdk: ">=3.3.0 <4.0.0"

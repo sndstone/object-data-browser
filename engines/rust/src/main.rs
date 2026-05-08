@@ -9,23 +9,24 @@ use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, BucketLocationConstraint,
-    BucketVersioningStatus, CorsConfiguration, CorsRule, CreateBucketConfiguration, Delete,
-    CompletedMultipartUpload, CompletedPart,
-    LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, NoncurrentVersionExpiration,
-    NoncurrentVersionTransition, ObjectIdentifier, ServerSideEncryption,
-    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
-    Tag, Tagging, Transition, TransitionStorageClass, VersioningConfiguration,
+    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, CorsConfiguration, CorsRule,
+    CreateBucketConfiguration, Delete, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
+    NoncurrentVersionExpiration, NoncurrentVersionTransition, ObjectIdentifier,
+    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+    ServerSideEncryptionRule, Tag, Tagging, Transition, TransitionStorageClass,
+    VersioningConfiguration,
 };
 use aws_sdk_s3::Client;
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
@@ -147,6 +148,35 @@ impl std::error::Error for SidecarError {}
 
 type SidecarResult = Result<Value, SidecarError>;
 
+#[derive(Clone)]
+enum BenchmarkTaskKind {
+    Put { key: String, size_bytes: usize },
+    Get { key: String, size_bytes: usize },
+    DeleteSingle { key: String, size_bytes: usize },
+    DeleteMulti { keys: Vec<String> },
+}
+
+#[derive(Clone)]
+struct BenchmarkTask {
+    order: usize,
+    kind: BenchmarkTaskKind,
+}
+
+struct BenchmarkTaskResult {
+    order: usize,
+    operation: &'static str,
+    key: String,
+    size_bytes: usize,
+    bytes_transferred: i64,
+    checksum_state: String,
+    latency_ms: f64,
+    operation_count: i64,
+    elapsed_ms: f64,
+    upserted_object: Option<(String, usize)>,
+    removed_keys: Vec<String>,
+    log_line: Option<String>,
+}
+
 fn main() {
     let runtime = Runtime::new().expect("tokio runtime");
     let stdin = io::stdin();
@@ -214,8 +244,26 @@ async fn handle_request(request: Request) -> SidecarResult {
                 {"key": "benchmark", "label": "Integrated benchmark mode", "state": "supported"},
             ]
         })),
-        "testProfile" => test_profile(request.params.get("profile").cloned().unwrap_or(Value::Null)).await,
-        "listBuckets" => list_buckets(request.params.get("profile").cloned().unwrap_or(Value::Null)).await,
+        "testProfile" => {
+            test_profile(
+                request
+                    .params
+                    .get("profile")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            )
+            .await
+        }
+        "listBuckets" => {
+            list_buckets(
+                request
+                    .params
+                    .get("profile")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            )
+            .await
+        }
         "createBucket" => create_bucket(request.params).await,
         "deleteBucket" => delete_bucket(request.params).await,
         "setBucketVersioning" => set_bucket_versioning(request.params).await,
@@ -255,7 +303,10 @@ async fn handle_request(request: Request) -> SidecarResult {
         "exportBenchmarkResults" => export_benchmark_results(request.params).await,
         _ => Err(SidecarError::new(
             "unsupported_feature",
-            format!("Method {} is not implemented in the Rust engine.", request.method),
+            format!(
+                "Method {} is not implemented in the Rust engine.",
+                request.method
+            ),
         )),
     }
 }
@@ -372,9 +423,18 @@ async fn set_bucket_versioning(params: Value) -> SidecarResult {
 
 async fn put_bucket_lifecycle(params: Value) -> SidecarResult {
     let (_, bucket_name, client) = bucket_context(&params).await?;
-    let lifecycle_json = required_text(&params, "lifecycleJson", "Bucket name and lifecycle JSON are required.")?;
-    let parsed: Value = serde_json::from_str(&lifecycle_json)
-        .map_err(|error| SidecarError::with_details("invalid_config", "Lifecycle JSON could not be parsed.", json!({"reason": error.to_string()})))?;
+    let lifecycle_json = required_text(
+        &params,
+        "lifecycleJson",
+        "Bucket name and lifecycle JSON are required.",
+    )?;
+    let parsed: Value = serde_json::from_str(&lifecycle_json).map_err(|error| {
+        SidecarError::with_details(
+            "invalid_config",
+            "Lifecycle JSON could not be parsed.",
+            json!({"reason": error.to_string()}),
+        )
+    })?;
     let rules = parse_lifecycle_rules(parsed.get("Rules").unwrap_or(&Value::Null))?;
     let config = BucketLifecycleConfiguration::builder()
         .set_rules(Some(rules))
@@ -403,7 +463,11 @@ async fn delete_bucket_lifecycle(params: Value) -> SidecarResult {
 
 async fn put_bucket_policy(params: Value) -> SidecarResult {
     let (_, bucket_name, client) = bucket_context(&params).await?;
-    let policy_json = required_text(&params, "policyJson", "Bucket name and policy JSON are required.")?;
+    let policy_json = required_text(
+        &params,
+        "policyJson",
+        "Bucket name and policy JSON are required.",
+    )?;
     client
         .put_bucket_policy()
         .bucket(bucket_name)
@@ -427,9 +491,18 @@ async fn delete_bucket_policy(params: Value) -> SidecarResult {
 
 async fn put_bucket_cors(params: Value) -> SidecarResult {
     let (_, bucket_name, client) = bucket_context(&params).await?;
-    let cors_json = required_text(&params, "corsJson", "Bucket name and CORS JSON are required.")?;
-    let parsed: Value = serde_json::from_str(&cors_json)
-        .map_err(|error| SidecarError::with_details("invalid_config", "CORS JSON could not be parsed.", json!({"reason": error.to_string()})))?;
+    let cors_json = required_text(
+        &params,
+        "corsJson",
+        "Bucket name and CORS JSON are required.",
+    )?;
+    let parsed: Value = serde_json::from_str(&cors_json).map_err(|error| {
+        SidecarError::with_details(
+            "invalid_config",
+            "CORS JSON could not be parsed.",
+            json!({"reason": error.to_string()}),
+        )
+    })?;
     let rules = parse_cors_rules(&parsed)?;
     client
         .put_bucket_cors()
@@ -459,10 +532,18 @@ async fn delete_bucket_cors(params: Value) -> SidecarResult {
 
 async fn put_bucket_encryption(params: Value) -> SidecarResult {
     let (_, bucket_name, client) = bucket_context(&params).await?;
-    let encryption_json =
-        required_text(&params, "encryptionJson", "Bucket name and encryption JSON are required.")?;
-    let parsed: Value = serde_json::from_str(&encryption_json)
-        .map_err(|error| SidecarError::with_details("invalid_config", "Encryption JSON could not be parsed.", json!({"reason": error.to_string()})))?;
+    let encryption_json = required_text(
+        &params,
+        "encryptionJson",
+        "Bucket name and encryption JSON are required.",
+    )?;
+    let parsed: Value = serde_json::from_str(&encryption_json).map_err(|error| {
+        SidecarError::with_details(
+            "invalid_config",
+            "Encryption JSON could not be parsed.",
+            json!({"reason": error.to_string()}),
+        )
+    })?;
     let config = parse_encryption_configuration(&parsed)?;
     client
         .put_bucket_encryption()
@@ -530,7 +611,9 @@ async fn list_objects(params: Value) -> SidecarResult {
     let (_, bucket_name, client) = bucket_context(&params).await?;
     let prefix = params["prefix"].as_str().unwrap_or_default();
     let flat = params["flat"].as_bool().unwrap_or(false);
-    let continuation = params["cursor"]["value"].as_str().filter(|value| !value.is_empty());
+    let continuation = params["cursor"]["value"]
+        .as_str()
+        .filter(|value| !value.is_empty());
     let mut request = client
         .list_objects_v2()
         .bucket(bucket_name.clone())
@@ -605,23 +688,52 @@ async fn get_bucket_admin_state(params: Value) -> SidecarResult {
     let (_, bucket_name, client) = bucket_context(&params).await?;
     let mut api_calls: Vec<Value> = Vec::new();
 
-    let versioning = record_api(&mut api_calls, "GetBucketVersioning", client.get_bucket_versioning().bucket(&bucket_name).send()).await?;
-    let encryption = optional_api(&mut api_calls, "GetBucketEncryption", client.get_bucket_encryption().bucket(&bucket_name).send()).await?;
+    let versioning = record_api(
+        &mut api_calls,
+        "GetBucketVersioning",
+        client.get_bucket_versioning().bucket(&bucket_name).send(),
+    )
+    .await?;
+    let encryption = optional_api(
+        &mut api_calls,
+        "GetBucketEncryption",
+        client.get_bucket_encryption().bucket(&bucket_name).send(),
+    )
+    .await?;
     let lifecycle = optional_api(
         &mut api_calls,
         "GetBucketLifecycleConfiguration",
-        client.get_bucket_lifecycle_configuration().bucket(&bucket_name).send(),
+        client
+            .get_bucket_lifecycle_configuration()
+            .bucket(&bucket_name)
+            .send(),
     )
     .await?;
-    let policy =
-        optional_api(&mut api_calls, "GetBucketPolicy", client.get_bucket_policy().bucket(&bucket_name).send()).await?;
-    let cors = optional_api(&mut api_calls, "GetBucketCors", client.get_bucket_cors().bucket(&bucket_name).send()).await?;
-    let tagging =
-        optional_api(&mut api_calls, "GetBucketTagging", client.get_bucket_tagging().bucket(&bucket_name).send()).await?;
+    let policy = optional_api(
+        &mut api_calls,
+        "GetBucketPolicy",
+        client.get_bucket_policy().bucket(&bucket_name).send(),
+    )
+    .await?;
+    let cors = optional_api(
+        &mut api_calls,
+        "GetBucketCors",
+        client.get_bucket_cors().bucket(&bucket_name).send(),
+    )
+    .await?;
+    let tagging = optional_api(
+        &mut api_calls,
+        "GetBucketTagging",
+        client.get_bucket_tagging().bucket(&bucket_name).send(),
+    )
+    .await?;
     let object_lock = optional_api(
         &mut api_calls,
         "GetObjectLockConfiguration",
-        client.get_object_lock_configuration().bucket(&bucket_name).send(),
+        client
+            .get_object_lock_configuration()
+            .bucket(&bucket_name)
+            .send(),
     )
     .await?;
 
@@ -642,7 +754,10 @@ async fn get_bucket_admin_state(params: Value) -> SidecarResult {
     let encryption_json = encryption
         .as_ref()
         .and_then(|output| output.server_side_encryption_configuration())
-        .map(|config| serde_json::to_string_pretty(&encryption_raw(config)).unwrap_or_else(|_| "{}".to_string()))
+        .map(|config| {
+            serde_json::to_string_pretty(&encryption_raw(config))
+                .unwrap_or_else(|_| "{}".to_string())
+        })
         .unwrap_or_else(|| "{}".to_string());
     let encryption_summary = encryption
         .as_ref()
@@ -664,37 +779,46 @@ async fn get_bucket_admin_state(params: Value) -> SidecarResult {
             output
                 .tag_set()
                 .iter()
-                .map(|tag| (tag.key().to_string(), Value::String(tag.value().to_string())))
+                .map(|tag| {
+                    (
+                        tag.key().to_string(),
+                        Value::String(tag.value().to_string()),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();
 
-    let (object_lock_enabled, object_lock_mode, object_lock_retention_days) = if let Some(output) = object_lock {
-        if let Some(configuration) = output.object_lock_configuration() {
-            if let Some(rule) = configuration.rule() {
-                if let Some(retention) = rule.default_retention() {
-                    let retention_value = retention
-                        .days()
-                        .map(Value::from)
-                        .or_else(|| retention.years().map(Value::from))
-                        .unwrap_or(Value::Null);
-                    (
-                        true,
-                        retention.mode().map(|value| Value::String(value.as_str().to_string())).unwrap_or(Value::Null),
-                        retention_value,
-                    )
+    let (object_lock_enabled, object_lock_mode, object_lock_retention_days) =
+        if let Some(output) = object_lock {
+            if let Some(configuration) = output.object_lock_configuration() {
+                if let Some(rule) = configuration.rule() {
+                    if let Some(retention) = rule.default_retention() {
+                        let retention_value = retention
+                            .days()
+                            .map(Value::from)
+                            .or_else(|| retention.years().map(Value::from))
+                            .unwrap_or(Value::Null);
+                        (
+                            true,
+                            retention
+                                .mode()
+                                .map(|value| Value::String(value.as_str().to_string()))
+                                .unwrap_or(Value::Null),
+                            retention_value,
+                        )
+                    } else {
+                        (true, Value::Null, Value::Null)
+                    }
                 } else {
                     (true, Value::Null, Value::Null)
                 }
             } else {
-                (true, Value::Null, Value::Null)
+                (false, Value::Null, Value::Null)
             }
         } else {
             (false, Value::Null, Value::Null)
-        }
-    } else {
-        (false, Value::Null, Value::Null)
-    };
+        };
 
     Ok(json!({
         "bucketName": bucket_name,
@@ -721,10 +845,16 @@ async fn get_bucket_admin_state(params: Value) -> SidecarResult {
 async fn list_object_versions(params: Value) -> SidecarResult {
     let (_, bucket_name, client) = bucket_context(&params).await?;
     let key = params["key"].as_str().unwrap_or_default();
-    let filter_value = params["options"]["filterValue"].as_str().unwrap_or_default();
+    let filter_value = params["options"]["filterValue"]
+        .as_str()
+        .unwrap_or_default();
     let filter_mode = params["options"]["filterMode"].as_str().unwrap_or("prefix");
     let effective_prefix = if key.is_empty() {
-        if filter_mode == "prefix" { filter_value } else { "" }
+        if filter_mode == "prefix" {
+            filter_value
+        } else {
+            ""
+        }
     } else {
         key
     };
@@ -768,8 +898,15 @@ async fn list_object_versions(params: Value) -> SidecarResult {
             "storageClass": "DELETE_MARKER",
         }));
     }
-    items.sort_by(|left, right| right["modifiedAt"].as_str().cmp(&left["modifiedAt"].as_str()));
-    let delete_marker_count = items.iter().filter(|value| value["deleteMarker"].as_bool().unwrap_or(false)).count();
+    items.sort_by(|left, right| {
+        right["modifiedAt"]
+            .as_str()
+            .cmp(&left["modifiedAt"].as_str())
+    });
+    let delete_marker_count = items
+        .iter()
+        .filter(|value| value["deleteMarker"].as_bool().unwrap_or(false))
+        .count();
     Ok(json!({
         "items": items,
         "cursor": {"value": null, "hasMore": false},
@@ -781,7 +918,11 @@ async fn list_object_versions(params: Value) -> SidecarResult {
 
 async fn get_object_details(params: Value) -> SidecarResult {
     let (profile, bucket_name, client) = bucket_context(&params).await?;
-    let key = required_text(&params, "key", "Bucket name and object key are required for object inspection.")?;
+    let key = required_text(
+        &params,
+        "key",
+        "Bucket name and object key are required for object inspection.",
+    )?;
     let mut api_calls = Vec::new();
     let mut debug_events = vec![json!({
         "timestamp": now_iso(),
@@ -789,11 +930,20 @@ async fn get_object_details(params: Value) -> SidecarResult {
         "message": format!("Fetching object diagnostics for {bucket_name}/{key}."),
     })];
 
-    let head = record_api(&mut api_calls, "HeadObject", client.head_object().bucket(&bucket_name).key(&key).send()).await?;
+    let head = record_api(
+        &mut api_calls,
+        "HeadObject",
+        client.head_object().bucket(&bucket_name).key(&key).send(),
+    )
+    .await?;
     let tagging = optional_api(
         &mut api_calls,
         "GetObjectTagging",
-        client.get_object_tagging().bucket(&bucket_name).key(&key).send(),
+        client
+            .get_object_tagging()
+            .bucket(&bucket_name)
+            .key(&key)
+            .send(),
     )
     .await?;
 
@@ -804,7 +954,10 @@ async fn get_object_details(params: Value) -> SidecarResult {
         .map(|(key, value)| (key.to_string(), Value::String(value.to_string())))
         .collect();
     let mut headers = Map::new();
-    if let Some(etag) = head.e_tag().and_then(|value| trim_quotes_option(Some(value))) {
+    if let Some(etag) = head
+        .e_tag()
+        .and_then(|value| trim_quotes_option(Some(value)))
+    {
         headers.insert("ETag".to_string(), Value::String(etag));
     }
     headers.insert(
@@ -813,7 +966,10 @@ async fn get_object_details(params: Value) -> SidecarResult {
     );
     if let Some(content_type) = head.content_type() {
         if !content_type.is_empty() {
-            headers.insert("Content-Type".to_string(), Value::String(content_type.to_string()));
+            headers.insert(
+                "Content-Type".to_string(),
+                Value::String(content_type.to_string()),
+            );
         }
     }
     headers.insert(
@@ -821,11 +977,17 @@ async fn get_object_details(params: Value) -> SidecarResult {
         Value::String(serialize_aws_datetime(head.last_modified())),
     );
     if let Some(storage_class) = head.storage_class() {
-        headers.insert("Storage-Class".to_string(), Value::String(storage_class.as_str().to_string()));
+        headers.insert(
+            "Storage-Class".to_string(),
+            Value::String(storage_class.as_str().to_string()),
+        );
     }
     if let Some(cache_control) = head.cache_control() {
         if !cache_control.is_empty() {
-            headers.insert("Cache-Control".to_string(), Value::String(cache_control.to_string()));
+            headers.insert(
+                "Cache-Control".to_string(),
+                Value::String(cache_control.to_string()),
+            );
         }
     }
 
@@ -835,7 +997,12 @@ async fn get_object_details(params: Value) -> SidecarResult {
             output
                 .tag_set()
                 .iter()
-                .map(|tag| (tag.key().to_string(), Value::String(tag.value().to_string())))
+                .map(|tag| {
+                    (
+                        tag.key().to_string(),
+                        Value::String(tag.value().to_string()),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -866,7 +1033,11 @@ async fn get_object_details(params: Value) -> SidecarResult {
 
 async fn create_folder(params: Value) -> SidecarResult {
     let (_, bucket_name, client) = bucket_context(&params).await?;
-    let mut key = required_text(&params, "key", "Bucket name and key are required to create a folder.")?;
+    let mut key = required_text(
+        &params,
+        "key",
+        "Bucket name and key are required to create a folder.",
+    )?;
     if !key.ends_with('/') {
         key.push('/');
     }
@@ -883,11 +1054,26 @@ async fn create_folder(params: Value) -> SidecarResult {
 
 async fn copy_object(params: Value) -> SidecarResult {
     let profile = parse_profile(&params["profile"])?;
-    let source_bucket = required_text(&params, "sourceBucketName", "Copy source and destination are required.")?;
-    let source_key = required_text(&params, "sourceKey", "Copy source and destination are required.")?;
-    let destination_bucket =
-        required_text(&params, "destinationBucketName", "Copy source and destination are required.")?;
-    let destination_key = required_text(&params, "destinationKey", "Copy source and destination are required.")?;
+    let source_bucket = required_text(
+        &params,
+        "sourceBucketName",
+        "Copy source and destination are required.",
+    )?;
+    let source_key = required_text(
+        &params,
+        "sourceKey",
+        "Copy source and destination are required.",
+    )?;
+    let destination_bucket = required_text(
+        &params,
+        "destinationBucketName",
+        "Copy source and destination are required.",
+    )?;
+    let destination_key = required_text(
+        &params,
+        "destinationKey",
+        "Copy source and destination are required.",
+    )?;
     let client = build_client(&profile).await?;
     client
         .copy_object()
@@ -906,8 +1092,16 @@ async fn move_object(params: Value) -> SidecarResult {
     let client = build_client(&profile).await?;
     client
         .delete_object()
-        .bucket(required_text(&params, "sourceBucketName", "Copy source and destination are required.")?)
-        .key(required_text(&params, "sourceKey", "Copy source and destination are required.")?)
+        .bucket(required_text(
+            &params,
+            "sourceBucketName",
+            "Copy source and destination are required.",
+        )?)
+        .key(required_text(
+            &params,
+            "sourceKey",
+            "Copy source and destination are required.",
+        )?)
         .send()
         .await
         .map_err(map_sdk_error)?;
@@ -918,7 +1112,10 @@ async fn delete_objects(params: Value) -> SidecarResult {
     let (_, bucket_name, client) = bucket_context(&params).await?;
     let keys = string_array(params.get("keys").unwrap_or(&Value::Null));
     if keys.is_empty() {
-        return Err(SidecarError::new("invalid_config", "Bucket name and keys are required."));
+        return Err(SidecarError::new(
+            "invalid_config",
+            "Bucket name and keys are required.",
+        ));
     }
     let objects: Vec<ObjectIdentifier> = keys
         .into_iter()
@@ -957,11 +1154,14 @@ async fn delete_object_versions(params: Value) -> SidecarResult {
     let versions = params
         .get("versions")
         .and_then(Value::as_array)
-        .ok_or_else(|| SidecarError::new("invalid_config", "Bucket name and versions are required."))?;
+        .ok_or_else(|| {
+            SidecarError::new("invalid_config", "Bucket name and versions are required.")
+        })?;
     let objects: Vec<ObjectIdentifier> = versions
         .iter()
         .map(|item| {
-            let mut builder = ObjectIdentifier::builder().key(item["key"].as_str().unwrap_or_default());
+            let mut builder =
+                ObjectIdentifier::builder().key(item["key"].as_str().unwrap_or_default());
             if let Some(version_id) = item["versionId"].as_str() {
                 if !version_id.is_empty() {
                     builder = builder.version_id(version_id);
@@ -1001,10 +1201,17 @@ async fn start_upload(params: Value) -> SidecarResult {
     let prefix = params["prefix"].as_str().unwrap_or_default();
     let file_paths = string_array(params.get("filePaths").unwrap_or(&Value::Null));
     if file_paths.is_empty() {
-        return Err(SidecarError::new("invalid_config", "Bucket name and file paths are required."));
+        return Err(SidecarError::new(
+            "invalid_config",
+            "Bucket name and file paths are required.",
+        ));
     }
-    let multipart_threshold_bytes =
-        params["multipartThresholdMiB"].as_u64().unwrap_or(32).max(1) * 1024 * 1024;
+    let multipart_threshold_bytes = params["multipartThresholdMiB"]
+        .as_u64()
+        .unwrap_or(32)
+        .max(1)
+        * 1024
+        * 1024;
     let multipart_chunk_bytes =
         params["multipartChunkMiB"].as_u64().unwrap_or(8).max(1) * 1024 * 1024;
     let paths = file_paths.iter().map(PathBuf::from).collect::<Vec<_>>();
@@ -1012,8 +1219,8 @@ async fn start_upload(params: Value) -> SidecarResult {
     let mut parts_total = 0_u64;
     let mut uses_multipart = false;
     for path in &paths {
-        let metadata =
-            fs::metadata(path).map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+        let metadata = fs::metadata(path)
+            .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
         total_bytes += metadata.len();
         if metadata.len() >= multipart_threshold_bytes {
             uses_multipart = true;
@@ -1028,7 +1235,11 @@ async fn start_upload(params: Value) -> SidecarResult {
     } else {
         None
     };
-    let part_total_value = if parts_total > 0 { Some(parts_total) } else { None };
+    let part_total_value = if parts_total > 0 {
+        Some(parts_total)
+    } else {
+        None
+    };
     let mut output_lines = vec![format!(
         "Queued {} file(s) for upload to {bucket_name}.",
         paths.len()
@@ -1066,19 +1277,29 @@ async fn start_upload(params: Value) -> SidecarResult {
     ));
     for path in &paths {
         let key = if prefix.is_empty() {
-            path.file_name().and_then(|value| value.to_str()).unwrap_or_default().to_string()
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string()
         } else {
-            format!("{prefix}{}", path.file_name().and_then(|value| value.to_str()).unwrap_or_default())
+            format!(
+                "{prefix}{}",
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+            )
         };
         let file_name = path
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_string();
-        let file_bytes =
-            fs::read(path).map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+        let file_bytes = fs::read(path)
+            .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
         let file_size = file_bytes.len() as u64;
-        output_lines.push(format!("Uploading {file_name} ({file_size} bytes) to {key}."));
+        output_lines.push(format!(
+            "Uploading {file_name} ({file_size} bytes) to {key}."
+        ));
         if file_size >= multipart_threshold_bytes {
             let upload_id = client
                 .create_multipart_upload()
@@ -1089,7 +1310,12 @@ async fn start_upload(params: Value) -> SidecarResult {
                 .map_err(map_sdk_error)?
                 .upload_id()
                 .map(str::to_owned)
-                .ok_or_else(|| SidecarError::new("engine_unavailable", "Multipart upload did not return an upload ID."))?;
+                .ok_or_else(|| {
+                    SidecarError::new(
+                        "engine_unavailable",
+                        "Multipart upload did not return an upload ID.",
+                    )
+                })?;
             let mut completed_parts = Vec::new();
             let mut offset = 0_usize;
             let mut part_number = 1_i32;
@@ -1190,7 +1416,10 @@ async fn start_upload(params: Value) -> SidecarResult {
             output_lines.clone(),
         ));
     }
-    output_lines.push(format!("Uploaded {} file(s) into {bucket_name}.", paths.len()));
+    output_lines.push(format!(
+        "Uploaded {} file(s) into {bucket_name}.",
+        paths.len()
+    ));
     Ok(transfer_job(
         job_id,
         label,
@@ -1224,17 +1453,28 @@ async fn start_upload(params: Value) -> SidecarResult {
 async fn start_download(params: Value) -> SidecarResult {
     let (_, bucket_name, client) = bucket_context(&params).await?;
     let keys = string_array(params.get("keys").unwrap_or(&Value::Null));
-    let destination_path =
-        required_text(&params, "destinationPath", "Bucket, keys, and destination path are required.")?;
+    let destination_path = required_text(
+        &params,
+        "destinationPath",
+        "Bucket, keys, and destination path are required.",
+    )?;
     if keys.is_empty() {
-        return Err(SidecarError::new("invalid_config", "Bucket, keys, and destination path are required."));
+        return Err(SidecarError::new(
+            "invalid_config",
+            "Bucket, keys, and destination path are required.",
+        ));
     }
-    let multipart_threshold_bytes =
-        params["multipartThresholdMiB"].as_u64().unwrap_or(32).max(1) * 1024 * 1024;
+    let multipart_threshold_bytes = params["multipartThresholdMiB"]
+        .as_u64()
+        .unwrap_or(32)
+        .max(1)
+        * 1024
+        * 1024;
     let multipart_chunk_bytes =
         params["multipartChunkMiB"].as_u64().unwrap_or(8).max(1) * 1024 * 1024;
     let destination = PathBuf::from(&destination_path);
-    fs::create_dir_all(&destination).map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+    fs::create_dir_all(&destination)
+        .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
     let mut total_bytes = 0_u64;
     let mut parts_total = 0_u64;
     let mut uses_multipart = false;
@@ -1263,7 +1503,11 @@ async fn start_download(params: Value) -> SidecarResult {
     } else {
         None
     };
-    let part_total_value = if parts_total > 0 { Some(parts_total) } else { None };
+    let part_total_value = if parts_total > 0 {
+        Some(parts_total)
+    } else {
+        None
+    };
     let mut output_lines = vec![format!(
         "Queued {} object(s) for download to {destination_path}.",
         keys.len()
@@ -1298,7 +1542,10 @@ async fn start_download(params: Value) -> SidecarResult {
     for key in &keys {
         let target = destination.join(Path::new(key).file_name().unwrap_or_default());
         let object_size = *object_sizes.get(key).unwrap_or(&0);
-        output_lines.push(format!("Downloading {key} ({object_size} bytes) to {:?}.", target));
+        output_lines.push(format!(
+            "Downloading {key} ({object_size} bytes) to {:?}.",
+            target
+        ));
         if object_size >= multipart_threshold_bytes {
             let mut downloaded = Vec::new();
             let mut start = 0_u64;
@@ -1393,7 +1640,10 @@ async fn start_download(params: Value) -> SidecarResult {
         items_completed += 1;
         output_lines.push(format!("Finished downloading {key}."));
     }
-    output_lines.push(format!("Downloaded {} object(s) into {destination_path}.", keys.len()));
+    output_lines.push(format!(
+        "Downloaded {} object(s) into {destination_path}.",
+        keys.len()
+    ));
     Ok(transfer_job(
         job_id,
         label,
@@ -1423,7 +1673,11 @@ async fn start_download(params: Value) -> SidecarResult {
 async fn generate_presigned_url(params: Value) -> SidecarResult {
     let (profile, bucket_name, client) = bucket_context(&params).await?;
     let _ = profile;
-    let key = required_text(&params, "key", "Bucket name and object key are required to generate a presigned URL.")?;
+    let key = required_text(
+        &params,
+        "key",
+        "Bucket name and object key are required to generate a presigned URL.",
+    )?;
     let expiration_seconds = params["expirationSeconds"].as_u64().unwrap_or(3600).max(1);
     let presigned = client
         .get_object()
@@ -1536,8 +1790,7 @@ async fn start_benchmark(params: Value) -> SidecarResult {
         &mut state,
         &format!(
             "Benchmark target bucket: {} via {}.",
-            benchmark_bucket,
-            benchmark_endpoint
+            benchmark_bucket, benchmark_endpoint
         ),
     );
     write_benchmark_state(&state)?;
@@ -1545,11 +1798,20 @@ async fn start_benchmark(params: Value) -> SidecarResult {
 }
 
 async fn get_benchmark_status(params: Value) -> SidecarResult {
-    materialize_benchmark_state(read_benchmark_state(required_text(&params, "runId", "Benchmark run ID is required.")?)?).await
+    materialize_benchmark_state(read_benchmark_state(required_text(
+        &params,
+        "runId",
+        "Benchmark run ID is required.",
+    )?)?)
+    .await
 }
 
 async fn pause_benchmark(params: Value) -> SidecarResult {
-    let mut state = read_benchmark_state(required_text(&params, "runId", "Benchmark run ID is required.")?)?;
+    let mut state = read_benchmark_state(required_text(
+        &params,
+        "runId",
+        "Benchmark run ID is required.",
+    )?)?;
     refresh_benchmark_snapshot(&mut state);
     state["status"] = Value::String("paused".to_string());
     append_benchmark_log(&mut state, "Benchmark paused by user.");
@@ -1559,7 +1821,11 @@ async fn pause_benchmark(params: Value) -> SidecarResult {
 }
 
 async fn resume_benchmark(params: Value) -> SidecarResult {
-    let mut state = read_benchmark_state(required_text(&params, "runId", "Benchmark run ID is required.")?)?;
+    let mut state = read_benchmark_state(required_text(
+        &params,
+        "runId",
+        "Benchmark run ID is required.",
+    )?)?;
     state["status"] = Value::String("running".to_string());
     state["lastUpdatedAt"] = Value::String(now_iso());
     append_benchmark_log(&mut state, "Benchmark resumed by user.");
@@ -1568,7 +1834,11 @@ async fn resume_benchmark(params: Value) -> SidecarResult {
 }
 
 async fn stop_benchmark(params: Value) -> SidecarResult {
-    let mut state = read_benchmark_state(required_text(&params, "runId", "Benchmark run ID is required.")?)?;
+    let mut state = read_benchmark_state(required_text(
+        &params,
+        "runId",
+        "Benchmark run ID is required.",
+    )?)?;
     refresh_benchmark_snapshot(&mut state);
     state["status"] = Value::String("stopped".to_string());
     state["completedAt"] = Value::String(now_iso());
@@ -1584,9 +1854,15 @@ async fn export_benchmark_results(params: Value) -> SidecarResult {
     let config = state["config"].as_object().cloned().unwrap_or_default();
     let format = params["format"].as_str().unwrap_or("csv").to_lowercase();
     let path = if format == "json" {
-        config.get("jsonOutputPath").and_then(Value::as_str).unwrap_or_default()
+        config
+            .get("jsonOutputPath")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
     } else {
-        config.get("csvOutputPath").and_then(Value::as_str).unwrap_or_default()
+        config
+            .get("csvOutputPath")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
     };
     Ok(json!({
         "format": format,
@@ -1632,15 +1908,34 @@ async fn bucket_context(params: &Value) -> Result<(Profile, String, Client), Sid
 }
 
 fn parse_profile(value: &Value) -> Result<Profile, SidecarError> {
-    let endpoint_url = value["endpointUrl"].as_str().unwrap_or_default().trim().to_string();
-    let access_key = value["accessKey"].as_str().unwrap_or_default().trim().to_string();
-    let secret_key = value["secretKey"].as_str().unwrap_or_default().trim().to_string();
-    let mut region = value["region"].as_str().unwrap_or("us-east-1").trim().to_string();
+    let endpoint_url = value["endpointUrl"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let access_key = value["accessKey"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let secret_key = value["secretKey"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut region = value["region"]
+        .as_str()
+        .unwrap_or("us-east-1")
+        .trim()
+        .to_string();
     if region.is_empty() {
         region = "us-east-1".to_string();
     }
     if endpoint_url.is_empty() {
-        return Err(SidecarError::new("invalid_config", "Endpoint URL is required."));
+        return Err(SidecarError::new(
+            "invalid_config",
+            "Endpoint URL is required.",
+        ));
     }
     if access_key.is_empty() || secret_key.is_empty() {
         return Err(SidecarError::new(
@@ -1658,7 +1953,9 @@ fn parse_profile(value: &Value) -> Result<Profile, SidecarError> {
             .filter(|token| !token.trim().is_empty())
             .map(|token| token.to_string()),
         path_style: value["pathStyle"].as_bool().unwrap_or(false),
-        verify_tls: !value.get("verifyTls").is_some_and(|verify| !verify.as_bool().unwrap_or(true)),
+        verify_tls: !value
+            .get("verifyTls")
+            .is_some_and(|verify| !verify.as_bool().unwrap_or(true)),
         connect_timeout_seconds: value["connectTimeoutSeconds"].as_i64().unwrap_or(5).max(1),
         read_timeout_seconds: value["readTimeoutSeconds"].as_i64().unwrap_or(60).max(1),
         max_attempts: value["maxAttempts"].as_u64().unwrap_or(5).max(1) as u32,
@@ -1744,12 +2041,17 @@ fn parse_lifecycle_rules(value: &Value) -> Result<Vec<LifecycleRule>, SidecarErr
     };
     let mut rules = Vec::new();
     for item in items {
-        let mut builder = LifecycleRule::builder()
-            .status(if item["Status"].as_str().unwrap_or("Disabled").eq_ignore_ascii_case("Enabled") {
+        let mut builder = LifecycleRule::builder().status(
+            if item["Status"]
+                .as_str()
+                .unwrap_or("Disabled")
+                .eq_ignore_ascii_case("Enabled")
+            {
                 aws_sdk_s3::types::ExpirationStatus::Enabled
             } else {
                 aws_sdk_s3::types::ExpirationStatus::Disabled
-            });
+            },
+        );
         if let Some(id) = item["ID"].as_str().filter(|value| !value.is_empty()) {
             builder = builder.id(id);
         }
@@ -1781,8 +2083,11 @@ fn parse_lifecycle_rules(value: &Value) -> Result<Vec<LifecycleRule>, SidecarErr
                     if let Some(days) = transition.get("Days").and_then(Value::as_i64) {
                         builder = builder.days(days as i32);
                     }
-                    if let Some(storage_class) = transition.get("StorageClass").and_then(Value::as_str) {
-                        builder = builder.storage_class(TransitionStorageClass::from(storage_class));
+                    if let Some(storage_class) =
+                        transition.get("StorageClass").and_then(Value::as_str)
+                    {
+                        builder =
+                            builder.storage_class(TransitionStorageClass::from(storage_class));
                     }
                     builder.build()
                 })
@@ -1812,8 +2117,11 @@ fn parse_lifecycle_rules(value: &Value) -> Result<Vec<LifecycleRule>, SidecarErr
                     if let Some(days) = transition.get("NoncurrentDays").and_then(Value::as_i64) {
                         builder = builder.noncurrent_days(days as i32);
                     }
-                    if let Some(storage_class) = transition.get("StorageClass").and_then(Value::as_str) {
-                        builder = builder.storage_class(TransitionStorageClass::from(storage_class));
+                    if let Some(storage_class) =
+                        transition.get("StorageClass").and_then(Value::as_str)
+                    {
+                        builder =
+                            builder.storage_class(TransitionStorageClass::from(storage_class));
                     }
                     builder.build()
                 })
@@ -1827,7 +2135,11 @@ fn parse_lifecycle_rules(value: &Value) -> Result<Vec<LifecycleRule>, SidecarErr
                     .build(),
             );
         }
-        rules.push(builder.build().map_err(|error| SidecarError::new("invalid_config", error.to_string()))?);
+        rules.push(
+            builder
+                .build()
+                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?,
+        );
     }
     Ok(rules)
 }
@@ -1851,18 +2163,28 @@ fn parse_cors_rules(value: &Value) -> Result<Vec<CorsRule>, SidecarError> {
         for expose_header in string_array(item.get("ExposeHeaders").unwrap_or(&Value::Null)) {
             builder = builder.expose_headers(expose_header);
         }
-        if let Some(id) = item.get("ID").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+        if let Some(id) = item
+            .get("ID")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
             builder = builder.id(id);
         }
         if let Some(max_age) = item.get("MaxAgeSeconds").and_then(Value::as_i64) {
             builder = builder.max_age_seconds(max_age as i32);
         }
-        rules.push(builder.build().map_err(|error| SidecarError::new("invalid_config", error.to_string()))?);
+        rules.push(
+            builder
+                .build()
+                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?,
+        );
     }
     Ok(rules)
 }
 
-fn parse_encryption_configuration(value: &Value) -> Result<ServerSideEncryptionConfiguration, SidecarError> {
+fn parse_encryption_configuration(
+    value: &Value,
+) -> Result<ServerSideEncryptionConfiguration, SidecarError> {
     let Some(items) = value.get("Rules").and_then(Value::as_array) else {
         return ServerSideEncryptionConfiguration::builder()
             .build()
@@ -1871,12 +2193,20 @@ fn parse_encryption_configuration(value: &Value) -> Result<ServerSideEncryptionC
     let mut rules = Vec::new();
     for item in items {
         let mut builder = ServerSideEncryptionRule::builder();
-        if let Some(defaults) = item.get("ApplyServerSideEncryptionByDefault").and_then(Value::as_object) {
+        if let Some(defaults) = item
+            .get("ApplyServerSideEncryptionByDefault")
+            .and_then(Value::as_object)
+        {
             let mut defaults_builder = ServerSideEncryptionByDefault::builder();
             if let Some(algorithm) = defaults.get("SSEAlgorithm").and_then(Value::as_str) {
-                defaults_builder = defaults_builder.sse_algorithm(ServerSideEncryption::from(algorithm));
+                defaults_builder =
+                    defaults_builder.sse_algorithm(ServerSideEncryption::from(algorithm));
             }
-            if let Some(key_id) = defaults.get("KMSMasterKeyID").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+            if let Some(key_id) = defaults
+                .get("KMSMasterKeyID")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
                 defaults_builder = defaults_builder.kms_master_key_id(key_id);
             }
             builder = builder.apply_server_side_encryption_by_default(
@@ -2047,7 +2377,11 @@ fn emit_transfer_event(job: &Value) {
 fn transfer_strategy_label(direction: &str, uses_multipart: bool) -> String {
     format!(
         "{} {direction}",
-        if uses_multipart { "Multipart" } else { "Single-part" }
+        if uses_multipart {
+            "Multipart"
+        } else {
+            "Single-part"
+        }
     )
 }
 
@@ -2060,8 +2394,9 @@ fn progress_fraction(bytes_transferred: u64, total_bytes: u64) -> f64 {
 }
 
 fn runtime_dir() -> Result<PathBuf, SidecarError> {
-    let path = std::env::temp_dir().join("s3-browser-crossplat-rust-engine");
-    fs::create_dir_all(&path).map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
+    let path = std::env::temp_dir().join("object-data-browser-rust-engine");
+    fs::create_dir_all(&path)
+        .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
     Ok(path)
 }
 
@@ -2087,7 +2422,8 @@ fn write_benchmark_state(state: &Value) -> Result<(), SidecarError> {
     let path = benchmark_state_path(state["id"].as_str().unwrap_or_default())?;
     let output = serde_json::to_string(state)
         .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
-    fs::write(path, output).map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))
+    fs::write(path, output)
+        .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))
 }
 
 fn refresh_benchmark_snapshot(state: &mut Value) {
@@ -2113,21 +2449,20 @@ fn refresh_benchmark_snapshot(state: &mut Value) {
         .filter_map(|item| item.get("latencyMs").and_then(Value::as_f64))
         .collect();
     state["averageLatencyMs"] = Value::from(round1(mean_f64(&latencies)));
-    let throughput_series = state["resultSummary"]["throughputSeries"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    state["throughputOpsPerSecond"] = Value::from(
-        throughput_series
-            .last()
-            .and_then(|item| item.get("opsPerSecond"))
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-    );
+    let active_elapsed = state["activeElapsedSeconds"].as_f64().unwrap_or(0.0);
+    let processed_count = state["processedCount"].as_i64().unwrap_or(0);
+    state["throughputOpsPerSecond"] = Value::from(if active_elapsed <= 0.0 {
+        0.0
+    } else {
+        round1(processed_count as f64 / active_elapsed)
+    });
 }
 
 async fn materialize_benchmark_state(mut state: Value) -> SidecarResult {
-    if matches!(state["status"].as_str(), Some("paused" | "completed" | "stopped" | "failed")) {
+    if matches!(
+        state["status"].as_str(),
+        Some("paused" | "completed" | "stopped" | "failed")
+    ) {
         return Ok(state);
     }
     let config = state["config"].as_object().cloned().unwrap_or_default();
@@ -2168,71 +2503,72 @@ async fn materialize_benchmark_state(mut state: Value) -> SidecarResult {
         .and_then(Value::as_u64)
         .unwrap_or(1000)
         .max(1) as usize;
-    let threads = config
+    let parallelism = config
         .get("concurrentThreads")
         .and_then(Value::as_u64)
         .unwrap_or(1)
         .max(1) as usize;
-    let processed = state["processedCount"].as_u64().unwrap_or(0) as usize;
-    let duration_complete = config
+    let test_mode = config
         .get("testMode")
         .and_then(Value::as_str)
-        .unwrap_or("duration")
-        != "operation-count"
-        && active_elapsed >= duration_seconds as f64;
-    let operation_complete = config
-        .get("testMode")
-        .and_then(Value::as_str)
-        .unwrap_or("duration")
-        == "operation-count"
-        && processed >= operation_count;
-    let effective_elapsed = if duration_complete {
-        state["activeElapsedSeconds"] = Value::from(duration_seconds as f64);
-        duration_seconds as f64
-    } else {
-        active_elapsed
-    };
-    let mut target_processed = (effective_elapsed * threads as f64 * 8.0) as usize;
-    if processed == 0 && target_processed == 0 && !duration_complete && !operation_complete {
-        target_processed = 1;
-    }
-    if config
-        .get("testMode")
-        .and_then(Value::as_str)
-        .unwrap_or("duration")
-        == "operation-count"
-    {
-        target_processed = target_processed.min(operation_count);
-    }
-    let mut batch_size = target_processed.saturating_sub(processed);
-    if duration_complete || operation_complete {
-        batch_size = 0;
-    }
-    batch_size = batch_size.min((threads * 8).max(32));
-    if batch_size == 0 && processed == 0 && !duration_complete && !operation_complete {
-        batch_size = 1;
-    }
-    if batch_size > 0 {
+        .unwrap_or("duration");
+    let duration_complete =
+        test_mode != "operation-count" && active_elapsed >= duration_seconds as f64;
+    let operation_complete = test_mode == "operation-count"
+        && state["processedCount"].as_u64().unwrap_or(0) as usize >= operation_count;
+    let call_started = Instant::now();
+    let call_base_elapsed_ms = active_elapsed * 1000.0;
+    let execution_budget_seconds =
+        ((now - last_updated).num_milliseconds().max(0) as f64 / 1000.0).clamp(0.25, 1.5);
+    if !duration_complete && !operation_complete && parallelism > 0 {
         let profile = benchmark_profile(
             state.get("profile").cloned().unwrap_or(Value::Null),
             &config,
         )?;
         let client = build_client(&profile).await?;
-        for _ in 0..batch_size {
-            if config
-                .get("testMode")
-                .and_then(Value::as_str)
-                .unwrap_or("duration")
-                == "operation-count"
+        while call_started.elapsed().as_secs_f64() < execution_budget_seconds {
+            if test_mode == "operation-count"
                 && state["processedCount"].as_u64().unwrap_or(0) as usize >= operation_count
             {
                 break;
             }
-            if let Err(error) = run_benchmark_operation(&mut state, &client).await {
-                state["status"] = Value::String("failed".to_string());
-                state["completedAt"] = Value::String(now_iso());
-                append_benchmark_log(&mut state, &format!("Benchmark failed: {}", error.message));
+            if test_mode != "operation-count"
+                && state["activeElapsedSeconds"].as_f64().unwrap_or(0.0)
+                    + call_started.elapsed().as_secs_f64()
+                    >= duration_seconds as f64
+            {
                 break;
+            }
+            let remaining_operations = if test_mode == "operation-count" {
+                operation_count
+                    .saturating_sub(state["processedCount"].as_u64().unwrap_or(0) as usize)
+            } else {
+                usize::MAX
+            };
+            let task_count = parallelism.min(remaining_operations.max(1));
+            let tasks = plan_benchmark_batch(&mut state, task_count, remaining_operations);
+            if tasks.is_empty() {
+                break;
+            }
+            match execute_benchmark_batch(
+                &tasks,
+                &client,
+                &state,
+                call_started,
+                call_base_elapsed_ms,
+            )
+            .await
+            {
+                Ok(results) => apply_benchmark_batch_results(&mut state, results),
+                Err(error) => {
+                    state["status"] = Value::String("failed".to_string());
+                    state["completedAt"] = Value::String(now_iso());
+                    append_benchmark_log(
+                        &mut state,
+                        &format!("Benchmark failed: {}", error.message),
+                    );
+                    break;
+                }
             }
         }
     }
@@ -2254,10 +2590,7 @@ async fn materialize_benchmark_state(mut state: Value) -> SidecarResult {
             let processed_count = state["processedCount"].as_u64().unwrap_or(0);
             append_benchmark_log(
                 &mut state,
-                &format!(
-                    "Benchmark completed after {} request(s).",
-                    processed_count
-                ),
+                &format!("Benchmark completed after {} request(s).", processed_count),
             );
         }
     }
@@ -2306,20 +2639,22 @@ fn persist_benchmark_outputs(state: &Value) -> Result<(), SidecarError> {
             record["key"].as_str().unwrap_or_default(),
         ));
     }
-    fs::write(
-        csv_path,
-        csv.join("\n") + "\n",
-    )
-    .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
+    fs::write(csv_path, csv.join("\n") + "\n")
+        .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
     fs::write(
         json_path,
-        serde_json::to_string_pretty(&state["resultSummary"])
-        .unwrap_or_else(|_| "{}".to_string()),
+        serde_json::to_string_pretty(&state["resultSummary"]).unwrap_or_else(|_| "{}".to_string()),
     )
     .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
     let log_lines = state["liveLog"]
         .as_array()
-        .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n"))
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
         .unwrap_or_default();
     fs::write(log_path, log_lines)
         .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
@@ -2348,23 +2683,46 @@ fn benchmark_ratios(workload_type: &str) -> [(&'static str, usize); 3] {
     }
 }
 
-fn benchmark_profile(profile_value: Value, config: &Map<String, Value>) -> Result<Profile, SidecarError> {
+fn benchmark_profile(
+    profile_value: Value,
+    config: &Map<String, Value>,
+) -> Result<Profile, SidecarError> {
     let mut merged = profile_value.as_object().cloned().unwrap_or_default();
     merged.insert(
         "connectTimeoutSeconds".to_string(),
-        Value::from(config.get("connectTimeoutSeconds").and_then(Value::as_i64).unwrap_or(5)),
+        Value::from(
+            config
+                .get("connectTimeoutSeconds")
+                .and_then(Value::as_i64)
+                .unwrap_or(5),
+        ),
     );
     merged.insert(
         "readTimeoutSeconds".to_string(),
-        Value::from(config.get("readTimeoutSeconds").and_then(Value::as_i64).unwrap_or(60)),
+        Value::from(
+            config
+                .get("readTimeoutSeconds")
+                .and_then(Value::as_i64)
+                .unwrap_or(60),
+        ),
     );
     merged.insert(
         "maxAttempts".to_string(),
-        Value::from(config.get("maxAttempts").and_then(Value::as_u64).unwrap_or(5)),
+        Value::from(
+            config
+                .get("maxAttempts")
+                .and_then(Value::as_u64)
+                .unwrap_or(5),
+        ),
     );
     merged.insert(
         "maxConcurrentRequests".to_string(),
-        Value::from(config.get("maxPoolConnections").and_then(Value::as_u64).unwrap_or(10)),
+        Value::from(
+            config
+                .get("maxPoolConnections")
+                .and_then(Value::as_u64)
+                .unwrap_or(10),
+        ),
     );
     parse_profile(&Value::Object(merged))
 }
@@ -2384,7 +2742,8 @@ fn benchmark_size_list(config: &Map<String, Value>) -> Vec<usize> {
         .get("objectSizes")
         .and_then(Value::as_array)
         .map(|items| {
-            items.iter()
+            items
+                .iter()
                 .filter_map(Value::as_u64)
                 .map(|value| value as usize)
                 .filter(|value| *value > 0)
@@ -2405,7 +2764,11 @@ fn benchmark_payload(run_id: &str, key: &str, size: usize, random_data: bool) ->
         return vec![b'A'; size];
     }
     let seed = format!("{run_id}:{key}:{size}").into_bytes();
-    let source = if seed.is_empty() { b"s3-benchmark".to_vec() } else { seed };
+    let source = if seed.is_empty() {
+        b"s3-benchmark".to_vec()
+    } else {
+        seed
+    };
     let pattern_len = (source.len() * 8).clamp(64, 4096);
     let mut pattern = vec![0u8; pattern_len];
     for index in 0..pattern_len {
@@ -2486,6 +2849,603 @@ fn benchmark_delete_batch_size(config: &Map<String, Value>, active_count: usize)
     batch_size.min(1000).min(active_count).max(1)
 }
 
+fn benchmark_operation_mix(config: &Map<String, Value>) -> Vec<(&'static str, usize)> {
+    let workload_type = config
+        .get("workloadType")
+        .and_then(Value::as_str)
+        .unwrap_or("mixed");
+    let mix = match workload_type {
+        "write-heavy" => vec![("PUT", 60), ("GET", 30), ("DELETE", 10)],
+        "read-heavy" => vec![("PUT", 25), ("GET", 65), ("DELETE", 10)],
+        "delete" => vec![("DELETE", 100)],
+        "write-only" => vec![("PUT", 100)],
+        "read-only" => vec![("GET", 100)],
+        "custom" => vec![
+            (
+                "PUT",
+                config
+                    .get("writePercent")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(33) as usize,
+            ),
+            (
+                "GET",
+                config
+                    .get("readPercent")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(34) as usize,
+            ),
+            (
+                "DELETE",
+                config
+                    .get("deletePercent")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(33) as usize,
+            ),
+        ],
+        _ => vec![("PUT", 34), ("GET", 33), ("DELETE", 33)],
+    };
+    let filtered: Vec<(&'static str, usize)> =
+        mix.into_iter().filter(|(_, weight)| *weight > 0).collect();
+    if filtered.is_empty() {
+        vec![("PUT", 100)]
+    } else {
+        filtered
+    }
+}
+
+fn benchmark_operation_for_slot(config: &Map<String, Value>, slot: usize) -> &'static str {
+    let mix = benchmark_operation_mix(config);
+    let total_weight: usize = mix.iter().map(|(_, weight)| *weight).sum::<usize>().max(1);
+    let mut cumulative = 0usize;
+    let target = slot % total_weight;
+    for (operation, weight) in mix {
+        cumulative += weight;
+        if target < cumulative {
+            return operation;
+        }
+    }
+    "PUT"
+}
+
+fn plan_benchmark_batch(
+    state: &mut Value,
+    task_count: usize,
+    remaining_operations: usize,
+) -> Vec<BenchmarkTask> {
+    if task_count == 0 || remaining_operations == 0 {
+        return Vec::new();
+    }
+    let config = state["config"].as_object().cloned().unwrap_or_default();
+    let sizes = benchmark_size_list(&config);
+    let object_limit = config
+        .get("objectCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(sizes.len() as u64)
+        .max(1) as usize;
+    let mut planned_active_objects = state["activeObjects"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut next_size_index = state["nextSizeIndex"].as_u64().unwrap_or(0) as usize;
+    let mut next_active_index = state["nextActiveIndex"].as_u64().unwrap_or(0) as usize;
+    let mut next_object_index = state["nextObjectIndex"].as_u64().unwrap_or(0);
+    let mut scheduled_operations = 0usize;
+    let mut tasks = Vec::new();
+
+    for order in 0..task_count {
+        if scheduled_operations >= remaining_operations {
+            break;
+        }
+        let size_bytes = sizes[next_size_index % sizes.len()];
+        next_size_index += 1;
+        let processed_slot =
+            state["processedCount"].as_u64().unwrap_or(0) as usize + scheduled_operations;
+        let mut operation = benchmark_operation_for_slot(&config, processed_slot);
+        if matches!(operation, "GET" | "DELETE") && planned_active_objects.is_empty() {
+            operation = "PUT";
+        }
+        match operation {
+            "PUT" => {
+                let key = if planned_active_objects.len() >= object_limit
+                    && !planned_active_objects.is_empty()
+                {
+                    let selected = planned_active_objects
+                        [next_active_index % planned_active_objects.len()]["key"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    next_active_index += 1;
+                    selected
+                } else {
+                    let selected = format!(
+                        "{}obj-{next_object_index:06}-{size_bytes}.bin",
+                        state["benchmarkPrefix"].as_str().unwrap_or_default()
+                    );
+                    next_object_index += 1;
+                    selected
+                };
+                let mut updated = false;
+                for item in &mut planned_active_objects {
+                    if item["key"].as_str().unwrap_or_default() == key {
+                        item["sizeBytes"] = Value::from(size_bytes as i64);
+                        updated = true;
+                        break;
+                    }
+                }
+                if !updated {
+                    planned_active_objects.push(json!({"key": key, "sizeBytes": size_bytes}));
+                }
+                tasks.push(BenchmarkTask {
+                    order,
+                    kind: BenchmarkTaskKind::Put { key, size_bytes },
+                });
+                scheduled_operations += 1;
+            }
+            "GET" => {
+                let target = planned_active_objects
+                    [next_active_index % planned_active_objects.len()]
+                .clone();
+                next_active_index += 1;
+                tasks.push(BenchmarkTask {
+                    order,
+                    kind: BenchmarkTaskKind::Get {
+                        key: target["key"].as_str().unwrap_or_default().to_string(),
+                        size_bytes: target["sizeBytes"].as_u64().unwrap_or(size_bytes as u64)
+                            as usize,
+                    },
+                });
+                scheduled_operations += 1;
+            }
+            _ => {
+                let allowed_operations = remaining_operations
+                    .saturating_sub(scheduled_operations)
+                    .max(1);
+                let delete_batch_size =
+                    benchmark_delete_batch_size(&config, planned_active_objects.len())
+                        .min(allowed_operations);
+                if delete_batch_size <= 1 || benchmark_delete_mode(&config) != "multi-object-post" {
+                    let target = planned_active_objects
+                        [next_active_index % planned_active_objects.len()]
+                    .clone();
+                    next_active_index += 1;
+                    let selected_key = target["key"].as_str().unwrap_or_default().to_string();
+                    let selected_size =
+                        target["sizeBytes"].as_u64().unwrap_or(size_bytes as u64) as usize;
+                    planned_active_objects
+                        .retain(|item| item["key"].as_str().unwrap_or_default() != selected_key);
+                    tasks.push(BenchmarkTask {
+                        order,
+                        kind: BenchmarkTaskKind::DeleteSingle {
+                            key: selected_key,
+                            size_bytes: selected_size,
+                        },
+                    });
+                    scheduled_operations += 1;
+                } else {
+                    let selected_keys: Vec<String> = (0..delete_batch_size)
+                        .map(|offset| {
+                            planned_active_objects
+                                [(next_active_index + offset) % planned_active_objects.len()]["key"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string()
+                        })
+                        .collect();
+                    next_active_index += delete_batch_size;
+                    planned_active_objects.retain(|item| {
+                        let key = item["key"].as_str().unwrap_or_default();
+                        !selected_keys.iter().any(|selected| selected == key)
+                    });
+                    tasks.push(BenchmarkTask {
+                        order,
+                        kind: BenchmarkTaskKind::DeleteMulti {
+                            keys: selected_keys,
+                        },
+                    });
+                    scheduled_operations += delete_batch_size;
+                }
+            }
+        }
+    }
+
+    state["nextSizeIndex"] = Value::from(next_size_index as u64);
+    state["nextActiveIndex"] = Value::from(next_active_index as u64);
+    state["nextObjectIndex"] = Value::from(next_object_index);
+    tasks
+}
+
+async fn execute_benchmark_batch(
+    tasks: &[BenchmarkTask],
+    client: &Client,
+    state: &Value,
+    call_started: Instant,
+    call_base_elapsed_ms: f64,
+) -> Result<Vec<BenchmarkTaskResult>, SidecarError> {
+    let config = state["config"].as_object().cloned().unwrap_or_default();
+    let bucket_name = config
+        .get("bucketName")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let run_id = state["id"].as_str().unwrap_or_default().to_string();
+    let random_data = config
+        .get("randomData")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let validate_checksum = config
+        .get("validateChecksum")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mut join_set = tokio::task::JoinSet::new();
+    for task in tasks.iter().cloned() {
+        let task_client = client.clone();
+        let task_bucket = bucket_name.clone();
+        let task_run_id = run_id.clone();
+        join_set.spawn(async move {
+            execute_benchmark_task(
+                task,
+                task_client,
+                task_bucket,
+                task_run_id,
+                random_data,
+                validate_checksum,
+                call_started,
+                call_base_elapsed_ms,
+            )
+            .await
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(joined) = join_set.join_next().await {
+        let result = joined
+            .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))??;
+        results.push(result);
+    }
+    results.sort_by(|left, right| {
+        left.elapsed_ms
+            .partial_cmp(&right.elapsed_ms)
+            .unwrap_or(Ordering::Equal)
+            .then(left.order.cmp(&right.order))
+    });
+    Ok(results)
+}
+
+async fn execute_benchmark_task(
+    task: BenchmarkTask,
+    client: Client,
+    bucket_name: String,
+    run_id: String,
+    random_data: bool,
+    validate_checksum: bool,
+    call_started: Instant,
+    call_base_elapsed_ms: f64,
+) -> Result<BenchmarkTaskResult, SidecarError> {
+    let started = Instant::now();
+    match task.kind {
+        BenchmarkTaskKind::Put { key, size_bytes } => {
+            let payload = benchmark_payload(&run_id, &key, size_bytes, random_data);
+            client
+                .put_object()
+                .bucket(&bucket_name)
+                .key(&key)
+                .body(ByteStream::from(payload.clone()))
+                .send()
+                .await
+                .map_err(map_sdk_error)?;
+            Ok(BenchmarkTaskResult {
+                order: task.order,
+                operation: "PUT",
+                key: key.clone(),
+                size_bytes,
+                bytes_transferred: payload.len() as i64,
+                checksum_state: "not_used".to_string(),
+                latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+                operation_count: 1,
+                elapsed_ms: call_base_elapsed_ms + (call_started.elapsed().as_secs_f64() * 1000.0),
+                upserted_object: Some((key, size_bytes)),
+                removed_keys: Vec::new(),
+                log_line: None,
+            })
+        }
+        BenchmarkTaskKind::Get { key, size_bytes } => {
+            let output = match client
+                .get_object()
+                .bucket(&bucket_name)
+                .key(&key)
+                .send()
+                .await
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    let mapped = map_sdk_error(error);
+                    if is_missing_benchmark_key(&mapped) {
+                        return Ok(BenchmarkTaskResult {
+                            order: task.order,
+                            operation: "GET",
+                            key: key.clone(),
+                            size_bytes,
+                            bytes_transferred: 0,
+                            checksum_state: "not_used".to_string(),
+                            latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+                            operation_count: 0,
+                            elapsed_ms: call_base_elapsed_ms
+                                + (call_started.elapsed().as_secs_f64() * 1000.0),
+                            upserted_object: None,
+                            removed_keys: vec![key.clone()],
+                            log_line: Some(format!(
+                                "Skipped missing benchmark object {key}; rotating to the next object."
+                            )),
+                        });
+                    }
+                    return Err(mapped);
+                }
+            };
+            let bytes = output
+                .body
+                .collect()
+                .await
+                .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?
+                .into_bytes();
+            let expected = benchmark_payload(&run_id, &key, size_bytes, random_data);
+            Ok(BenchmarkTaskResult {
+                order: task.order,
+                operation: "GET",
+                key,
+                size_bytes,
+                bytes_transferred: bytes.len() as i64,
+                checksum_state: if validate_checksum {
+                    if bytes.as_ref() == expected.as_slice() {
+                        "validated_success".to_string()
+                    } else {
+                        "validated_failure".to_string()
+                    }
+                } else {
+                    "not_used".to_string()
+                },
+                latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+                operation_count: 1,
+                elapsed_ms: call_base_elapsed_ms + (call_started.elapsed().as_secs_f64() * 1000.0),
+                upserted_object: None,
+                removed_keys: Vec::new(),
+                log_line: None,
+            })
+        }
+        BenchmarkTaskKind::DeleteSingle { key, size_bytes } => {
+            match client
+                .delete_object()
+                .bucket(&bucket_name)
+                .key(&key)
+                .send()
+                .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    let mapped = map_sdk_error(error);
+                    if is_missing_benchmark_key(&mapped) {
+                        return Ok(BenchmarkTaskResult {
+                            order: task.order,
+                            operation: "DELETE",
+                            key: key.clone(),
+                            size_bytes,
+                            bytes_transferred: 0,
+                            checksum_state: "not_used".to_string(),
+                            latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+                            operation_count: 0,
+                            elapsed_ms: call_base_elapsed_ms
+                                + (call_started.elapsed().as_secs_f64() * 1000.0),
+                            upserted_object: None,
+                            removed_keys: vec![key.clone()],
+                            log_line: Some(format!(
+                                "Skipped missing benchmark object {key}; rotating to the next object."
+                            )),
+                        });
+                    }
+                    return Err(mapped);
+                }
+            }
+            Ok(BenchmarkTaskResult {
+                order: task.order,
+                operation: "DELETE",
+                key: key.clone(),
+                size_bytes,
+                bytes_transferred: 0,
+                checksum_state: "not_used".to_string(),
+                latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+                operation_count: 1,
+                elapsed_ms: call_base_elapsed_ms + (call_started.elapsed().as_secs_f64() * 1000.0),
+                upserted_object: None,
+                removed_keys: vec![key],
+                log_line: None,
+            })
+        }
+        BenchmarkTaskKind::DeleteMulti { keys } => {
+            let objects: Vec<ObjectIdentifier> = keys
+                .iter()
+                .map(|key| {
+                    ObjectIdentifier::builder()
+                        .key(key)
+                        .build()
+                        .map_err(|error| SidecarError::new("invalid_config", error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let delete = Delete::builder()
+                .set_objects(Some(objects))
+                .quiet(false)
+                .build()
+                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+            let output = client
+                .delete_objects()
+                .bucket(&bucket_name)
+                .delete(delete)
+                .send()
+                .await
+                .map_err(map_sdk_error)?;
+            let mut deleted_keys = Vec::new();
+            for item in output.deleted() {
+                if let Some(target) = item.key() {
+                    if !target.is_empty() {
+                        deleted_keys.push(target.to_string());
+                    }
+                }
+            }
+            let mut missing_keys = Vec::new();
+            let mut fatal_errors = Vec::new();
+            for item in output.errors() {
+                let target = item.key().unwrap_or_default();
+                let code = item.code().unwrap_or_default().to_ascii_lowercase();
+                let message = item.message().unwrap_or_default().to_string();
+                if matches!(code.as_str(), "nosuchkey" | "notfound" | "404")
+                    || message.to_ascii_lowercase().contains("does not exist")
+                {
+                    if !target.is_empty() {
+                        missing_keys.push(target.to_string());
+                    }
+                    continue;
+                }
+                fatal_errors.push(format!(
+                    "{}: {}",
+                    if target.is_empty() {
+                        "(unknown)"
+                    } else {
+                        target
+                    },
+                    if message.is_empty() {
+                        item.code().unwrap_or("delete error")
+                    } else {
+                        message.as_str()
+                    }
+                ));
+            }
+            if !fatal_errors.is_empty() {
+                return Err(SidecarError::new("delete_failed", fatal_errors.join("; ")));
+            }
+            let deleted_count = deleted_keys.len() as i64;
+            let key = if deleted_count > 1 {
+                format!(
+                    "{} (+{} more)",
+                    deleted_keys
+                        .first()
+                        .cloned()
+                        .or_else(|| keys.first().cloned())
+                        .unwrap_or_default(),
+                    deleted_count - 1
+                )
+            } else {
+                deleted_keys
+                    .first()
+                    .cloned()
+                    .or_else(|| keys.first().cloned())
+                    .unwrap_or_default()
+            };
+            let log_line = if !missing_keys.is_empty() {
+                Some(format!(
+                    "Skipped {} missing benchmark object(s) during multi-delete POST.",
+                    missing_keys.len()
+                ))
+            } else {
+                None
+            };
+            let mut removed_keys = deleted_keys.clone();
+            removed_keys.extend(missing_keys);
+            Ok(BenchmarkTaskResult {
+                order: task.order,
+                operation: "DELETE",
+                key,
+                size_bytes: 0,
+                bytes_transferred: 0,
+                checksum_state: "not_used".to_string(),
+                latency_ms: started.elapsed().as_secs_f64() * 1000.0,
+                operation_count: deleted_count,
+                elapsed_ms: call_base_elapsed_ms + (call_started.elapsed().as_secs_f64() * 1000.0),
+                upserted_object: None,
+                removed_keys,
+                log_line,
+            })
+        }
+    }
+}
+
+fn apply_benchmark_batch_results(state: &mut Value, results: Vec<BenchmarkTaskResult>) {
+    let reduced_logging = state["config"]["reducedLogging"].as_bool().unwrap_or(false);
+    let mut active_objects = state["activeObjects"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut history = state["history"].as_array().cloned().unwrap_or_default();
+    for result in results {
+        if let Some((key, size_bytes)) = &result.upserted_object {
+            let mut updated = false;
+            for item in &mut active_objects {
+                if item["key"].as_str().unwrap_or_default() == key {
+                    item["sizeBytes"] = Value::from(*size_bytes as i64);
+                    updated = true;
+                    break;
+                }
+            }
+            if !updated {
+                active_objects.push(json!({"key": key, "sizeBytes": size_bytes}));
+            }
+        }
+        if !result.removed_keys.is_empty() {
+            active_objects.retain(|item| {
+                let current_key = item["key"].as_str().unwrap_or_default();
+                !result.removed_keys.iter().any(|entry| entry == current_key)
+            });
+        }
+        if let Some(line) = result.log_line.as_deref() {
+            append_benchmark_log(state, line);
+        }
+        if result.operation_count <= 0 {
+            continue;
+        }
+        let second = ((result.elapsed_ms / 1000.0).floor() as i64).max(0) + 1;
+        history.push(json!({
+            "timestamp": now_iso(),
+            "second": second,
+            "elapsedMs": round1(result.elapsed_ms),
+            "operation": result.operation,
+            "key": result.key,
+            "sizeBytes": result.size_bytes,
+            "latencyMs": round1(result.latency_ms),
+            "bytesTransferred": result.bytes_transferred,
+            "success": true,
+            "checksumState": result.checksum_state,
+            "operationCount": result.operation_count,
+        }));
+        if !reduced_logging {
+            if result.operation == "DELETE" && result.operation_count > 1 {
+                append_benchmark_log(
+                    state,
+                    &format!(
+                        "DELETE POST removed {} object(s) in {:.1} ms.",
+                        result.operation_count,
+                        round1(result.latency_ms)
+                    ),
+                );
+            } else {
+                append_benchmark_log(
+                    state,
+                    &format!(
+                        "{} {} completed in {:.1} ms.",
+                        result.operation,
+                        result.key,
+                        round1(result.latency_ms)
+                    ),
+                );
+            }
+        }
+    }
+    state["history"] = Value::Array(history);
+    state["activeObjects"] = Value::Array(active_objects);
+    state["processedCount"] = Value::from(
+        state["history"]
+            .as_array()
+            .map(|items| items.iter().map(benchmark_operation_count).sum::<i64>())
+            .unwrap_or(0),
+    );
+}
+
 fn benchmark_summary_from_state(state: &Value) -> Value {
     let config_map = state["config"].as_object().cloned().unwrap_or_default();
     let history = state["history"].as_array().cloned().unwrap_or_default();
@@ -2502,35 +3462,63 @@ fn benchmark_summary_from_state(state: &Value) -> Value {
         let operation_count = benchmark_operation_count(record);
         operations_by_type.insert(
             operation.clone(),
-            Value::from(operations_by_type.get(&operation).and_then(Value::as_i64).unwrap_or(0) + operation_count),
+            Value::from(
+                operations_by_type
+                    .get(&operation)
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    + operation_count,
+            ),
         );
-        let checksum_state = record["checksumState"].as_str().unwrap_or("not_used").to_string();
+        let checksum_state = record["checksumState"]
+            .as_str()
+            .unwrap_or("not_used")
+            .to_string();
         checksum_stats.insert(
             checksum_state.clone(),
-            Value::from(checksum_stats.get(&checksum_state).and_then(Value::as_i64).unwrap_or(0) + operation_count),
+            Value::from(
+                checksum_stats
+                    .get(&checksum_state)
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    + operation_count,
+            ),
         );
         let latency = record["latencyMs"].as_f64().unwrap_or(0.0);
         latencies.push(latency);
-        let second = record["second"].as_i64().unwrap_or(1).max(1);
+        let elapsed_ms = record["elapsedMs"].as_f64().unwrap_or(0.0).max(0.0);
+        let second = ((elapsed_ms / 1000.0).floor() as i64).max(0) + 1;
         windows.entry(second).or_default().push(record.clone());
         let size = record["sizeBytes"].as_i64().unwrap_or(0);
         if size > 0 {
             size_latency.entry(size).or_default().push(latency);
         }
     }
-    let throughput_series: Vec<Value> = windows
-        .iter()
-        .map(|(second, items)| {
+    let window_count = state["activeElapsedSeconds"]
+        .as_f64()
+        .unwrap_or(0.0)
+        .ceil()
+        .max(windows.keys().last().copied().unwrap_or(0) as f64)
+        .max(1.0) as i64;
+    let throughput_series: Vec<Value> = (1..=window_count)
+        .map(|second| {
+            let items = windows.get(&second).cloned().unwrap_or_default();
             let mut operations = Map::new();
             let mut window_latencies = Vec::new();
             let mut bytes_per_second = 0i64;
             let mut ops_per_second = 0i64;
-            for item in items {
+            for item in &items {
                 let operation = item["operation"].as_str().unwrap_or_default().to_string();
                 let operation_count = benchmark_operation_count(item);
                 operations.insert(
                     operation.clone(),
-                    Value::from(operations.get(&operation).and_then(Value::as_i64).unwrap_or(0) + operation_count),
+                    Value::from(
+                        operations
+                            .get(&operation)
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0)
+                            + operation_count,
+                    ),
                 );
                 window_latencies.push(item["latencyMs"].as_f64().unwrap_or(0.0));
                 bytes_per_second += item["bytesTransferred"].as_i64().unwrap_or(0);
@@ -2552,21 +3540,23 @@ fn benchmark_summary_from_state(state: &Value) -> Value {
         .iter()
         .enumerate()
         .map(|(index, record)| {
-            let second = record["second"].as_i64().unwrap_or(1).max(1);
+            let elapsed_ms = record["elapsedMs"].as_f64().unwrap_or(0.0).max(0.0);
+            let second = ((elapsed_ms / 1000.0).floor() as i64).max(0) + 1;
             let position = second_positions.get(&second).copied().unwrap_or(0) + 1;
             second_positions.insert(second, position);
-            let mut elapsed_ms = record["elapsedMs"].as_f64().unwrap_or(0.0);
-            if elapsed_ms <= 0.0 {
+            let mut plotted_elapsed_ms = elapsed_ms;
+            if plotted_elapsed_ms <= 0.0 {
                 let second_count = windows.get(&second).map(Vec::len).unwrap_or(0);
-                let elapsed_seconds = (second - 1) as f64 + (position as f64 / (second_count + 1) as f64);
-                elapsed_ms = elapsed_seconds * 1000.0;
+                let elapsed_seconds =
+                    (second - 1) as f64 + (position as f64 / (second_count + 1) as f64);
+                plotted_elapsed_ms = elapsed_seconds * 1000.0;
             }
             json!({
                 "sequence": index + 1,
                 "operation": record["operation"].as_str().unwrap_or_default().to_ascii_uppercase(),
                 "second": second,
-                "elapsedMs": round1(elapsed_ms),
-                "label": benchmark_timeline_label(elapsed_ms / 1000.0),
+                "elapsedMs": round1(plotted_elapsed_ms),
+                "label": benchmark_timeline_label(plotted_elapsed_ms / 1000.0),
                 "latencyMs": round1(record["latencyMs"].as_f64().unwrap_or(0.0)),
                 "sizeBytes": record["sizeBytes"].as_i64().unwrap_or(0),
                 "bytesTransferred": record["bytesTransferred"].as_i64().unwrap_or(0),
@@ -2656,14 +3646,24 @@ fn benchmark_summary_from_state(state: &Value) -> Value {
 
 async fn run_benchmark_operation(state: &mut Value, client: &Client) -> Result<(), SidecarError> {
     let config = state["config"].as_object().cloned().unwrap_or_default();
-    let mut active_objects = state["activeObjects"].as_array().cloned().unwrap_or_default();
+    let mut active_objects = state["activeObjects"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let mut history = state["history"].as_array().cloned().unwrap_or_default();
     let sizes = benchmark_size_list(&config);
     let next_size_index = state["nextSizeIndex"].as_u64().unwrap_or(0) as usize;
     let mut size_bytes = sizes[next_size_index % sizes.len()];
     state["nextSizeIndex"] = Value::from((next_size_index + 1) as u64);
-    let object_limit = config.get("objectCount").and_then(Value::as_u64).unwrap_or(sizes.len() as u64).max(1) as usize;
-    let bucket_name = config.get("bucketName").and_then(Value::as_str).unwrap_or_default();
+    let object_limit = config
+        .get("objectCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(sizes.len() as u64)
+        .max(1) as usize;
+    let bucket_name = config
+        .get("bucketName")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let operation: String;
     let key: String;
     let bytes_transferred: i64;
@@ -2674,7 +3674,12 @@ async fn run_benchmark_operation(state: &mut Value, client: &Client) -> Result<(
         let slot = state["processedCount"].as_u64().unwrap_or(0) as usize % 100;
         let mut cumulative = 0usize;
         let mut selected_operation = "PUT".to_string();
-        for ratio in benchmark_ratios(config.get("workloadType").and_then(Value::as_str).unwrap_or("mixed")) {
+        for ratio in benchmark_ratios(
+            config
+                .get("workloadType")
+                .and_then(Value::as_str)
+                .unwrap_or("mixed"),
+        ) {
             cumulative += ratio.1 as usize;
             if slot < cumulative {
                 selected_operation = ratio.0.to_string();
@@ -2688,25 +3693,29 @@ async fn run_benchmark_operation(state: &mut Value, client: &Client) -> Result<(
         let started = std::time::Instant::now();
         match selected_operation.as_str() {
             "PUT" => {
-                let selected_key = if active_objects.len() >= object_limit && !active_objects.is_empty() {
-                    state["nextActiveIndex"] = Value::from((next_active_index + 1) as u64);
-                    active_objects[next_active_index % active_objects.len()]["key"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string()
-                } else {
-                    let next_object_index = state["nextObjectIndex"].as_u64().unwrap_or(0);
-                    state["nextObjectIndex"] = Value::from(next_object_index + 1);
-                    format!(
-                        "{}obj-{next_object_index:06}-{size_bytes}.bin",
-                        state["benchmarkPrefix"].as_str().unwrap_or_default()
-                    )
-                };
+                let selected_key =
+                    if active_objects.len() >= object_limit && !active_objects.is_empty() {
+                        state["nextActiveIndex"] = Value::from((next_active_index + 1) as u64);
+                        active_objects[next_active_index % active_objects.len()]["key"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string()
+                    } else {
+                        let next_object_index = state["nextObjectIndex"].as_u64().unwrap_or(0);
+                        state["nextObjectIndex"] = Value::from(next_object_index + 1);
+                        format!(
+                            "{}obj-{next_object_index:06}-{size_bytes}.bin",
+                            state["benchmarkPrefix"].as_str().unwrap_or_default()
+                        )
+                    };
                 let payload = benchmark_payload(
                     state["id"].as_str().unwrap_or_default(),
                     &selected_key,
                     size_bytes,
-                    config.get("randomData").and_then(Value::as_bool).unwrap_or(true),
+                    config
+                        .get("randomData")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
                 );
                 client
                     .put_object()
@@ -2750,7 +3759,9 @@ async fn run_benchmark_operation(state: &mut Value, client: &Client) -> Result<(
                     Err(error) => {
                         let mapped = map_sdk_error(error);
                         if is_missing_benchmark_key(&mapped) {
-                            active_objects.retain(|item| item["key"].as_str().unwrap_or_default() != selected_key);
+                            active_objects.retain(|item| {
+                                item["key"].as_str().unwrap_or_default() != selected_key
+                            });
                             state["activeObjects"] = Value::Array(active_objects.clone());
                             append_benchmark_log(
                                 state,
@@ -2771,12 +3782,19 @@ async fn run_benchmark_operation(state: &mut Value, client: &Client) -> Result<(
                     state["id"].as_str().unwrap_or_default(),
                     &selected_key,
                     size_bytes,
-                    config.get("randomData").and_then(Value::as_bool).unwrap_or(true),
+                    config
+                        .get("randomData")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
                 );
                 operation = selected_operation;
                 key = selected_key;
                 bytes_transferred = bytes.len() as i64;
-                checksum_state = if config.get("validateChecksum").and_then(Value::as_bool).unwrap_or(true) {
+                checksum_state = if config
+                    .get("validateChecksum")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+                {
                     if bytes.as_ref() == expected.as_slice() {
                         "validated_success".to_string()
                     } else {
@@ -2799,15 +3817,19 @@ async fn run_benchmark_operation(state: &mut Value, client: &Client) -> Result<(
                             .to_string()
                     })
                     .collect();
-                state["nextActiveIndex"] = Value::from((next_active_index + delete_batch_size) as u64);
-                if benchmark_delete_mode(&config) == "multi-object-post" && selected_keys.len() > 1 {
+                state["nextActiveIndex"] =
+                    Value::from((next_active_index + delete_batch_size) as u64);
+                if benchmark_delete_mode(&config) == "multi-object-post" && selected_keys.len() > 1
+                {
                     let objects: Vec<ObjectIdentifier> = selected_keys
                         .iter()
                         .map(|item| {
                             ObjectIdentifier::builder()
                                 .key(item)
                                 .build()
-                                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))
+                                .map_err(|error| {
+                                    SidecarError::new("invalid_config", error.to_string())
+                                })
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let delete = Delete::builder()
@@ -2846,8 +3868,16 @@ async fn run_benchmark_operation(state: &mut Value, client: &Client) -> Result<(
                         }
                         fatal_errors.push(format!(
                             "{}: {}",
-                            if target.is_empty() { "(unknown)" } else { target },
-                            if message.is_empty() { item.code().unwrap_or("delete error") } else { message.as_str() }
+                            if target.is_empty() {
+                                "(unknown)"
+                            } else {
+                                target
+                            },
+                            if message.is_empty() {
+                                item.code().unwrap_or("delete error")
+                            } else {
+                                message.as_str()
+                            }
                         ));
                     }
                     if !fatal_errors.is_empty() {
@@ -2905,7 +3935,9 @@ async fn run_benchmark_operation(state: &mut Value, client: &Client) -> Result<(
                     Err(error) => {
                         let mapped = map_sdk_error(error);
                         if is_missing_benchmark_key(&mapped) {
-                            active_objects.retain(|item| item["key"].as_str().unwrap_or_default() != selected_key);
+                            active_objects.retain(|item| {
+                                item["key"].as_str().unwrap_or_default() != selected_key
+                            });
                             state["activeObjects"] = Value::Array(active_objects.clone());
                             append_benchmark_log(
                                 state,
@@ -2916,7 +3948,8 @@ async fn run_benchmark_operation(state: &mut Value, client: &Client) -> Result<(
                         return Err(mapped);
                     }
                 }
-                active_objects.retain(|item| item["key"].as_str().unwrap_or_default() != selected_key);
+                active_objects
+                    .retain(|item| item["key"].as_str().unwrap_or_default() != selected_key);
                 operation = selected_operation;
                 key = selected_key;
                 bytes_transferred = 0;
@@ -2951,10 +3984,21 @@ async fn run_benchmark_operation(state: &mut Value, client: &Client) -> Result<(
     if operation == "DELETE" && operation_count > 1 {
         append_benchmark_log(
             state,
-            &format!("DELETE POST removed {operation_count} object(s) in {:.1} ms.", round1(latency_ms)),
+            &format!(
+                "DELETE POST removed {operation_count} object(s) in {:.1} ms.",
+                round1(latency_ms)
+            ),
         );
     } else {
-        append_benchmark_log(state, &format!("{} {} completed in {:.1} ms.", operation, key, round1(latency_ms)));
+        append_benchmark_log(
+            state,
+            &format!(
+                "{} {} completed in {:.1} ms.",
+                operation,
+                key,
+                round1(latency_ms)
+            ),
+        );
     }
     Ok(())
 }
@@ -3019,7 +4063,10 @@ fn benchmark_summary(processed_count: usize, workload_type: &str) -> Value {
     })
 }
 
-fn benchmark_operations(processed_count: usize, workload_type: &str) -> serde_json::Map<String, Value> {
+fn benchmark_operations(
+    processed_count: usize,
+    workload_type: &str,
+) -> serde_json::Map<String, Value> {
     let ratios = match workload_type {
         "write-heavy" => [("PUT", 60usize), ("GET", 30usize), ("DELETE", 10usize)],
         "read-heavy" => [("PUT", 25usize), ("GET", 65usize), ("DELETE", 10usize)],
@@ -3040,9 +4087,7 @@ fn benchmark_operations(processed_count: usize, workload_type: &str) -> serde_js
     operations
 }
 
-fn benchmark_throughput_series(
-    operations: &serde_json::Map<String, Value>,
-) -> Vec<Value> {
+fn benchmark_throughput_series(operations: &serde_json::Map<String, Value>) -> Vec<Value> {
     let total_ratio = operations
         .values()
         .filter_map(Value::as_f64)
@@ -3063,7 +4108,9 @@ fn benchmark_throughput_series(
                 per_operation.insert(operation.clone(), json!(op_count));
                 per_operation_latency.insert(
                     operation.clone(),
-                    json!(round1(average_latency_ms * operation_latency_factor(operation))),
+                    json!(round1(
+                        average_latency_ms * operation_latency_factor(operation)
+                    )),
                 );
             }
             json!({
@@ -3100,9 +4147,7 @@ fn benchmark_latency_by_operation() -> Value {
     })
 }
 
-fn benchmark_operation_details(
-    operations: &serde_json::Map<String, Value>,
-) -> Vec<Value> {
+fn benchmark_operation_details(operations: &serde_json::Map<String, Value>) -> Vec<Value> {
     let total = operations
         .values()
         .filter_map(Value::as_f64)
@@ -3282,14 +4327,16 @@ impl Intercept for HttpTraceInterceptor {
         let body = request
             .body()
             .bytes()
-            .map(|bytes| summarize_body(
-                request
-                    .headers()
-                    .get("content-type")
-                    .map(|value| value.as_ref())
-                    .unwrap_or(""),
-                bytes,
-            ))
+            .map(|bytes| {
+                summarize_body(
+                    request
+                        .headers()
+                        .get("content-type")
+                        .map(|value| value.as_ref())
+                        .unwrap_or(""),
+                    bytes,
+                )
+            })
             .unwrap_or_else(|| "[omitted streaming body]".to_string());
         emit_structured_log(
             "API",
@@ -3320,14 +4367,16 @@ impl Intercept for HttpTraceInterceptor {
         let body = response
             .body()
             .bytes()
-            .map(|bytes| summarize_body(
-                response
-                    .headers()
-                    .get("content-type")
-                    .map(|value| value.as_ref())
-                    .unwrap_or(""),
-                bytes,
-            ))
+            .map(|bytes| {
+                summarize_body(
+                    response
+                        .headers()
+                        .get("content-type")
+                        .map(|value| value.as_ref())
+                        .unwrap_or(""),
+                    bytes,
+                )
+            })
             .unwrap_or_else(|| "[omitted streaming body]".to_string());
         emit_structured_log(
             "API",

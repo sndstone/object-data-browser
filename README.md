@@ -1,6 +1,6 @@
-# S3 Browser Crossplat
+# Object Data Browser
 
-`s3-browser-crossplat` is a greenfield cross-platform S3 browser monorepo. It contains:
+`object-data-browser` is a greenfield cross-platform object data browser monorepo. It contains:
 
 - A Flutter app shell for Windows, macOS, Linux, and Android
 - A versioned engine contract shared by Python, Go, Rust, and Java backends
@@ -10,7 +10,7 @@
 ## Layout
 
 ```text
-s3-browser-crossplat/
+object-data-browser/
 ├── apps/flutter_app
 ├── contracts
 ├── docs
@@ -54,7 +54,7 @@ Windows builds now handle the symlink prerequisite in the same script. If Develo
 
 Windows desktop packaging also stages the Python, Go, Rust, and Java sidecars into the app bundle, so those toolchains are bootstrapped during a Windows build by default. Use `-IncludeEngineToolchains` when you want those extra backend toolchains staged for other targets too.
 
-Windows Android builds also stage an Android SDK under `.tmp/toolchains/android-sdk`, accept licenses, sign the release output with the debug key for sideloading, and copy the primary arm64 APK to `dist/android/s3-browser-crossplat-android-<version>-arm64.apk`. The Android App Bundle remains available as a secondary artifact in `dist/android/`.
+Windows Android builds also stage an Android SDK under `.tmp/toolchains/android-sdk`, accept licenses, sign the release output with the debug key for sideloading, and copy the primary arm64 APK to `dist/android/object-data-browser-android-<version>-arm64.apk`. The Android App Bundle remains available as a secondary artifact in `dist/android/`.
 
 ## Immediate Next Steps
 

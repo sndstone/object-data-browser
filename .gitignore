@@ -9,6 +9,7 @@ coverage/
 pubspec.lock
 *.class
 *.jar
+!apps/flutter_app/android/gradle/wrapper/gradle-wrapper.jar
 *.pyc
 __pycache__/
 target/

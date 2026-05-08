@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "S3 Browser Engine Contract",
+  "title": "Object Data Browser Engine Contract",
   "type": "object",
   "required": [
     "requestId",

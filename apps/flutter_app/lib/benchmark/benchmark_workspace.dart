@@ -8,6 +8,8 @@ import 'package:flutter/rendering.dart';
 
 import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
+import '../theme/app_theme.dart';
+import '../widgets/compact_selector.dart';
 
 enum _BenchmarkPreviewSection {
   latency,
@@ -113,26 +115,30 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     final config = controller.benchmarkDraft;
     final previewRun = controller.selectedBenchmarkRun;
 
+    final isDesktopCompact =
+        AppTheme.isDesktopPlatform(Theme.of(context).platform);
+    final outerPad = isDesktopCompact ? 10.0 : 14.0;
+    final gap = isDesktopCompact ? 10.0 : 14.0;
     return LayoutBuilder(
       builder: (context, constraints) {
         final useStackedLayout =
             constraints.maxWidth < 1180 || constraints.maxHeight < 920;
         if (useStackedLayout) {
           final configHeight =
-              (constraints.maxHeight * 0.62).clamp(460.0, 860.0).toDouble();
+              (constraints.maxHeight * 0.62).clamp(420.0, 800.0).toDouble();
           final panelHeight =
-              (constraints.maxHeight * 0.5).clamp(380.0, 720.0).toDouble();
+              (constraints.maxHeight * 0.5).clamp(340.0, 680.0).toDouble();
           return ListView(
-            padding: const EdgeInsets.all(16),
+            padding: EdgeInsets.all(outerPad),
             children: [
               SizedBox(
                   height: configHeight, child: _configPanel(context, config)),
-              const SizedBox(height: 16),
+              SizedBox(height: gap),
               SizedBox(height: panelHeight, child: _runPanel(context, run)),
-              const SizedBox(height: 16),
+              SizedBox(height: gap),
               SizedBox(
                   height: panelHeight, child: _historyPanel(context, history)),
-              const SizedBox(height: 16),
+              SizedBox(height: gap),
               SizedBox(
                 height: math.max(panelHeight + 80, 520),
                 child: _resultsPanel(context, previewRun),
@@ -142,7 +148,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
         }
 
         return Padding(
-          padding: const EdgeInsets.all(16),
+          padding: EdgeInsets.all(outerPad),
           child: Column(
             children: [
               Expanded(
@@ -153,7 +159,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                       flex: 7,
                       child: _configPanel(context, config),
                     ),
-                    const SizedBox(width: 16),
+                    SizedBox(width: gap),
                     Expanded(
                       flex: 4,
                       child: _runPanel(context, run),
@@ -161,13 +167,13 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                   ],
                 ),
               ),
-              const SizedBox(height: 16),
+              SizedBox(height: gap),
               Expanded(
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Expanded(flex: 3, child: _historyPanel(context, history)),
-                    const SizedBox(width: 16),
+                    SizedBox(width: gap),
                     Expanded(
                         flex: 7, child: _resultsPanel(context, previewRun)),
                   ],
@@ -209,76 +215,98 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     final bucketOptions =
         controller.buckets.map((bucket) => bucket.name).toList();
     final isDurationMode = config.testMode == 'duration';
+    final isDesktopCompact =
+        AppTheme.isDesktopPlatform(Theme.of(context).platform);
+    final panelPadding = isDesktopCompact ? 10.0 : 14.0;
 
     return Card(
       clipBehavior: Clip.antiAlias,
       child: ListView(
-        padding: const EdgeInsets.all(20),
+        padding: EdgeInsets.all(panelPadding),
         children: [
           Text('Benchmark control',
-              style: Theme.of(context).textTheme.titleLarge),
+              style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 6),
+          Builder(builder: (context) {
+            final starting = controller.isBusy('benchmark-start');
+            final activeRun = controller.benchmarkRun;
+            final runReady =
+                activeRun != null && activeRun.status != 'starting';
+            return Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.icon(
+                  onPressed: selectedProfile == null || starting
+                      ? null
+                      : () {
+                          _flushBenchmarkEditors();
+                          controller.startBenchmark();
+                        },
+                  icon: starting
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            valueColor:
+                                AlwaysStoppedAnimation<Color>(Colors.white),
+                          ),
+                        )
+                      : const Icon(Icons.play_arrow),
+                  label: Text(starting ? 'Starting…' : 'Start benchmark'),
+                ),
+                OutlinedButton.icon(
+                  onPressed:
+                      !runReady || starting ? null : controller.pauseBenchmark,
+                  icon: const Icon(Icons.pause),
+                  label: const Text('Pause'),
+                ),
+                OutlinedButton.icon(
+                  onPressed:
+                      !runReady || starting ? null : controller.resumeBenchmark,
+                  icon: const Icon(Icons.play_circle_outline),
+                  label: const Text('Resume'),
+                ),
+                OutlinedButton.icon(
+                  onPressed:
+                      !runReady || starting ? null : controller.stopBenchmark,
+                  icon: const Icon(Icons.stop),
+                  label: const Text('Stop'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: starting ? null : controller.pollBenchmark,
+                  icon: const Icon(Icons.sync),
+                  label: const Text('Refresh status'),
+                ),
+              ],
+            );
+          }),
           const SizedBox(height: 12),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              FilledButton.icon(
-                onPressed: selectedProfile == null
-                    ? null
-                    : () {
-                        _flushBenchmarkEditors();
-                        controller.startBenchmark();
-                      },
-                icon: const Icon(Icons.play_arrow),
-                label: const Text('Start benchmark'),
-              ),
-              OutlinedButton.icon(
-                onPressed: controller.benchmarkRun == null
-                    ? null
-                    : controller.pauseBenchmark,
-                icon: const Icon(Icons.pause),
-                label: const Text('Pause'),
-              ),
-              OutlinedButton.icon(
-                onPressed: controller.benchmarkRun == null
-                    ? null
-                    : controller.resumeBenchmark,
-                icon: const Icon(Icons.play_circle_outline),
-                label: const Text('Resume'),
-              ),
-              OutlinedButton.icon(
-                onPressed: controller.benchmarkRun == null
-                    ? null
-                    : controller.stopBenchmark,
-                icon: const Icon(Icons.stop),
-                label: const Text('Stop'),
-              ),
-              OutlinedButton.icon(
-                onPressed: controller.pollBenchmark,
-                icon: const Icon(Icons.sync),
-                label: const Text('Refresh status'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
           ListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('Active endpoint profile'),
             subtitle: Text(selectedProfile?.name ?? 'No profile selected'),
             trailing: Text(controller.activeEngineId),
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 14),
           Text('Workload', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
           DropdownButtonFormField<String>(
             initialValue: config.workloadType,
-            decoration: const InputDecoration(labelText: 'Workload type'),
+            decoration: _fieldDecoration(label: 'Workload'),
             items: const [
-              DropdownMenuItem(value: 'mixed', child: Text('Mixed')),
+              DropdownMenuItem(
+                  value: 'mixed', child: Text('Mixed (PUT/GET/DELETE)')),
               DropdownMenuItem(
                   value: 'write-heavy', child: Text('Write-heavy')),
               DropdownMenuItem(value: 'read-heavy', child: Text('Read-heavy')),
               DropdownMenuItem(value: 'delete', child: Text('Delete')),
+              DropdownMenuItem(
+                  value: 'write-only', child: Text('Write-only (PUT only)')),
+              DropdownMenuItem(
+                  value: 'read-only', child: Text('Read-only (GET only)')),
+              DropdownMenuItem(value: 'custom', child: Text('Custom mix (%)')),
             ],
             onChanged: (value) {
               if (value != null) {
@@ -287,10 +315,14 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
               }
             },
           ),
-          const SizedBox(height: 12),
+          if (config.workloadType == 'custom') ...[
+            const SizedBox(height: 8),
+            _customMixCard(context, config),
+          ],
+          const SizedBox(height: 8),
           DropdownButtonFormField<String>(
             initialValue: config.deleteMode,
-            decoration: const InputDecoration(labelText: 'Delete request mode'),
+            decoration: _fieldDecoration(label: 'Delete mode'),
             items: const [
               DropdownMenuItem(
                 value: 'single',
@@ -309,9 +341,9 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
               }
             },
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
           Container(
-            padding: const EdgeInsets.all(12),
+            padding: const EdgeInsets.all(10),
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(14),
               color: Theme.of(context).colorScheme.surfaceContainerHighest,
@@ -322,10 +354,10 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                   : 'Delete phases issue one S3 DELETE request per object for direct per-key behavior.',
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           DropdownButtonFormField<String>(
             initialValue: config.testMode,
-            decoration: const InputDecoration(labelText: 'Run mode'),
+            decoration: _fieldDecoration(label: 'Run mode'),
             items: const [
               DropdownMenuItem(value: 'duration', child: Text('Duration')),
               DropdownMenuItem(
@@ -340,9 +372,9 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
               }
             },
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
           Container(
-            padding: const EdgeInsets.all(12),
+            padding: const EdgeInsets.all(10),
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(14),
               color: Theme.of(context).colorScheme.surfaceContainerHighest,
@@ -353,12 +385,12 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                   : 'Active stop condition: operation count. This run stops when the configured number of operations has completed.',
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           DropdownButtonFormField<String>(
             initialValue: bucketOptions.contains(config.bucketName)
                 ? config.bucketName
                 : null,
-            decoration: const InputDecoration(labelText: 'Bucket'),
+            decoration: _fieldDecoration(label: 'Bucket'),
             items: bucketOptions
                 .map(
                   (bucketName) => DropdownMenuItem(
@@ -384,7 +416,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                 'Refresh buckets in Browser first if you need a target bucket here.',
               ),
             ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           _textField(
             fieldKey: 'prefix',
             label: 'Prefix',
@@ -393,10 +425,10 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
               controller.updateBenchmarkDraft(config.copyWith(prefix: value));
             },
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           _textField(
             fieldKey: 'objectSizes',
-            label: 'Object sizes (comma separated bytes)',
+            label: 'Sizes (bytes, comma-separated)',
             initialValue: config.objectSizes.join(','),
             onChanged: (value) {
               final sizes = value
@@ -410,7 +442,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
               }
             },
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           _adaptiveFieldPair(
             context: context,
             leading: _numberField(
@@ -425,9 +457,8 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             ),
             trailing: _numberField(
               fieldKey: 'datasetObjectCount',
-              label: 'Dataset object count',
-              helperText:
-                  'Object pool size for the workload. This does not stop the run.',
+              label: 'Object pool',
+              helperText: 'Working set size.',
               initialValue: config.objectCount,
               onChanged: (value) {
                 controller.updateBenchmarkDraft(
@@ -436,7 +467,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
               },
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           _adaptiveFieldPair(
             context: context,
             leading: _numberField(
@@ -444,7 +475,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
               label: 'Duration (s)',
               helperText: isDurationMode
                   ? 'Active stop condition.'
-                  : 'Disabled while run mode is operation count.',
+                  : 'Disabled in operation-count mode.',
               enabled: isDurationMode,
               initialValue: config.durationSeconds,
               onChanged: (value) {
@@ -457,7 +488,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
               fieldKey: 'operationCount',
               label: 'Operation count',
               helperText: isDurationMode
-                  ? 'Disabled while run mode is duration.'
+                  ? 'Disabled in duration mode.'
                   : 'Active stop condition.',
               enabled: !isDurationMode,
               initialValue: config.operationCount,
@@ -468,17 +499,17 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
               },
             ),
           ),
-          const Divider(height: 28),
+          const Divider(height: 14),
           Text(
             'Debug and transport',
             style: Theme.of(context).textTheme.titleMedium,
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
           _adaptiveFieldPair(
             context: context,
             leading: _numberField(
               fieldKey: 'connectTimeoutSeconds',
-              label: 'Connect timeout',
+              label: 'Connect timeout (s)',
               initialValue: config.connectTimeoutSeconds,
               onChanged: (value) {
                 controller.updateBenchmarkDraft(
@@ -488,7 +519,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             ),
             trailing: _numberField(
               fieldKey: 'readTimeoutSeconds',
-              label: 'Read timeout',
+              label: 'Read timeout (s)',
               initialValue: config.readTimeoutSeconds,
               onChanged: (value) {
                 controller.updateBenchmarkDraft(
@@ -497,7 +528,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
               },
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           _adaptiveFieldPair(
             context: context,
             leading: _numberField(
@@ -511,7 +542,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             ),
             trailing: _numberField(
               fieldKey: 'maxPoolConnections',
-              label: 'Pool connections',
+              label: 'Pool',
               initialValue: config.maxPoolConnections,
               onChanged: (value) {
                 controller.updateBenchmarkDraft(
@@ -520,7 +551,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
               },
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           _numberField(
             fieldKey: 'dataCacheMb',
             label: 'Data cache (MB)',
@@ -530,7 +561,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                   .updateBenchmarkDraft(config.copyWith(dataCacheMb: value));
             },
           ),
-          SwitchListTile(
+          _compactSwitchTile(
             value: config.validateChecksum,
             onChanged: (value) {
               controller.updateBenchmarkDraft(
@@ -539,7 +570,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             },
             title: const Text('Validate checksums'),
           ),
-          SwitchListTile(
+          _compactSwitchTile(
             value: config.randomData,
             onChanged: (value) {
               controller
@@ -547,7 +578,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             },
             title: const Text('Use random data'),
           ),
-          SwitchListTile(
+          _compactSwitchTile(
             value: config.inMemoryData,
             onChanged: (value) {
               controller
@@ -564,9 +595,28 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                   : 'Disabled in Settings. Enable it there when you need benchmark tracing.',
             ),
           ),
-          const Divider(height: 28),
+          const Padding(
+            padding: EdgeInsets.only(top: 2, bottom: 2),
+            child: Text(
+              'Tip: push Threads and Pool first. Turn off checksum validation and keep reduced logging on for the fastest baseline.',
+              style: TextStyle(fontStyle: FontStyle.italic),
+            ),
+          ),
+          _compactSwitchTile(
+            value: config.reducedLogging,
+            onChanged: (value) {
+              controller.updateBenchmarkDraft(
+                config.copyWith(reducedLogging: value),
+              );
+            },
+            title: const Text('Less accurate logging (reduces overhead)'),
+            subtitle: const Text(
+              'Skips per-object success log lines. Timings and summaries still come from completed requests.',
+            ),
+          ),
+          const Divider(height: 14),
           Text('Outputs', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
           _textField(
             fieldKey: 'csvOutputPath',
             label: 'CSV output',
@@ -576,7 +626,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                   .updateBenchmarkDraft(config.copyWith(csvOutputPath: value));
             },
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           _textField(
             fieldKey: 'jsonOutputPath',
             label: 'JSON output',
@@ -586,10 +636,10 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                   .updateBenchmarkDraft(config.copyWith(jsonOutputPath: value));
             },
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           _textField(
             fieldKey: 'logFilePath',
-            label: 'Log file',
+            label: 'Log output',
             initialValue: config.logFilePath,
             onChanged: (value) {
               controller
@@ -610,6 +660,8 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             MapEntry('JSON', run.config.jsonOutputPath),
             MapEntry('Log', run.config.logFilePath),
           ];
+    final isDesktopCompact =
+        AppTheme.isDesktopPlatform(Theme.of(context).platform);
     return Card(
       clipBehavior: Clip.antiAlias,
       child: LayoutBuilder(
@@ -617,18 +669,43 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
           final logHeight =
               (constraints.maxHeight * 0.32).clamp(160.0, 240.0).toDouble();
           return Padding(
-            padding: const EdgeInsets.all(20),
+            padding: EdgeInsets.all(isDesktopCompact ? 12.0 : 16.0),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text('Active run',
-                    style: Theme.of(context).textTheme.titleLarge),
+                    style: Theme.of(context).textTheme.titleMedium),
                 const SizedBox(height: 12),
                 if (run == null)
                   const Expanded(
                     child: Align(
                       alignment: Alignment.topLeft,
                       child: Text('No benchmark is running.'),
+                    ),
+                  )
+                else if (run.status == 'starting')
+                  Expanded(
+                    child: Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const SizedBox(
+                            width: 28,
+                            height: 28,
+                            child: CircularProgressIndicator(strokeWidth: 2.4),
+                          ),
+                          const SizedBox(height: 14),
+                          Text(
+                            'Starting benchmark…',
+                            style: Theme.of(context).textTheme.titleMedium,
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'Contacting ${controller.activeEngineId} engine',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                      ),
                     ),
                   )
                 else
@@ -657,10 +734,19 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                                   'Latency',
                                   '${run.averageLatencyMs.toStringAsFixed(1)} ms average',
                                 ),
-                                _stat(
+                                _statWithTooltip(
                                   context,
-                                  'Throughput',
+                                  'Current ops/s',
                                   '${run.throughputOpsPerSecond.toStringAsFixed(0)} ops/s',
+                                  tooltip:
+                                      'Measured from completed operations over active elapsed time. This is the benchmark’s truth source for live throughput.',
+                                ),
+                                _statWithTooltip(
+                                  context,
+                                  'Current data rate',
+                                  '${controller.estimatedMibsForRun(run).toStringAsFixed(2)} MiB/s',
+                                  tooltip:
+                                      'Current ops/s × average configured object size. Approximate because the workload mix can vary by size.',
                                 ),
                                 const SizedBox(height: 12),
                                 Text('Current activity',
@@ -774,16 +860,19 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
 
   Widget _historyPanel(BuildContext context, List<BenchmarkRun> history) {
     final selectedRun = controller.selectedBenchmarkRun;
+    final activeRun = controller.benchmarkRun;
+    final isDesktopCompact =
+        AppTheme.isDesktopPlatform(Theme.of(context).platform);
     return Card(
       clipBehavior: Clip.antiAlias,
       child: Padding(
-        padding: const EdgeInsets.all(20),
+        padding: EdgeInsets.all(isDesktopCompact ? 12.0 : 16.0),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text('Benchmark history',
-                style: Theme.of(context).textTheme.titleLarge),
-            const SizedBox(height: 12),
+                style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
             Expanded(
               child: history.isEmpty
                   ? const Text('No benchmark runs recorded yet.')
@@ -792,14 +881,42 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                       separatorBuilder: (_, __) => const Divider(height: 1),
                       itemBuilder: (context, index) {
                         final item = history[index];
+                        final isActive = activeRun?.id == item.id;
+                        final subtitleParts = [
+                          item.config.workloadType,
+                          item.config.engineId,
+                          item.config.bucketName,
+                        ];
+                        String subtitleText = subtitleParts
+                            .where((s) => s.isNotEmpty)
+                            .join(' - ');
+                        if (isActive && item.status == 'running') {
+                          final elapsed =
+                              DateTime.now().difference(item.startedAt);
+                          final minutes = elapsed.inMinutes;
+                          final seconds = elapsed.inSeconds % 60;
+                          subtitleText += ' - ${minutes}m ${seconds}s elapsed';
+                        }
+                        final textTheme = Theme.of(context).textTheme;
                         return ListTile(
+                          dense: true,
                           contentPadding: EdgeInsets.zero,
                           selected: selectedRun?.id == item.id,
-                          title: Text(item.id),
-                          subtitle: Text(
-                            '${item.config.workloadType} • ${item.config.engineId} • ${item.config.bucketName}',
+                          title: Text(
+                            item.id,
+                            style: textTheme.bodySmall,
+                            overflow: TextOverflow.ellipsis,
                           ),
-                          trailing: Text(item.status),
+                          subtitle: Text(
+                            subtitleText,
+                            style: textTheme.bodySmall?.copyWith(
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurfaceVariant,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          trailing: _statusChip(context, item.status),
                           onTap: () => controller.selectBenchmarkRun(item.id),
                         );
                       },
@@ -811,16 +928,45 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     );
   }
 
+  Widget _statusChip(BuildContext context, String status) {
+    final (color, icon) = switch (status) {
+      'starting' => (
+          Theme.of(context).colorScheme.primary,
+          Icons.hourglass_top,
+        ),
+      'running' => (Colors.green.shade600, Icons.play_circle_filled),
+      'paused' => (Colors.orange.shade600, Icons.pause_circle_filled),
+      'stopped' => (Colors.red.shade600, Icons.stop_circle),
+      'completed' => (Colors.blue.shade600, Icons.check_circle),
+      _ => (Colors.grey.shade500, Icons.circle_outlined),
+    };
+    final labelStyle = Theme.of(context).textTheme.labelSmall?.copyWith(
+          color: color,
+          fontWeight: FontWeight.w600,
+        );
+    return Chip(
+      avatar: Icon(icon, color: color, size: 14),
+      label: Text(status, style: labelStyle),
+      padding: EdgeInsets.zero,
+      visualDensity: VisualDensity.compact,
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      side: BorderSide.none,
+      backgroundColor: color.withValues(alpha: 0.1),
+    );
+  }
+
   Widget _resultsPanel(BuildContext context, BenchmarkRun? run) {
     final summary = controller.benchmarkSummaryForRun(run);
     final operations =
         summary == null ? const <String>[] : _availableOperations(summary);
     _syncOperationFilter(operations);
+    final isDesktopCompact =
+        AppTheme.isDesktopPlatform(Theme.of(context).platform);
 
     return Card(
       clipBehavior: Clip.antiAlias,
       child: Padding(
-        padding: const EdgeInsets.all(20),
+        padding: EdgeInsets.all(isDesktopCompact ? 12.0 : 16.0),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -831,7 +977,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text('Results preview',
-                          style: Theme.of(context).textTheme.titleLarge),
+                          style: Theme.of(context).textTheme.titleMedium),
                       const SizedBox(height: 8),
                       if (run != null) ...[
                         Text('Viewing ${run.id}'),
@@ -924,7 +1070,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                         'Operation mix',
                         summary.operationsByType.entries
                             .map((entry) => '${entry.key} ${entry.value}')
-                            .join(' • '),
+                            .join(' - '),
                       ),
                       _summaryListTile(
                         context,
@@ -934,7 +1080,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                               (entry) =>
                                   '${entry.key.toUpperCase()} ${entry.value.toStringAsFixed(1)} ms',
                             )
-                            .join(' • '),
+                            .join(' - '),
                       ),
                       _summaryListTile(
                         context,
@@ -1229,19 +1375,21 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: _BenchmarkPreviewSection.values
+                CompactSelector<_BenchmarkPreviewSection>(
+                  selected: _previewSection,
+                  wrap: true,
+                  dense: true,
+                  onChanged: (section) {
+                    updateUi(() {
+                      _previewSection = section;
+                    });
+                  },
+                  options: _BenchmarkPreviewSection.values
                       .map(
-                        (section) => ChoiceChip(
-                          selected: _previewSection == section,
-                          label: Text(_previewLabel(section)),
-                          onSelected: (_) {
-                            updateUi(() {
-                              _previewSection = section;
-                            });
-                          },
+                        (section) => CompactSelectorOption(
+                          value: section,
+                          icon: _previewIcon(section),
+                          label: _previewLabel(section),
                         ),
                       )
                       .toList(),
@@ -2277,9 +2425,10 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     final controller = _controllerFor(fieldKey, initialValue);
     final focusNode = _focusNodeFor(fieldKey);
     return TextFormField(
+      key: ValueKey('benchmark-field-$fieldKey'),
       controller: controller,
       focusNode: focusNode,
-      decoration: InputDecoration(labelText: label),
+      decoration: _fieldDecoration(label: label),
       onChanged: onChanged,
       onTapOutside: (_) => onChanged(controller.text),
       onFieldSubmitted: (_) => onChanged(controller.text),
@@ -2297,14 +2446,12 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     final controller = _controllerFor(fieldKey, '$initialValue');
     final focusNode = _focusNodeFor(fieldKey);
     return TextFormField(
+      key: ValueKey('benchmark-field-$fieldKey'),
       controller: controller,
       focusNode: focusNode,
       enabled: enabled,
       keyboardType: TextInputType.number,
-      decoration: InputDecoration(
-        labelText: label,
-        helperText: helperText,
-      ),
+      decoration: _fieldDecoration(label: label, helperText: helperText),
       onChanged: (value) {
         final parsed = int.tryParse(value.trim());
         if (parsed != null) {
@@ -2313,6 +2460,34 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
       },
       onTapOutside: (_) => _commitNumberController(controller, onChanged),
       onFieldSubmitted: (_) => _commitNumberController(controller, onChanged),
+    );
+  }
+
+  InputDecoration _fieldDecoration({
+    required String label,
+    String? helperText,
+  }) {
+    return InputDecoration(
+      labelText: label,
+      helperText: helperText,
+      helperMaxLines: 3,
+    );
+  }
+
+  Widget _compactSwitchTile({
+    required bool value,
+    required ValueChanged<bool> onChanged,
+    required Widget title,
+    Widget? subtitle,
+  }) {
+    return SwitchListTile(
+      value: value,
+      onChanged: onChanged,
+      title: title,
+      subtitle: subtitle,
+      dense: true,
+      contentPadding: EdgeInsets.zero,
+      visualDensity: VisualDensity.compact,
     );
   }
 
@@ -2423,6 +2598,208 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
           ],
         ),
       ),
+    );
+  }
+
+  /// Like [_stat] but shows a small info icon with a tooltip explaining the
+  /// measurement methodology.
+  Widget _statWithTooltip(
+    BuildContext context,
+    String label,
+    String value, {
+    required String tooltip,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Expanded(
+            child: RichText(
+              text: TextSpan(
+                style:
+                    DefaultTextStyle.of(context).style.copyWith(height: 1.35),
+                children: [
+                  TextSpan(
+                    text: '$label: ',
+                    style: const TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  TextSpan(text: value),
+                ],
+              ),
+            ),
+          ),
+          Tooltip(
+            message: tooltip,
+            preferBelow: false,
+            constraints: const BoxConstraints(maxWidth: 280),
+            child: Icon(
+              Icons.info_outline,
+              size: 14,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Card shown when the workload type is 'custom', with sliders for
+  /// read / write / delete percentages that always sum to 100.
+  Widget _customMixCard(BuildContext context, BenchmarkConfig config) {
+    final total =
+        config.readPercent + config.writePercent + config.deletePercent;
+    final balanced = total == 100;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(14),
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        border: balanced
+            ? null
+            : Border.all(
+                color:
+                    Theme.of(context).colorScheme.error.withValues(alpha: 0.6),
+              ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Custom operation mix',
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+              ),
+              Chip(
+                label: Text(
+                  'Total: $total%',
+                  style: TextStyle(
+                    color: balanced
+                        ? Colors.green.shade700
+                        : Theme.of(context).colorScheme.error,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                padding: EdgeInsets.zero,
+                visualDensity: VisualDensity.compact,
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                side: BorderSide.none,
+                backgroundColor: balanced
+                    ? Colors.green.shade50
+                    : Theme.of(context)
+                        .colorScheme
+                        .errorContainer
+                        .withValues(alpha: 0.4),
+              ),
+            ],
+          ),
+          if (!balanced)
+            Padding(
+              padding: const EdgeInsets.only(top: 4, bottom: 4),
+              child: Text(
+                'Percentages must sum to 100. Adjust the sliders below.',
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.error,
+                  fontSize: 12,
+                ),
+              ),
+            ),
+          const SizedBox(height: 8),
+          _mixSlider(
+            context,
+            label: 'Write (PUT)',
+            percent: config.writePercent,
+            color: Colors.teal.shade600,
+            onChanged: (value) {
+              // Clamp so write + read ≤ 100, give remainder to delete.
+              final clamped = value.clamp(0, 100 - config.readPercent);
+              controller.updateBenchmarkDraft(config.copyWith(
+                writePercent: clamped,
+                deletePercent: 100 - clamped - config.readPercent,
+              ));
+            },
+          ),
+          _mixSlider(
+            context,
+            label: 'Read (GET)',
+            percent: config.readPercent,
+            color: Colors.blue.shade600,
+            onChanged: (value) {
+              final clamped = value.clamp(0, 100 - config.writePercent);
+              controller.updateBenchmarkDraft(config.copyWith(
+                readPercent: clamped,
+                deletePercent: 100 - config.writePercent - clamped,
+              ));
+            },
+          ),
+          _mixSlider(
+            context,
+            label: 'Delete',
+            percent: config.deletePercent,
+            color: Colors.red.shade600,
+            onChanged: (value) {
+              final clamped = value.clamp(0, 100 - config.writePercent);
+              controller.updateBenchmarkDraft(config.copyWith(
+                deletePercent: clamped,
+                readPercent: 100 - config.writePercent - clamped,
+              ));
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _mixSlider(
+    BuildContext context, {
+    required String label,
+    required int percent,
+    required Color color,
+    required ValueChanged<int> onChanged,
+  }) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 88,
+          child: Text(
+            label,
+            style: const TextStyle(fontSize: 12),
+          ),
+        ),
+        Expanded(
+          child: SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              activeTrackColor: color,
+              thumbColor: color,
+              overlayColor: color.withValues(alpha: 0.2),
+            ),
+            child: Slider(
+              min: 0,
+              max: 100,
+              divisions: 100,
+              value: percent.toDouble(),
+              label: '$percent%',
+              onChanged: (v) => onChanged(v.round()),
+            ),
+          ),
+        ),
+        SizedBox(
+          width: 36,
+          child: Text(
+            '$percent%',
+            textAlign: TextAlign.right,
+            style: TextStyle(
+              fontWeight: FontWeight.w700,
+              color: color,
+              fontSize: 12,
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -2815,6 +3192,18 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     };
   }
 
+  IconData _previewIcon(_BenchmarkPreviewSection section) {
+    return switch (section) {
+      _BenchmarkPreviewSection.latency => Icons.timer_outlined,
+      _BenchmarkPreviewSection.operations => Icons.account_tree_outlined,
+      _BenchmarkPreviewSection.throughput => Icons.speed_outlined,
+      _BenchmarkPreviewSection.latencyOverTime => Icons.show_chart,
+      _BenchmarkPreviewSection.normalizedLatency => Icons.scale_outlined,
+      _BenchmarkPreviewSection.sizes => Icons.stacked_bar_chart_outlined,
+      _BenchmarkPreviewSection.checksums => Icons.verified_outlined,
+    };
+  }
+
   String _lineStyleLabel(_BenchmarkLineStyle style) {
     return switch (style) {
       _BenchmarkLineStyle.line => 'Line',
@@ -2939,7 +3328,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             ? 'single sample'
             : 'sample spacing follows benchmark windows')
         : _formatSampleCadence((secondSeconds - firstSeconds).abs());
-    return 'Time axis: $first to $last • $count samples • $cadence';
+    return 'Time axis: $first to $last - $count samples - $cadence';
   }
 
   double? _labelSeconds(String label) {
@@ -2983,7 +3372,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     }
     return operations.entries
         .map((entry) => '${entry.key} ${entry.value}')
-        .join(' • ');
+        .join(' - ');
   }
 
   int _intMetric(Object? value) {

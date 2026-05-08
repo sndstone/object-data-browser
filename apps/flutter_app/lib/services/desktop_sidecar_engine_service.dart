@@ -1476,6 +1476,10 @@ class DesktopSidecarEngineService
       'jsonOutputPath': config.jsonOutputPath,
       'logFilePath': config.logFilePath,
       'debugMode': config.debugMode,
+      'readPercent': config.readPercent,
+      'writePercent': config.writePercent,
+      'deletePercent': config.deletePercent,
+      'reducedLogging': config.reducedLogging,
     };
   }
 
@@ -1842,6 +1846,16 @@ class DesktopSidecarEngineService
         logFilePath: ((json['config'] as Map?)?['logFilePath'] as String?) ??
             'benchmark.log',
         debugMode: ((json['config'] as Map?)?['debugMode'] as bool?) ?? false,
+        readPercent:
+            (((json['config'] as Map?)?['readPercent'] as num?)?.toInt()) ?? 34,
+        writePercent:
+            (((json['config'] as Map?)?['writePercent'] as num?)?.toInt()) ??
+                33,
+        deletePercent:
+            (((json['config'] as Map?)?['deletePercent'] as num?)?.toInt()) ??
+                33,
+        reducedLogging:
+            ((json['config'] as Map?)?['reducedLogging'] as bool?) ?? false,
       ),
       status: (json['status'] as String?) ?? 'unknown',
       processedCount: (json['processedCount'] as num?)?.toInt() ?? 0,

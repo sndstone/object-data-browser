@@ -86,7 +86,7 @@ void main() {
     );
 
     final storedFile = File(
-      '${tempDir.path}${Platform.pathSeparator}s3-browser-crossplat-state.json',
+      '${tempDir.path}${Platform.pathSeparator}object-data-browser-state.json',
     );
     final storedJson = await storedFile.readAsString();
     expect(storedJson, contains('inlineSecrets'));

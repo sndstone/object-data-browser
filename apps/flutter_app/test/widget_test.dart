@@ -15,7 +15,27 @@ class TestAppController extends AppController {
     required super.initialProfiles,
   });
 
+  BenchmarkConfig? capturedBenchmarkStartConfig;
+
   void emitChange() {
+    notifyListeners();
+  }
+
+  @override
+  Future<void> startBenchmark() async {
+    capturedBenchmarkStartConfig = benchmarkDraft;
+    benchmarkRun = BenchmarkRun(
+      id: 'bench-test',
+      config: benchmarkDraft,
+      status: 'running',
+      processedCount: 0,
+      startedAt: DateTime(2026, 3, 22, 16),
+      averageLatencyMs: 0,
+      throughputOpsPerSecond: 0,
+      liveLog: const [],
+    );
+    selectedBenchmarkRunId = benchmarkRun!.id;
+    benchmarkHistory = [benchmarkRun!, ...benchmarkHistory];
     notifyListeners();
   }
 }
@@ -107,6 +127,7 @@ Widget _bucketPanelApp(TestAppController controller, {required Size size}) {
               onEditBucketEncryption: (_) async {},
               onEditBucketTags: (_) async {},
               onToggleBucketVersioning: (_, __) async {},
+              onOpenBucket: (_) async {},
               onCopyBucket: (_) async {},
               inlineSpinnerBuilder: () => const SizedBox.shrink(),
               inlineStatBuilder: (label, value) => Text('$label: $value'),
@@ -246,7 +267,7 @@ void main() {
 
     await tester.pumpWidget(S3BrowserApp(controller: controller));
 
-    expect(find.text('S3 Browser Crossplat'), findsOneWidget);
+    expect(find.text('Object Data Browser'), findsOneWidget);
   });
 
   testWidgets('app renders top-level workspaces', (WidgetTester tester) async {
@@ -259,15 +280,15 @@ void main() {
     await tester.pumpWidget(S3BrowserApp(controller: controller));
     await tester.pumpAndSettle();
 
-    expect(find.text('S3 Browser Crossplat'), findsOneWidget);
-    expect(find.text('Browser'), findsWidgets);
+    expect(find.text('Object Data Browser'), findsOneWidget);
+    expect(find.text('Buckets'), findsWidgets);
     expect(find.text('Benchmark'), findsWidgets);
-    expect(find.text('Tasks'), findsWidgets);
+    expect(find.text('Jobs'), findsWidgets);
     expect(find.text('Settings'), findsWidgets);
     expect(find.text('Event Log'), findsWidgets);
   });
 
-  testWidgets('bucket list starts above profile summary in desktop layout', (
+  testWidgets('bucket list fills the desktop bucket panel', (
     WidgetTester tester,
   ) async {
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -280,21 +301,15 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    final createButton = find.widgetWithText(FilledButton, 'Create bucket');
+    final createButton = find.widgetWithText(FilledButton, 'New bucket');
     final firstBucket = find.text('bucket-0');
-    final summary = find.byKey(const ValueKey('bucket-profile-summary'));
 
     expect(firstBucket, findsOneWidget);
-    expect(summary, findsOneWidget);
-    expect(find.text('Test'), findsOneWidget);
-    expect(find.text('http://localhost:9000'), findsOneWidget);
+    expect(find.text('Selected profile'), findsNothing);
+    expect(find.text('http://localhost:9000'), findsNothing);
     expect(
       tester.getTopLeft(firstBucket).dy,
       greaterThan(tester.getBottomLeft(createButton).dy),
-    );
-    expect(
-      tester.getTopLeft(summary).dy,
-      greaterThan(tester.getTopLeft(firstBucket).dy),
     );
   });
 
@@ -312,11 +327,14 @@ void main() {
     await tester.pumpAndSettle();
 
     final bucketList = find.byKey(const ValueKey('bucket-panel-scroll'));
-    await tester.dragUntilVisible(
-      find.text('bucket-39'),
-      bucketList,
-      const Offset(0, -240),
-    );
+    final bucketListCenter = tester.getTopLeft(bucketList) +
+        tester.getSize(bucketList).center(Offset.zero);
+    for (var index = 0;
+        index < 15 && find.text('bucket-39').evaluate().isEmpty;
+        index++) {
+      await tester.dragFrom(bucketListCenter, const Offset(0, -700));
+      await tester.pumpAndSettle();
+    }
     await tester.pumpAndSettle();
 
     expect(find.text('bucket-39'), findsOneWidget);
@@ -336,14 +354,49 @@ void main() {
     await tester.pumpAndSettle();
 
     final bucketList = find.byKey(const ValueKey('bucket-panel-scroll'));
-    await tester.dragUntilVisible(
-      find.text('bucket-39'),
-      bucketList,
-      const Offset(0, -220),
-    );
+    final bucketListCenter = tester.getTopLeft(bucketList) +
+        tester.getSize(bucketList).center(Offset.zero);
+    for (var index = 0;
+        index < 8 && find.text('bucket-39').evaluate().isEmpty;
+        index++) {
+      await tester.dragFrom(bucketListCenter, const Offset(0, -520));
+      await tester.pumpAndSettle();
+    }
     await tester.pumpAndSettle();
 
     expect(find.text('bucket-39'), findsOneWidget);
+  });
+
+  testWidgets(
+      'compact browser starts on buckets and opens objects after bucket tap',
+      (WidgetTester tester) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(680, 1280));
+
+    final controller = await _buildController();
+    _seedBuckets(controller, count: 4);
+
+    await tester.pumpWidget(
+      _browserApp(
+        controller,
+        size: const Size(680, 1280),
+        compact: true,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.widgetWithText(FilledButton, 'New bucket'), findsOneWidget);
+    expect(find.widgetWithText(OutlinedButton, 'Create prefix'), findsNothing);
+
+    await tester.tap(find.text('bucket-1'));
+    await tester.pumpAndSettle();
+
+    expect(
+      controller.selectedBucket?.name,
+      'bucket-1',
+    );
+    expect(find.text('Objects'), findsWidgets);
+    expect(find.byTooltip('More actions'), findsOneWidget);
   });
 
   testWidgets('tasks workspace renders top-level running task details', (
@@ -375,7 +428,7 @@ void main() {
     await tester.pumpWidget(S3BrowserApp(controller: controller));
     await tester.pumpAndSettle();
 
-    expect(find.text('Tasks'), findsWidgets);
+    expect(find.text('Jobs'), findsWidgets);
     expect(find.text('Running'), findsWidgets);
     expect(find.text('Upload 1 file'), findsOneWidget);
     expect(find.text('Multipart upload'), findsOneWidget);
@@ -383,11 +436,222 @@ void main() {
     expect(find.textContaining('Parts: 2/4'), findsOneWidget);
   });
 
+  testWidgets('tasks workspace can cancel a running listing task', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1024));
+
+    final controller = await _buildController();
+    controller.browserTasks = [
+      BrowserTaskRecord(
+        id: 'refresh-objects-1',
+        kind: BrowserTaskKind.action,
+        label: 'Listing objects for bucket-0...',
+        status: 'running',
+        startedAt: DateTime(2026, 3, 11, 10, 0),
+        progress: 0,
+        bucketName: 'bucket-0',
+        actionKey: 'refresh-objects',
+        canCancel: true,
+      ),
+    ];
+    controller.activeTab = WorkspaceTab.tasks;
+    controller.emitChange();
+
+    await tester.pumpWidget(S3BrowserApp(controller: controller));
+    await tester.pump();
+
+    await tester.tap(find.text('Listing objects for bucket-0...'));
+    await tester.pump(const Duration(milliseconds: 600));
+    final cancelButton = tester
+        .widget<OutlinedButton>(find.widgetWithText(OutlinedButton, 'Cancel'));
+    cancelButton.onPressed!();
+    await tester.pump();
+
+    expect(controller.browserTasks.single.status, 'cancelling');
+    expect(controller.browserTasks.single.canCancel, isFalse);
+    expect(
+      controller.browserTasks.single.outputLines.last,
+      contains('Cancellation requested'),
+    );
+  });
+
+  testWidgets('listing banner clears after five seconds', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1024));
+
+    final controller = await _buildController();
+    controller.showBannerMessage('Listing objects for bucket-0...');
+
+    await tester.pumpWidget(S3BrowserApp(controller: controller));
+    await tester.pump();
+    expect(find.text('Listing objects for bucket-0...'), findsOneWidget);
+
+    await tester.pump(const Duration(milliseconds: 4999));
+    expect(find.text('Listing objects for bucket-0...'), findsOneWidget);
+
+    await tester.pump(const Duration(milliseconds: 2));
+    await tester.pump(const Duration(milliseconds: 260));
+    expect(find.text('Listing objects for bucket-0...'), findsNothing);
+  });
+
+  testWidgets('completed listing banner clears after two seconds', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1024));
+
+    final controller = await _buildController();
+    controller.showBannerMessage('Listed first 1000 objects in bucket-0.');
+
+    await tester.pumpWidget(S3BrowserApp(controller: controller));
+    await tester.pump();
+    expect(find.text('Listed first 1000 objects in bucket-0.'), findsOneWidget);
+
+    await tester.pump(const Duration(milliseconds: 1999));
+    expect(find.text('Listed first 1000 objects in bucket-0.'), findsOneWidget);
+
+    await tester.pump(const Duration(milliseconds: 2));
+    await tester.pump(const Duration(milliseconds: 260));
+    expect(find.text('Listed first 1000 objects in bucket-0.'), findsNothing);
+  });
+
+  testWidgets('listing banner opens the matching task', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1024));
+
+    final controller = await _buildController();
+    controller.browserTasks = [
+      BrowserTaskRecord(
+        id: 'refresh-objects-1',
+        kind: BrowserTaskKind.action,
+        label: 'Listing objects for bucket-0...',
+        status: 'completed',
+        startedAt: DateTime(2026, 3, 11, 10, 0),
+        completedAt: DateTime(2026, 3, 11, 10, 1),
+        progress: 1,
+        bucketName: 'bucket-0',
+        actionKey: 'refresh-objects',
+        outputLines: const ['Listed first 1000 objects.', 'Completed.'],
+      ),
+    ];
+    controller.bannerMessage = 'Listed first 1000 objects in bucket-0.';
+    controller.bannerTaskId = 'refresh-objects-1';
+    controller.emitChange();
+
+    await tester.pumpWidget(S3BrowserApp(controller: controller));
+    await tester.pump();
+
+    await tester.tap(find.text('Listed first 1000 objects in bucket-0.'));
+    await tester.pumpAndSettle();
+
+    expect(controller.activeTab, WorkspaceTab.tasks);
+    expect(controller.taskView, BrowserTaskView.all);
+    expect(controller.selectedTaskId, 'refresh-objects-1');
+    expect(find.text('Listing objects for bucket-0...'), findsOneWidget);
+    expect(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is SelectableText &&
+            (widget.data ?? '').contains('Listed first 1000 objects.'),
+      ),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('transfer banner shows progress and opens jobs', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1024));
+
+    final controller = await _buildController();
+    controller.browserTasks = [
+      BrowserTaskRecord(
+        id: 'upload-1',
+        kind: BrowserTaskKind.transfer,
+        label: 'Upload 1 file',
+        status: 'running',
+        startedAt: DateTime(2026, 3, 11, 10, 0),
+        progress: 0.4,
+        bucketName: 'bucket-0',
+        strategyLabel: 'Multipart upload',
+        itemCount: 1,
+        itemsCompleted: 0,
+      ),
+    ];
+    controller.bannerMessage = 'Upload in progress - 40%';
+    controller.bannerTaskId = 'upload-1';
+    controller.emitChange();
+
+    await tester.pumpWidget(S3BrowserApp(controller: controller));
+    await tester.pump();
+
+    expect(find.text('40%'), findsOneWidget);
+    expect(find.byKey(const ValueKey('banner-upload-1')), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byKey(const ValueKey('banner-upload-1')),
+        matching: find.byType(CircularProgressIndicator),
+      ),
+      findsNothing,
+    );
+
+    controller.browserTasks = [
+      controller.browserTasks.first.copyWith(progress: 0.76),
+    ];
+    controller.bannerMessage = 'Upload in progress - 76%';
+    controller.emitChange();
+    await tester.pump();
+
+    expect(find.byKey(const ValueKey('banner-upload-1')), findsOneWidget);
+    expect(find.text('76%'), findsOneWidget);
+
+    await tester.tap(find.text('Upload in progress - 76%'));
+    await tester.pumpAndSettle();
+
+    expect(controller.activeTab, WorkspaceTab.tasks);
+    expect(controller.taskView, BrowserTaskView.running);
+    expect(controller.selectedTaskId, 'upload-1');
+    expect(find.text('Jobs'), findsWidgets);
+  });
+
+  testWidgets('benchmark engine switch does not trigger browser listing status',
+      (
+    WidgetTester tester,
+  ) async {
+    final controller = await _buildController();
+    controller.activeTab = WorkspaceTab.benchmark;
+    controller.browserTasks = const [];
+    controller.emitChange();
+
+    await controller.setEngine('go');
+
+    expect(controller.activeEngineId, 'go');
+    expect(controller.benchmarkDraft.engineId, 'go');
+    expect(
+      controller.browserTasks
+          .where((task) =>
+              task.actionKey == 'refresh-buckets' ||
+              task.actionKey == 'refresh-objects')
+          .toList(),
+      isEmpty,
+    );
+    expect(controller.bannerMessage, isNot(contains('Listing')));
+  });
+
   testWidgets(
       'browser create prefix flow requires a name and updates the action label',
       (
     WidgetTester tester,
   ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1024));
     final controller = await _buildController();
 
     await tester.pumpWidget(
@@ -408,7 +672,7 @@ void main() {
 
     expect(find.text('Create prefix'), findsWidgets);
     await tester.tap(find.widgetWithText(FilledButton, 'Create').last);
-    await tester.pumpAndSettle();
+    await tester.pump(const Duration(milliseconds: 120));
 
     expect(find.byType(AlertDialog), findsOneWidget);
 
@@ -425,7 +689,7 @@ void main() {
     WidgetTester tester,
   ) async {
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    await tester.binding.setSurfaceSize(const Size(1440, 1024));
+    await tester.binding.setSurfaceSize(const Size(1600, 1200));
 
     final controller = await _buildController();
     controller.activeTab = WorkspaceTab.settings;
@@ -459,39 +723,153 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Filter mode'), findsAtLeastNWidgets(1));
-    expect(find.text('Object filter (prefix)'), findsOneWidget);
+    expect(find.text('Prefix'), findsWidgets);
     expect(find.text('Show all versions'), findsOneWidget);
     expect(find.text('Showing all versioned objects in the selected bucket.'),
         findsOneWidget);
+  });
+
+  testWidgets('object browser can list all backend pages on demand', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1024));
+
+    final controller = await _buildController();
+
+    await tester.pumpWidget(
+      _browserApp(
+        controller,
+        size: const Size(1440, 1024),
+        compact: false,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(controller.objects.length, 1000);
+    expect(controller.objectCursor.hasMore, isTrue);
+    expect(find.text('List all'), findsOneWidget);
+
+    await tester.tap(find.text('List all'));
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(
+      _browserApp(
+        controller,
+        size: const Size(1440, 1024),
+        compact: false,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(controller.objects.length, 2354);
+    expect(controller.objectCursor.hasMore, isFalse);
+    expect(find.text('All listed'), findsOneWidget);
+  });
+
+  testWidgets(
+      'header bucket search filters the open bucket and hides elsewhere', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1600, 1200));
+    final controller = await _buildController();
+
+    await tester.pumpWidget(S3BrowserApp(controller: controller));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Search current bucket...'), findsOneWidget);
+    expect(
+      controller.visibleObjects.map((object) => object.name),
+      containsAll(['photo-001.jpg', 'report-2026-03.csv']),
+    );
+
+    await tester.enterText(
+      find.byKey(const ValueKey('header-object-search-benchmark-scratch')),
+      'photo',
+    );
+    await tester.pumpAndSettle();
+
+    expect(controller.objectFilterMode, BrowserFilterMode.text);
+    expect(controller.objectFilterValue, 'photo');
+    expect(controller.visibleObjects.map((object) => object.name), [
+      'photo-001.jpg',
+    ]);
+
+    controller.activeTab = WorkspaceTab.settings;
+    controller.emitChange();
+    await tester.pumpAndSettle();
+
+    expect(find.text('Search current bucket...'), findsNothing);
+  });
+
+  testWidgets('header theme toggle switches dark and light modes', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1600, 1200));
+    final controller = await _buildController();
+
+    await tester.pumpWidget(S3BrowserApp(controller: controller));
+    await tester.pumpAndSettle();
+
+    expect(controller.settings.darkMode, isFalse);
+    await tester.tap(find.byTooltip('Switch to dark mode'));
+    await tester.pumpAndSettle();
+
+    expect(controller.settings.darkMode, isTrue);
+    await tester.tap(find.byTooltip('Switch to light mode'));
+    await tester.pumpAndSettle();
+
+    expect(controller.settings.darkMode, isFalse);
   });
 
   testWidgets(
       'benchmark start honors typed duration without submitting the field', (
     WidgetTester tester,
   ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1600, 1200));
     final controller = await _buildController();
 
     await tester.pumpWidget(_benchmarkApp(controller));
     await tester.pumpAndSettle();
 
-    await tester.enterText(
-      find.widgetWithText(TextFormField, 'Duration (s)'),
-      '60',
+    final durationField =
+        find.byKey(const ValueKey('benchmark-field-durationSeconds'));
+    await tester.scrollUntilVisible(
+      durationField,
+      220,
+      scrollable: find.byType(Scrollable).first,
     );
-    await tester.tap(find.widgetWithText(FilledButton, 'Start benchmark'));
+    await tester.enterText(durationField, '60');
+    final startButton = find.widgetWithText(FilledButton, 'Start benchmark');
+    await tester.scrollUntilVisible(
+      startButton,
+      -220,
+      scrollable: find.byType(Scrollable).first,
+    );
+    tester.widget<FilledButton>(startButton).onPressed!();
     await tester.pumpAndSettle();
 
     expect(controller.benchmarkRun, isNotNull);
-    expect(controller.benchmarkRun!.config.durationSeconds, 60);
+    expect(controller.capturedBenchmarkStartConfig?.durationSeconds, 60);
   });
 
   testWidgets('benchmark duration progress shows elapsed seconds of total', (
     WidgetTester tester,
   ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1600, 1200));
     final controller = await _buildController();
-    await controller.startBenchmark();
-    final run = controller.benchmarkRun!.copyWith(
+    final run = BenchmarkRun(
+      id: 'bench-test',
+      config: controller.benchmarkDraft,
       status: 'running',
+      processedCount: 12,
+      startedAt: DateTime(2026, 3, 22, 16),
+      averageLatencyMs: 3.4,
+      throughputOpsPerSecond: 20,
+      liveLog: const [],
       activeElapsedSeconds: 42,
     );
     controller.benchmarkRun = run;
@@ -502,12 +880,14 @@ void main() {
     await tester.pumpWidget(_benchmarkApp(controller));
     await tester.pumpAndSettle();
 
-    expect(find.text('42s of 120s'), findsOneWidget);
+    expect(find.text('42s of 60s'), findsOneWidget);
   });
 
   testWidgets('browser and benchmark screens no longer expose debug switches', (
     WidgetTester tester,
   ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1024));
     final controller = await _buildController();
     controller.inspectorTab = BrowserInspectorTab.tools;
     controller.emitChange();
@@ -527,9 +907,7 @@ void main() {
     expect(_debugSwitchFinder(), findsNothing);
   });
 
-  testWidgets(
-      'profile dropdown uses readable text styling in light mode desktop and compact layouts',
-      (
+  testWidgets('profile selector remains in the header after summary removal', (
     WidgetTester tester,
   ) async {
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -539,19 +917,17 @@ void main() {
     await tester.pumpWidget(S3BrowserApp(controller: controller));
     await tester.pumpAndSettle();
 
-    final desktopTexts = tester
-        .widgetList<Text>(find.text('Test'))
-        .where((text) => text.style?.color == Colors.black87);
-    expect(desktopTexts, isNotEmpty);
+    expect(find.text('Endpoint profile'), findsOneWidget);
+    expect(find.text('Selected profile'), findsNothing);
+    expect(find.text('http://localhost:9000'), findsNothing);
 
     await tester.binding.setSurfaceSize(const Size(960, 1280));
     await tester.pumpWidget(S3BrowserApp(controller: controller));
     await tester.pumpAndSettle();
 
-    final compactTexts = tester
-        .widgetList<Text>(find.text('Test'))
-        .where((text) => text.style?.color == Colors.black87);
-    expect(compactTexts, isNotEmpty);
+    expect(find.text('Endpoint profile'), findsOneWidget);
+    expect(find.text('Selected profile'), findsNothing);
+    expect(find.text('http://localhost:9000'), findsNothing);
   });
 
   testWidgets('event log groups API traces into expandable cards', (
@@ -602,8 +978,11 @@ void main() {
   testWidgets('events and debug inspector renders grouped trace cards', (
     WidgetTester tester,
   ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1600));
     final controller = await _buildController();
     controller.inspectorTab = BrowserInspectorTab.eventsAndDebug;
+    controller.selectedBucket = _bucket(0);
     controller.selectedObjectDetails = const ObjectDetails(
       key: 'backup-tool-v1.2.zip',
       metadata: {},
@@ -633,7 +1012,7 @@ void main() {
     await tester.pumpWidget(
       _browserApp(
         controller,
-        size: const Size(1440, 1024),
+        size: const Size(1440, 1600),
         compact: false,
       ),
     );
@@ -641,6 +1020,16 @@ void main() {
 
     expect(find.text('Trace log'), findsOneWidget);
     expect(find.text('HeadObject'), findsOneWidget);
+    await tester.scrollUntilVisible(
+      find.text('Debug excerpt'),
+      240,
+      scrollable: find
+          .descendant(
+            of: find.byKey(const ValueKey('events-and-debug')),
+            matching: find.byType(Scrollable),
+          )
+          .first,
+    );
     expect(find.text('Debug excerpt'), findsOneWidget);
   });
 

@@ -22,7 +22,7 @@ function Get-AppVersion {
 if (-not $OutputPath) {
     $Version = Get-AppVersion
     $ParentDir = Split-Path -Parent $RootDir
-    $OutputPath = Join-Path $ParentDir "s3-browser-crossplat-$Version-source.zip"
+    $OutputPath = Join-Path $ParentDir "object-data-browser-$Version-source.zip"
 }
 
 $ExcludePattern = '\\\.tmp\\|\\dist\\|\\apps\\flutter_app\\build\\|\\apps\\flutter_app\\\.dart_tool\\|\\apps\\flutter_app\\android\\\.gradle\\|\\engines\\rust\\target\\|\\engines\\go\\bin\\|\\engines\\java\\target\\|\\apps\\flutter_app\\\.idea\\'

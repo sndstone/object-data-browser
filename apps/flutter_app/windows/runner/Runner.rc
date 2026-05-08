@@ -90,12 +90,12 @@ BEGIN
         BLOCK "040904e4"
         BEGIN
             VALUE "CompanyName", "com.example.s3browser" "\0"
-            VALUE "FileDescription", "s3_browser_crossplat" "\0"
+            VALUE "FileDescription", "Object Data Browser" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "s3_browser_crossplat" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 com.example.s3browser. All rights reserved." "\0"
             VALUE "OriginalFilename", "s3_browser_crossplat.exe" "\0"
-            VALUE "ProductName", "s3_browser_crossplat" "\0"
+            VALUE "ProductName", "Object Data Browser" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

@@ -13,6 +13,19 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $RootDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+
+function Resolve-FullPath {
+    param([string]$Path)
+
+    if ([System.IO.Path]::IsPathRooted($Path)) {
+        return [System.IO.Path]::GetFullPath($Path)
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $Path))
+}
+
+$ReleaseDir = Resolve-FullPath $ReleaseDir
+$ToolsDir = Resolve-FullPath $ToolsDir
 $ToolCacheDir = Join-Path $RootDir ".tmp\toolchains"
 $EngineSourceDir = Join-Path $RootDir "engines"
 $StageRoot = Join-Path $ReleaseDir "engines"
@@ -64,10 +77,23 @@ function Download-File {
 }
 
 function Remove-DirectoryIfExists {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [int]$Attempts = 6
+    )
 
     if (Test-Path $Path) {
-        Remove-Item -Recurse -Force $Path
+        for ($Attempt = 1; $Attempt -le $Attempts; $Attempt++) {
+            try {
+                Remove-Item -Recurse -Force $Path -ErrorAction Stop
+                break
+            } catch {
+                if ($Attempt -eq $Attempts) {
+                    throw
+                }
+                Start-Sleep -Milliseconds (300 * $Attempt)
+            }
+        }
     }
 }
 
@@ -172,6 +198,31 @@ function Enable-EmbeddedPythonSite {
     $Updated.Add("import site")
 
     Set-Content -Path $PthFile.FullName -Value $Updated -Encoding ASCII
+}
+
+function Get-AppVersion {
+    $PubspecPath = Join-Path $RootDir "apps\flutter_app\pubspec.yaml"
+    $Version = "2.0.10"
+    if (Test-Path $PubspecPath) {
+        $VersionMatch = Select-String -Path $PubspecPath -Pattern '^version:\s*([0-9]+\.[0-9]+\.[0-9]+)'
+        if ($VersionMatch) {
+            $Version = $VersionMatch.Matches[0].Groups[1].Value
+        }
+    }
+    return $Version
+}
+
+function Assert-RequiredEngineFiles {
+    param([object]$Manifest)
+
+    foreach ($Engine in $Manifest.engines) {
+        foreach ($RelativeFile in $Engine.requiredFiles) {
+            $Resolved = Join-Path $StageRoot $RelativeFile
+            if (-not (Test-Path $Resolved)) {
+                throw "Required sidecar file for $($Engine.id) was not staged: $Resolved"
+            }
+        }
+    }
 }
 
 function Stage-PythonEngine {
@@ -296,9 +347,25 @@ function Stage-RustEngine {
     New-Item -ItemType Directory -Force -Path $RustDest | Out-Null
 
     Push-Location $RustSource
-    Write-Host "Building Rust engine for $RustTargetTriple..."
-    & $CargoExe build --release --target $RustTargetTriple
-    Pop-Location
+    try {
+        Write-Host "Building Rust engine for $RustTargetTriple..."
+        $CargoProcess = Start-Process `
+            -FilePath $CargoExe `
+            -ArgumentList @(
+                "build",
+                "--release",
+                "--target",
+                $RustTargetTriple
+            ) `
+            -NoNewWindow `
+            -PassThru `
+            -Wait
+        if ($CargoProcess.ExitCode -ne 0) {
+            throw "Rust engine build failed with exit code $($CargoProcess.ExitCode)."
+        }
+    } finally {
+        Pop-Location
+    }
 
     if (-not (Test-Path $RustBinary)) {
         $FallbackBinary = Join-Path $RustSource "target\release\s3-browser-rust-engine.exe"
@@ -316,6 +383,7 @@ function Stage-RustEngine {
         }
     }
 
+    New-Item -ItemType Directory -Force -Path $RustDest | Out-Null
     Copy-Item `
         -Path $RustBinary `
         -Destination (Join-Path $RustDest "s3-browser-rust-engine.exe") `
@@ -326,18 +394,48 @@ function Stage-JavaEngine {
     $JavaSource = Join-Path $EngineSourceDir "java"
     $JavaDest = Join-Path $StageRoot "java"
     $GradleWrapper = Join-Path $RootDir "apps\flutter_app\android\gradlew.bat"
+    $JavaHome = Join-Path $ToolsDir "java"
     Remove-DirectoryIfExists $JavaDest
     New-Item -ItemType Directory -Force -Path $JavaDest | Out-Null
 
     if (-not (Test-Path $GradleWrapper)) {
         throw "Gradle wrapper was not found at $GradleWrapper."
     }
+    if (-not (Test-Path (Join-Path $JavaHome "bin\java.exe"))) {
+        throw "Java runtime was not found at $JavaHome."
+    }
 
     Copy-DirectoryContent -SourceDir (Join-Path $ToolsDir "java") -DestinationDir (Join-Path $JavaDest "runtime")
 
+    $PreviousJavaHome = $env:JAVA_HOME
+    $PreviousPath = $env:PATH
+    $env:JAVA_HOME = $JavaHome
+    $env:PATH = "$(Join-Path $JavaHome 'bin');$env:PATH"
     Push-Location (Join-Path $RootDir "apps\flutter_app\android")
-    & $GradleWrapper -p $JavaSource installDist --no-daemon
-    Pop-Location
+    try {
+        $GradleProcess = Start-Process `
+            -FilePath $GradleWrapper `
+            -ArgumentList @(
+                "-p",
+                $JavaSource,
+                "installDist",
+                "--no-daemon"
+            ) `
+            -NoNewWindow `
+            -PassThru `
+            -Wait
+        if ($GradleProcess.ExitCode -ne 0) {
+            throw "Java engine installDist failed with exit code $($GradleProcess.ExitCode)."
+        }
+    } finally {
+        Pop-Location
+        if ($null -eq $PreviousJavaHome) {
+            Remove-Item Env:JAVA_HOME -ErrorAction SilentlyContinue
+        } else {
+            $env:JAVA_HOME = $PreviousJavaHome
+        }
+        $env:PATH = $PreviousPath
+    }
 
     Copy-DirectoryContent `
         -SourceDir (Join-Path $JavaSource "build\install\s3-browser-java-engine\lib") `
@@ -363,14 +461,15 @@ Stage-GoEngine
 Stage-RustEngine
 Stage-JavaEngine
 
+$EngineVersion = Get-AppVersion
 $Manifest = @{
-    version = "2.0.10"
+    version = $EngineVersion
     architecture = $Arch
     generatedAt = (Get-Date).ToString("o")
     engines = @(
         @{
             id = "python"
-            version = "2.0.10"
+            version = $EngineVersion
             executable = "python\python.exe"
             arguments = @("engine\main.py")
             workingDirectory = "python"
@@ -381,7 +480,7 @@ $Manifest = @{
         },
         @{
             id = "go"
-            version = "2.0.10"
+            version = $EngineVersion
             executable = "go\s3-browser-go-engine.exe"
             arguments = @()
             workingDirectory = "go"
@@ -391,7 +490,7 @@ $Manifest = @{
         },
         @{
             id = "rust"
-            version = "2.0.10"
+            version = $EngineVersion
             executable = "rust\s3-browser-rust-engine.exe"
             arguments = @()
             workingDirectory = "rust"
@@ -401,7 +500,7 @@ $Manifest = @{
         },
         @{
             id = "java"
-            version = "2.0.10"
+            version = $EngineVersion
             executable = "java\run-java-engine.bat"
             arguments = @()
             workingDirectory = "java"
@@ -414,5 +513,6 @@ $Manifest = @{
     )
 }
 
+Assert-RequiredEngineFiles -Manifest $Manifest
 $Manifest | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $StageRoot "manifest.json") -Encoding UTF8
 Write-Host "Staged desktop engine sidecars into $StageRoot"

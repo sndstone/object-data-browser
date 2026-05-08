@@ -136,7 +136,8 @@ class _ApiTraceCard extends StatelessWidget {
     final summaryParts = <String>[
       _formatDateTime(entry.timestamp),
       if ((entry.engineId ?? '').isNotEmpty) entry.engineId!,
-      if ((entry.responseStatus ?? '').isNotEmpty) 'Status ${entry.responseStatus}',
+      if ((entry.responseStatus ?? '').isNotEmpty)
+        'Status ${entry.responseStatus}',
       if (entry.latencyMs != null) '${entry.latencyMs} ms',
     ];
     final contextParts = <String>[
@@ -173,7 +174,7 @@ class _ApiTraceCard extends StatelessWidget {
             if (contextParts.isNotEmpty) ...[
               const SizedBox(height: 8),
               Text(
-                contextParts.join(' • '),
+                contextParts.join(' - '),
                 style: theme.textTheme.bodySmall,
               ),
             ],
@@ -294,7 +295,7 @@ class _EventEntryCard extends StatelessWidget {
             if (contextParts.isNotEmpty) ...[
               const SizedBox(height: 8),
               Text(
-                contextParts.join(' • '),
+                contextParts.join(' - '),
                 style: theme.textTheme.bodySmall,
               ),
             ],
@@ -357,7 +358,7 @@ class _ParsedApiEntryCard extends StatelessWidget {
             if (contextParts.isNotEmpty) ...[
               const SizedBox(height: 8),
               Text(
-                contextParts.join(' • '),
+                contextParts.join(' - '),
                 style: theme.textTheme.bodySmall,
               ),
             ],
@@ -456,8 +457,10 @@ _ParsedApiMessage? _parseRawApiMessage(EventLogEntry entry) {
   if (prefix.startsWith('SEND ')) {
     final sendParts = prefix.substring(5).trim();
     final splitIndex = sendParts.indexOf(' ');
-    final method = splitIndex == -1 ? sendParts : sendParts.substring(0, splitIndex);
-    final url = splitIndex == -1 ? null : sendParts.substring(splitIndex + 1).trim();
+    final method =
+        splitIndex == -1 ? sendParts : sendParts.substring(0, splitIndex);
+    final url =
+        splitIndex == -1 ? null : sendParts.substring(splitIndex + 1).trim();
     return _ParsedApiMessage(
       title: method.isEmpty ? entry.category : method,
       phaseLabel: 'Send',

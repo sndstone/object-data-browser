@@ -140,7 +140,7 @@ class LocalAppStateRepository implements AppStateRepository {
   Future<File> _stateFile() async {
     final supportDir = await _applicationSupportDirectoryProvider();
     return File(
-      '${supportDir.path}${Platform.pathSeparator}s3-browser-crossplat-state.json',
+      '${supportDir.path}${Platform.pathSeparator}object-data-browser-state.json',
     );
   }
 

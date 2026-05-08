@@ -1,18 +1,18 @@
-name: s3-browser-crossplat
+name: object-data-browser
 arch: {{ARCH}}
 platform: linux
 version: 2.0.10
 section: utils
 priority: optional
-maintainer: S3 Browser Crossplat
-description: Cross-platform S3 browser with pluggable backend engines
-homepage: https://example.invalid/s3-browser-crossplat
+maintainer: Object Data Browser
+description: Cross-platform object data browser with pluggable backend engines
+homepage: https://example.invalid/object-data-browser
 license: Proprietary
 contents:
-  - src: {{ROOT}}/usr/lib/s3-browser-crossplat/
-    dst: /usr/lib/s3-browser-crossplat
-  - src: {{ROOT}}/usr/bin/s3-browser-crossplat
-    dst: /usr/bin/s3-browser-crossplat
+  - src: {{ROOT}}/usr/lib/object-data-browser/
+    dst: /usr/lib/object-data-browser
+  - src: {{ROOT}}/usr/bin/object-data-browser
+    dst: /usr/bin/object-data-browser
 overrides:
   deb:
     file_name_template: "{{ .ConventionalFileName }}"

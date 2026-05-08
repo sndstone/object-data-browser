@@ -306,7 +306,11 @@ function Ensure-AndroidSdk {
         "build-tools;35.0.0",
         "ndk;27.0.12077973"
     )) {
-        & $SdkManager "--sdk_root=$AndroidRoot" $Package | Out-Null
+        $InstallCommand = '"' + $SdkManager + '" --sdk_root="' + $AndroidRoot + '" "' + $Package + '"'
+        $null = & cmd.exe /c $InstallCommand
+        if ($LASTEXITCODE -ne 0) {
+            throw "Android SDK package install failed: $Package"
+        }
     }
 }
 

@@ -2,8 +2,9 @@ import 'package:flutter/material.dart';
 
 import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
+import '../widgets/compact_selector.dart';
 
-class TasksWorkspace extends StatelessWidget {
+class TasksWorkspace extends StatefulWidget {
   const TasksWorkspace({
     super.key,
     required this.controller,
@@ -12,101 +13,71 @@ class TasksWorkspace extends StatelessWidget {
   final AppController controller;
 
   @override
+  State<TasksWorkspace> createState() => _TasksWorkspaceState();
+}
+
+class _TasksWorkspaceState extends State<TasksWorkspace> {
+  @override
   Widget build(BuildContext context) {
-    return DefaultTabController(
-      length: 3,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(20),
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(30),
-                gradient: LinearGradient(
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                  colors: [
-                    Theme.of(context).colorScheme.surface,
-                    Theme.of(context)
-                        .colorScheme
-                        .primaryContainer
-                        .withValues(alpha: 0.38),
-                    Theme.of(context)
-                        .colorScheme
-                        .secondaryContainer
-                        .withValues(alpha: 0.2),
-                  ],
-                ),
-                border: Border.all(
-                  color: Theme.of(context).colorScheme.outlineVariant,
-                ),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Task stream',
-                    style: Theme.of(context).textTheme.headlineSmall,
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Track uploads, downloads, bucket operations, tools, and benchmark runs from one queue.',
-                    style: Theme.of(context).textTheme.bodyLarge,
-                  ),
-                ],
+    final theme = Theme.of(context);
+    final view = widget.controller.taskView;
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              color: theme.colorScheme.surface,
+              border: Border.all(
+                color: theme.colorScheme.outlineVariant,
               ),
             ),
-            const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(6),
-              decoration: BoxDecoration(
-                color: Theme.of(context)
-                    .colorScheme
-                    .surface
-                    .withValues(alpha: 0.82),
-                borderRadius: BorderRadius.circular(999),
-                border: Border.all(
-                  color: Theme.of(context).colorScheme.outlineVariant,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Jobs', style: theme.textTheme.headlineSmall),
+                const SizedBox(height: 8),
+                Text(
+                  'Track running work, review failures, and open completed jobs.',
+                  style: theme.textTheme.bodyLarge,
                 ),
-              ),
-              child: TabBar(
-                isScrollable: true,
-                overlayColor: const WidgetStatePropertyAll(Colors.transparent),
-                splashFactory: NoSplash.splashFactory,
-                splashBorderRadius: BorderRadius.circular(999),
-                tabAlignment: TabAlignment.start,
-                labelPadding: const EdgeInsets.symmetric(horizontal: 18),
-                tabs: const [
-                  Tab(text: 'Running'),
-                  Tab(text: 'Failed'),
-                  Tab(text: 'All'),
-                ],
-              ),
+              ],
             ),
-            const SizedBox(height: 16),
-            Expanded(
-              child: TabBarView(
-                children: [
-                  _TaskList(
-                    controller: controller,
-                    view: BrowserTaskView.running,
-                  ),
-                  _TaskList(
-                    controller: controller,
-                    view: BrowserTaskView.failed,
-                  ),
-                  _TaskList(
-                    controller: controller,
-                    view: BrowserTaskView.all,
-                  ),
-                ],
+          ),
+          const SizedBox(height: 16),
+          CompactSelector<BrowserTaskView>(
+            selected: view,
+            onChanged: widget.controller.setTaskView,
+            options: const [
+              CompactSelectorOption(
+                value: BrowserTaskView.running,
+                icon: Icons.play_circle_outline,
+                label: 'Running',
               ),
+              CompactSelectorOption(
+                value: BrowserTaskView.failed,
+                icon: Icons.error_outline,
+                label: 'Failed',
+              ),
+              CompactSelectorOption(
+                value: BrowserTaskView.all,
+                icon: Icons.view_list_outlined,
+                label: 'All',
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Expanded(
+            child: _TaskList(
+              controller: widget.controller,
+              view: view,
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -175,12 +146,20 @@ class _TaskCard extends StatelessWidget {
         'Items: ${(task.itemsCompleted ?? 0)}/${task.itemCount}',
       if (task.partsTotal != null)
         'Parts: ${(task.partsCompleted ?? 0)}/${task.partsTotal}'
-            '${task.partSizeBytes == null ? '' : ' • ${_formatBytes(task.partSizeBytes!)} per part'}',
+            '${task.partSizeBytes == null ? '' : ' - ${_formatBytes(task.partSizeBytes!)} per part'}',
     ];
 
     return Card(
       margin: EdgeInsets.zero,
       child: ExpansionTile(
+        key:
+            ValueKey('task-${task.id}-${task.id == controller.selectedTaskId}'),
+        initiallyExpanded: task.id == controller.selectedTaskId,
+        onExpansionChanged: (expanded) {
+          if (expanded) {
+            controller.selectTask(task.id);
+          }
+        },
         tilePadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
         title: Text(
@@ -235,6 +214,12 @@ class _TaskCard extends StatelessWidget {
             spacing: 8,
             runSpacing: 8,
             children: [
+              if (task.kind == BrowserTaskKind.action && task.canCancel)
+                OutlinedButton.icon(
+                  onPressed: () => controller.cancelTask(task),
+                  icon: const Icon(Icons.stop_circle_outlined),
+                  label: const Text('Cancel'),
+                ),
               if (task.kind == BrowserTaskKind.transfer)
                 OutlinedButton(
                   onPressed: task.canPause
@@ -260,6 +245,12 @@ class _TaskCard extends StatelessWidget {
                 OutlinedButton(
                   onPressed: () => controller.selectTab(WorkspaceTab.benchmark),
                   child: const Text('Open benchmark'),
+                ),
+              if (task.kind == BrowserTaskKind.benchmark && task.canCancel)
+                OutlinedButton.icon(
+                  onPressed: () => controller.cancelTask(task),
+                  icon: const Icon(Icons.stop_circle_outlined),
+                  label: const Text('Stop'),
                 ),
               if (task.kind == BrowserTaskKind.action &&
                   task.workspaceTab != null)

@@ -121,6 +121,8 @@ void main() {
 
     expect(controller.engines, isNotEmpty);
     expect(controller.buckets, isNotEmpty);
+    expect(controller.objects.length, 1000);
+    expect(controller.objectCursor.hasMore, isTrue);
     expect(controller.adminState, isNotNull);
     expect(controller.eventLog, isNotEmpty);
 
@@ -129,6 +131,32 @@ void main() {
 
     await controller.exportBenchmarkResults('json');
     expect(controller.bannerMessage, contains('benchmark-results.json'));
+  });
+
+  test('controller lists all object pages only when requested', () async {
+    final controller = AppController(
+      engineService: MockEngineService(),
+      initialSettings: _settings,
+      initialProfiles: const [_profile],
+    );
+
+    await controller.initialize();
+
+    expect(controller.objects.length, 1000);
+    expect(controller.objectCursor.hasMore, isTrue);
+    expect(controller.listAllKeys, isFalse);
+
+    await controller.listAllObjectsForCurrentBucket();
+
+    expect(controller.objects.length, 2354);
+    expect(controller.objectCursor.hasMore, isFalse);
+    expect(controller.listAllKeys, isTrue);
+
+    await controller.setSelectedBucket(controller.buckets.last);
+
+    expect(controller.objects.length, 1000);
+    expect(controller.objectCursor.hasMore, isTrue);
+    expect(controller.listAllKeys, isFalse);
   });
 
   test(
@@ -308,6 +336,8 @@ void main() {
     expect(runningTransfer.status, anyOf('queued', 'running'));
     expect(runningTransfer.strategyLabel, isNotNull);
     expect(runningTransfer.outputLines, isNotEmpty);
+    expect(controller.bannerTaskId, runningTransfer.id);
+    expect(controller.bannerMessage, contains('%'));
 
     await uploadFuture;
 
@@ -316,5 +346,36 @@ void main() {
     );
     expect(completedTransfer.status, 'completed');
     expect(completedTransfer.progress, 1);
+    expect(controller.bannerTaskId, completedTransfer.id);
+    expect(controller.bannerMessage, 'Upload complete - 100%');
+  });
+
+  test('controller cancels running listing action tasks', () async {
+    final controller = AppController(
+      engineService: MockEngineService(),
+      initialSettings: _settings,
+      initialProfiles: const [_profile],
+    );
+    controller.browserTasks = [
+      BrowserTaskRecord(
+        id: 'refresh-buckets-1',
+        kind: BrowserTaskKind.action,
+        label: 'Listing buckets for Test...',
+        status: 'running',
+        startedAt: DateTime(2026, 4, 27, 10),
+        progress: 0,
+        actionKey: 'refresh-buckets',
+        canCancel: true,
+      ),
+    ];
+
+    await controller.cancelTask(controller.browserTasks.single);
+
+    expect(controller.browserTasks.single.status, 'cancelling');
+    expect(controller.browserTasks.single.canCancel, isFalse);
+    expect(
+      controller.browserTasks.single.outputLines.last,
+      contains('Cancellation requested'),
+    );
   });
 }

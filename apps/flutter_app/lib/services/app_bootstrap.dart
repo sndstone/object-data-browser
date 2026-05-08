@@ -51,7 +51,7 @@ class AppBootstrap {
       benchmarkLogPath: '${tempDir.path}${Platform.pathSeparator}benchmark.log',
       browserInspectorLayout: BrowserInspectorLayout.bottom,
       browserInspectorSize: 360,
-      uiScalePercent: 70,
+      uiScalePercent: 75,
       logTextScalePercent: 90,
     );
     final storedState = await repository.loadState();
