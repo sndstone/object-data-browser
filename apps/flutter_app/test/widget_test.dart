@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:s3_browser_crossplat/app/s3_browser_app.dart';
@@ -271,6 +272,7 @@ void main() {
   });
 
   testWidgets('app renders top-level workspaces', (WidgetTester tester) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
     addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.binding.setSurfaceSize(const Size(1600, 1200));
     final controller = await _buildController();
@@ -279,6 +281,7 @@ void main() {
 
     await tester.pumpWidget(S3BrowserApp(controller: controller));
     await tester.pumpAndSettle();
+    debugDefaultTargetPlatformOverride = null;
 
     expect(find.text('Object Data Browser'), findsOneWidget);
     expect(find.text('Buckets'), findsWidgets);

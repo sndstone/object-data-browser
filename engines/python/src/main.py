@@ -1111,6 +1111,11 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
     bucket_name = str(params.get("bucketName", "")).strip()
     prefix = str(params.get("prefix", "")).strip()
     file_paths = [str(item) for item in params.get("filePaths", []) if str(item).strip()]
+    object_key_by_path = {
+        str(key): str(value).replace("\\", "/").lstrip("/")
+        for key, value in dict(params.get("objectKeyByPath", {}) or {}).items()
+        if str(value).strip()
+    }
     if not bucket_name or not file_paths:
         raise SidecarError("invalid_config", "Bucket name and file paths are required.")
     multipart_threshold_bytes = _int_param(params, "multipartThresholdMiB", 32) * 1024 * 1024
@@ -1153,7 +1158,8 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
     )
     _emit_transfer_event(queued_job)
     for path in paths:
-        target_key = f"{prefix}{path.name}" if prefix else path.name
+        target_name = object_key_by_path.get(str(path), path.name)
+        target_key = f"{prefix}{target_name}" if prefix else target_name
         file_size = path.stat().st_size
         output_lines.append(f"Uploading {path.name} ({file_size} bytes) to {target_key}.")
         if file_size >= multipart_threshold_bytes:

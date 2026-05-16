@@ -678,6 +678,7 @@ class DesktopSidecarEngineService
     required String bucketName,
     required String prefix,
     required List<String> filePaths,
+    required Map<String, String> objectKeyByPath,
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
   }) {
@@ -689,6 +690,7 @@ class DesktopSidecarEngineService
         'bucketName': bucketName,
         'prefix': prefix,
         'filePaths': filePaths,
+        'objectKeyByPath': objectKeyByPath,
         'multipartThresholdMiB': multipartThresholdMiB,
         'multipartChunkMiB': multipartChunkMiB,
       },
@@ -700,6 +702,7 @@ class DesktopSidecarEngineService
         bucketName: bucketName,
         prefix: prefix,
         filePaths: filePaths,
+        objectKeyByPath: objectKeyByPath,
         multipartThresholdMiB: multipartThresholdMiB,
         multipartChunkMiB: multipartChunkMiB,
       ),
@@ -1990,7 +1993,7 @@ class _EngineManifestEntry {
   factory _EngineManifestEntry.fromJson(Map<String, Object?> json) {
     return _EngineManifestEntry(
       id: json['id'] as String? ?? '',
-      version: json['version'] as String? ?? '2.0.10',
+      version: json['version'] as String? ?? '2.0.16',
       executable: json['executable'] as String? ?? '',
       arguments: (json['arguments'] as List<Object?>? ?? const [])
           .map((item) => item.toString())

@@ -280,10 +280,10 @@ func parseProfile(payload map[string]interface{}) (profile, error) {
 		SessionToken:          strings.TrimSpace(asString(payload["sessionToken"])),
 		PathStyle:             asBool(payload["pathStyle"]),
 		VerifyTLS:             !payloadHasFalse(payload["verifyTls"]),
-			ConnectTimeoutSeconds: maxInt(asInt(payload["connectTimeoutSeconds"]), 1, 5),
-			ReadTimeoutSeconds:    maxInt(asInt(payload["readTimeoutSeconds"]), 1, 60),
-			MaxAttempts:           maxInt(asInt(payload["maxAttempts"]), 1, 5),
-			MaxPoolConnections:    maxInt(asInt(payload["maxConcurrentRequests"]), 1, 10),
+		ConnectTimeoutSeconds: maxInt(asInt(payload["connectTimeoutSeconds"]), 1, 5),
+		ReadTimeoutSeconds:    maxInt(asInt(payload["readTimeoutSeconds"]), 1, 60),
+		MaxAttempts:           maxInt(asInt(payload["maxAttempts"]), 1, 5),
+		MaxPoolConnections:    maxInt(asInt(payload["maxConcurrentRequests"]), 1, 10),
 		Diagnostics:           parseDiagnostics(payload),
 	}, nil
 }
@@ -300,7 +300,7 @@ func buildClient(p profile) (*s3.Client, context.Context, error) {
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: !p.VerifyTLS},
 	}
 	httpClient := &http.Client{
-		Timeout: time.Duration(p.ConnectTimeoutSeconds+p.ReadTimeoutSeconds) * time.Second,
+		Timeout:   time.Duration(p.ConnectTimeoutSeconds+p.ReadTimeoutSeconds) * time.Second,
 		Transport: loggingRoundTripper{base: baseTransport, diagnostics: p.Diagnostics},
 	}
 
@@ -474,9 +474,9 @@ func testProfile(profilePayload map[string]interface{}) (map[string]interface{},
 		host = parsed.Host
 	}
 	return map[string]interface{}{
-		"ok":         true,
+		"ok":          true,
 		"bucketCount": len(output.Buckets),
-		"endpoint":   host,
+		"endpoint":    host,
 	}, nil
 }
 
@@ -496,11 +496,11 @@ func listBuckets(profilePayload map[string]interface{}) (map[string]interface{},
 	items := make([]map[string]interface{}, 0, len(output.Buckets))
 	for _, bucket := range output.Buckets {
 		items = append(items, map[string]interface{}{
-			"name":             aws.ToString(bucket.Name),
-			"region":           p.Region,
-			"objectCountHint":  0,
+			"name":              aws.ToString(bucket.Name),
+			"region":            p.Region,
+			"objectCountHint":   0,
 			"versioningEnabled": false,
-			"createdAt":        serializeTime(bucket.CreationDate),
+			"createdAt":         serializeTime(bucket.CreationDate),
 		})
 	}
 	return map[string]interface{}{"items": items}, nil
@@ -807,24 +807,24 @@ func getBucketAdminState(params map[string]interface{}) (map[string]interface{},
 	}
 
 	return map[string]interface{}{
-		"bucketName":               bucketName,
-		"versioningEnabled":        versioning.Status == types.BucketVersioningStatusEnabled,
-		"versioningStatus":         string(versioning.Status),
-		"objectLockEnabled":        lockConfig != nil && lockConfig.ObjectLockConfiguration != nil,
-		"lifecycleEnabled":         len(lifecycleRules) > 0,
-		"policyAttached":           policy != nil && policy.Policy != nil && aws.ToString(policy.Policy) != "",
-		"corsEnabled":              cors != nil && len(cors.CORSRules) > 0,
-		"encryptionEnabled":        encryption != nil && encryption.ServerSideEncryptionConfiguration != nil && len(encryption.ServerSideEncryptionConfiguration.Rules) > 0,
-		"encryptionSummary":        encryptionSummary,
-		"objectLockMode":           emptyToNil(objectLockMode),
-		"objectLockRetentionDays":  objectLockRetention,
-		"tags":                     tags,
-		"lifecycleRules":           lifecycleRules,
-		"lifecycleJson":            lifecycleJSON,
-		"policyJson":               policyJSON,
-		"corsJson":                 corsJSON,
-		"encryptionJson":           encryptionJSON,
-		"apiCalls":                 apiCalls,
+		"bucketName":              bucketName,
+		"versioningEnabled":       versioning.Status == types.BucketVersioningStatusEnabled,
+		"versioningStatus":        string(versioning.Status),
+		"objectLockEnabled":       lockConfig != nil && lockConfig.ObjectLockConfiguration != nil,
+		"lifecycleEnabled":        len(lifecycleRules) > 0,
+		"policyAttached":          policy != nil && policy.Policy != nil && aws.ToString(policy.Policy) != "",
+		"corsEnabled":             cors != nil && len(cors.CORSRules) > 0,
+		"encryptionEnabled":       encryption != nil && encryption.ServerSideEncryptionConfiguration != nil && len(encryption.ServerSideEncryptionConfiguration.Rules) > 0,
+		"encryptionSummary":       encryptionSummary,
+		"objectLockMode":          emptyToNil(objectLockMode),
+		"objectLockRetentionDays": objectLockRetention,
+		"tags":                    tags,
+		"lifecycleRules":          lifecycleRules,
+		"lifecycleJson":           lifecycleJSON,
+		"policyJson":              policyJSON,
+		"corsJson":                corsJSON,
+		"encryptionJson":          encryptionJSON,
+		"apiCalls":                apiCalls,
 	}, nil
 }
 
@@ -940,7 +940,7 @@ func putBucketEncryption(params map[string]interface{}) (map[string]interface{},
 		return nil, &sidecarError{Code: "invalid_config", Message: "Encryption JSON could not be parsed.", Details: map[string]interface{}{"reason": err.Error()}}
 	}
 	if _, err = client.PutBucketEncryption(ctx, &s3.PutBucketEncryptionInput{
-		Bucket: aws.String(bucketName),
+		Bucket:                            aws.String(bucketName),
 		ServerSideEncryptionConfiguration: &configPayload,
 	}); err != nil {
 		return nil, err
@@ -973,7 +973,7 @@ func putBucketTagging(params map[string]interface{}) (map[string]interface{}, er
 		tagSet = append(tagSet, types.Tag{Key: aws.String(key), Value: aws.String(asString(value))})
 	}
 	if _, err = client.PutBucketTagging(ctx, &s3.PutBucketTaggingInput{
-		Bucket: aws.String(bucketName),
+		Bucket:  aws.String(bucketName),
 		Tagging: &types.Tagging{TagSet: tagSet},
 	}); err != nil {
 		return nil, err
@@ -1111,12 +1111,12 @@ func getObjectDetails(params map[string]interface{}) (map[string]interface{}, er
 		metadata[key] = value
 	}
 	headers := map[string]string{
-		"ETag":          trimQuotesString(aws.ToString(head.ETag)),
-			"Content-Length": fmt.Sprintf("%d", aws.ToInt64(head.ContentLength)),
-		"Content-Type":  aws.ToString(head.ContentType),
-		"Last-Modified": serializeTime(head.LastModified),
-		"Storage-Class": string(head.StorageClass),
-		"Cache-Control": aws.ToString(head.CacheControl),
+		"ETag":           trimQuotesString(aws.ToString(head.ETag)),
+		"Content-Length": fmt.Sprintf("%d", aws.ToInt64(head.ContentLength)),
+		"Content-Type":   aws.ToString(head.ContentType),
+		"Last-Modified":  serializeTime(head.LastModified),
+		"Storage-Class":  string(head.StorageClass),
+		"Cache-Control":  aws.ToString(head.CacheControl),
 	}
 	for key, value := range headers {
 		if strings.TrimSpace(value) == "" {
@@ -1135,12 +1135,12 @@ func getObjectDetails(params map[string]interface{}) (map[string]interface{}, er
 		"message":   fmt.Sprintf("Loaded metadata and %d tag(s) for %s.", len(tags), key),
 	})
 	return map[string]interface{}{
-		"key":       key,
-		"metadata":  metadata,
-		"headers":   headers,
-		"tags":      tags,
+		"key":         key,
+		"metadata":    metadata,
+		"headers":     headers,
+		"tags":        tags,
 		"debugEvents": debugEvents,
-		"apiCalls":  apiCalls,
+		"apiCalls":    apiCalls,
 		"debugLogExcerpt": []string{
 			fmt.Sprintf("Resolved endpoint %s.", p.EndpointURL),
 			fmt.Sprintf("Completed HEAD and tagging diagnostics for %s/%s.", bucketName, key),
@@ -1305,6 +1305,7 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 	}
 	prefix := strings.TrimSpace(asString(params["prefix"]))
 	filePaths := asStringSlice(params["filePaths"])
+	objectKeyByPath := asStringMap(params["objectKeyByPath"])
 	if len(filePaths) == 0 {
 		return nil, &sidecarError{Code: "invalid_config", Message: "Bucket name and file paths are required."}
 	}
@@ -1350,6 +1351,9 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 			return nil, statErr
 		}
 		targetKey := filepath.Base(filePath)
+		if mappedKey, ok := objectKeyByPath[filePath]; ok && strings.TrimSpace(mappedKey) != "" {
+			targetKey = strings.TrimLeft(strings.ReplaceAll(mappedKey, "\\", "/"), "/")
+		}
 		if prefix != "" {
 			targetKey = prefix + targetKey
 		}
@@ -1999,12 +2003,12 @@ func benchmarkSummaryFromState(state map[string]interface{}) map[string]interfac
 	for _, sizeBytes := range sizeKeys {
 		values := sizeLatency[sizeBytes]
 		sizeLatencyBuckets = append(sizeLatencyBuckets, map[string]interface{}{
-			"sizeBytes":     sizeBytes,
-			"count":         len(values),
-			"avgLatencyMs":  roundFloat(meanFloat(values)),
-			"p50LatencyMs":  roundFloat(benchmarkPercentile(values, 50)),
-			"p95LatencyMs":  roundFloat(benchmarkPercentile(values, 95)),
-			"p99LatencyMs":  roundFloat(benchmarkPercentile(values, 99)),
+			"sizeBytes":    sizeBytes,
+			"count":        len(values),
+			"avgLatencyMs": roundFloat(meanFloat(values)),
+			"p50LatencyMs": roundFloat(benchmarkPercentile(values, 50)),
+			"p95LatencyMs": roundFloat(benchmarkPercentile(values, 95)),
+			"p99LatencyMs": roundFloat(benchmarkPercentile(values, 99)),
 		})
 	}
 	sizes := benchmarkSizeList(asMap(state["config"]))
@@ -2027,12 +2031,12 @@ func benchmarkSummaryFromState(state map[string]interface{}) map[string]interfac
 			}
 			return total
 		}(),
-		"operationsByType":      operationsByType,
-		"latencyPercentilesMs":  benchmarkLatencyPercentiles(latencies),
-		"throughputSeries":      throughputSeries,
-		"latencyTimeline":       latencyTimeline,
-		"sizeLatencyBuckets":    sizeLatencyBuckets,
-		"checksumStats":         checksumStats,
+		"operationsByType":     operationsByType,
+		"latencyPercentilesMs": benchmarkLatencyPercentiles(latencies),
+		"throughputSeries":     throughputSeries,
+		"latencyTimeline":      latencyTimeline,
+		"sizeLatencyBuckets":   sizeLatencyBuckets,
+		"checksumStats":        checksumStats,
 		"detailMetrics": map[string]interface{}{
 			"sampleCount":            sampleCount,
 			"sampleWindowSeconds":    1,
@@ -2647,17 +2651,17 @@ func optionalAPI(ctx context.Context, client *s3.Client, apiCalls *[]map[string]
 
 func missingBucketConfigCodes() map[string]struct{} {
 	return map[string]struct{}{
-		"NoSuchLifecycleConfiguration":                     {},
-		"NoSuchBucketPolicy":                               {},
-		"NoSuchCORSConfiguration":                          {},
-		"NoSuchBucket":                                     {},
-		"NoSuchTagSet":                                     {},
-		"ObjectLockConfigurationNotFoundError":             {},
-		"NoSuchObjectLockConfiguration":                    {},
-		"ServerSideEncryptionConfigurationNotFoundError":   {},
-		"MethodNotAllowed":                                 {},
-		"NotImplemented":                                   {},
-		"XNotImplemented":                                  {},
+		"NoSuchLifecycleConfiguration":                   {},
+		"NoSuchBucketPolicy":                             {},
+		"NoSuchCORSConfiguration":                        {},
+		"NoSuchBucket":                                   {},
+		"NoSuchTagSet":                                   {},
+		"ObjectLockConfigurationNotFoundError":           {},
+		"NoSuchObjectLockConfiguration":                  {},
+		"ServerSideEncryptionConfigurationNotFoundError": {},
+		"MethodNotAllowed":                               {},
+		"NotImplemented":                                 {},
+		"XNotImplemented":                                {},
 	}
 }
 
@@ -2887,6 +2891,24 @@ func asStringSlice(value interface{}) []string {
 		text := strings.TrimSpace(asString(item))
 		if text != "" {
 			result = append(result, text)
+		}
+	}
+	return result
+}
+
+func asStringMap(value interface{}) map[string]string {
+	result := map[string]string{}
+	raw, ok := value.(map[string]interface{})
+	if !ok {
+		if typed, ok := value.(map[string]string); ok {
+			return typed
+		}
+		return result
+	}
+	for key, item := range raw {
+		text := strings.TrimSpace(asString(item))
+		if text != "" {
+			result[key] = text
 		}
 	}
 	return result

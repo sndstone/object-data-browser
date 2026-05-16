@@ -1200,6 +1200,7 @@ async fn start_upload(params: Value) -> SidecarResult {
     let (_, bucket_name, client) = bucket_context(&params).await?;
     let prefix = params["prefix"].as_str().unwrap_or_default();
     let file_paths = string_array(params.get("filePaths").unwrap_or(&Value::Null));
+    let object_key_by_path = string_map(params.get("objectKeyByPath").unwrap_or(&Value::Null));
     if file_paths.is_empty() {
         return Err(SidecarError::new(
             "invalid_config",
@@ -1276,18 +1277,20 @@ async fn start_upload(params: Value) -> SidecarResult {
         output_lines.clone(),
     ));
     for path in &paths {
+        let default_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let target_name = object_key_by_path
+            .get(&path.to_string_lossy().to_string())
+            .map(|value| value.replace('\\', "/").trim_start_matches('/').to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| default_name.clone());
         let key = if prefix.is_empty() {
-            path.file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default()
-                .to_string()
+            target_name
         } else {
-            format!(
-                "{prefix}{}",
-                path.file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default()
-            )
+            format!("{prefix}{target_name}")
         };
         let file_name = path
             .file_name()
@@ -4211,6 +4214,24 @@ fn string_array(value: &Value) -> Vec<String> {
                 .map(str::trim)
                 .filter(|item| !item.is_empty())
                 .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn string_map(value: &Value) -> BTreeMap<String, String> {
+    value
+        .as_object()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|(key, value)| {
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .map(|item| (key.clone(), item.to_string()))
+                })
                 .collect()
         })
         .unwrap_or_default()

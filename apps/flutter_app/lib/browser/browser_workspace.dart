@@ -95,6 +95,154 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     await controller.startSampleUpload(paths);
   }
 
+  Future<void> _pickFolderAndUpload() async {
+    final folderPath = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: 'Select folder to upload',
+    );
+    if (folderPath == null || folderPath.trim().isEmpty) {
+      return;
+    }
+    final folder = Directory(folderPath);
+    if (!await folder.exists()) {
+      controller.showBannerMessage(
+        'Selected folder is not available.',
+        category: 'Transfers',
+      );
+      return;
+    }
+
+    final List<File> files;
+    try {
+      files = await folder
+          .list(recursive: true, followLinks: false)
+          .where((entity) => entity is File)
+          .cast<File>()
+          .toList();
+    } on FileSystemException catch (error) {
+      controller.showBannerMessage(
+        'Could not read selected folder: ${error.message}',
+        category: 'Transfers',
+      );
+      return;
+    }
+    files.sort((left, right) => left.path.compareTo(right.path));
+    if (files.isEmpty) {
+      controller.showBannerMessage(
+        'Selected folder does not contain uploadable files.',
+        category: 'Transfers',
+      );
+      return;
+    }
+
+    final folderName = _pathName(folder.path);
+    final filePaths = files.map((file) => file.path).toList(growable: false);
+    final objectKeyByPath = <String, String>{
+      for (final file in files)
+        file.path: _joinObjectKeyParts([
+          folderName,
+          _relativePathInside(folder.path, file.path),
+        ]),
+    };
+    await controller.startSampleUpload(
+      filePaths,
+      objectKeyByPath: objectKeyByPath,
+    );
+  }
+
+  Future<void> _uploadPaths(List<String> paths) async {
+    final filePaths = <String>[];
+    final objectKeyByPath = <String, String>{};
+    for (final path in paths) {
+      final type = await FileSystemEntity.type(path, followLinks: false);
+      if (type == FileSystemEntityType.directory) {
+        final folder = Directory(path);
+        final folderName = _pathName(folder.path);
+        await for (final entity
+            in folder.list(recursive: true, followLinks: false)) {
+          if (entity is! File) {
+            continue;
+          }
+          filePaths.add(entity.path);
+          objectKeyByPath[entity.path] = _joinObjectKeyParts([
+            folderName,
+            _relativePathInside(folder.path, entity.path),
+          ]);
+        }
+      } else if (type == FileSystemEntityType.file) {
+        filePaths.add(path);
+      }
+    }
+    filePaths.sort();
+    if (filePaths.isEmpty) {
+      return;
+    }
+    await controller.startSampleUpload(
+      filePaths,
+      objectKeyByPath: objectKeyByPath,
+    );
+  }
+
+  Future<void> _showUploadPicker(BuildContext context) async {
+    final selected = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.file_upload_outlined),
+                title: const Text('Upload files'),
+                onTap: () => Navigator.of(context).pop('files'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.drive_folder_upload_outlined),
+                title: const Text('Upload folder'),
+                onTap: () => Navigator.of(context).pop('folder'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (!mounted || selected == null) {
+      return;
+    }
+    if (selected == 'folder') {
+      await _pickFolderAndUpload();
+    } else {
+      await _pickFilesAndUpload();
+    }
+  }
+
+  String _pathName(String path) {
+    final normalized = path.replaceAll('\\', '/');
+    final trimmed = normalized.endsWith('/')
+        ? normalized.substring(0, normalized.length - 1)
+        : normalized;
+    final name = trimmed.split('/').last.trim();
+    return name.isEmpty ? 'folder' : name;
+  }
+
+  String _relativePathInside(String rootPath, String filePath) {
+    final root = rootPath.replaceAll('\\', '/').replaceFirst(RegExp(r'/$'), '');
+    final file = filePath.replaceAll('\\', '/');
+    if (file.startsWith('$root/')) {
+      return file.substring(root.length + 1);
+    }
+    return _pathName(filePath);
+  }
+
+  String _joinObjectKeyParts(List<String> parts) {
+    return parts
+        .expand((part) => part.replaceAll('\\', '/').split('/'))
+        .map((part) => part.trim())
+        .where((part) => part.isNotEmpty && part != '.')
+        .join('/');
+  }
+
   Future<void> _openBucket(BucketSummary bucket,
       {required bool compact}) async {
     await controller.setSelectedBucket(bucket);
@@ -211,7 +359,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       builder: (context, constraints) {
         final width = constraints.maxWidth;
         final desktopCompact = _desktopCompact(context);
-        if (width < 700) {
+        if (width < 700 || (!desktopCompact && width < 900)) {
           return _mobileBrowserShell(context);
         }
 
@@ -273,7 +421,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     return DropTarget(
       onDragDone: (detail) async {
         final files = detail.files.map((file) => file.path).toList();
-        await controller.startSampleUpload(files);
+        await _uploadPaths(files);
       },
       child: content,
     );
@@ -479,12 +627,14 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   Widget _objectPanel(BuildContext context, {required bool compact}) {
-    final phone = MediaQuery.sizeOf(context).width < 700;
+    final width = MediaQuery.sizeOf(context).width;
+    final phone = width < 700;
+    final mobileTablet = !phone && Platform.isAndroid;
     final desktopCompact = _desktopCompact(context);
-    final availableWidth = MediaQuery.sizeOf(context).width -
-        (phone ? 32 : (desktopCompact ? 48 : 64));
+    final denseObjectControls = phone || mobileTablet || desktopCompact;
+    final availableWidth = width - (phone ? 32 : (desktopCompact ? 48 : 64));
     final phonePanelHeight =
-        (MediaQuery.sizeOf(context).height * 0.72).clamp(600.0, 860.0);
+        (MediaQuery.sizeOf(context).height * 0.78).clamp(560.0, 920.0);
     final hasProfile = controller.selectedProfile != null;
     final hasBucket = controller.selectedBucket != null;
     final hasSelectedObject = controller.selectedObject != null;
@@ -497,8 +647,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     final isDownloading = controller.isBusy('download');
     final isDeleting = controller.isBusy('delete-object');
     final isSelectingObject = controller.isBusy('select-object');
-    final panelPadding = desktopCompact && !phone ? 12.0 : 16.0;
-    final controlSpacing = desktopCompact && !phone ? 10.0 : 12.0;
+    final panelPadding = denseObjectControls ? 12.0 : 16.0;
+    final controlSpacing = denseObjectControls ? 8.0 : 12.0;
     final mobileControlSpacing = phone ? 8.0 : controlSpacing;
     final mobileFilterWidth = (availableWidth * 0.34).clamp(112.0, 156.0);
 
@@ -621,7 +771,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     Widget mobileUploadButton() {
       return IconButton.filled(
         tooltip: isUploading ? 'Uploading...' : 'Upload',
-        onPressed: hasBucket && !isUploading ? _pickFilesAndUpload : null,
+        onPressed:
+            hasBucket && !isUploading ? () => _showUploadPicker(context) : null,
         icon: isUploading ? _inlineSpinner() : const Icon(Icons.upload_file),
         constraints: const BoxConstraints.tightFor(width: 40, height: 40),
         padding: EdgeInsets.zero,
@@ -702,12 +853,12 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               )
             else
               Wrap(
-                spacing: desktopCompact ? 6 : 8,
-                runSpacing: desktopCompact ? 6 : 8,
+                spacing: denseObjectControls ? 6 : 8,
+                runSpacing: denseObjectControls ? 6 : 8,
                 crossAxisAlignment: WrapCrossAlignment.center,
                 children: [
                   ActionChip(
-                    visualDensity: desktopCompact
+                    visualDensity: denseObjectControls
                         ? VisualDensity.compact
                         : VisualDensity.standard,
                     avatar: const Icon(Icons.home_outlined, size: 16),
@@ -716,7 +867,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                   ),
                   if (currentPrefix.isNotEmpty)
                     ActionChip(
-                      visualDensity: desktopCompact
+                      visualDensity: denseObjectControls
                           ? VisualDensity.compact
                           : VisualDensity.standard,
                       avatar:
@@ -768,13 +919,14 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                 spacing: controlSpacing,
                 runSpacing: controlSpacing,
                 children: [
-                  filterModeControl(width: desktopCompact ? 152 : 168),
-                  filterValueControl(width: desktopCompact ? 216 : 240),
-                  sortFieldControl(width: desktopCompact ? 188 : 220),
+                  filterModeControl(width: denseObjectControls ? 144 : 168),
+                  filterValueControl(width: denseObjectControls ? 200 : 240),
+                  sortFieldControl(width: denseObjectControls ? 176 : 220),
                   sortDirectionButton(),
                   FilledButton.icon(
-                    onPressed:
-                        hasBucket && !isUploading ? _pickFilesAndUpload : null,
+                    onPressed: hasBucket && !isUploading
+                        ? () => _showUploadPicker(context)
+                        : null,
                     icon: isUploading
                         ? _inlineSpinner()
                         : const Icon(Icons.upload_file),
@@ -930,7 +1082,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                   ],
                 ),
               ),
-            if (!phone) ...[
+            if (!phone && !Platform.isAndroid) ...[
               Container(
                 decoration: BoxDecoration(
                   color: Theme.of(context).colorScheme.surface,
@@ -960,8 +1112,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               Expanded(child: listView)
             else if (compact)
               SizedBox(
-                height: (MediaQuery.sizeOf(context).height * 0.42)
-                    .clamp(280.0, 520.0),
+                height: (MediaQuery.sizeOf(context).height *
+                        (mobileTablet ? 0.58 : 0.42))
+                    .clamp(mobileTablet ? 360.0 : 280.0,
+                        mobileTablet ? 760.0 : 520.0),
                 child: listView,
               )
             else
@@ -2295,150 +2449,166 @@ class _ObjectTable extends StatelessWidget {
       color: theme.colorScheme.onSurfaceVariant,
       fontWeight: FontWeight.w800,
     );
-    return Column(
-      children: [
-        Container(
-          height: 34,
-          padding: const EdgeInsets.symmetric(horizontal: 8),
-          decoration: BoxDecoration(
-            border: Border(
-              bottom: BorderSide(color: theme.colorScheme.outlineVariant),
-            ),
-          ),
-          child: Row(
-            children: [
-              const SizedBox(width: 34),
-              Expanded(
-                flex: 5,
-                child: Text('Name', style: headerStyle),
-              ),
-              Expanded(
-                flex: 2,
-                child: Text('Last modified', style: headerStyle),
-              ),
-              SizedBox(
-                width: 92,
-                child: Text('Size', style: headerStyle),
-              ),
-              SizedBox(
-                width: 88,
-                child: Text('Type', style: headerStyle),
-              ),
-              const SizedBox(width: 34),
-            ],
-          ),
-        ),
-        Expanded(
-          child: ListView.separated(
-            primary: false,
-            physics: const AlwaysScrollableScrollPhysics(),
-            itemCount: objects.length,
-            separatorBuilder: (_, __) => Divider(
-              height: 1,
-              color: theme.colorScheme.outlineVariant.withValues(alpha: 0.55),
-            ),
-            itemBuilder: (context, index) {
-              final object = objects[index];
-              final selected = selectedKey == object.key;
-              return Material(
-                color: selected
-                    ? theme.colorScheme.primaryContainer.withValues(alpha: 0.72)
-                    : Colors.transparent,
-                borderRadius: BorderRadius.circular(6),
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(6),
-                  onTap: () => onSelect(object),
-                  child: Container(
-                    height: 38,
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
-                    child: Row(
-                      children: [
-                        SizedBox(
-                          width: 34,
-                          child: Icon(
-                            selected
-                                ? Icons.check_box
-                                : Icons.check_box_outline_blank,
-                            size: 18,
-                            color: selected
-                                ? theme.colorScheme.primary
-                                : theme.colorScheme.outline,
-                          ),
-                        ),
-                        Expanded(
-                          flex: 5,
-                          child: Row(
-                            children: [
-                              Icon(
-                                object.isFolder
-                                    ? Icons.folder
-                                    : Icons.insert_drive_file_outlined,
-                                size: 18,
-                                color: object.isFolder
-                                    ? theme.colorScheme.onSurfaceVariant
-                                    : theme.colorScheme.primary,
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Text(
-                                  object.name,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: theme.textTheme.bodyMedium?.copyWith(
-                                    color: theme.colorScheme.onSurface,
-                                    fontWeight: selected
-                                        ? FontWeight.w700
-                                        : FontWeight.w500,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        Expanded(
-                          flex: 2,
-                          child: Text(
-                            _formatTableDateTime(object.modifiedAt),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: theme.textTheme.bodySmall,
-                          ),
-                        ),
-                        SizedBox(
-                          width: 92,
-                          child: Text(
-                            object.isFolder
-                                ? '--'
-                                : _formatTableBytes(object.size),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: theme.textTheme.bodySmall,
-                          ),
-                        ),
-                        SizedBox(
-                          width: 88,
-                          child: Text(
-                            object.isFolder
-                                ? 'Folder'
-                                : _shortObjectType(contentTypeFor(object)),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: theme.textTheme.bodySmall,
-                          ),
-                        ),
-                        const SizedBox(
-                          width: 34,
-                          child: Icon(Icons.more_horiz, size: 18),
-                        ),
-                      ],
-                    ),
-                  ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final narrow = constraints.maxWidth < 520;
+        final veryNarrow = constraints.maxWidth < 380;
+        final selectWidth = narrow ? 26.0 : 32.0;
+        final modifiedWidth = veryNarrow ? 72.0 : (narrow ? 86.0 : 128.0);
+        final sizeWidth = veryNarrow ? 52.0 : (narrow ? 64.0 : 86.0);
+        final typeWidth = veryNarrow ? 48.0 : (narrow ? 62.0 : 84.0);
+        final horizontalPadding = narrow ? 4.0 : 8.0;
+        final nameGap = narrow ? 6.0 : 10.0;
+
+        return Column(
+          children: [
+            Container(
+              height: narrow ? 32 : 34,
+              padding: EdgeInsets.symmetric(horizontal: horizontalPadding),
+              decoration: BoxDecoration(
+                border: Border(
+                  bottom: BorderSide(color: theme.colorScheme.outlineVariant),
                 ),
-              );
-            },
-          ),
-        ),
-      ],
+              ),
+              child: Row(
+                children: [
+                  SizedBox(width: selectWidth),
+                  Expanded(
+                    child: Text('Name', style: headerStyle),
+                  ),
+                  SizedBox(
+                    width: modifiedWidth,
+                    child: Text('Modified', style: headerStyle),
+                  ),
+                  SizedBox(
+                    width: sizeWidth,
+                    child: Text('Size', style: headerStyle),
+                  ),
+                  SizedBox(
+                    width: typeWidth,
+                    child: Text('Type', style: headerStyle),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: ListView.separated(
+                primary: false,
+                physics: const AlwaysScrollableScrollPhysics(),
+                itemCount: objects.length,
+                separatorBuilder: (_, __) => Divider(
+                  height: 1,
+                  color:
+                      theme.colorScheme.outlineVariant.withValues(alpha: 0.55),
+                ),
+                itemBuilder: (context, index) {
+                  final object = objects[index];
+                  final selected = selectedKey == object.key;
+                  return Material(
+                    color: selected
+                        ? theme.colorScheme.primaryContainer
+                            .withValues(alpha: 0.72)
+                        : Colors.transparent,
+                    borderRadius: BorderRadius.circular(6),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(6),
+                      onTap: () => onSelect(object),
+                      child: Container(
+                        height: narrow ? 36 : 38,
+                        padding:
+                            EdgeInsets.symmetric(horizontal: horizontalPadding),
+                        child: Row(
+                          children: [
+                            SizedBox(
+                              width: selectWidth,
+                              child: Icon(
+                                selected
+                                    ? Icons.check_box
+                                    : Icons.check_box_outline_blank,
+                                size: narrow ? 16 : 18,
+                                color: selected
+                                    ? theme.colorScheme.primary
+                                    : theme.colorScheme.outline,
+                              ),
+                            ),
+                            Expanded(
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    object.isFolder
+                                        ? Icons.folder
+                                        : Icons.insert_drive_file_outlined,
+                                    size: narrow ? 16 : 18,
+                                    color: object.isFolder
+                                        ? theme.colorScheme.onSurfaceVariant
+                                        : theme.colorScheme.primary,
+                                  ),
+                                  SizedBox(width: nameGap),
+                                  Expanded(
+                                    child: Text(
+                                      object.name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style:
+                                          theme.textTheme.bodyMedium?.copyWith(
+                                        color: theme.colorScheme.onSurface,
+                                        fontWeight: selected
+                                            ? FontWeight.w700
+                                            : FontWeight.w500,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            SizedBox(
+                              width: modifiedWidth,
+                              child: Text(
+                                _formatTableDateTime(
+                                  object.modifiedAt,
+                                  compact: narrow,
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.bodySmall,
+                              ),
+                            ),
+                            SizedBox(
+                              width: sizeWidth,
+                              child: Text(
+                                object.isFolder
+                                    ? '--'
+                                    : _formatTableBytes(
+                                        object.size,
+                                        compact: narrow,
+                                      ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.bodySmall,
+                              ),
+                            ),
+                            SizedBox(
+                              width: typeWidth,
+                              child: Text(
+                                object.isFolder
+                                    ? 'Folder'
+                                    : _shortObjectType(contentTypeFor(object)),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.bodySmall,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 
@@ -2449,24 +2619,27 @@ class _ObjectTable extends StatelessWidget {
     return value.isEmpty ? '--' : value;
   }
 
-  static String _formatTableBytes(int value) {
+  static String _formatTableBytes(int value, {bool compact = false}) {
     if (value >= 1024 * 1024 * 1024) {
-      return '${(value / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+      return '${(value / (1024 * 1024 * 1024)).toStringAsFixed(1)}${compact ? 'G' : ' GB'}';
     }
     if (value >= 1024 * 1024) {
-      return '${(value / (1024 * 1024)).toStringAsFixed(1)} MB';
+      return '${(value / (1024 * 1024)).toStringAsFixed(1)}${compact ? 'M' : ' MB'}';
     }
     if (value >= 1024) {
-      return '${(value / 1024).toStringAsFixed(1)} KB';
+      return '${(value / 1024).toStringAsFixed(1)}${compact ? 'K' : ' KB'}';
     }
-    return '$value B';
+    return compact ? '$value' : '$value B';
   }
 
-  static String _formatTableDateTime(DateTime value) {
+  static String _formatTableDateTime(DateTime value, {bool compact = false}) {
     final month = value.month.toString().padLeft(2, '0');
     final day = value.day.toString().padLeft(2, '0');
     final hour = value.hour.toString().padLeft(2, '0');
     final minute = value.minute.toString().padLeft(2, '0');
+    if (compact) {
+      return '$month-$day $hour:$minute';
+    }
     return '${value.year}-$month-$day $hour:$minute';
   }
 }

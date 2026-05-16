@@ -58,6 +58,35 @@ void main() {
     expect(buckets.single.versioningEnabled, isTrue);
   });
 
+  test('listBuckets accepts Android object-keyed platform maps', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'dispatch') {
+        return <Object?, Object?>{
+          'items': <Object?>[
+            <Object?, Object?>{
+              'name': 'typed-map-bucket',
+              'region': 'eu-central-1',
+              'objectCountHint': 3,
+              'versioningEnabled': false,
+              'createdAt': '2026-05-16T10:30:00Z',
+            },
+          ],
+        };
+      }
+      return null;
+    });
+
+    final service = AndroidEngineService(channel: channel);
+    final buckets =
+        await service.listBuckets(engineId: 'android', profile: profile());
+
+    expect(buckets, hasLength(1));
+    expect(buckets.single.name, 'typed-map-bucket');
+    expect(buckets.single.region, 'eu-central-1');
+    expect(buckets.single.objectCountHint, 3);
+  });
+
   test('emits structured Android API traces when diagnostics are enabled',
       () async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger

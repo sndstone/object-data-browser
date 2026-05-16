@@ -875,6 +875,7 @@ public final class Main {
     private static Map<String, Object> startUpload(JsonNode params) throws IOException {
         BucketContext context = bucketContext(params);
         List<String> filePaths = stringArray(params.path("filePaths"));
+        Map<String, String> objectKeyByPath = stringMap(params.path("objectKeyByPath"));
         if (filePaths.isEmpty()) {
             throw new SidecarException("invalid_config", "Bucket name and file paths are required.");
         }
@@ -942,7 +943,11 @@ public final class Main {
         try (S3Client client = context.client()) {
             for (Path path : paths) {
                 long fileSize = Files.size(path);
-                String key = prefix.isBlank() ? path.getFileName().toString() : prefix + path.getFileName();
+                String targetName = objectKeyByPath.getOrDefault(
+                    path.toString(),
+                    path.getFileName().toString()
+                ).replace('\\', '/').replaceFirst("^/+", "");
+                String key = prefix.isBlank() ? targetName : prefix + targetName;
                 outputLines.add("Uploading " + path.getFileName() + " (" + fileSize + " bytes) to " + key + ".");
                 if (fileSize >= multipartThresholdBytes) {
                     String uploadId = client.createMultipartUpload(CreateMultipartUploadRequest.builder()
@@ -2587,6 +2592,20 @@ public final class Main {
             String value = item.asText("").trim();
             if (!value.isBlank()) {
                 values.add(value);
+            }
+        });
+        return values;
+    }
+
+    private static Map<String, String> stringMap(JsonNode node) {
+        Map<String, String> values = new LinkedHashMap<>();
+        if (node == null || !node.isObject()) {
+            return values;
+        }
+        node.fields().forEachRemaining(entry -> {
+            String value = entry.getValue().asText("").trim();
+            if (!value.isBlank()) {
+                values.put(entry.getKey(), value);
             }
         });
         return values;

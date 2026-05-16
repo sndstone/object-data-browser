@@ -80,12 +80,13 @@ class LocalAppStateRepository implements AppStateRepository {
     final file = await _stateFile();
     final previousIds = await _storedProfileIds(file);
     final nextIds = profiles.map((profile) => profile.id).toSet();
-    final inlineSecrets = <String, Map<String, String?>>{};
 
     for (final profile in profiles) {
       final persistedToSecureStore = await _writeProfileSecrets(profile);
       if (!persistedToSecureStore) {
-        inlineSecrets[profile.id] = _profileSecretsToJson(profile);
+        throw StateError(
+          'Secure credential storage is unavailable. Profile secrets were not saved to local plaintext state.',
+        );
       }
     }
     for (final removedId in previousIds.difference(nextIds)) {
@@ -100,7 +101,6 @@ class LocalAppStateRepository implements AppStateRepository {
         'profiles': profiles
             .map((profile) => _profileMetadataToJson(
                   profile,
-                  inlineSecrets: inlineSecrets[profile.id],
                 ))
             .toList(),
       }),
@@ -215,16 +215,14 @@ class LocalAppStateRepository implements AppStateRepository {
       await _secretStore.deleteSecret(_secretKey(profileId, 'secretKey'));
       await _secretStore.deleteSecret(_secretKey(profileId, 'sessionToken'));
     } catch (_) {
-      // Leave inline fallback cleanup to the next JSON write when secure storage
-      // is unavailable in local builds.
+      // Deleting a removed profile should not block saving the remaining state.
     }
   }
 
   Map<String, Object?> _profileMetadataToJson(
-    EndpointProfile profile, {
-    Map<String, String?>? inlineSecrets,
-  }) {
-    final json = <String, Object?>{
+    EndpointProfile profile,
+  ) {
+    return <String, Object?>{
       'id': profile.id,
       'name': profile.name,
       'endpointUrl': profile.endpointUrl,
@@ -240,10 +238,6 @@ class LocalAppStateRepository implements AppStateRepository {
       'maxAttempts': profile.maxAttempts,
       'maxRequestsPerSecond': profile.maxRequestsPerSecond,
     };
-    if (inlineSecrets != null) {
-      json['inlineSecrets'] = inlineSecrets;
-    }
-    return json;
   }
 
   Future<String?> _readSecret({
@@ -255,15 +249,6 @@ class LocalAppStateRepository implements AppStateRepository {
     } catch (_) {
       return null;
     }
-  }
-
-  Map<String, String?> _profileSecretsToJson(EndpointProfile profile) {
-    return {
-      'accessKey': profile.accessKey,
-      'secretKey': profile.secretKey,
-      'sessionToken':
-          (profile.sessionToken ?? '').isEmpty ? null : profile.sessionToken,
-    };
   }
 
   String _secretKey(String profileId, String field) {

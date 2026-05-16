@@ -220,6 +220,7 @@ abstract class EngineService {
     required String bucketName,
     required String prefix,
     required List<String> filePaths,
+    required Map<String, String> objectKeyByPath,
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
   });

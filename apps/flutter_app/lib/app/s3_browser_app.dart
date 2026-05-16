@@ -27,13 +27,24 @@ class S3BrowserApp extends StatefulWidget {
 
 class _S3BrowserAppState extends State<S3BrowserApp> {
   Timer? _benchmarkTimer;
-  static const List<WorkspaceTab> _navTabs = [
+  static const List<WorkspaceTab> _allNavTabs = [
     WorkspaceTab.browser,
     WorkspaceTab.tasks,
     WorkspaceTab.benchmark,
     WorkspaceTab.eventLog,
     WorkspaceTab.settings,
   ];
+
+  List<WorkspaceTab> _visibleNavTabs() {
+    final hideBenchmark = defaultTargetPlatform == TargetPlatform.android ||
+        defaultTargetPlatform == TargetPlatform.iOS;
+    if (!hideBenchmark) {
+      return _allNavTabs;
+    }
+    return _allNavTabs
+        .where((tab) => tab != WorkspaceTab.benchmark)
+        .toList(growable: false);
+  }
 
   @override
   void initState() {
@@ -95,13 +106,24 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
             builder: (context, constraints) {
               final phone = constraints.maxWidth < 700;
               final compact = constraints.maxWidth < 1200;
+              final navTabs = _visibleNavTabs();
+              final activeTab = navTabs.contains(controller.activeTab)
+                  ? controller.activeTab
+                  : WorkspaceTab.browser;
+              if (activeTab != controller.activeTab) {
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (mounted) {
+                    controller.selectTab(activeTab);
+                  }
+                });
+              }
               final body = AnimatedSwitcher(
                 duration: controller.settings.enableAnimations
                     ? const Duration(milliseconds: 280)
                     : Duration.zero,
                 switchInCurve: Curves.easeOutCubic,
                 switchOutCurve: Curves.easeInCubic,
-                child: switch (controller.activeTab) {
+                child: switch (activeTab) {
                   WorkspaceTab.browser => BrowserWorkspace(
                       key: const ValueKey('browser'),
                       controller: controller,
@@ -127,15 +149,19 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
               );
 
               return Scaffold(
-                bottomNavigationBar: phone ? _buildBottomNav(controller) : null,
+                bottomNavigationBar:
+                    phone ? _buildBottomNav(controller, navTabs) : null,
                 body: ColoredBox(
-                  color: Theme.of(context).colorScheme.inverseSurface,
+                  color: controller.settings.darkMode
+                      ? AppTheme.darkRail
+                      : Theme.of(context).colorScheme.inverseSurface,
                   child: SafeArea(
                     child: Stack(
                       children: [
                         Row(
                           children: [
-                            if (!compact) _buildRail(context, controller),
+                            if (!compact)
+                              _buildRail(context, controller, navTabs),
                             Expanded(
                               child: Container(
                                 decoration: BoxDecoration(
@@ -155,7 +181,7 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
                                       phone: phone,
                                     ),
                                     if (compact && !phone)
-                                      _buildTopTabs(controller),
+                                      _buildTopTabs(controller, navTabs),
                                     Expanded(child: body),
                                   ],
                                 ),
@@ -181,12 +207,18 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
     );
   }
 
-  Widget _buildRail(BuildContext context, AppController controller) {
+  Widget _buildRail(
+    BuildContext context,
+    AppController controller,
+    List<WorkspaceTab> navTabs,
+  ) {
     final theme = Theme.of(context);
     return Container(
       width: 126,
       padding: const EdgeInsets.fromLTRB(10, 18, 10, 12),
-      color: theme.colorScheme.inverseSurface,
+      color: controller.settings.darkMode
+          ? AppTheme.darkRail
+          : theme.colorScheme.inverseSurface,
       child: Column(
         children: [
           Container(
@@ -210,7 +242,7 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
             ),
           ),
           const SizedBox(height: 42),
-          ..._navTabs.map(
+          ...navTabs.map(
             (tab) => _RailDestination(
               selected: controller.activeTab == tab,
               icon: _tabIcon(tab, selected: false),
@@ -225,13 +257,16 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
     );
   }
 
-  Widget _buildTopTabs(AppController controller) {
+  Widget _buildTopTabs(
+    AppController controller,
+    List<WorkspaceTab> navTabs,
+  ) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
       child: CompactSelector<WorkspaceTab>(
         selected: controller.activeTab,
         onChanged: controller.selectTab,
-        options: _navTabs
+        options: navTabs
             .map(
               (tab) => CompactSelectorOption(
                 value: tab,
@@ -244,11 +279,16 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
     );
   }
 
-  Widget _buildBottomNav(AppController controller) {
+  Widget _buildBottomNav(
+    AppController controller,
+    List<WorkspaceTab> navTabs,
+  ) {
     return NavigationBar(
-      selectedIndex: _navTabs.indexOf(controller.activeTab),
-      onDestinationSelected: (index) => controller.selectTab(_navTabs[index]),
-      destinations: _navTabs
+      selectedIndex: navTabs.contains(controller.activeTab)
+          ? navTabs.indexOf(controller.activeTab)
+          : 0,
+      onDestinationSelected: (index) => controller.selectTab(navTabs[index]),
+      destinations: navTabs
           .map(
             (tab) => NavigationDestination(
               icon: Icon(_tabIcon(tab, selected: false)),

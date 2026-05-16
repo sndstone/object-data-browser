@@ -792,6 +792,9 @@ class MainActivity : FlutterActivity() {
         val bucketName = requireString(params, "bucketName", "Bucket name is required.")
         val prefix = params["prefix"]?.toString() ?: ""
         val filePaths = stringList(params["filePaths"])
+        val objectKeyByPath = stringAnyMap(params["objectKeyByPath"]).mapValues {
+            it.value?.toString().orEmpty()
+        }
         val multipartThresholdMiB = (params["multipartThresholdMiB"] as? Number)?.toInt() ?: 32
         val multipartChunkMiB = (params["multipartChunkMiB"] as? Number)?.toInt() ?: 8
         if (filePaths.isEmpty()) {
@@ -831,7 +834,9 @@ class MainActivity : FlutterActivity() {
             if (!source.exists()) {
                 throw EngineFailure("invalid_config", "Upload source was not found: $filePath")
             }
-            val destinationKey = buildDestinationKey(prefix, source.name)
+            val destinationName = objectKeyByPath[filePath]?.takeIf { it.isNotBlank() }
+                ?: source.name
+            val destinationKey = buildDestinationKey(prefix, destinationName)
             val metadata = ObjectMetadata().apply {
                 contentLength = source.length()
             }
@@ -2031,7 +2036,8 @@ class MainActivity : FlutterActivity() {
 
     private fun buildDestinationKey(prefix: String, fileName: String): String {
         val normalizedPrefix = ensureTrailingSlash(prefix).takeIf { it.isNotBlank() } ?: ""
-        return "$normalizedPrefix$fileName"
+        val normalizedName = fileName.replace('\\', '/').trimStart('/')
+        return "$normalizedPrefix$normalizedName"
     }
 
     private fun ensureTrailingSlash(value: String): String {

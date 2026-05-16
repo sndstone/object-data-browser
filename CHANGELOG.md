@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.16 - 2026-05-16
+
+- Added folder-aware uploads that preserve relative object keys for backup-style transfers.
+- Hid the benchmark workspace on Android and iOS navigation surfaces.
+- Fixed Android platform-channel map normalization for bucket listing.
+
 ## 2.0.15 - 2026-05-08
 
 - Renamed the application and packaging metadata to Object Data Browser.

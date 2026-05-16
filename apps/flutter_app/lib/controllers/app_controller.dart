@@ -1010,7 +1010,10 @@ class AppController extends ChangeNotifier {
     });
   }
 
-  Future<void> startSampleUpload(List<String> filePaths) async {
+  Future<void> startSampleUpload(
+    List<String> filePaths, {
+    Map<String, String> objectKeyByPath = const <String, String>{},
+  }) async {
     final profile = selectedProfile;
     final bucket = selectedBucket;
     if (profile == null || bucket == null || filePaths.isEmpty) {
@@ -1024,6 +1027,7 @@ class AppController extends ChangeNotifier {
           bucketName: bucket.name,
           prefix: currentPrefix,
           filePaths: filePaths,
+          objectKeyByPath: objectKeyByPath,
           multipartThresholdMiB: settings.multipartThresholdMiB,
           multipartChunkMiB: settings.multipartChunkMiB,
         );
@@ -1035,7 +1039,7 @@ class AppController extends ChangeNotifier {
           level: 'INFO',
           category: 'Transfers',
           message:
-              'Started upload job ${job.id} for ${filePaths.length} files into ${bucket.name}.',
+              'Started upload job ${job.id} for ${filePaths.length} file(s) into ${bucket.name}.',
           includeSelectionContext: true,
           source: 'task-tray',
         );

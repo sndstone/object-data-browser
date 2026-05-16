@@ -4,9 +4,9 @@ import 'package:s3_browser_crossplat/models/domain_models.dart';
 import 'package:s3_browser_crossplat/settings/version_details_catalog.dart';
 
 void main() {
-  test('application version is 2.0.14', () {
-    expect(kApplicationVersion, '2.0.14');
-    expect(kApplicationBuild, '2.0.14+1');
+  test('application version is 2.0.16', () {
+    expect(kApplicationVersion, '2.0.16');
+    expect(kApplicationBuild, '2.0.16+1');
   });
 
   test('android version details exclude desktop-only dependency entries', () {

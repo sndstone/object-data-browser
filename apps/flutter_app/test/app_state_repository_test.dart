@@ -68,7 +68,7 @@ const _profile = EndpointProfile(
 
 void main() {
   test(
-      'repository falls back to inline secrets when secure storage is unavailable',
+      'repository refuses to write plaintext secrets when secure storage is unavailable',
       () async {
     final tempDir =
         await Directory.systemTemp.createTemp('app-state-repository-test');
@@ -79,22 +79,18 @@ void main() {
       applicationSupportDirectoryProvider: () async => tempDir,
     );
 
-    await repository.saveState(
-      settings: _settings,
-      profiles: const [_profile],
-      selectedProfileId: _profile.id,
+    expect(
+      repository.saveState(
+        settings: _settings,
+        profiles: const [_profile],
+        selectedProfileId: _profile.id,
+      ),
+      throwsStateError,
     );
 
     final storedFile = File(
       '${tempDir.path}${Platform.pathSeparator}object-data-browser-state.json',
     );
-    final storedJson = await storedFile.readAsString();
-    expect(storedJson, contains('inlineSecrets'));
-
-    final restored = await repository.loadState();
-    expect(restored, isNotNull);
-    expect(restored!.profiles.single.accessKey, _profile.accessKey);
-    expect(restored.profiles.single.secretKey, _profile.secretKey);
-    expect(restored.profiles.single.sessionToken, _profile.sessionToken);
+    expect(await storedFile.exists(), isFalse);
   });
 }

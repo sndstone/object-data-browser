@@ -60,7 +60,7 @@ class AndroidEngineService
           id: value['id'] as String? ?? 'android',
           label: value['label'] as String? ?? 'Android Engine',
           language: value['language'] as String? ?? 'native',
-          version: value['version'] as String? ?? '2.0.10',
+          version: value['version'] as String? ?? '2.0.16',
           available: value['available'] as bool? ?? true,
           desktopSupported: false,
           androidSupported: true,
@@ -575,6 +575,7 @@ class AndroidEngineService
     required String bucketName,
     required String prefix,
     required List<String> filePaths,
+    required Map<String, String> objectKeyByPath,
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
   }) async {
@@ -586,6 +587,7 @@ class AndroidEngineService
         'bucketName': bucketName,
         'prefix': prefix,
         'filePaths': filePaths,
+        'objectKeyByPath': objectKeyByPath,
         'multipartThresholdMiB': multipartThresholdMiB,
         'multipartChunkMiB': multipartChunkMiB,
       },
@@ -891,7 +893,7 @@ class AndroidEngineService
     );
 
     try {
-      final result = await _channel.invokeMapMethod<String, Object?>(
+      final result = await _channel.invokeMethod<Object?>(
         'dispatch',
         <String, Object?>{
           'engineId': engineId,
@@ -899,7 +901,7 @@ class AndroidEngineService
           'params': params,
         },
       );
-      final payload = Map<String, Object?>.from(result ?? const {});
+      final payload = _stringKeyedMap(result);
       final latencyMs = DateTime.now().difference(startedAt).inMilliseconds;
       final responseHead = {
         'engineId': engineId,
@@ -940,12 +942,14 @@ class AndroidEngineService
 
       final error = payload['error'];
       if (error is Map) {
-        final mappedError = Map<String, Object?>.from(error);
+        final mappedError = _stringKeyedMap(error);
         throw EngineException(
           code: _parseErrorCode(mappedError['code'] as String?),
           message:
               (mappedError['message'] as String?) ?? 'Unknown engine error.',
-          details: mappedError['details'] as Map<String, Object?>?,
+          details: mappedError['details'] is Map
+              ? _stringKeyedMap(mappedError['details'])
+              : null,
         );
       }
 
@@ -974,11 +978,29 @@ class AndroidEngineService
       throw EngineException(
         code: _parseErrorCode(error.code),
         message: error.message ?? 'Android engine bridge failed.',
-        details: error.details is Map
-            ? Map<String, Object?>.from(error.details as Map)
-            : null,
+        details: error.details is Map ? _stringKeyedMap(error.details) : null,
       );
     }
+  }
+
+  static Map<String, Object?> _stringKeyedMap(Object? value) {
+    if (value is! Map) {
+      return <String, Object?>{};
+    }
+    return value.map(
+      (key, mapValue) =>
+          MapEntry(key.toString(), _normalizeChannelValue(mapValue)),
+    );
+  }
+
+  static Object? _normalizeChannelValue(Object? value) {
+    if (value is Map) {
+      return _stringKeyedMap(value);
+    }
+    if (value is List) {
+      return value.map(_normalizeChannelValue).toList(growable: false);
+    }
+    return value;
   }
 
   Future<Map<String, Object?>> _missingPluginFallback({
