@@ -60,7 +60,7 @@ class AndroidEngineService
           id: value['id'] as String? ?? 'android',
           label: value['label'] as String? ?? 'Android Engine',
           language: value['language'] as String? ?? 'native',
-          version: value['version'] as String? ?? '2.0.16',
+          version: value['version'] as String? ?? '2.0.17',
           available: value['available'] as bool? ?? true,
           desktopSupported: false,
           androidSupported: true,

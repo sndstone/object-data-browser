@@ -276,7 +276,7 @@ public final class Main {
     private static Map<String, Object> health() {
         return orderedMap(
             "engine", "java",
-            "version", "2.0.10",
+            "version", "2.0.17",
             "available", true,
             "methods", SUPPORTED_METHODS,
             "nativeSdk", "aws-sdk-java-v2"

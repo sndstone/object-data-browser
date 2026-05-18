@@ -344,7 +344,7 @@ def _health() -> dict[str, Any]:
 
     return {
         "engine": "python",
-        "version": "2.0.10",
+        "version": "2.0.17",
         "available": available,
         "dependencyState": dependency_state,
         "methods": [

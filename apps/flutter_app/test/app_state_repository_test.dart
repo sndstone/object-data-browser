@@ -50,8 +50,8 @@ const _settings = AppSettings(
   benchmarkLogPath: '/tmp/benchmark.log',
   browserInspectorLayout: BrowserInspectorLayout.bottom,
   browserInspectorSize: 360,
-  uiScalePercent: 80,
-  logTextScalePercent: 90,
+  uiScalePercent: 70,
+  logTextScalePercent: 80,
 );
 
 const _profile = EndpointProfile(

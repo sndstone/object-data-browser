@@ -99,6 +99,7 @@ case "$PLATFORM" in
       exit 1
     fi
     "$ROOT_DIR/scripts/stage-engines.sh" --release-dir "$MACOS_APP_DIR" --tools-dir "$TOOLS_DIR" --arch "$ARCH"
+    codesign --force --sign - "$MACOS_APP_DIR"
     "$ROOT_DIR/scripts/package-macos.sh" --app-bundle "$MACOS_APP_DIR" --arch "$ARCH"
     ;;
   android)

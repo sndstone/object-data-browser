@@ -1380,6 +1380,8 @@ class DesktopSidecarEngineService
     }
 
     final candidates = <String>[
+      _join(File(Platform.resolvedExecutable).parent.parent.path, 'Resources',
+          'engines'),
       _join(File(Platform.resolvedExecutable).parent.path, 'engines'),
       _join(Directory.current.path, 'engines'),
       _join(Directory.current.path, '..', '..', 'engines'),
@@ -1993,7 +1995,7 @@ class _EngineManifestEntry {
   factory _EngineManifestEntry.fromJson(Map<String, Object?> json) {
     return _EngineManifestEntry(
       id: json['id'] as String? ?? '',
-      version: json['version'] as String? ?? '2.0.16',
+      version: json['version'] as String? ?? '2.0.17',
       executable: json['executable'] as String? ?? '',
       arguments: (json['arguments'] as List<Object?>? ?? const [])
           .map((item) => item.toString())

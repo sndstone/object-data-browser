@@ -41,40 +41,41 @@ class TestAppController extends AppController {
   }
 }
 
-Future<TestAppController> _buildController() async {
+Future<TestAppController> _buildController({AppSettings? settings}) async {
   final controller = TestAppController(
     engineService: MockEngineService(),
-    initialSettings: const AppSettings(
-      darkMode: false,
-      defaultEngineId: 'rust',
-      downloadPath: r'C:\Temp\downloads',
-      tempPath: r'C:\Temp',
-      transferConcurrency: 8,
-      multipartThresholdMiB: 32,
-      multipartChunkMiB: 8,
-      enableAnimations: true,
-      enableDiagnostics: true,
-      enableApiLogging: false,
-      enableDebugLogging: false,
-      safeRetries: 3,
-      benchmarkChartSmoothing: true,
-      retryBaseDelayMs: 250,
-      retryMaxDelayMs: 4000,
-      requestDelayMs: 0,
-      connectTimeoutSeconds: 5,
-      readTimeoutSeconds: 60,
-      maxPoolConnections: 200,
-      maxRequestsPerSecond: 0,
-      enableCrashRecovery: true,
-      defaultPresignMinutes: 60,
-      benchmarkDataCacheMb: 0,
-      benchmarkDebugMode: false,
-      benchmarkLogPath: r'C:\Temp\benchmark.log',
-      browserInspectorLayout: BrowserInspectorLayout.bottom,
-      browserInspectorSize: 360,
-      uiScalePercent: 80,
-      logTextScalePercent: 90,
-    ),
+    initialSettings: settings ??
+        const AppSettings(
+          darkMode: false,
+          defaultEngineId: 'rust',
+          downloadPath: r'C:\Temp\downloads',
+          tempPath: r'C:\Temp',
+          transferConcurrency: 8,
+          multipartThresholdMiB: 32,
+          multipartChunkMiB: 8,
+          enableAnimations: true,
+          enableDiagnostics: true,
+          enableApiLogging: false,
+          enableDebugLogging: false,
+          safeRetries: 3,
+          benchmarkChartSmoothing: true,
+          retryBaseDelayMs: 250,
+          retryMaxDelayMs: 4000,
+          requestDelayMs: 0,
+          connectTimeoutSeconds: 5,
+          readTimeoutSeconds: 60,
+          maxPoolConnections: 200,
+          maxRequestsPerSecond: 0,
+          enableCrashRecovery: true,
+          defaultPresignMinutes: 60,
+          benchmarkDataCacheMb: 0,
+          benchmarkDebugMode: false,
+          benchmarkLogPath: r'C:\Temp\benchmark.log',
+          browserInspectorLayout: BrowserInspectorLayout.bottom,
+          browserInspectorSize: 360,
+          uiScalePercent: 70,
+          logTextScalePercent: 80,
+        ),
     initialProfiles: const [
       EndpointProfile(
         id: 'test',
@@ -247,8 +248,8 @@ void main() {
         benchmarkLogPath: r'C:\Temp\benchmark.log',
         browserInspectorLayout: BrowserInspectorLayout.bottom,
         browserInspectorSize: 360,
-        uiScalePercent: 80,
-        logTextScalePercent: 90,
+        uiScalePercent: 70,
+        logTextScalePercent: 80,
       ),
       initialProfiles: const [
         EndpointProfile(
@@ -400,6 +401,103 @@ void main() {
     );
     expect(find.text('Objects'), findsWidgets);
     expect(find.byTooltip('More actions'), findsOneWidget);
+  });
+
+  testWidgets('compact desktop browser opens inspector from nested action', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(960, 900));
+
+    final controller = await _buildController();
+    await controller.updateSettings(
+      controller.settings.copyWith(browserInspectorSize: 560),
+    );
+
+    await tester.pumpWidget(
+      _browserApp(
+        controller,
+        size: const Size(960, 900),
+        compact: true,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Inspector'), findsNothing);
+    expect(
+      find.text(
+        'Drag and drop files here to upload them into the current bucket prefix.',
+      ),
+      findsNothing,
+    );
+    expect(find.widgetWithText(OutlinedButton, 'Create prefix'), findsNothing);
+    expect(find.widgetWithText(FilterChip, 'List all'), findsNothing);
+
+    final objectListSize =
+        tester.getSize(find.byKey(const ValueKey('object-panel-list')));
+    expect(objectListSize.height, greaterThan(360));
+
+    await tester.tap(find.byTooltip('Inspector'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Inspector'), findsOneWidget);
+    expect(find.text('Bucket info'), findsOneWidget);
+  });
+
+  testWidgets('compact desktop browser exposes lesser actions in menu', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1199, 800));
+
+    final controller = await _buildController();
+    await tester.pumpWidget(
+      _browserApp(
+        controller,
+        size: const Size(1199, 800),
+        compact: true,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.widgetWithText(OutlinedButton, 'Delete'), findsNothing);
+    expect(find.widgetWithText(OutlinedButton, 'Create prefix'), findsNothing);
+    await tester.tap(find.byTooltip('More actions'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Object actions'), findsOneWidget);
+    expect(find.widgetWithText(OutlinedButton, 'Inspector'), findsOneWidget);
+    expect(
+        find.widgetWithText(OutlinedButton, 'Create prefix'), findsOneWidget);
+    expect(find.widgetWithText(OutlinedButton, 'List all'), findsOneWidget);
+    expect(find.text('Flat view'), findsOneWidget);
+  });
+
+  testWidgets('wide desktop browser keeps persistent inspector and drag bar', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1024));
+
+    final controller = await _buildController();
+    await tester.pumpWidget(
+      _browserApp(
+        controller,
+        size: const Size(1440, 1024),
+        compact: false,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Inspector'), findsOneWidget);
+    expect(
+      find.text(
+        'Drag and drop files here to upload them into the current bucket prefix.',
+      ),
+      findsOneWidget,
+    );
+    expect(
+        find.widgetWithText(OutlinedButton, 'Create prefix'), findsOneWidget);
   });
 
   testWidgets('tasks workspace renders top-level running task details', (

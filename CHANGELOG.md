@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.17 - 2026-05-18
+
+- Fixed compact desktop inspector resize bounds so small macOS and Windows windows no longer crash with invalid clamp arguments.
+- Reworked the 700-1199px browser layout to prioritize object rows by moving the inspector and lesser-used object actions into nested menus.
+- Hid the compact desktop drag-and-drop hint while preserving desktop drop uploads.
+- Updated fresh-install defaults to 70% UI scale and 80% log text scale for denser mid-size layouts.
+- Added macOS DMG packaging verification and refreshed app, sidecar, and packaging metadata.
+
 ## 2.0.16 - 2026-05-16
 
 - Added folder-aware uploads that preserve relative object keys for backup-style transfers.

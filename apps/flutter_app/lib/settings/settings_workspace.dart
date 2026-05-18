@@ -277,7 +277,7 @@ class SettingsWorkspace extends StatelessWidget {
               contentPadding: EdgeInsets.zero,
               title: Text('UI scale: ${settings.uiScalePercent}%'),
               subtitle: const Text(
-                'Smaller values fit more controls onscreen. Below 80% also reduces padding and element sizing. 75% is the default.',
+                'Smaller values fit more controls onscreen. Below 80% also reduces padding and element sizing. 70% is the default.',
               ),
             ),
             Slider(
@@ -564,13 +564,16 @@ class SettingsWorkspace extends StatelessWidget {
           border: Border.all(color: theme.colorScheme.outlineVariant),
         ),
         padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(title, style: theme.textTheme.titleLarge),
-            const SizedBox(height: 8),
-            ...children,
-          ],
+        child: Material(
+          color: Colors.transparent,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: theme.textTheme.titleLarge),
+              const SizedBox(height: 8),
+              ...children,
+            ],
+          ),
         ),
       ),
     );

@@ -1349,7 +1349,7 @@ class AppSettings {
   }
 
   factory AppSettings.fromJson(Map<String, Object?> json) {
-    final uiScalePercent = (json['uiScalePercent'] as num?)?.toInt() ?? 75;
+    final uiScalePercent = (json['uiScalePercent'] as num?)?.toInt() ?? 70;
     return AppSettings(
       darkMode: json['darkMode'] as bool? ?? false,
       defaultEngineId: (json['defaultEngineId'] as String?) ?? 'python',
@@ -1387,7 +1387,7 @@ class AppSettings {
       browserInspectorSize:
           (json['browserInspectorSize'] as num?)?.toInt() ?? 360,
       uiScalePercent: uiScalePercent,
-      logTextScalePercent: (json['logTextScalePercent'] as num?)?.toInt() ?? 90,
+      logTextScalePercent: (json['logTextScalePercent'] as num?)?.toInt() ?? 80,
     );
   }
 
