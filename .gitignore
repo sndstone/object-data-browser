@@ -3,6 +3,7 @@
 .flutter-plugins-dependencies
 .packages
 .tmp/
+.gradle/
 build/
 dist/
 coverage/

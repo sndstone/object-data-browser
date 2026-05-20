@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../controllers/app_controller.dart';
 import '../logs/structured_log_list.dart';
@@ -265,6 +266,111 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     }
   }
 
+  Future<void> _showObjectMenu(
+    BuildContext context,
+    ObjectEntry object,
+    Offset position,
+  ) async {
+    await controller.selectObjectForContextMenu(object);
+    if (!mounted) {
+      return;
+    }
+    final selected = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        position.dx,
+        position.dy,
+      ),
+      items: [
+        if (object.isFolder && !controller.flatView)
+          const PopupMenuItem(
+            value: 'open-folder',
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.folder_open_outlined),
+              title: Text('Open folder'),
+            ),
+          )
+        else ...[
+          const PopupMenuItem(
+            value: 'inspect',
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.article_outlined),
+              title: Text('Inspect object'),
+            ),
+          ),
+          const PopupMenuItem(
+            value: 'download',
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.download),
+              title: Text('Download'),
+            ),
+          ),
+          const PopupMenuItem(
+            value: 'presign',
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.link),
+              title: Text('Generate presigned URL'),
+            ),
+          ),
+        ],
+        const PopupMenuItem(
+          value: 'copy-key',
+          child: ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.key_outlined),
+            title: Text('Copy key'),
+          ),
+        ),
+        const PopupMenuDivider(),
+        PopupMenuItem(
+          value: 'delete',
+          enabled: !object.isFolder,
+          child: const ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.delete_outline),
+            title: Text('Delete'),
+          ),
+        ),
+      ],
+    );
+    if (!mounted || selected == null) {
+      return;
+    }
+    switch (selected) {
+      case 'open-folder':
+        await controller.openFolder(object);
+        return;
+      case 'inspect':
+        await controller.selectObjectFromList(object, openFolders: false);
+        return;
+      case 'download':
+        await controller.startSampleDownload();
+        return;
+      case 'presign':
+        await controller.generateSelectedPresignedUrl();
+        return;
+      case 'copy-key':
+        await Clipboard.setData(ClipboardData(text: object.key));
+        controller.showBannerMessage(
+          'Copied object key.',
+          category: 'Objects',
+          source: 'object-browser',
+        );
+        return;
+      case 'delete':
+        await controller.deleteSelectedObject();
+        return;
+      default:
+        return;
+    }
+  }
+
   Widget _mobileBrowserShell(BuildContext context) {
     final hasProfile = controller.selectedProfile != null;
     final hasBucket = controller.selectedBucket != null;
@@ -458,7 +564,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
 
   Future<void> _showMobileObjectActions(BuildContext context) async {
     final hasBucket = controller.selectedBucket != null;
-    final hasSelectedObject = controller.selectedObject != null;
+    final hasSelectedObject = controller.operationSelectedObjects.isNotEmpty;
     final rootContext = context;
     await showModalBottomSheet<void>(
       context: context,
@@ -680,7 +786,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         (MediaQuery.sizeOf(context).height * 0.78).clamp(560.0, 920.0);
     final hasProfile = controller.selectedProfile != null;
     final hasBucket = controller.selectedBucket != null;
-    final hasSelectedObject = controller.selectedObject != null;
+    final hasSelectedObject = controller.operationSelectedObjects.isNotEmpty;
     final objects = controller.pagedVisibleObjects;
     final filteredObjectCount = controller.visibleObjects.length;
     final loadedObjectCount = controller.objects.length;
@@ -690,6 +796,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     final isDownloading = controller.isBusy('download');
     final isDeleting = controller.isBusy('delete-object');
     final isSelectingObject = controller.isBusy('select-object');
+    final selectedFileCount = controller.operationSelectedObjects.length;
     final panelPadding = denseObjectControls ? 12.0 : 16.0;
     final controlSpacing = denseObjectControls ? 8.0 : 12.0;
     final mobileControlSpacing = phone ? 8.0 : controlSpacing;
@@ -825,7 +932,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
 
     Widget mobileDownloadButton() {
       return IconButton.filledTonal(
-        tooltip: isDownloading ? 'Downloading...' : 'Download',
+        tooltip: isDownloading
+            ? 'Downloading...'
+            : selectedFileCount <= 1
+                ? 'Download'
+                : 'Download $selectedFileCount objects',
         onPressed: hasSelectedObject && !isDownloading
             ? controller.startSampleDownload
             : null,
@@ -863,9 +974,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             key: _objectListKey,
             child: _ObjectTable(
               objects: objects,
-              selectedKey: controller.selectedObject?.key,
+              selectedKeys: controller.selectedObjectKeys,
               contentTypeFor: controller.objectContentType,
-              onSelect: controller.setSelectedObject,
+              onSelect: controller.selectObjectFromList,
+              onSelectRows: controller.setObjectSelectionForRows,
+              onShowObjectMenu: _showObjectMenu,
             ),
           );
 
@@ -895,7 +1008,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                 if (hasBucket)
                   Chip(
                     visualDensity: VisualDensity.compact,
-                    label: Text('$filteredObjectCount objects'),
+                    label: Text(
+                      controller.selectedObjectCount == 0
+                          ? '$filteredObjectCount objects'
+                          : '${controller.selectedObjectCount} selected',
+                    ),
                   ),
               ],
             ),
@@ -1000,7 +1117,13 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                     icon: isDownloading
                         ? _inlineSpinner()
                         : const Icon(Icons.download),
-                    label: Text(isDownloading ? 'Downloading...' : 'Download'),
+                    label: Text(
+                      isDownloading
+                          ? 'Downloading...'
+                          : selectedFileCount <= 1
+                              ? 'Download'
+                              : 'Download $selectedFileCount',
+                    ),
                   ),
                   OutlinedButton.icon(
                     onPressed: hasSelectedObject && !isDeleting
@@ -1009,7 +1132,13 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                     icon: isDeleting
                         ? _inlineSpinner()
                         : const Icon(Icons.delete_outline),
-                    label: Text(isDeleting ? 'Deleting...' : 'Delete'),
+                    label: Text(
+                      isDeleting
+                          ? 'Deleting...'
+                          : selectedFileCount <= 1
+                              ? 'Delete'
+                              : 'Delete $selectedFileCount',
+                    ),
                   ),
                   OutlinedButton.icon(
                     onPressed: hasBucket
@@ -1546,7 +1675,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   Widget _versionsView(BuildContext context) {
     final options = controller.versionBrowserOptions;
     final versions = controller.visibleVersions;
-    final hasSelectedObject = controller.selectedObject != null;
+    final hasSelectedObject = controller.operationSelectedObjects.isNotEmpty;
 
     return _adaptivePanelListView(
       context,
@@ -2493,18 +2622,40 @@ class _CreatePrefixDialogState extends State<_CreatePrefixDialog> {
   }
 }
 
+typedef _ObjectSelectCallback = Future<void> Function(
+  ObjectEntry object, {
+  bool toggle,
+  bool range,
+  bool openFolders,
+});
+
+typedef _ObjectRowsSelectionCallback = void Function(
+  List<ObjectEntry> rows,
+  bool selected,
+);
+
+typedef _ObjectMenuCallback = Future<void> Function(
+  BuildContext context,
+  ObjectEntry object,
+  Offset position,
+);
+
 class _ObjectTable extends StatelessWidget {
   const _ObjectTable({
     required this.objects,
-    required this.selectedKey,
+    required this.selectedKeys,
     required this.contentTypeFor,
     required this.onSelect,
+    required this.onSelectRows,
+    required this.onShowObjectMenu,
   });
 
   final List<ObjectEntry> objects;
-  final String? selectedKey;
+  final Set<String> selectedKeys;
   final String Function(ObjectEntry object) contentTypeFor;
-  final ValueChanged<ObjectEntry> onSelect;
+  final _ObjectSelectCallback onSelect;
+  final _ObjectRowsSelectionCallback onSelectRows;
+  final _ObjectMenuCallback onShowObjectMenu;
 
   @override
   Widget build(BuildContext context) {
@@ -2523,6 +2674,11 @@ class _ObjectTable extends StatelessWidget {
         final typeWidth = veryNarrow ? 48.0 : (narrow ? 62.0 : 84.0);
         final horizontalPadding = narrow ? 4.0 : 8.0;
         final nameGap = narrow ? 6.0 : 10.0;
+        final selectedCount =
+            objects.where((object) => selectedKeys.contains(object.key)).length;
+        final allSelected =
+            objects.isNotEmpty && selectedCount == objects.length;
+        final partlySelected = selectedCount > 0 && !allSelected;
 
         return Column(
           children: [
@@ -2536,7 +2692,18 @@ class _ObjectTable extends StatelessWidget {
               ),
               child: Row(
                 children: [
-                  SizedBox(width: selectWidth),
+                  SizedBox(
+                    width: selectWidth,
+                    child: Checkbox(
+                      value: partlySelected ? null : allSelected,
+                      tristate: true,
+                      onChanged: objects.isEmpty
+                          ? null
+                          : (_) => onSelectRows(objects, !allSelected),
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      visualDensity: VisualDensity.compact,
+                    ),
+                  ),
                   Expanded(
                     child: Text('Name', style: headerStyle),
                   ),
@@ -2567,7 +2734,35 @@ class _ObjectTable extends StatelessWidget {
                 ),
                 itemBuilder: (context, index) {
                   final object = objects[index];
-                  final selected = selectedKey == object.key;
+                  final selected = selectedKeys.contains(object.key);
+                  Future<void> selectFromPointer() {
+                    final pressed =
+                        HardwareKeyboard.instance.logicalKeysPressed;
+                    final toggle =
+                        pressed.contains(LogicalKeyboardKey.controlLeft) ||
+                            pressed.contains(LogicalKeyboardKey.controlRight) ||
+                            pressed.contains(LogicalKeyboardKey.metaLeft) ||
+                            pressed.contains(LogicalKeyboardKey.metaRight);
+                    final range =
+                        pressed.contains(LogicalKeyboardKey.shiftLeft) ||
+                            pressed.contains(LogicalKeyboardKey.shiftRight);
+                    return onSelect(
+                      object,
+                      toggle: toggle,
+                      range: range,
+                    );
+                  }
+
+                  Offset menuAnchorForRow() {
+                    final box = context.findRenderObject() as RenderBox?;
+                    if (box == null) {
+                      return Offset.zero;
+                    }
+                    return box.localToGlobal(
+                      Offset(box.size.width / 2, box.size.height / 2),
+                    );
+                  }
+
                   return Material(
                     color: selected
                         ? theme.colorScheme.primaryContainer
@@ -2576,7 +2771,17 @@ class _ObjectTable extends StatelessWidget {
                     borderRadius: BorderRadius.circular(6),
                     child: InkWell(
                       borderRadius: BorderRadius.circular(6),
-                      onTap: () => onSelect(object),
+                      onTap: selectFromPointer,
+                      onSecondaryTapDown: (details) => onShowObjectMenu(
+                        context,
+                        object,
+                        details.globalPosition,
+                      ),
+                      onLongPress: () => onShowObjectMenu(
+                        context,
+                        object,
+                        menuAnchorForRow(),
+                      ),
                       child: Container(
                         height: narrow ? 36 : 38,
                         padding:
@@ -2585,14 +2790,16 @@ class _ObjectTable extends StatelessWidget {
                           children: [
                             SizedBox(
                               width: selectWidth,
-                              child: Icon(
-                                selected
-                                    ? Icons.check_box
-                                    : Icons.check_box_outline_blank,
-                                size: narrow ? 16 : 18,
-                                color: selected
-                                    ? theme.colorScheme.primary
-                                    : theme.colorScheme.outline,
+                              child: Checkbox(
+                                value: selected,
+                                onChanged: (_) => onSelect(
+                                  object,
+                                  toggle: true,
+                                  openFolders: false,
+                                ),
+                                materialTapTargetSize:
+                                    MaterialTapTargetSize.shrinkWrap,
+                                visualDensity: VisualDensity.compact,
                               ),
                             ),
                             Expanded(
