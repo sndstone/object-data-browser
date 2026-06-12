@@ -68,6 +68,92 @@ class _ChartSeries {
   final List<_ChartPoint> points;
 }
 
+class _BenchmarkPreset {
+  const _BenchmarkPreset({
+    required this.id,
+    required this.label,
+    required this.description,
+    required this.workloadType,
+    required this.objectSizes,
+    required this.concurrentThreads,
+    required this.objectCount,
+    required this.durationSeconds,
+    required this.maxPoolConnections,
+    this.validateChecksum,
+    this.reducedLogging,
+  });
+
+  final String id;
+  final String label;
+  final String description;
+  final String workloadType;
+  final List<int> objectSizes;
+  final int concurrentThreads;
+  final int objectCount;
+  final int durationSeconds;
+  final int maxPoolConnections;
+
+  /// Only applied (and matched) when non-null; presets that do not care about
+  /// these switches leave the user's current setting untouched.
+  final bool? validateChecksum;
+  final bool? reducedLogging;
+}
+
+const List<_BenchmarkPreset> _benchmarkPresets = <_BenchmarkPreset>[
+  _BenchmarkPreset(
+    id: 'quick-check',
+    label: 'Quick check',
+    description:
+        '1 MiB objects · 16 threads · 512 object pool · 30 s · read-heavy · 128 pool connections',
+    workloadType: 'read-heavy',
+    objectSizes: <int>[1048576],
+    concurrentThreads: 16,
+    objectCount: 512,
+    durationSeconds: 30,
+    maxPoolConnections: 128,
+  ),
+  _BenchmarkPreset(
+    id: 'standard',
+    label: 'Standard',
+    description:
+        '64 KiB + 1 MiB + 8 MiB objects · 64 threads · 4096 object pool · 60 s · mixed · 512 pool connections',
+    workloadType: 'mixed',
+    objectSizes: <int>[65536, 1048576, 8388608],
+    concurrentThreads: 64,
+    objectCount: 4096,
+    durationSeconds: 60,
+    maxPoolConnections: 512,
+  ),
+  _BenchmarkPreset(
+    id: 'throughput-stress',
+    label: 'Throughput stress',
+    description:
+        '16 MiB + 64 MiB objects · 128 threads · 2048 object pool · 300 s · write-heavy · 1024 pool connections · checksums off · reduced logging',
+    workloadType: 'write-heavy',
+    objectSizes: <int>[16777216, 67108864],
+    concurrentThreads: 128,
+    objectCount: 2048,
+    durationSeconds: 300,
+    maxPoolConnections: 1024,
+    validateChecksum: false,
+    reducedLogging: true,
+  ),
+  _BenchmarkPreset(
+    id: 'iops-stress',
+    label: 'IOPS stress (small objects)',
+    description:
+        '4 KiB + 16 KiB objects · 256 threads · 8192 object pool · 300 s · mixed · 1024 pool connections · checksums off · reduced logging',
+    workloadType: 'mixed',
+    objectSizes: <int>[4096, 16384],
+    concurrentThreads: 256,
+    objectCount: 8192,
+    durationSeconds: 300,
+    maxPoolConnections: 1024,
+    validateChecksum: false,
+    reducedLogging: true,
+  ),
+];
+
 class BenchmarkWorkspace extends StatefulWidget {
   const BenchmarkWorkspace({
     super.key,
@@ -290,9 +376,12 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             trailing: Text(controller.activeEngineId),
           ),
           const SizedBox(height: 14),
+          _presetSelector(context, config),
+          const SizedBox(height: 14),
           Text('Workload', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 6),
           DropdownButtonFormField<String>(
+            key: ValueKey('benchmark-workload-${config.workloadType}'),
             initialValue: config.workloadType,
             decoration: _fieldDecoration(label: 'Workload'),
             items: const [
@@ -356,6 +445,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
           ),
           const SizedBox(height: 8),
           DropdownButtonFormField<String>(
+            key: ValueKey('benchmark-test-mode-${config.testMode}'),
             initialValue: config.testMode,
             decoration: _fieldDecoration(label: 'Run mode'),
             items: const [
@@ -598,7 +688,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
           const Padding(
             padding: EdgeInsets.only(top: 2, bottom: 2),
             child: Text(
-              'Tip: push Threads and Pool first. Turn off checksum validation and keep reduced logging on for the fastest baseline.',
+              'Tip: start from a preset — Throughput stress and IOPS stress are the ones that truly saturate a target. To push further, raise Threads and Pool first, turn off checksum validation, and keep reduced logging on.',
               style: TextStyle(fontStyle: FontStyle.italic),
             ),
           ),
@@ -2413,6 +2503,127 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
           ),
         ),
       ),
+    );
+  }
+
+  Widget _presetSelector(BuildContext context, BenchmarkConfig config) {
+    final activePresetId = _activePresetId(config);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Presets', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            for (final preset in _benchmarkPresets)
+              ChoiceChip(
+                key: ValueKey('benchmark-preset-${preset.id}'),
+                label: Text(preset.label),
+                tooltip: preset.description,
+                selected: activePresetId == preset.id,
+                onSelected: (_) => _applyBenchmarkPreset(preset),
+              ),
+            ChoiceChip(
+              key: const ValueKey('benchmark-preset-custom'),
+              label: const Text('Custom'),
+              tooltip:
+                  'Active when the fields below differ from every preset. Edit any field to get here.',
+              selected: activePresetId == null,
+              onSelected: (_) {},
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            color: Theme.of(context).colorScheme.surfaceContainerHighest,
+          ),
+          child: const Text(
+            'Presets fill the fields below; edit anything afterwards and the selection becomes Custom. '
+            'Quick check sanity-tests a target, Standard gives a balanced profile, and Throughput stress '
+            'or IOPS stress are the ones that truly saturate a target.',
+          ),
+        ),
+      ],
+    );
+  }
+
+  String? _activePresetId(BenchmarkConfig config) {
+    for (final preset in _benchmarkPresets) {
+      if (_presetMatchesConfig(preset, config)) {
+        return preset.id;
+      }
+    }
+    return null;
+  }
+
+  bool _presetMatchesConfig(_BenchmarkPreset preset, BenchmarkConfig config) {
+    if (config.workloadType != preset.workloadType ||
+        config.testMode != 'duration' ||
+        config.concurrentThreads != preset.concurrentThreads ||
+        config.objectCount != preset.objectCount ||
+        config.durationSeconds != preset.durationSeconds ||
+        config.maxPoolConnections != preset.maxPoolConnections) {
+      return false;
+    }
+    if (preset.validateChecksum != null &&
+        config.validateChecksum != preset.validateChecksum) {
+      return false;
+    }
+    if (preset.reducedLogging != null &&
+        config.reducedLogging != preset.reducedLogging) {
+      return false;
+    }
+    return _intListsEqual(config.objectSizes, preset.objectSizes);
+  }
+
+  bool _intListsEqual(List<int> a, List<int> b) {
+    if (a.length != b.length) {
+      return false;
+    }
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void _applyBenchmarkPreset(_BenchmarkPreset preset) {
+    FocusScope.of(context).unfocus();
+    final config = controller.benchmarkDraft;
+    controller.updateBenchmarkDraft(
+      config.copyWith(
+        workloadType: preset.workloadType,
+        testMode: 'duration',
+        objectSizes: preset.objectSizes,
+        concurrentThreads: preset.concurrentThreads,
+        objectCount: preset.objectCount,
+        durationSeconds: preset.durationSeconds,
+        maxPoolConnections: preset.maxPoolConnections,
+        validateChecksum: preset.validateChecksum ?? config.validateChecksum,
+        reducedLogging: preset.reducedLogging ?? config.reducedLogging,
+      ),
+    );
+    _setFieldText('objectSizes', preset.objectSizes.join(','));
+    _setFieldText('threads', '${preset.concurrentThreads}');
+    _setFieldText('datasetObjectCount', '${preset.objectCount}');
+    _setFieldText('durationSeconds', '${preset.durationSeconds}');
+    _setFieldText('maxPoolConnections', '${preset.maxPoolConnections}');
+  }
+
+  void _setFieldText(String fieldKey, String value) {
+    final fieldController = _fieldControllers[fieldKey];
+    if (fieldController == null || fieldController.text == value) {
+      return;
+    }
+    fieldController.value = TextEditingValue(
+      text: value,
+      selection: TextSelection.collapsed(offset: value.length),
     );
   }
 

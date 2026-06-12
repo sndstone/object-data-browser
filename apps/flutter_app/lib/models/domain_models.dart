@@ -28,6 +28,29 @@ enum CapabilityState {
 enum EndpointProfileType {
   s3Compatible,
   awsS3,
+  azureBlob,
+}
+
+extension EndpointProfileTypeInfo on EndpointProfileType {
+  bool get isAzure => this == EndpointProfileType.azureBlob;
+
+  String get displayLabel => switch (this) {
+        EndpointProfileType.s3Compatible => 'S3 compatible',
+        EndpointProfileType.awsS3 => 'AWS S3',
+        EndpointProfileType.azureBlob => 'Azure Blob Storage',
+      };
+
+  /// Label for the field stored in [EndpointProfile.accessKey].
+  String get accessKeyLabel => switch (this) {
+        EndpointProfileType.azureBlob => 'Storage account name',
+        _ => 'Access key',
+      };
+
+  /// Label for the field stored in [EndpointProfile.secretKey].
+  String get secretKeyLabel => switch (this) {
+        EndpointProfileType.azureBlob => 'Account access key',
+        _ => 'Secret key',
+      };
 }
 
 enum BrowserInspectorTab {
@@ -204,6 +227,7 @@ class EndpointProfile {
       verifyTls: json['verifyTls'] as bool? ?? true,
       endpointType: switch (json['endpointType'] as String? ?? 's3Compatible') {
         'awsS3' => EndpointProfileType.awsS3,
+        'azureBlob' => EndpointProfileType.azureBlob,
         _ => EndpointProfileType.s3Compatible,
       },
       signerOverride: json['signerOverride'] as String?,

@@ -4,12 +4,12 @@ import 'dart:math' as math;
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../controllers/app_controller.dart';
 import '../logs/structured_log_list.dart';
 import '../models/domain_models.dart';
 import '../theme/app_theme.dart';
+import '../theme/breakpoints.dart';
 import '../widgets/compact_selector.dart';
 
 const _bucketActionBarKey = ValueKey('bucket-panel-actions');
@@ -266,111 +266,6 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     }
   }
 
-  Future<void> _showObjectMenu(
-    BuildContext context,
-    ObjectEntry object,
-    Offset position,
-  ) async {
-    await controller.selectObjectForContextMenu(object);
-    if (!mounted) {
-      return;
-    }
-    final selected = await showMenu<String>(
-      context: context,
-      position: RelativeRect.fromLTRB(
-        position.dx,
-        position.dy,
-        position.dx,
-        position.dy,
-      ),
-      items: [
-        if (object.isFolder && !controller.flatView)
-          const PopupMenuItem(
-            value: 'open-folder',
-            child: ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.folder_open_outlined),
-              title: Text('Open folder'),
-            ),
-          )
-        else ...[
-          const PopupMenuItem(
-            value: 'inspect',
-            child: ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.article_outlined),
-              title: Text('Inspect object'),
-            ),
-          ),
-          const PopupMenuItem(
-            value: 'download',
-            child: ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.download),
-              title: Text('Download'),
-            ),
-          ),
-          const PopupMenuItem(
-            value: 'presign',
-            child: ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.link),
-              title: Text('Generate presigned URL'),
-            ),
-          ),
-        ],
-        const PopupMenuItem(
-          value: 'copy-key',
-          child: ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(Icons.key_outlined),
-            title: Text('Copy key'),
-          ),
-        ),
-        const PopupMenuDivider(),
-        PopupMenuItem(
-          value: 'delete',
-          enabled: !object.isFolder,
-          child: const ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(Icons.delete_outline),
-            title: Text('Delete'),
-          ),
-        ),
-      ],
-    );
-    if (!mounted || selected == null) {
-      return;
-    }
-    switch (selected) {
-      case 'open-folder':
-        await controller.openFolder(object);
-        return;
-      case 'inspect':
-        await controller.selectObjectFromList(object, openFolders: false);
-        return;
-      case 'download':
-        await controller.startSampleDownload();
-        return;
-      case 'presign':
-        await controller.generateSelectedPresignedUrl();
-        return;
-      case 'copy-key':
-        await Clipboard.setData(ClipboardData(text: object.key));
-        controller.showBannerMessage(
-          'Copied object key.',
-          category: 'Objects',
-          source: 'object-browser',
-        );
-        return;
-      case 'delete':
-        await controller.deleteSelectedObject();
-        return;
-      default:
-        return;
-    }
-  }
-
   Widget _mobileBrowserShell(BuildContext context) {
     final hasProfile = controller.selectedProfile != null;
     final hasBucket = controller.selectedBucket != null;
@@ -477,20 +372,25 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       builder: (context, constraints) {
         final width = constraints.maxWidth;
         final desktopCompact = _desktopCompact(context);
-        if (width < 700 || (!desktopCompact && width < 900)) {
+        if (width < Breakpoints.phone ||
+            (!desktopCompact && width < Breakpoints.touchPhone)) {
           return _mobileBrowserShell(context);
         }
 
-        final compactDesktop = widget.compact;
-        final inspectorOnRight = !compactDesktop &&
-            _settings.browserInspectorLayout == BrowserInspectorLayout.right &&
-            width >= 1100;
-        final inspectorSize = compactDesktop
-            ? 0.0
-            : _resolveInspectorSize(context, constraints, inspectorOnRight);
-        final outerPadding = desktopCompact ? 10.0 : 14.0;
-        final panelGap = desktopCompact ? 8.0 : 10.0;
-        final bucketPanelWidth = desktopCompact ? 284.0 : 300.0;
+        // Tablet range (and a desktop window resized into it): keep the
+        // bucket panel and object list side by side, with the inspector
+        // docked below the objects so it stays reachable.
+        final tablet = !Breakpoints.isDesktop(width);
+        final inspectorOnRight = !tablet &&
+            _settings.browserInspectorLayout == BrowserInspectorLayout.right;
+        final inspectorSize =
+            _resolveInspectorSize(context, constraints, inspectorOnRight);
+        final roomy = width >= Breakpoints.desktopWide;
+        final outerPadding =
+            tablet ? 10.0 : (desktopCompact && !roomy ? 10.0 : 14.0);
+        final panelGap = tablet ? 8.0 : (desktopCompact && !roomy ? 8.0 : 10.0);
+        final bucketPanelWidth =
+            tablet ? 252.0 : (desktopCompact && !roomy ? 284.0 : 300.0);
 
         return Padding(
           padding: EdgeInsets.all(outerPadding),
@@ -503,32 +403,31 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               ),
               SizedBox(width: panelGap),
               Expanded(
-                child: compactDesktop
-                    ? _objectPanel(context, compact: true)
-                    : inspectorOnRight
-                        ? Row(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Expanded(
-                                  child: _objectPanel(context, compact: false)),
-                              _resizeHandle(Axis.horizontal),
-                              SizedBox(
-                                width: inspectorSize,
-                                child: _inspectorPanel(context, compact: false),
-                              ),
-                            ],
-                          )
-                        : Column(
-                            children: [
-                              Expanded(
-                                  child: _objectPanel(context, compact: false)),
-                              _resizeHandle(Axis.vertical),
-                              SizedBox(
-                                height: inspectorSize,
-                                child: _inspectorPanel(context, compact: false),
-                              ),
-                            ],
+                child: inspectorOnRight
+                    ? Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Expanded(
+                              child: _objectPanel(context, compact: false)),
+                          _resizeHandle(Axis.horizontal),
+                          SizedBox(
+                            width: inspectorSize,
+                            child: _inspectorPanel(context, compact: false),
                           ),
+                        ],
+                      )
+                    : Column(
+                        children: [
+                          Expanded(
+                              child:
+                                  _objectPanel(context, compact: tablet)),
+                          _resizeHandle(Axis.vertical),
+                          SizedBox(
+                            height: inspectorSize,
+                            child: _inspectorPanel(context, compact: false),
+                          ),
+                        ],
+                      ),
               ),
             ],
           ),
@@ -536,7 +435,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       },
     );
 
-    if (Platform.isAndroid || MediaQuery.sizeOf(context).width < 700) {
+    if (Platform.isAndroid ||
+        Breakpoints.isPhone(MediaQuery.sizeOf(context).width)) {
       return content;
     }
 
@@ -564,7 +464,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
 
   Future<void> _showMobileObjectActions(BuildContext context) async {
     final hasBucket = controller.selectedBucket != null;
-    final hasSelectedObject = controller.operationSelectedObjects.isNotEmpty;
+    final hasSelectedObject = controller.selectedObject != null;
     final rootContext = context;
     await showModalBottomSheet<void>(
       context: context,
@@ -776,7 +676,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
 
   Widget _objectPanel(BuildContext context, {required bool compact}) {
     final width = MediaQuery.sizeOf(context).width;
-    final phone = width < 700;
+    final phone = Breakpoints.isPhone(width);
     final mobileTablet = !phone && Platform.isAndroid;
     final desktopCompact = _desktopCompact(context);
     final compactDesktop = compact && !phone;
@@ -786,7 +686,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         (MediaQuery.sizeOf(context).height * 0.78).clamp(560.0, 920.0);
     final hasProfile = controller.selectedProfile != null;
     final hasBucket = controller.selectedBucket != null;
-    final hasSelectedObject = controller.operationSelectedObjects.isNotEmpty;
+    final hasSelectedObject = controller.selectedObject != null;
     final objects = controller.pagedVisibleObjects;
     final filteredObjectCount = controller.visibleObjects.length;
     final loadedObjectCount = controller.objects.length;
@@ -796,7 +696,6 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     final isDownloading = controller.isBusy('download');
     final isDeleting = controller.isBusy('delete-object');
     final isSelectingObject = controller.isBusy('select-object');
-    final selectedFileCount = controller.operationSelectedObjects.length;
     final panelPadding = denseObjectControls ? 12.0 : 16.0;
     final controlSpacing = denseObjectControls ? 8.0 : 12.0;
     final mobileControlSpacing = phone ? 8.0 : controlSpacing;
@@ -932,11 +831,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
 
     Widget mobileDownloadButton() {
       return IconButton.filledTonal(
-        tooltip: isDownloading
-            ? 'Downloading...'
-            : selectedFileCount <= 1
-                ? 'Download'
-                : 'Download $selectedFileCount objects',
+        tooltip: isDownloading ? 'Downloading...' : 'Download',
         onPressed: hasSelectedObject && !isDownloading
             ? controller.startSampleDownload
             : null,
@@ -974,11 +869,9 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             key: _objectListKey,
             child: _ObjectTable(
               objects: objects,
-              selectedKeys: controller.selectedObjectKeys,
+              selectedKey: controller.selectedObject?.key,
               contentTypeFor: controller.objectContentType,
-              onSelect: controller.selectObjectFromList,
-              onSelectRows: controller.setObjectSelectionForRows,
-              onShowObjectMenu: _showObjectMenu,
+              onSelect: controller.setSelectedObject,
             ),
           );
 
@@ -1008,11 +901,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                 if (hasBucket)
                   Chip(
                     visualDensity: VisualDensity.compact,
-                    label: Text(
-                      controller.selectedObjectCount == 0
-                          ? '$filteredObjectCount objects'
-                          : '${controller.selectedObjectCount} selected',
-                    ),
+                    label: Text('$filteredObjectCount objects'),
                   ),
               ],
             ),
@@ -1117,13 +1006,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                     icon: isDownloading
                         ? _inlineSpinner()
                         : const Icon(Icons.download),
-                    label: Text(
-                      isDownloading
-                          ? 'Downloading...'
-                          : selectedFileCount <= 1
-                              ? 'Download'
-                              : 'Download $selectedFileCount',
-                    ),
+                    label: Text(isDownloading ? 'Downloading...' : 'Download'),
                   ),
                   OutlinedButton.icon(
                     onPressed: hasSelectedObject && !isDeleting
@@ -1132,13 +1015,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                     icon: isDeleting
                         ? _inlineSpinner()
                         : const Icon(Icons.delete_outline),
-                    label: Text(
-                      isDeleting
-                          ? 'Deleting...'
-                          : selectedFileCount <= 1
-                              ? 'Delete'
-                              : 'Delete $selectedFileCount',
-                    ),
+                    label: Text(isDeleting ? 'Deleting...' : 'Delete'),
                   ),
                   OutlinedButton.icon(
                     onPressed: hasBucket
@@ -1355,8 +1232,21 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   Widget _inspectorPanel(BuildContext context, {required bool compact}) {
-    final phone = MediaQuery.sizeOf(context).width < 700;
-    final tab = controller.inspectorTab;
+    final phone = Breakpoints.isPhone(MediaQuery.sizeOf(context).width);
+    // Object versioning and presigned URLs are S3-only features.
+    final isAzure = controller.selectedProfile?.endpointType ==
+        EndpointProfileType.azureBlob;
+    final availableTabs = BrowserInspectorTab.values
+        .where(
+          (entry) =>
+              !isAzure ||
+              (entry != BrowserInspectorTab.versions &&
+                  entry != BrowserInspectorTab.presign),
+        )
+        .toList();
+    final tab = availableTabs.contains(controller.inspectorTab)
+        ? controller.inspectorTab
+        : BrowserInspectorTab.objectDetails;
     final desktopCompact = _desktopCompact(context);
     final panelBody = AnimatedSwitcher(
       duration: const Duration(milliseconds: 220),
@@ -1385,7 +1275,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               wrap: true,
               dense: true,
               onChanged: controller.setInspectorTab,
-              options: BrowserInspectorTab.values
+              options: availableTabs
                   .map(
                     (entry) => CompactSelectorOption(
                       value: entry,
@@ -1675,7 +1565,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   Widget _versionsView(BuildContext context) {
     final options = controller.versionBrowserOptions;
     final versions = controller.visibleVersions;
-    final hasSelectedObject = controller.operationSelectedObjects.isNotEmpty;
+    final hasSelectedObject = controller.selectedObject != null;
 
     return _adaptivePanelListView(
       context,
@@ -2131,7 +2021,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     required Key key,
     required List<Widget> children,
   }) {
-    final phone = MediaQuery.sizeOf(context).width < 700;
+    final phone = Breakpoints.isPhone(MediaQuery.sizeOf(context).width);
     return ListView(
       key: key,
       shrinkWrap: phone,
@@ -2622,40 +2512,18 @@ class _CreatePrefixDialogState extends State<_CreatePrefixDialog> {
   }
 }
 
-typedef _ObjectSelectCallback = Future<void> Function(
-  ObjectEntry object, {
-  bool toggle,
-  bool range,
-  bool openFolders,
-});
-
-typedef _ObjectRowsSelectionCallback = void Function(
-  List<ObjectEntry> rows,
-  bool selected,
-);
-
-typedef _ObjectMenuCallback = Future<void> Function(
-  BuildContext context,
-  ObjectEntry object,
-  Offset position,
-);
-
 class _ObjectTable extends StatelessWidget {
   const _ObjectTable({
     required this.objects,
-    required this.selectedKeys,
+    required this.selectedKey,
     required this.contentTypeFor,
     required this.onSelect,
-    required this.onSelectRows,
-    required this.onShowObjectMenu,
   });
 
   final List<ObjectEntry> objects;
-  final Set<String> selectedKeys;
+  final String? selectedKey;
   final String Function(ObjectEntry object) contentTypeFor;
-  final _ObjectSelectCallback onSelect;
-  final _ObjectRowsSelectionCallback onSelectRows;
-  final _ObjectMenuCallback onShowObjectMenu;
+  final ValueChanged<ObjectEntry> onSelect;
 
   @override
   Widget build(BuildContext context) {
@@ -2668,17 +2536,17 @@ class _ObjectTable extends StatelessWidget {
       builder: (context, constraints) {
         final narrow = constraints.maxWidth < 520;
         final veryNarrow = constraints.maxWidth < 380;
+        // Wide desktop panels get extra detail columns.
+        final showStorageClass = constraints.maxWidth >= 860;
+        final showEtag = constraints.maxWidth >= 1100;
         final selectWidth = narrow ? 26.0 : 32.0;
         final modifiedWidth = veryNarrow ? 72.0 : (narrow ? 86.0 : 128.0);
         final sizeWidth = veryNarrow ? 52.0 : (narrow ? 64.0 : 86.0);
         final typeWidth = veryNarrow ? 48.0 : (narrow ? 62.0 : 84.0);
+        const storageClassWidth = 110.0;
+        const etagWidth = 150.0;
         final horizontalPadding = narrow ? 4.0 : 8.0;
         final nameGap = narrow ? 6.0 : 10.0;
-        final selectedCount =
-            objects.where((object) => selectedKeys.contains(object.key)).length;
-        final allSelected =
-            objects.isNotEmpty && selectedCount == objects.length;
-        final partlySelected = selectedCount > 0 && !allSelected;
 
         return Column(
           children: [
@@ -2692,18 +2560,7 @@ class _ObjectTable extends StatelessWidget {
               ),
               child: Row(
                 children: [
-                  SizedBox(
-                    width: selectWidth,
-                    child: Checkbox(
-                      value: partlySelected ? null : allSelected,
-                      tristate: true,
-                      onChanged: objects.isEmpty
-                          ? null
-                          : (_) => onSelectRows(objects, !allSelected),
-                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      visualDensity: VisualDensity.compact,
-                    ),
-                  ),
+                  SizedBox(width: selectWidth),
                   Expanded(
                     child: Text('Name', style: headerStyle),
                   ),
@@ -2719,6 +2576,16 @@ class _ObjectTable extends StatelessWidget {
                     width: typeWidth,
                     child: Text('Type', style: headerStyle),
                   ),
+                  if (showStorageClass)
+                    SizedBox(
+                      width: storageClassWidth,
+                      child: Text('Storage class', style: headerStyle),
+                    ),
+                  if (showEtag)
+                    SizedBox(
+                      width: etagWidth,
+                      child: Text('ETag', style: headerStyle),
+                    ),
                 ],
               ),
             ),
@@ -2734,35 +2601,7 @@ class _ObjectTable extends StatelessWidget {
                 ),
                 itemBuilder: (context, index) {
                   final object = objects[index];
-                  final selected = selectedKeys.contains(object.key);
-                  Future<void> selectFromPointer() {
-                    final pressed =
-                        HardwareKeyboard.instance.logicalKeysPressed;
-                    final toggle =
-                        pressed.contains(LogicalKeyboardKey.controlLeft) ||
-                            pressed.contains(LogicalKeyboardKey.controlRight) ||
-                            pressed.contains(LogicalKeyboardKey.metaLeft) ||
-                            pressed.contains(LogicalKeyboardKey.metaRight);
-                    final range =
-                        pressed.contains(LogicalKeyboardKey.shiftLeft) ||
-                            pressed.contains(LogicalKeyboardKey.shiftRight);
-                    return onSelect(
-                      object,
-                      toggle: toggle,
-                      range: range,
-                    );
-                  }
-
-                  Offset menuAnchorForRow() {
-                    final box = context.findRenderObject() as RenderBox?;
-                    if (box == null) {
-                      return Offset.zero;
-                    }
-                    return box.localToGlobal(
-                      Offset(box.size.width / 2, box.size.height / 2),
-                    );
-                  }
-
+                  final selected = selectedKey == object.key;
                   return Material(
                     color: selected
                         ? theme.colorScheme.primaryContainer
@@ -2771,17 +2610,7 @@ class _ObjectTable extends StatelessWidget {
                     borderRadius: BorderRadius.circular(6),
                     child: InkWell(
                       borderRadius: BorderRadius.circular(6),
-                      onTap: selectFromPointer,
-                      onSecondaryTapDown: (details) => onShowObjectMenu(
-                        context,
-                        object,
-                        details.globalPosition,
-                      ),
-                      onLongPress: () => onShowObjectMenu(
-                        context,
-                        object,
-                        menuAnchorForRow(),
-                      ),
+                      onTap: () => onSelect(object),
                       child: Container(
                         height: narrow ? 36 : 38,
                         padding:
@@ -2790,16 +2619,14 @@ class _ObjectTable extends StatelessWidget {
                           children: [
                             SizedBox(
                               width: selectWidth,
-                              child: Checkbox(
-                                value: selected,
-                                onChanged: (_) => onSelect(
-                                  object,
-                                  toggle: true,
-                                  openFolders: false,
-                                ),
-                                materialTapTargetSize:
-                                    MaterialTapTargetSize.shrinkWrap,
-                                visualDensity: VisualDensity.compact,
+                              child: Icon(
+                                selected
+                                    ? Icons.check_box
+                                    : Icons.check_box_outline_blank,
+                                size: narrow ? 16 : 18,
+                                color: selected
+                                    ? theme.colorScheme.primary
+                                    : theme.colorScheme.outline,
                               ),
                             ),
                             Expanded(
@@ -2869,6 +2696,31 @@ class _ObjectTable extends StatelessWidget {
                                 style: theme.textTheme.bodySmall,
                               ),
                             ),
+                            if (showStorageClass)
+                              SizedBox(
+                                width: storageClassWidth,
+                                child: Text(
+                                  object.isFolder ||
+                                          object.storageClass.isEmpty
+                                      ? '--'
+                                      : object.storageClass,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.bodySmall,
+                                ),
+                              ),
+                            if (showEtag)
+                              SizedBox(
+                                width: etagWidth,
+                                child: Text(
+                                  object.isFolder
+                                      ? '--'
+                                      : _shortEtag(object.etag),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.bodySmall,
+                                ),
+                              ),
                           ],
                         ),
                       ),
@@ -2881,6 +2733,13 @@ class _ObjectTable extends StatelessWidget {
         );
       },
     );
+  }
+
+  static String _shortEtag(String? value) {
+    if (value == null || value.isEmpty) {
+      return '--';
+    }
+    return value.replaceAll('"', '');
   }
 
   static String _shortObjectType(String value) {
@@ -2961,6 +2820,10 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
     BucketSummary bucket,
     Offset position,
   ) async {
+    // Versioning, lifecycle, policy, encryption, and tagging are S3-only
+    // bucket admin features.
+    final isAzure = widget.controller.selectedProfile?.endpointType ==
+        EndpointProfileType.azureBlob;
     final selected = await showMenu<String>(
       context: context,
       position: RelativeRect.fromLTRB(
@@ -2978,57 +2841,59 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
             title: Text('Open bucket'),
           ),
         ),
-        PopupMenuItem(
-          value: bucket.versioningEnabled
-              ? 'suspend-versioning'
-              : 'enable-versioning',
-          child: ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(
-              bucket.versioningEnabled
-                  ? Icons.pause_circle_outline
-                  : Icons.history_toggle_off_rounded,
+        if (!isAzure) ...[
+          PopupMenuItem(
+            value: bucket.versioningEnabled
+                ? 'suspend-versioning'
+                : 'enable-versioning',
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(
+                bucket.versioningEnabled
+                    ? Icons.pause_circle_outline
+                    : Icons.history_toggle_off_rounded,
+              ),
+              title: Text(
+                bucket.versioningEnabled
+                    ? 'Suspend versioning'
+                    : 'Enable versioning',
+              ),
             ),
-            title: Text(
-              bucket.versioningEnabled
-                  ? 'Suspend versioning'
-                  : 'Enable versioning',
+          ),
+          const PopupMenuDivider(),
+          const PopupMenuItem(
+            value: 'lifecycle',
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.schedule_outlined),
+              title: Text('Lifecycle policy'),
             ),
           ),
-        ),
-        const PopupMenuDivider(),
-        const PopupMenuItem(
-          value: 'lifecycle',
-          child: ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(Icons.schedule_outlined),
-            title: Text('Lifecycle policy'),
+          const PopupMenuItem(
+            value: 'policy',
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.policy_outlined),
+              title: Text('Bucket policy'),
+            ),
           ),
-        ),
-        const PopupMenuItem(
-          value: 'policy',
-          child: ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(Icons.policy_outlined),
-            title: Text('Bucket policy'),
+          const PopupMenuItem(
+            value: 'encryption',
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.lock_outline),
+              title: Text('Bucket encryption'),
+            ),
           ),
-        ),
-        const PopupMenuItem(
-          value: 'encryption',
-          child: ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(Icons.lock_outline),
-            title: Text('Bucket encryption'),
+          const PopupMenuItem(
+            value: 'tags',
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.sell_outlined),
+              title: Text('Bucket tagging'),
+            ),
           ),
-        ),
-        const PopupMenuItem(
-          value: 'tags',
-          child: ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(Icons.sell_outlined),
-            title: Text('Bucket tagging'),
-          ),
-        ),
+        ],
         const PopupMenuItem(
           value: 'copy',
           child: ListTile(

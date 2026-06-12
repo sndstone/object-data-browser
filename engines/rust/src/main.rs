@@ -225,7 +225,7 @@ async fn handle_request(request: Request) -> SidecarResult {
     match request.method.as_str() {
         "health" => Ok(json!({
             "engine": "rust",
-            "version": "2.0.7",
+            "version": "2.1.0",
             "available": true,
             "methods": SUPPORTED_METHODS,
             "nativeSdk": "aws-sdk-rust",
@@ -1911,6 +1911,12 @@ async fn bucket_context(params: &Value) -> Result<(Profile, String, Client), Sid
 }
 
 fn parse_profile(value: &Value) -> Result<Profile, SidecarError> {
+    if value["endpointType"].as_str().unwrap_or_default().trim() == "azureBlob" {
+        return Err(SidecarError::new(
+            "unsupported_feature",
+            "Azure Blob profiles are not supported by the rust engine yet. Switch the engine to Go or Python in Settings.",
+        ));
+    }
     let endpoint_url = value["endpointUrl"]
         .as_str()
         .unwrap_or_default()

@@ -11,6 +11,7 @@ import '../models/domain_models.dart';
 import '../settings/settings_workspace.dart';
 import '../tasks/tasks_workspace.dart';
 import '../theme/app_theme.dart';
+import '../theme/breakpoints.dart';
 import '../widgets/compact_selector.dart';
 
 class S3BrowserApp extends StatefulWidget {
@@ -104,8 +105,8 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
           ),
           child: LayoutBuilder(
             builder: (context, constraints) {
-              final phone = constraints.maxWidth < 700;
-              final compact = constraints.maxWidth < 1200;
+              final phone = Breakpoints.isPhone(constraints.maxWidth);
+              final compact = !Breakpoints.isDesktop(constraints.maxWidth);
               final navTabs = _visibleNavTabs();
               final activeTab = navTabs.contains(controller.activeTab)
                   ? controller.activeTab
@@ -630,7 +631,7 @@ class _HeaderControlStrip extends StatelessWidget {
   Widget build(BuildContext context) {
     final profiles = controller.profiles;
     final engines = controller.engines;
-    final phone = MediaQuery.sizeOf(context).width < 700;
+    final phone = Breakpoints.isPhone(MediaQuery.sizeOf(context).width);
     final desktopCompact =
         AppTheme.isDesktopPlatform(Theme.of(context).platform);
     return Container(

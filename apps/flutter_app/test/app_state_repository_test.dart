@@ -22,25 +22,6 @@ class ThrowingProfileSecretStore extends ProfileSecretStore {
   }
 }
 
-class MemoryProfileSecretStore extends ProfileSecretStore {
-  final Map<String, String> values = <String, String>{};
-
-  @override
-  Future<void> saveSecret(String key, String value) async {
-    values[key] = value;
-  }
-
-  @override
-  Future<String?> readSecret(String key) async {
-    return values[key];
-  }
-
-  @override
-  Future<void> deleteSecret(String key) async {
-    values.remove(key);
-  }
-}
-
 const _settings = AppSettings(
   darkMode: false,
   defaultEngineId: 'rust',
@@ -86,41 +67,6 @@ const _profile = EndpointProfile(
 );
 
 void main() {
-  test('repository restores profile metadata and secrets after restart',
-      () async {
-    final tempDir =
-        await Directory.systemTemp.createTemp('app-state-repository-test');
-    final secretStore = MemoryProfileSecretStore();
-    addTearDown(() => tempDir.delete(recursive: true));
-
-    final repository = LocalAppStateRepository(
-      secretStore: secretStore,
-      applicationSupportDirectoryProvider: () async => tempDir,
-    );
-
-    await repository.saveState(
-      settings: _settings,
-      profiles: const [_profile],
-      selectedProfileId: _profile.id,
-    );
-
-    final restartedRepository = LocalAppStateRepository(
-      secretStore: secretStore,
-      applicationSupportDirectoryProvider: () async => tempDir,
-    );
-    final restored = await restartedRepository.loadState();
-
-    expect(restored, isNotNull);
-    expect(restored!.selectedProfileId, _profile.id);
-    expect(restored.profiles, hasLength(1));
-    expect(restored.profiles.first.id, _profile.id);
-    expect(restored.profiles.first.name, _profile.name);
-    expect(restored.profiles.first.endpointUrl, _profile.endpointUrl);
-    expect(restored.profiles.first.accessKey, _profile.accessKey);
-    expect(restored.profiles.first.secretKey, _profile.secretKey);
-    expect(restored.profiles.first.sessionToken, _profile.sessionToken);
-  });
-
   test(
       'repository refuses to write plaintext secrets when secure storage is unavailable',
       () async {

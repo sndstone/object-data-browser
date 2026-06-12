@@ -25,6 +25,9 @@ object-data-browser/
 This repository now includes:
 
 - The initial Flutter application scaffold with adaptive Browser, Benchmark, and Settings workspaces
+- Endpoint profiles for S3-compatible targets, AWS S3, and Azure Blob Storage (account name + access key; implemented in the Go and Python engines, see `docs/FEATURE_MATRIX.md`)
+- Unified responsive breakpoints (phone < 700 px, tablet < 1200 px, desktop >= 1200 px) that apply equally to resized desktop windows
+- Persistent sidecar engine processes (one long-lived process per engine instead of one per request)
 - The shared domain models and engine interface expected by all backends
 - Mock engine wiring so the UI shell is functional before the real engines are completed
 - Language-specific engine stubs for Python, Go, Rust, and Java

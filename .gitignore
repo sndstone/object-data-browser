@@ -3,9 +3,9 @@
 .flutter-plugins-dependencies
 .packages
 .tmp/
-.gradle/
 build/
 dist/
+.DS_Store
 coverage/
 pubspec.lock
 *.class

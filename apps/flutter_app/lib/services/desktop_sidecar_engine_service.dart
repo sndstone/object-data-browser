@@ -12,9 +12,9 @@ class DesktopSidecarEngineService
         EngineLogSinkRegistrant,
         TransferJobSinkRegistrant {
   DesktopSidecarEngineService({
-    DesktopEngineHost host = const DesktopEngineHost(),
+    DesktopEngineHost? host,
     EngineService? fallback,
-  })  : _host = host,
+  })  : _host = host ?? DesktopEngineHost(),
         _fallback = fallback ?? MockEngineService();
 
   final DesktopEngineHost _host;
@@ -29,6 +29,11 @@ class DesktopSidecarEngineService
   Map<String, _EngineManifestEntry>? _cachedManifest;
   String? _cachedEngineRoot;
   final Map<String, String> _benchmarkEngines = <String, String>{};
+
+  /// Shuts down the long-lived sidecar engine processes owned by the host.
+  void dispose() {
+    _host.dispose();
+  }
 
   @override
   void setLogSink(EngineLogCallback? sink) {

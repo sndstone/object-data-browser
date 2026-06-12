@@ -276,7 +276,7 @@ public final class Main {
     private static Map<String, Object> health() {
         return orderedMap(
             "engine", "java",
-            "version", "2.0.17",
+            "version", "2.1.0",
             "available", true,
             "methods", SUPPORTED_METHODS,
             "nativeSdk", "aws-sdk-java-v2"
@@ -1412,6 +1412,12 @@ public final class Main {
     }
 
     private static Profile parseProfile(JsonNode payload) {
+        if ("azureBlob".equals(payload.path("endpointType").asText("").trim())) {
+            throw new SidecarException(
+                "unsupported_feature",
+                "Azure Blob profiles are not supported by the java engine yet. Switch the engine to Go or Python in Settings."
+            );
+        }
         String endpointUrl = payload.path("endpointUrl").asText("").trim();
         String accessKey = payload.path("accessKey").asText("").trim();
         String secretKey = payload.path("secretKey").asText("").trim();

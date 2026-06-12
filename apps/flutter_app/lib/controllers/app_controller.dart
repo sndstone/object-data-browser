@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -87,7 +88,31 @@ String awsEndpointForRegion(String region) {
   return 'https://s3.$normalizedRegion.amazonaws.com';
 }
 
+String azureEndpointForAccount(String accountName) {
+  final trimmed = accountName.trim();
+  if (trimmed.isEmpty) {
+    return '';
+  }
+  return 'https://$trimmed.blob.core.windows.net';
+}
+
 EndpointProfile normalizeEndpointProfile(EndpointProfile profile) {
+  if (profile.endpointType == EndpointProfileType.azureBlob) {
+    // accessKey carries the storage account name; an empty endpoint URL means
+    // the engine derives https://<account>.blob.core.windows.net. A custom
+    // endpoint (Azurite, sovereign clouds) is normalized like any other URL.
+    final customEndpoint = profile.endpointUrl.trim();
+    final usesHttps = customEndpoint.isEmpty ||
+        endpointUsesHttps(customEndpoint, fallback: true);
+    return profile.copyWith(
+      endpointUrl: customEndpoint.isEmpty
+          ? ''
+          : normalizeEndpointUrl(customEndpoint, preferHttps: true),
+      region: profile.region.trim(),
+      pathStyle: false,
+      verifyTls: usesHttps ? profile.verifyTls : false,
+    );
+  }
   final normalizedRegion = profile.endpointType == EndpointProfileType.awsS3
       ? (profile.region.trim().isEmpty ? 'us-east-1' : profile.region.trim())
       : profile.region.trim();
@@ -228,8 +253,6 @@ class AppController extends ChangeNotifier {
   EndpointProfile? selectedProfile;
   BucketSummary? selectedBucket;
   ObjectEntry? selectedObject;
-  Set<String> selectedObjectKeys = <String>{};
-  String? _objectSelectionAnchorKey;
   String activeEngineId = 'rust';
   String currentPrefix = '';
   String objectFilterValue = '';
@@ -238,6 +261,9 @@ class AppController extends ChangeNotifier {
   bool objectSortDescending = true;
   bool flatView = false;
   static const int objectPageSize = 1000;
+  static const int eventLogLimit = 5000;
+
+  Timer? _busyLineNotifyTimer;
   int objectPage = 1;
   bool showAllObjects = false;
   bool listAllKeys = false;
@@ -517,8 +543,6 @@ class AppController extends ChangeNotifier {
       objectCursor = const ListCursor(value: null, hasMore: false);
       listAllKeys = false;
       selectedObject = null;
-      selectedObjectKeys = <String>{};
-      _objectSelectionAnchorKey = null;
       selectedObjectDetails = null;
       notifyListeners();
       return;
@@ -585,14 +609,9 @@ class AppController extends ChangeNotifier {
         objects = allItems;
         objectCursor = cursor;
         _resetObjectPagination();
-        _pruneObjectSelection();
         selectedObject = previousSelectionKey == null
             ? null
             : _objectByKey(previousSelectionKey);
-        if (selectedObject != null && selectedObjectKeys.isEmpty) {
-          selectedObjectKeys = <String>{selectedObject!.key};
-          _objectSelectionAnchorKey = selectedObject!.key;
-        }
         if (objects.isEmpty) {
           bannerMessage = 'No objects found in ${bucket.name}.';
           _addEvent(
@@ -670,14 +689,9 @@ class AppController extends ChangeNotifier {
           objects = allItems;
           objectCursor = cursor;
           _resetObjectPagination();
-          _pruneObjectSelection();
           selectedObject = previousSelectionKey == null
               ? null
               : _objectByKey(previousSelectionKey);
-          if (selectedObject != null && selectedObjectKeys.isEmpty) {
-            selectedObjectKeys = <String>{selectedObject!.key};
-            _objectSelectionAnchorKey = selectedObject!.key;
-          }
           bannerMessage = cursor.hasMore
               ? 'Listed ${objects.length} objects in ${bucket.name}. More are available.'
               : 'Listed all ${objects.length} objects in ${bucket.name}.';
@@ -703,8 +717,6 @@ class AppController extends ChangeNotifier {
       currentPrefix = '';
       _syncObjectFilterWithPrefix();
       selectedObject = null;
-      selectedObjectKeys = <String>{};
-      _objectSelectionAnchorKey = null;
       selectedObjectDetails = null;
       adminState = null;
       benchmarkDraft = benchmarkDraft.copyWith(bucketName: bucket.name);
@@ -762,98 +774,26 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> setSelectedObject(ObjectEntry object) async {
-    await selectObjectFromList(object);
-  }
-
-  Future<void> selectObjectFromList(
-    ObjectEntry object, {
-    bool toggle = false,
-    bool range = false,
-    bool openFolders = true,
-  }) async {
-    if (object.isFolder && !flatView && openFolders && !toggle && !range) {
+    if (object.isFolder && !flatView) {
       await openFolder(object);
       return;
     }
     await _runBusy(
         'select-object', 'Loading object details for ${object.name}...',
         () async {
-      if (range && _objectSelectionAnchorKey != null) {
-        selectedObjectKeys = _selectionWithRangeTo(object);
-      } else if (toggle) {
-        final nextKeys = selectedObjectKeys.toSet();
-        if (nextKeys.contains(object.key)) {
-          nextKeys.remove(object.key);
-        } else {
-          nextKeys.add(object.key);
-        }
-        selectedObjectKeys = nextKeys;
-        _objectSelectionAnchorKey = object.key;
-      } else {
-        selectedObjectKeys = <String>{object.key};
-        _objectSelectionAnchorKey = object.key;
-      }
       selectedObject = object;
-      if (!selectedObjectKeys.contains(object.key)) {
-        selectedObject = _firstSelectedObject();
-      }
       _addEvent(
         level: 'INFO',
         category: 'Objects',
-        message: selectedObjectKeys.length <= 1
-            ? 'Selected object ${object.key}.'
-            : 'Selected ${selectedObjectKeys.length} objects.',
+        message: 'Selected object ${object.key}.',
         includeSelectionContext: true,
         objectKey: object.key,
         source: 'object-browser',
       );
       inspectorTab = BrowserInspectorTab.objectDetails;
-      if (selectedObject != null && !selectedObject!.isFolder) {
-        await _loadSelectionArtifacts();
-      } else {
-        selectedObjectDetails = null;
-        notifyListeners();
-      }
+      await _loadSelectionArtifacts();
       notifyListeners();
     });
-  }
-
-  Future<void> selectObjectForContextMenu(ObjectEntry object) async {
-    if (selectedObjectKeys.contains(object.key)) {
-      selectedObject = object;
-      notifyListeners();
-      return;
-    }
-    await selectObjectFromList(object, openFolders: false);
-  }
-
-  void setObjectSelectionForRows(List<ObjectEntry> rows, bool selected) {
-    final rowKeys = rows.map((entry) => entry.key).toSet();
-    if (rowKeys.isEmpty) {
-      return;
-    }
-    final nextKeys = selectedObjectKeys.toSet();
-    if (selected) {
-      nextKeys.addAll(rowKeys);
-      _objectSelectionAnchorKey = rows.last.key;
-    } else {
-      nextKeys.removeAll(rowKeys);
-      if (_objectSelectionAnchorKey != null &&
-          !nextKeys.contains(_objectSelectionAnchorKey)) {
-        _objectSelectionAnchorKey = nextKeys.isEmpty ? null : nextKeys.last;
-      }
-    }
-    selectedObjectKeys = nextKeys;
-    selectedObject = selected
-        ? (selectedObject != null &&
-                selectedObjectKeys.contains(selectedObject!.key)
-            ? selectedObject
-            : rows.first)
-        : _firstSelectedObject();
-    if (selectedObject == null || selectedObject!.isFolder) {
-      selectedObjectDetails = null;
-    }
-    notifyListeners();
   }
 
   Future<void> toggleFlatView(bool value) async {
@@ -1069,38 +1009,30 @@ class AppController extends ChangeNotifier {
   Future<void> deleteSelectedObject() async {
     final profile = selectedProfile;
     final bucket = selectedBucket;
-    final selectedObjects = operationSelectedObjects;
-    if (profile == null || bucket == null || selectedObjects.isEmpty) {
+    final object = selectedObject;
+    if (profile == null || bucket == null || object == null) {
       return;
     }
-    final keys = selectedObjects.map((object) => object.key).toList();
-    await _runBusy(
-        'delete-object',
-        keys.length == 1
-            ? 'Deleting ${selectedObjects.first.name}...'
-            : 'Deleting ${keys.length} objects...', () async {
+    await _runBusy('delete-object', 'Deleting ${object.name}...', () async {
       await _guard('Objects', () async {
         final result = await _engineService.deleteObjects(
           engineId: activeEngineId,
           profile: profile,
           bucketName: bucket.name,
-          keys: keys,
+          keys: [object.key],
         );
         bannerMessage = 'Deleted ${result.successCount} objects.';
         _addEvent(
           level: 'INFO',
           category: 'Objects',
           message:
-              'Delete request for ${keys.length} object(s) completed with ${result.successCount} successes and ${result.failureCount} failures.',
+              'Delete request for ${object.key} completed with ${result.successCount} successes and ${result.failureCount} failures.',
           includeSelectionContext: true,
-          objectKey: keys.length == 1 ? keys.first : null,
+          objectKey: object.key,
           source: 'object-browser',
         );
-        final deletedKeys = keys.toSet();
-        objects =
-            objects.where((entry) => !deletedKeys.contains(entry.key)).toList();
-        selectedObjectKeys = selectedObjectKeys.difference(deletedKeys);
-        selectedObject = _firstSelectedObject();
+        objects = objects.where((entry) => entry.key != object.key).toList();
+        selectedObject = null;
         await _loadSelectionArtifacts();
       });
     });
@@ -1146,18 +1078,17 @@ class AppController extends ChangeNotifier {
   Future<void> startSampleDownload() async {
     final profile = selectedProfile;
     final bucket = selectedBucket;
-    final selectedObjects = operationSelectedObjects;
-    if (profile == null || bucket == null || selectedObjects.isEmpty) {
+    final object = selectedObject;
+    if (profile == null || bucket == null || object == null) {
       return;
     }
-    final keys = selectedObjects.map((object) => object.key).toList();
     await _runBusy('download', 'Starting download...', () async {
       await _guard('Transfers', () async {
         final job = await _engineService.startDownload(
           engineId: activeEngineId,
           profile: profile,
           bucketName: bucket.name,
-          keys: keys,
+          keys: [object.key],
           destinationPath: settings.downloadPath,
           multipartThresholdMiB: settings.multipartThresholdMiB,
           multipartChunkMiB: settings.multipartChunkMiB,
@@ -1172,9 +1103,9 @@ class AppController extends ChangeNotifier {
           level: 'INFO',
           category: 'Transfers',
           message:
-              'Started download job ${job.id} for ${keys.length} object(s) into $destinationLabel.',
+              'Started download job ${job.id} for ${object.key} into $destinationLabel.',
           includeSelectionContext: true,
-          objectKey: keys.length == 1 ? keys.first : null,
+          objectKey: object.key,
           source: 'task-tray',
         );
       });
@@ -1805,8 +1736,6 @@ class AppController extends ChangeNotifier {
       selectedProfile = profiles.isEmpty ? null : profiles.first;
       buckets = const [];
       objects = const [];
-      selectedObjectKeys = <String>{};
-      _objectSelectionAnchorKey = null;
       versions = const [];
       capabilities = const [];
       selectedBucket = null;
@@ -2206,23 +2135,6 @@ class AppController extends ChangeNotifier {
     return results.sublist(start, end);
   }
 
-  List<ObjectEntry> get selectedObjects {
-    if (selectedObjectKeys.isEmpty) {
-      return selectedObject == null ? const [] : [selectedObject!];
-    }
-    return objects
-        .where((entry) => selectedObjectKeys.contains(entry.key))
-        .toList();
-  }
-
-  List<ObjectEntry> get operationSelectedObjects {
-    return selectedObjects.where((entry) => !entry.isFolder).toList();
-  }
-
-  int get selectedObjectCount => selectedObjectKeys.isEmpty
-      ? (selectedObject == null ? 0 : 1)
-      : selectedObjectKeys.length;
-
   int get objectPageCount {
     final count = visibleObjects.length;
     if (count <= objectPageSize) {
@@ -2480,14 +2392,13 @@ class AppController extends ChangeNotifier {
     );
     versions = versionResult.items;
     versionCursor = versionResult.cursor;
-    if (object == null || object.isFolder) {
+    if (object == null) {
       selectedObjectDetails = null;
       _addEvent(
         level: 'INFO',
         category: 'Versions',
-        message: object == null
-            ? 'Loaded ${versions.length} version entries for bucket ${bucket.name}.'
-            : 'Loaded ${versions.length} version entries for prefix ${object.key}.',
+        message:
+            'Loaded ${versions.length} version entries for bucket ${bucket.name}.',
         includeSelectionContext: true,
         source: 'version-browser',
       );
@@ -2612,6 +2523,12 @@ class AppController extends ChangeNotifier {
       }
       _busyActions.remove(actionKey);
       _busyTaskIds.remove(actionKey);
+      // Any pending coalesced progress notification is superseded by the
+      // notify below; cancelling keeps tests free of stray timers.
+      if (_busyActions.isEmpty) {
+        _busyLineNotifyTimer?.cancel();
+        _busyLineNotifyTimer = null;
+      }
       notifyListeners();
     }
   }
@@ -2633,7 +2550,25 @@ class AppController extends ChangeNotifier {
         ],
       ),
     );
-    notifyListeners();
+    _notifyBusyLineAppended();
+  }
+
+  @override
+  void dispose() {
+    _busyLineNotifyTimer?.cancel();
+    super.dispose();
+  }
+
+  // Progress lines can arrive per listing page; coalesce the resulting
+  // listener notifications so large listings don't rebuild the UI per page.
+  void _notifyBusyLineAppended() {
+    if (_busyLineNotifyTimer?.isActive ?? false) {
+      return;
+    }
+    _busyLineNotifyTimer = Timer(const Duration(milliseconds: 80), () {
+      _busyLineNotifyTimer = null;
+      notifyListeners();
+    });
   }
 
   bool _isListingActionKey(String actionKey) {
@@ -2728,6 +2663,11 @@ class AppController extends ChangeNotifier {
       ),
       ...eventLog,
     ];
+    // Keep the in-memory event log bounded; long sessions with API tracing
+    // enabled would otherwise grow without limit.
+    if (eventLog.length > eventLogLimit) {
+      eventLog = eventLog.sublist(0, eventLogLimit);
+    }
   }
 
   void _debug({
@@ -2840,8 +2780,6 @@ class AppController extends ChangeNotifier {
             objects = const [];
             versions = const [];
             selectedObject = null;
-            selectedObjectKeys = <String>{};
-            _objectSelectionAnchorKey = null;
             selectedObjectDetails = null;
             currentPrefix = '';
             _syncObjectFilterWithPrefix();
@@ -3148,48 +3086,6 @@ class AppController extends ChangeNotifier {
       }
     }
     return null;
-  }
-
-  ObjectEntry? _firstSelectedObject() {
-    for (final entry in objects) {
-      if (selectedObjectKeys.contains(entry.key)) {
-        return entry;
-      }
-    }
-    return null;
-  }
-
-  Set<String> _selectionWithRangeTo(ObjectEntry object) {
-    final visibleRows = pagedVisibleObjects;
-    final anchorIndex = visibleRows.indexWhere(
-      (entry) => entry.key == _objectSelectionAnchorKey,
-    );
-    final targetIndex = visibleRows.indexWhere(
-      (entry) => entry.key == object.key,
-    );
-    if (anchorIndex < 0 || targetIndex < 0) {
-      _objectSelectionAnchorKey = object.key;
-      return <String>{object.key};
-    }
-    final start = math.min(anchorIndex, targetIndex);
-    final end = math.max(anchorIndex, targetIndex);
-    return <String>{
-      ...selectedObjectKeys,
-      for (final entry in visibleRows.sublist(start, end + 1)) entry.key,
-    };
-  }
-
-  void _pruneObjectSelection() {
-    if (selectedObjectKeys.isEmpty) {
-      return;
-    }
-    final loadedKeys = objects.map((entry) => entry.key).toSet();
-    selectedObjectKeys = selectedObjectKeys.intersection(loadedKeys);
-    if (_objectSelectionAnchorKey != null &&
-        !selectedObjectKeys.contains(_objectSelectionAnchorKey)) {
-      _objectSelectionAnchorKey =
-          selectedObjectKeys.isEmpty ? null : selectedObjectKeys.last;
-    }
   }
 
   void _upsertTask(BrowserTaskRecord task) {

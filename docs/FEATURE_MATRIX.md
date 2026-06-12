@@ -2,6 +2,22 @@
 
 This file is the required parity checklist for all backend engines. A feature is only considered complete when every supported engine on a platform implements the same request and response semantics.
 
+## Storage Providers
+
+Profiles carry an `endpointType` of `s3Compatible`, `awsS3`, or `azureBlob`.
+
+| Provider | Auth | Python | Go | Rust | Java |
+| --- | --- | --- | --- | --- | --- |
+| S3-compatible (MinIO, Ceph, etc.) | Access/secret key (SigV4) | Supported | Supported | Supported | Supported |
+| AWS S3 | Access/secret key (SigV4) | Supported | Supported | Supported | Supported |
+| Azure Blob Storage | Account name + access key (Shared Key) | Supported | Supported | `unsupported_feature` error | `unsupported_feature` error |
+
+Azure notes:
+
+- The profile's access-key field holds the storage account name; the secret-key field holds the account access key. An empty endpoint URL resolves to `https://<account>.blob.core.windows.net`; set a custom URL for Azurite or sovereign clouds.
+- Buckets map to containers and folder markers to zero-byte blobs with a trailing `/`.
+- Versioning, lifecycle, policy, CORS, encryption, tagging, and presigned URLs are S3-only; engines return `unsupported_feature` and the UI hides those controls for Azure profiles.
+
 Legend:
 
 - `Required`: must be implemented for all engines on supported platforms

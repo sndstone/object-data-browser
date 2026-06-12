@@ -1,5 +1,39 @@
 # Changelog
 
+## 2.1.0 - 2026-06-12
+
+### Azure Blob Storage support
+- Added Azure Blob Storage as a third endpoint type alongside S3-compatible and AWS S3.
+- Authentication uses the storage account name (access key field) and account access key (secret key field). An empty endpoint URL resolves to `https://<account>.blob.core.windows.net`; a custom URL supports Azurite and sovereign clouds.
+- Implemented in the Go and Python engines via raw REST and Shared Key signing — no new runtime dependencies.
+- Rust and Java engines return a clean `unsupported_feature` response with instructions to switch engine.
+- S3-only features (versioning, presigned URLs, lifecycle/policy/CORS/encryption/tagging) are hidden in the UI for Azure profiles and rejected by engines.
+- Containers map to buckets; folder markers are zero-byte blobs with a trailing `/`; objects upload single-shot under 64 MiB and use 16 MiB block uploads above that threshold.
+
+### Benchmark — real parallel execution
+- Fixed a serial-execution bug where the Go benchmark ran all operations in a single loop regardless of the thread count setting.
+- Replaced with a true goroutine worker pool: mutex-guarded slot planning, lock-free per-op execution, and post-batch result aggregation.
+- Per-tick batch cap raised from `threads × 8` (min 32) to `threads × 32` (max 8 192).
+- Benchmark now works against Azure Blob Storage targets as well as S3.
+- Added four benchmark presets to the UI — Quick check, Standard, Throughput stress (16/64 MiB objects, 128 threads, 5 min), and IOPS stress (4/16 KiB objects, 256 threads, 8 192-object pool).
+
+### Performance — persistent engine processes
+- The desktop engine host previously spawned a new engine process for every API call (fork/exec + Python interpreter startup per request). Engine processes are now persistent and pooled.
+- Requests are matched to idle workers by request ID; a new worker is spawned only when all existing workers are busy. Crash recovery fails pending requests cleanly and respawns the process automatically. `dispose()` kills all child processes.
+
+### Responsive layout overhaul
+- Unified responsive breakpoints into a single `Breakpoints` class: phone < 700 px, tablet 700–1 199 px, desktop ≥ 1 200 px, wide ≥ 1 500 px.
+- Breakpoints are window-width driven, so resizing a desktop window walks through the same layouts as physical device sizes — no separate "compact desktop" path.
+- Tablet layout now docks the inspector below the object list with a resize handle instead of hiding it entirely.
+- Wide desktop (≥ 860 px object panel) adds Storage Class and ETag columns to the object table.
+
+### Performance hygiene
+- In-memory event log capped at 5 000 entries (was unbounded).
+- Per-page listing-progress notifications coalesced with an 80 ms debounce timer to prevent O(n) UI rebuilds on large buckets.
+
+### Engine versions
+- All four engines bumped to version 2.1.0.
+
 ## 2.0.17 - 2026-05-18
 
 - Fixed compact desktop inspector resize bounds so small macOS and Windows windows no longer crash with invalid clamp arguments.

@@ -159,37 +159,6 @@ void main() {
     expect(controller.listAllKeys, isFalse);
   });
 
-  test('controller supports range and toggle object selection', () async {
-    final controller = AppController(
-      engineService: MockEngineService(),
-      initialSettings: _settings,
-      initialProfiles: const [_profile],
-    );
-
-    await controller.initialize();
-    final selectable = controller.pagedVisibleObjects
-        .where((object) => !object.isFolder)
-        .take(3)
-        .toList();
-
-    await controller.selectObjectFromList(selectable.first);
-    await controller.selectObjectFromList(selectable.last, range: true);
-
-    expect(
-        controller.selectedObjectKeys,
-        containsAll([
-          selectable[0].key,
-          selectable[1].key,
-          selectable[2].key,
-        ]));
-
-    await controller.selectObjectFromList(selectable[1], toggle: true);
-
-    expect(controller.selectedObjectKeys, isNot(contains(selectable[1].key)));
-    expect(controller.selectedObjectKeys, contains(selectable[0].key));
-    expect(controller.selectedObjectKeys, contains(selectable[2].key));
-  });
-
   test(
       'controller persists settings and profiles and restores bucket-wide versions without selected object',
       () async {

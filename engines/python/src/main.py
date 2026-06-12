@@ -3,18 +3,27 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import io
 import json
 import socket
 import ssl
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import formatdate, parsedate_to_datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
 class SidecarError(Exception):
@@ -28,6 +37,7 @@ class SidecarError(Exception):
 @dataclass(frozen=True)
 class Profile:
     endpoint_url: str
+    endpoint_type: str
     region: str
     access_key: str
     secret_key: str
@@ -73,17 +83,19 @@ def _lazy_boto_imports():
 
 def _parse_profile(payload: dict[str, Any]) -> Profile:
     endpoint_url = str(payload.get("endpointUrl", "")).strip()
+    endpoint_type = str(payload.get("endpointType", "")).strip() or "s3Compatible"
     access_key = str(payload.get("accessKey", "")).strip()
     secret_key = str(payload.get("secretKey", "")).strip()
     region = str(payload.get("region", "")).strip() or "us-east-1"
 
-    if not endpoint_url:
+    if not endpoint_url and endpoint_type != "azureBlob":
         raise SidecarError("invalid_config", "Endpoint URL is required.")
     if not access_key or not secret_key:
         raise SidecarError("invalid_config", "Access key and secret key are required.")
 
     return Profile(
         endpoint_url=endpoint_url,
+        endpoint_type=endpoint_type,
         region=region,
         access_key=access_key,
         secret_key=secret_key,
@@ -333,6 +345,1151 @@ def _map_exception(error: Exception) -> SidecarError:
     return SidecarError("unknown", str(error))
 
 
+# ---------------------------------------------------------------------------
+# Azure Blob Storage support (Shared Key auth, Python standard library only)
+# ---------------------------------------------------------------------------
+
+_AZURE_API_VERSION = "2021-12-02"
+_AZURE_PUT_BLOB_LIMIT = 64 * 1024 * 1024
+_AZURE_BLOCK_SIZE = 16 * 1024 * 1024
+
+_AZURE_UNSUPPORTED_METHODS = {
+    "setBucketVersioning",
+    "putBucketLifecycle",
+    "deleteBucketLifecycle",
+    "putBucketPolicy",
+    "deleteBucketPolicy",
+    "putBucketCors",
+    "deleteBucketCors",
+    "putBucketEncryption",
+    "deleteBucketEncryption",
+    "putBucketTagging",
+    "deleteBucketTagging",
+    "listObjectVersions",
+    "deleteObjectVersions",
+    "generatePresignedUrl",
+}
+
+
+def _is_azure_profile(profile_payload: Any) -> bool:
+    if not isinstance(profile_payload, dict):
+        return False
+    return str(profile_payload.get("endpointType", "")).strip() == "azureBlob"
+
+
+def _azure_parse_rfc1123(value: Any) -> datetime:
+    try:
+        parsed = parsedate_to_datetime(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except (TypeError, ValueError):
+        return datetime.now(tz=timezone.utc)
+
+
+class _AzureBlobClient:
+    """Minimal Azure Blob service client implementing Shared Key signing."""
+
+    def __init__(self, profile: Profile):
+        self.profile = profile
+        self.account = profile.access_key
+        try:
+            self.key = base64.b64decode(profile.secret_key)
+        except (ValueError, TypeError) as error:
+            raise SidecarError(
+                "invalid_config",
+                "Azure account access key must be valid base64.",
+            ) from error
+        if not self.key:
+            raise SidecarError("invalid_config", "Azure account access key must not be empty.")
+
+        base = profile.endpoint_url.strip().rstrip("/")
+        if not base:
+            base = f"https://{self.account}.blob.core.windows.net"
+        parsed = urlparse(base)
+        if not parsed.scheme or not parsed.netloc:
+            raise SidecarError("invalid_config", f"Invalid Azure Blob endpoint URL: {base}")
+        self.scheme = parsed.scheme
+        self.netloc = parsed.netloc
+        # Azurite-style endpoints embed "/{account}" in the URL path.
+        self.base_path = parsed.path.rstrip("/")
+        self.base_url = f"{self.scheme}://{self.netloc}{self.base_path}"
+        self.timeout = max(profile.connect_timeout_seconds, profile.read_timeout_seconds)
+        self.context: ssl.SSLContext | None = None
+        if self.scheme == "https":
+            context = ssl.create_default_context()
+            if not profile.verify_tls:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            self.context = context
+
+    def blob_path(self, container: str, key: str | None = None) -> str:
+        path = f"/{quote(container, safe='')}"
+        if key is not None:
+            path += f"/{quote(key, safe='/')}"
+        return path
+
+    def _string_to_sign(
+        self,
+        method: str,
+        full_path: str,
+        query: dict[str, str],
+        headers: dict[str, str],
+    ) -> str:
+        def header(name: str) -> str:
+            return str(headers.get(name, "") or "")
+
+        content_length = header("Content-Length")
+        if content_length == "0":
+            content_length = ""
+
+        canonical_headers = "".join(
+            f"{name}:{value}\n"
+            for name, value in sorted(
+                (str(name).lower(), str(value).strip())
+                for name, value in headers.items()
+                if str(name).lower().startswith("x-ms-")
+            )
+        )
+        canonical_resource = f"/{self.account}{full_path}"
+        for name in sorted(query, key=lambda item: str(item).lower()):
+            canonical_resource += f"\n{str(name).lower()}:{query[name]}"
+
+        return (
+            "\n".join(
+                [
+                    method.upper(),
+                    header("Content-Encoding"),
+                    header("Content-Language"),
+                    content_length,
+                    header("Content-MD5"),
+                    header("Content-Type"),
+                    "",  # Date is left empty because x-ms-date is always set.
+                    header("If-Modified-Since"),
+                    header("If-Match"),
+                    header("If-None-Match"),
+                    header("If-Unmodified-Since"),
+                    header("Range"),
+                ]
+            )
+            + "\n"
+            + canonical_headers
+            + canonical_resource
+        )
+
+    def _map_http_error(self, error: urllib.error.HTTPError) -> SidecarError:
+        status = int(getattr(error, "code", 0) or 0)
+        try:
+            body = error.read()
+        except Exception:  # noqa: BLE001
+            body = b""
+        code = str(error.headers.get("x-ms-error-code", "") or "") if error.headers else ""
+        message = ""
+        if body:
+            try:
+                root = ET.fromstring(body.decode("utf-8", errors="replace"))
+                code = code or str(root.findtext("Code") or "")
+                raw_message = str(root.findtext("Message") or "")
+                message = raw_message.splitlines()[0] if raw_message else ""
+            except ET.ParseError:
+                pass
+        if not message:
+            if status == 404:
+                message = "The specified resource does not exist."
+            else:
+                message = f"Azure Blob request failed with HTTP {status} ({code or 'Unknown'})."
+        details = {"azureCode": code or "Unknown", "httpStatus": status}
+        if status in {401, 403} or code in {
+            "AuthenticationFailed",
+            "AuthorizationFailure",
+            "InvalidAuthenticationInfo",
+            "InsufficientAccountPermissions",
+        }:
+            return SidecarError("auth_failed", message, details)
+        if status == 503 or code == "ServerBusy":
+            return SidecarError("throttled", message, details)
+        if code == "OperationTimedOut":
+            return SidecarError("timeout", message, details)
+        return SidecarError("unknown", message, details)
+
+    def open(
+        self,
+        method: str,
+        path: str = "",
+        query: dict[str, Any] | None = None,
+        headers: dict[str, Any] | None = None,
+        body: bytes | None = None,
+    ):
+        """Issue a signed request and return the open HTTP response."""
+        query_params = {str(name): str(value) for name, value in dict(query or {}).items()}
+        request_headers: dict[str, str] = {
+            "x-ms-version": _AZURE_API_VERSION,
+            "x-ms-date": formatdate(usegmt=True),
+        }
+        for name, value in dict(headers or {}).items():
+            request_headers[str(name)] = str(value)
+        if body is not None:
+            request_headers["Content-Length"] = str(len(body))
+            # urllib injects "application/x-www-form-urlencoded" when a body is
+            # present and no Content-Type is set, which would break the
+            # signature; pin an explicit value so the signed header matches.
+            if not any(str(name).lower() == "content-type" for name in request_headers):
+                request_headers["Content-Type"] = "application/octet-stream"
+
+        full_path = f"{self.base_path}{path}" or "/"
+        string_to_sign = self._string_to_sign(method, full_path, query_params, request_headers)
+        signature = base64.b64encode(
+            hmac.new(self.key, string_to_sign.encode("utf-8"), hashlib.sha256).digest()
+        ).decode("ascii")
+        request_headers["Authorization"] = f"SharedKey {self.account}:{signature}"
+
+        url = f"{self.scheme}://{self.netloc}{full_path}"
+        if query_params:
+            url += "?" + "&".join(
+                f"{quote(name, safe='')}={quote(value, safe='')}"
+                for name, value in sorted(query_params.items())
+            )
+
+        if self.profile.enable_api_logging:
+            _emit_structured_log(
+                "API",
+                "HttpSend",
+                f"SEND {method.upper()} {url} HEADERS={json.dumps(_sanitize_headers(request_headers), sort_keys=True)} BODY=[{len(body or b'')} byte(s)]",
+                "api",
+            )
+
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method=method.upper(),
+            headers=request_headers,
+        )
+        try:
+            response = urllib.request.urlopen(request, timeout=self.timeout, context=self.context)
+        except urllib.error.HTTPError as error:
+            mapped = self._map_http_error(error)
+            if self.profile.enable_api_logging:
+                _emit_structured_log(
+                    "API",
+                    "HttpReceive",
+                    f"RECV {method.upper()} {url} STATUS={mapped.details.get('httpStatus')} CODE={mapped.details.get('azureCode')}",
+                    "api",
+                )
+            raise mapped from error
+        except (socket.timeout, TimeoutError) as error:
+            raise SidecarError("timeout", str(error)) from error
+        except ssl.SSLError as error:
+            raise SidecarError("tls_error", str(error)) from error
+        except urllib.error.URLError as error:
+            reason = getattr(error, "reason", error)
+            if isinstance(reason, ssl.SSLError):
+                raise SidecarError("tls_error", str(reason)) from error
+            if isinstance(reason, (socket.timeout, TimeoutError)):
+                raise SidecarError("timeout", str(reason)) from error
+            raise SidecarError("engine_unavailable", str(reason)) from error
+        except (ConnectionError, OSError) as error:
+            raise SidecarError("engine_unavailable", str(error)) from error
+
+        if self.profile.enable_api_logging:
+            _emit_structured_log(
+                "API",
+                "HttpReceive",
+                f"RECV {method.upper()} {url} STATUS={response.status}",
+                "api",
+            )
+        return response
+
+    def request(
+        self,
+        method: str,
+        path: str = "",
+        query: dict[str, Any] | None = None,
+        headers: dict[str, Any] | None = None,
+        body: bytes | None = None,
+    ) -> tuple[int, Any, bytes]:
+        response = self.open(method, path, query=query, headers=headers, body=body)
+        with response:
+            data = response.read()
+            return int(response.status), response.headers, data
+
+
+def _azure_parse_xml(body: bytes) -> ET.Element:
+    try:
+        return ET.fromstring(body)
+    except ET.ParseError as error:
+        raise SidecarError(
+            "unknown",
+            f"Azure Blob service returned an unparseable XML response: {error}",
+        ) from error
+
+
+def _azure_list_containers_page(
+    client: _AzureBlobClient,
+    marker: str | None = None,
+    maxresults: int | None = None,
+) -> tuple[list[dict[str, str]], str]:
+    query: dict[str, Any] = {"comp": "list"}
+    if marker:
+        query["marker"] = marker
+    if maxresults:
+        query["maxresults"] = str(maxresults)
+    _, _, body = client.request("GET", "", query=query)
+    root = _azure_parse_xml(body)
+    containers: list[dict[str, str]] = []
+    for node in root.iterfind("Containers/Container"):
+        name = str(node.findtext("Name") or "")
+        if not name:
+            continue
+        containers.append(
+            {
+                "name": name,
+                "lastModified": str(node.findtext("Properties/Last-Modified") or ""),
+            }
+        )
+    next_marker = str(root.findtext("NextMarker") or "").strip()
+    return containers, next_marker
+
+
+def _azure_test_profile(profile_payload: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(profile_payload)
+    client = _AzureBlobClient(profile)
+    containers, _ = _azure_list_containers_page(client, maxresults=1)
+    return {
+        "ok": True,
+        "bucketCount": len(containers),
+        "endpoint": client.netloc,
+    }
+
+
+def _azure_list_buckets(profile_payload: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(profile_payload)
+    client = _AzureBlobClient(profile)
+    buckets: list[dict[str, Any]] = []
+    marker: str | None = None
+    while True:
+        containers, marker = _azure_list_containers_page(client, marker=marker)
+        for container in containers:
+            buckets.append(
+                {
+                    "name": container["name"],
+                    "region": profile.region,
+                    "objectCountHint": 0,
+                    "versioningEnabled": False,
+                    "createdAt": _serialize_dt(_azure_parse_rfc1123(container["lastModified"])),
+                }
+            )
+        if not marker:
+            break
+    return {"items": buckets}
+
+
+def _azure_create_bucket(params: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(params.get("profile", {}))
+    bucket_name = str(params.get("bucketName", "")).strip()
+    if not bucket_name:
+        raise SidecarError("invalid_config", "Bucket name is required.")
+    client = _AzureBlobClient(profile)
+    client.request("PUT", client.blob_path(bucket_name), query={"restype": "container"}, body=b"")
+    return {
+        "name": bucket_name,
+        "region": profile.region,
+        "objectCountHint": 0,
+        "versioningEnabled": False,
+        "createdAt": _serialize_dt(datetime.now(tz=timezone.utc)),
+    }
+
+
+def _azure_delete_bucket(params: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(params.get("profile", {}))
+    bucket_name = str(params.get("bucketName", "")).strip()
+    if not bucket_name:
+        raise SidecarError("invalid_config", "Bucket name is required.")
+    client = _AzureBlobClient(profile)
+    client.request("DELETE", client.blob_path(bucket_name), query={"restype": "container"})
+    return {"deleted": True, "bucketName": bucket_name}
+
+
+def _azure_list_blobs_page(
+    client: _AzureBlobClient,
+    bucket_name: str,
+    *,
+    prefix: str = "",
+    delimiter: str | None = None,
+    marker: str | None = None,
+    maxresults: int = 1000,
+) -> tuple[ET.Element, str]:
+    query: dict[str, Any] = {
+        "restype": "container",
+        "comp": "list",
+        "maxresults": str(maxresults),
+    }
+    if prefix:
+        query["prefix"] = prefix
+    if delimiter:
+        query["delimiter"] = delimiter
+    if marker:
+        query["marker"] = marker
+    _, _, body = client.request("GET", client.blob_path(bucket_name), query=query)
+    root = _azure_parse_xml(body)
+    next_marker = str(root.findtext("NextMarker") or "").strip()
+    return root, next_marker
+
+
+def _azure_list_objects(params: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(params.get("profile", {}))
+    bucket_name = str(params.get("bucketName", "")).strip()
+    if not bucket_name:
+        raise SidecarError("invalid_config", "Bucket name is required for object listing.")
+
+    prefix = str(params.get("prefix", "") or "")
+    flat = bool(params.get("flat", False))
+    cursor = params.get("cursor") or {}
+    continuation_token = cursor.get("value") if isinstance(cursor, dict) else None
+
+    client = _AzureBlobClient(profile)
+    root, next_marker = _azure_list_blobs_page(
+        client,
+        bucket_name,
+        prefix=prefix,
+        delimiter=None if flat else "/",
+        marker=str(continuation_token) if continuation_token else None,
+    )
+
+    items: list[dict[str, Any]] = []
+    for node in root.iterfind("Blobs/BlobPrefix"):
+        folder_prefix = str(node.findtext("Name") or "")
+        if not folder_prefix:
+            continue
+        folder_name = folder_prefix[len(prefix) :] if folder_prefix.startswith(prefix) else folder_prefix
+        items.append(
+            {
+                "key": folder_prefix,
+                "name": folder_name or folder_prefix,
+                "size": 0,
+                "storageClass": "FOLDER",
+                "modifiedAt": _serialize_dt(datetime.now(tz=timezone.utc)),
+                "isFolder": True,
+                "etag": None,
+                "metadataCount": 0,
+            }
+        )
+
+    for node in root.iterfind("Blobs/Blob"):
+        key = str(node.findtext("Name") or "")
+        if not key:
+            continue
+        if not flat and key == prefix:
+            continue
+        name = key[len(prefix) :] if prefix and key.startswith(prefix) else key
+        if not name:
+            name = key
+        items.append(
+            {
+                "key": key,
+                "name": name,
+                "size": int(node.findtext("Properties/Content-Length") or 0),
+                "storageClass": str(node.findtext("Properties/AccessTier") or "STANDARD"),
+                "modifiedAt": _serialize_dt(
+                    _azure_parse_rfc1123(node.findtext("Properties/Last-Modified") or "")
+                ),
+                "isFolder": False,
+                "etag": str(node.findtext("Properties/Etag") or "").strip('"') or None,
+                "metadataCount": 0,
+            }
+        )
+
+    items.sort(key=lambda item: (not bool(item["isFolder"]), str(item["key"]).lower()))
+    return {
+        "items": items,
+        "nextCursor": {
+            "value": next_marker or None,
+            "hasMore": bool(next_marker),
+        },
+    }
+
+
+def _azure_get_bucket_admin_state(params: dict[str, Any]) -> dict[str, Any]:
+    bucket_name = str(params.get("bucketName", "")).strip()
+    if not bucket_name:
+        raise SidecarError("invalid_config", "Bucket name is required for bucket admin inspection.")
+    # Azure Blob containers do not expose S3-style bucket administration, so a
+    # benign disabled state is returned for routine UI polling.
+    return {
+        "bucketName": bucket_name,
+        "versioningEnabled": False,
+        "versioningStatus": "Suspended",
+        "objectLockEnabled": False,
+        "lifecycleEnabled": False,
+        "policyAttached": False,
+        "corsEnabled": False,
+        "encryptionEnabled": False,
+        "encryptionSummary": "Not configured",
+        "objectLockMode": None,
+        "objectLockRetentionDays": None,
+        "tags": {},
+        "lifecycleRules": [],
+        "lifecycleJson": _json_dumps({"Rules": []}),
+        "policyJson": "{}",
+        "corsJson": _json_dumps([]),
+        "encryptionJson": _json_dumps({}),
+        "apiCalls": [],
+    }
+
+
+def _azure_get_object_details(params: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(params.get("profile", {}))
+    bucket_name = str(params.get("bucketName", "")).strip()
+    key = str(params.get("key", "")).strip()
+    if not bucket_name or not key:
+        raise SidecarError("invalid_config", "Bucket name and object key are required for object inspection.")
+
+    client = _AzureBlobClient(profile)
+    api_calls: list[dict[str, Any]] = []
+    debug_events: list[dict[str, Any]] = []
+
+    debug_events.append(
+        {
+            "timestamp": _serialize_dt(datetime.now(tz=timezone.utc)),
+            "level": "DEBUG",
+            "message": f"Fetching object diagnostics for {bucket_name}/{key}.",
+        }
+    )
+
+    _, head_headers, _ = _call_api(
+        api_calls,
+        "HeadBlob",
+        lambda: client.request("HEAD", client.blob_path(bucket_name, key)),
+    )
+
+    metadata = {
+        str(name)[len("x-ms-meta-") :]: str(value)
+        for name, value in head_headers.items()
+        if str(name).lower().startswith("x-ms-meta-")
+    }
+    last_modified = head_headers.get("Last-Modified", "")
+    headers = {
+        "ETag": str(head_headers.get("ETag", "")).strip('"'),
+        "Content-Length": str(head_headers.get("Content-Length", "")),
+        "Content-Type": str(head_headers.get("Content-Type", "")),
+        "Last-Modified": _serialize_dt(_azure_parse_rfc1123(last_modified)) if last_modified else "",
+        "Storage-Class": str(head_headers.get("x-ms-access-tier", "") or "STANDARD"),
+        "Cache-Control": str(head_headers.get("Cache-Control", "")),
+    }
+    headers = {name: value for name, value in headers.items() if value}
+
+    debug_events.append(
+        {
+            "timestamp": _serialize_dt(datetime.now(tz=timezone.utc)),
+            "level": "INFO",
+            "message": f"Loaded metadata and 0 tag(s) for {key}.",
+        }
+    )
+
+    return {
+        "key": key,
+        "metadata": metadata,
+        "headers": headers,
+        "tags": {},
+        "debugEvents": debug_events,
+        "apiCalls": api_calls,
+        "debugLogExcerpt": [
+            f"Resolved endpoint {client.base_url}.",
+            f"Completed HEAD diagnostics for {bucket_name}/{key}.",
+        ],
+        "rawDiagnostics": {
+            "bucketName": bucket_name,
+            "engineState": "healthy",
+        },
+    }
+
+
+def _azure_create_folder(params: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(params.get("profile", {}))
+    bucket_name = str(params.get("bucketName", "")).strip()
+    key = str(params.get("key", "")).strip()
+    if not bucket_name or not key:
+        raise SidecarError("invalid_config", "Bucket name and key are required to create a folder.")
+    if not key.endswith("/"):
+        key = f"{key}/"
+    client = _AzureBlobClient(profile)
+    client.request(
+        "PUT",
+        client.blob_path(bucket_name, key),
+        headers={"x-ms-blob-type": "BlockBlob", "Content-Type": "application/octet-stream"},
+        body=b"",
+    )
+    return {"created": True, "key": key}
+
+
+def _azure_wait_for_copy(client: _AzureBlobClient, dest_path: str, copy_status: str) -> None:
+    attempts = 0
+    while copy_status == "pending" and attempts < 60:
+        time.sleep(0.5)
+        response = client.open("HEAD", dest_path)
+        with response:
+            response.read()
+            copy_status = str(response.headers.get("x-ms-copy-status", "") or "success").lower()
+        attempts += 1
+    if copy_status not in {"", "success"}:
+        raise SidecarError(
+            "unknown",
+            f"Azure blob copy finished with status '{copy_status}'.",
+        )
+
+
+def _azure_copy_object(params: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(params.get("profile", {}))
+    src_bucket = str(params.get("sourceBucketName", "")).strip()
+    src_key = str(params.get("sourceKey", "")).strip()
+    dest_bucket = str(params.get("destinationBucketName", "")).strip()
+    dest_key = str(params.get("destinationKey", "")).strip()
+    if not src_bucket or not src_key or not dest_bucket or not dest_key:
+        raise SidecarError("invalid_config", "Copy source and destination are required.")
+    client = _AzureBlobClient(profile)
+    source_url = f"{client.scheme}://{client.netloc}{client.base_path}{client.blob_path(src_bucket, src_key)}"
+    dest_path = client.blob_path(dest_bucket, dest_key)
+    _, headers, _ = client.request(
+        "PUT",
+        dest_path,
+        headers={"x-ms-copy-source": source_url},
+        body=b"",
+    )
+    copy_status = str(headers.get("x-ms-copy-status", "") or "success").lower()
+    _azure_wait_for_copy(client, dest_path, copy_status)
+    return {"successCount": 1, "failureCount": 0, "failures": []}
+
+
+def _azure_move_object(params: dict[str, Any]) -> dict[str, Any]:
+    result = _azure_copy_object(params)
+    profile = _parse_profile(params.get("profile", {}))
+    client = _AzureBlobClient(profile)
+    client.request(
+        "DELETE",
+        client.blob_path(
+            str(params.get("sourceBucketName", "")).strip(),
+            str(params.get("sourceKey", "")).strip(),
+        ),
+    )
+    return result
+
+
+def _azure_delete_blob(client: _AzureBlobClient, bucket_name: str, key: str) -> None:
+    """Delete one blob; missing blobs are treated as already deleted."""
+    try:
+        client.request("DELETE", client.blob_path(bucket_name, key))
+    except SidecarError as error:
+        if int(error.details.get("httpStatus", 0) or 0) == 404:
+            return
+        raise
+
+
+def _azure_delete_objects(params: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(params.get("profile", {}))
+    bucket_name = str(params.get("bucketName", "")).strip()
+    keys = [str(item) for item in params.get("keys", []) if str(item).strip()]
+    if not bucket_name or not keys:
+        raise SidecarError("invalid_config", "Bucket name and keys are required.")
+    client = _AzureBlobClient(profile)
+    success_count = 0
+    failures: list[dict[str, Any]] = []
+    max_workers = max(1, min(profile.max_pool_connections, 16))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_azure_delete_blob, client, bucket_name, key): key for key in keys}
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                future.result()
+                success_count += 1
+            except SidecarError as error:
+                failures.append(
+                    {
+                        "target": key,
+                        "code": str(error.details.get("azureCode", error.code)),
+                        "message": error.message,
+                    }
+                )
+            except Exception as error:  # noqa: BLE001
+                failures.append({"target": key, "code": "unknown", "message": str(error)})
+    return {
+        "successCount": success_count,
+        "failureCount": len(failures),
+        "failures": failures,
+    }
+
+
+def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(params.get("profile", {}))
+    bucket_name = str(params.get("bucketName", "")).strip()
+    prefix = str(params.get("prefix", "")).strip()
+    file_paths = [str(item) for item in params.get("filePaths", []) if str(item).strip()]
+    object_key_by_path = {
+        str(key): str(value).replace("\\", "/").lstrip("/")
+        for key, value in dict(params.get("objectKeyByPath", {}) or {}).items()
+        if str(value).strip()
+    }
+    if not bucket_name or not file_paths:
+        raise SidecarError("invalid_config", "Bucket name and file paths are required.")
+    client = _AzureBlobClient(profile)
+    paths = [Path(file_path) for file_path in file_paths]
+    total_bytes = sum(path.stat().st_size for path in paths)
+    uses_multipart = any(path.stat().st_size >= _AZURE_PUT_BLOB_LIMIT for path in paths)
+    parts_total = sum(
+        max((path.stat().st_size + _AZURE_BLOCK_SIZE - 1) // _AZURE_BLOCK_SIZE, 1)
+        for path in paths
+        if path.stat().st_size >= _AZURE_PUT_BLOB_LIMIT
+    )
+    part_size_bytes = _AZURE_BLOCK_SIZE if parts_total > 0 else None
+    job_id = f"upload-{uuid.uuid4().hex[:8]}"
+    label = f"Upload {len(paths)} file(s) to {bucket_name}"
+    strategy_label = _transfer_strategy_label("upload", uses_multipart)
+    output_lines = [f"Queued {len(paths)} file(s) for upload to {bucket_name}."]
+    bytes_transferred = 0
+    items_completed = 0
+    parts_completed = 0
+    _emit_transfer_event(
+        _build_transfer_job(
+            job_id=job_id,
+            label=label,
+            direction="upload",
+            progress=0,
+            status="queued",
+            bytes_transferred=0,
+            total_bytes=total_bytes,
+            output_lines=list(output_lines),
+            strategy_label=strategy_label,
+            current_item_label=paths[0].name if paths else None,
+            item_count=len(paths),
+            items_completed=items_completed,
+            part_size_bytes=part_size_bytes,
+            parts_completed=parts_completed if part_size_bytes is not None else None,
+            parts_total=parts_total if part_size_bytes is not None else None,
+            can_pause=True,
+            can_cancel=True,
+        )
+    )
+    for path in paths:
+        target_name = object_key_by_path.get(str(path), path.name)
+        target_key = f"{prefix}{target_name}" if prefix else target_name
+        blob_path = client.blob_path(bucket_name, target_key)
+        file_size = path.stat().st_size
+        output_lines.append(f"Uploading {path.name} ({file_size} bytes) to {target_key}.")
+        if file_size >= _AZURE_PUT_BLOB_LIMIT:
+            block_ids: list[str] = []
+            block_index = 0
+            with path.open("rb") as handle:
+                while True:
+                    chunk = handle.read(_AZURE_BLOCK_SIZE)
+                    if not chunk:
+                        break
+                    block_id = base64.b64encode(f"block-{block_index:010d}".encode("ascii")).decode("ascii")
+                    client.request(
+                        "PUT",
+                        blob_path,
+                        query={"comp": "block", "blockid": block_id},
+                        body=chunk,
+                    )
+                    block_ids.append(block_id)
+                    bytes_transferred += len(chunk)
+                    parts_completed += 1
+                    output_lines.append(f"Uploaded part {block_index + 1} for {path.name}.")
+                    _emit_transfer_event(
+                        _build_transfer_job(
+                            job_id=job_id,
+                            label=label,
+                            direction="upload",
+                            progress=bytes_transferred / total_bytes if total_bytes else 1,
+                            status="running",
+                            bytes_transferred=bytes_transferred,
+                            total_bytes=total_bytes,
+                            output_lines=list(output_lines),
+                            strategy_label=strategy_label,
+                            current_item_label=path.name,
+                            item_count=len(paths),
+                            items_completed=items_completed,
+                            part_size_bytes=part_size_bytes,
+                            parts_completed=parts_completed,
+                            parts_total=parts_total,
+                            can_pause=True,
+                            can_cancel=True,
+                        )
+                    )
+                    block_index += 1
+            block_list_xml = "".join(f"<Latest>{block_id}</Latest>" for block_id in block_ids)
+            block_list_body = (
+                f'<?xml version="1.0" encoding="utf-8"?><BlockList>{block_list_xml}</BlockList>'
+            ).encode("utf-8")
+            client.request(
+                "PUT",
+                blob_path,
+                query={"comp": "blocklist"},
+                headers={"Content-Type": "application/xml"},
+                body=block_list_body,
+            )
+        else:
+            client.request(
+                "PUT",
+                blob_path,
+                headers={"x-ms-blob-type": "BlockBlob", "Content-Type": "application/octet-stream"},
+                body=path.read_bytes(),
+            )
+            bytes_transferred += file_size
+        items_completed += 1
+        output_lines.append(f"Finished uploading {path.name}.")
+        _emit_transfer_event(
+            _build_transfer_job(
+                job_id=job_id,
+                label=label,
+                direction="upload",
+                progress=bytes_transferred / total_bytes if total_bytes else 1,
+                status="running",
+                bytes_transferred=bytes_transferred,
+                total_bytes=total_bytes,
+                output_lines=list(output_lines),
+                strategy_label=strategy_label,
+                current_item_label=path.name,
+                item_count=len(paths),
+                items_completed=items_completed,
+                part_size_bytes=part_size_bytes,
+                parts_completed=parts_completed if part_size_bytes is not None else None,
+                parts_total=parts_total if part_size_bytes is not None else None,
+                can_pause=True,
+                can_cancel=True,
+            )
+        )
+    output_lines.append(f"Uploaded {len(paths)} file(s) into {bucket_name}.")
+    return _build_transfer_job(
+        job_id=job_id,
+        label=label,
+        direction="upload",
+        progress=1,
+        status="completed",
+        bytes_transferred=bytes_transferred,
+        total_bytes=total_bytes,
+        output_lines=output_lines,
+        strategy_label=strategy_label,
+        current_item_label=paths[-1].name if paths else None,
+        item_count=len(paths),
+        items_completed=items_completed,
+        part_size_bytes=part_size_bytes,
+        parts_completed=parts_completed if part_size_bytes is not None else None,
+        parts_total=parts_total if part_size_bytes is not None else None,
+    )
+
+
+def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(params.get("profile", {}))
+    bucket_name = str(params.get("bucketName", "")).strip()
+    keys = [str(item) for item in params.get("keys", []) if str(item).strip()]
+    destination_path = str(params.get("destinationPath", "")).strip()
+    if not bucket_name or not keys or not destination_path:
+        raise SidecarError("invalid_config", "Bucket, keys, and destination path are required.")
+    multipart_threshold_bytes = _int_param(params, "multipartThresholdMiB", 32) * 1024 * 1024
+    multipart_chunk_bytes = _int_param(params, "multipartChunkMiB", 8) * 1024 * 1024
+    client = _AzureBlobClient(profile)
+    destination = Path(destination_path)
+    destination.mkdir(parents=True, exist_ok=True)
+    sizes: dict[str, int] = {}
+    for key in keys:
+        _, head_headers, _ = client.request("HEAD", client.blob_path(bucket_name, key))
+        sizes[key] = int(head_headers.get("Content-Length", 0) or 0)
+    total_bytes = sum(sizes.values())
+    uses_multipart = any(size >= multipart_threshold_bytes for size in sizes.values())
+    parts_total = sum(
+        max((size + multipart_chunk_bytes - 1) // multipart_chunk_bytes, 1)
+        for size in sizes.values()
+        if size >= multipart_threshold_bytes
+    )
+    part_size_bytes = multipart_chunk_bytes if parts_total > 0 else None
+    job_id = f"download-{uuid.uuid4().hex[:8]}"
+    label = f"Download {len(keys)} object(s) from {bucket_name}"
+    strategy_label = _transfer_strategy_label("download", uses_multipart)
+    output_lines = [f"Queued {len(keys)} object(s) for download to {destination_path}."]
+    bytes_transferred = 0
+    items_completed = 0
+    parts_completed = 0
+    _emit_transfer_event(
+        _build_transfer_job(
+            job_id=job_id,
+            label=label,
+            direction="download",
+            progress=0,
+            status="queued",
+            bytes_transferred=0,
+            total_bytes=total_bytes,
+            output_lines=list(output_lines),
+            strategy_label=strategy_label,
+            current_item_label=keys[0] if keys else None,
+            item_count=len(keys),
+            items_completed=items_completed,
+            part_size_bytes=part_size_bytes,
+            parts_completed=parts_completed if part_size_bytes is not None else None,
+            parts_total=parts_total if part_size_bytes is not None else None,
+            can_pause=True,
+            can_cancel=True,
+        )
+    )
+    for key in keys:
+        target = destination / Path(key).name
+        object_size = sizes[key]
+        blob_path = client.blob_path(bucket_name, key)
+        output_lines.append(f"Downloading {key} ({object_size} bytes) to {target}.")
+        with target.open("wb") as handle:
+            if object_size >= multipart_threshold_bytes:
+                start = 0
+                while start < object_size:
+                    end = min(start + multipart_chunk_bytes - 1, object_size - 1)
+                    _, _, chunk = client.request(
+                        "GET",
+                        blob_path,
+                        headers={"Range": f"bytes={start}-{end}"},
+                    )
+                    handle.write(chunk)
+                    chunk_size = end - start + 1
+                    bytes_transferred += chunk_size
+                    parts_completed += 1
+                    output_lines.append(f"Downloaded byte range {start}-{end} for {key}.")
+                    _emit_transfer_event(
+                        _build_transfer_job(
+                            job_id=job_id,
+                            label=label,
+                            direction="download",
+                            progress=bytes_transferred / total_bytes if total_bytes else 1,
+                            status="running",
+                            bytes_transferred=bytes_transferred,
+                            total_bytes=total_bytes,
+                            output_lines=list(output_lines),
+                            strategy_label=strategy_label,
+                            current_item_label=key,
+                            item_count=len(keys),
+                            items_completed=items_completed,
+                            part_size_bytes=part_size_bytes,
+                            parts_completed=parts_completed,
+                            parts_total=parts_total,
+                            can_pause=True,
+                            can_cancel=True,
+                        )
+                    )
+                    start = end + 1
+            else:
+                response = client.open("GET", blob_path)
+                with response:
+                    while True:
+                        chunk = response.read(min(multipart_chunk_bytes, 1024 * 1024))
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        bytes_transferred += len(chunk)
+                        _emit_transfer_event(
+                            _build_transfer_job(
+                                job_id=job_id,
+                                label=label,
+                                direction="download",
+                                progress=bytes_transferred / total_bytes if total_bytes else 1,
+                                status="running",
+                                bytes_transferred=bytes_transferred,
+                                total_bytes=total_bytes,
+                                output_lines=list(output_lines),
+                                strategy_label=strategy_label,
+                                current_item_label=key,
+                                item_count=len(keys),
+                                items_completed=items_completed,
+                                part_size_bytes=part_size_bytes,
+                                parts_completed=parts_completed if part_size_bytes is not None else None,
+                                parts_total=parts_total if part_size_bytes is not None else None,
+                                can_pause=True,
+                                can_cancel=True,
+                            )
+                        )
+        items_completed += 1
+        output_lines.append(f"Finished downloading {key}.")
+    output_lines.append(f"Downloaded {len(keys)} object(s) into {destination_path}.")
+    return _build_transfer_job(
+        job_id=job_id,
+        label=label,
+        direction="download",
+        progress=1,
+        status="completed",
+        bytes_transferred=bytes_transferred,
+        total_bytes=total_bytes,
+        output_lines=output_lines,
+        strategy_label=strategy_label,
+        current_item_label=keys[-1] if keys else None,
+        item_count=len(keys),
+        items_completed=items_completed,
+        part_size_bytes=part_size_bytes,
+        parts_completed=parts_completed if part_size_bytes is not None else None,
+        parts_total=parts_total if part_size_bytes is not None else None,
+    )
+
+
+def _azure_run_put_testdata(params: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(params.get("profile", {}))
+    config = params.get("config") or {}
+    object_count = max(int(config.get("objectCount", 0) or 0), 0)
+    versions = max(int(config.get("versions", 1) or 1), 1)
+    bucket_name = str(config.get("bucketName", "")).strip()
+    prefix = str(config.get("prefix", "") or "")
+    threads = max(int(config.get("threads", 1) or 1), 1)
+    size_bytes = max(int(config.get("objectSizeBytes", config.get("sizeBytes", 4096)) or 4096), 0)
+    if not bucket_name:
+        raise SidecarError("invalid_config", "Bucket name is required.")
+    client = _AzureBlobClient(profile)
+    payload = b"A" * size_bytes
+
+    def put_one(index: int) -> None:
+        key = f"{prefix}testdata-{index:06d}.bin"
+        for _ in range(versions):
+            client.request(
+                "PUT",
+                client.blob_path(bucket_name, key),
+                headers={"x-ms-blob-type": "BlockBlob", "Content-Type": "application/octet-stream"},
+                body=payload,
+            )
+
+    with ThreadPoolExecutor(max_workers=min(threads, 16)) as pool:
+        futures = [pool.submit(put_one, index) for index in range(object_count)]
+        for future in as_completed(futures):
+            future.result()
+
+    return _tool_state(
+        "put-testdata.py",
+        f"Prepared {object_count} object(s) with {versions} version(s) each for {bucket_name}.",
+        [
+            f"Bucket: {bucket_name}",
+            f"Prefix: {config.get('prefix', '')}",
+            f"Threads: {config.get('threads', 1)}",
+        ],
+    )
+
+
+def _azure_run_delete_all(params: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(params.get("profile", {}))
+    config = params.get("config") or {}
+    bucket_name = str(config.get("bucketName", "")).strip()
+    prefix = str(config.get("prefix", "") or "")
+    max_workers = max(1, min(int(config.get("maxWorkers", 4) or 4), 16))
+    if not bucket_name:
+        raise SidecarError("invalid_config", "Bucket name is required.")
+    client = _AzureBlobClient(profile)
+
+    deleted_count = 0
+    failure_count = 0
+    marker: str | None = None
+    while True:
+        root, marker = _azure_list_blobs_page(client, bucket_name, prefix=prefix, marker=marker)
+        keys = [
+            str(node.findtext("Name") or "")
+            for node in root.iterfind("Blobs/Blob")
+            if str(node.findtext("Name") or "")
+        ]
+        if keys:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [pool.submit(_azure_delete_blob, client, bucket_name, key) for key in keys]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                        deleted_count += 1
+                    except Exception:  # noqa: BLE001
+                        failure_count += 1
+        if not marker:
+            break
+
+    return _tool_state(
+        "delete-all.py",
+        f"Deleted {deleted_count} object(s) from {bucket_name}.",
+        [
+            f"Batch size: {config.get('batchSize', 1000)}",
+            f"Workers: {config.get('maxWorkers', 1)}",
+            f"Deleted: {deleted_count}",
+            f"Failures: {failure_count}",
+        ],
+    )
+
+
+class _AzureBenchmarkClient:
+    """boto3-shaped facade over the Azure client for benchmark primitives."""
+
+    def __init__(self, profile: Profile):
+        self._client = _AzureBlobClient(profile)
+
+    def put_object(self, Bucket: str, Key: str, Body: bytes = b"", **_: Any) -> dict[str, Any]:  # noqa: N803
+        body = bytes(Body) if isinstance(Body, (bytes, bytearray)) else bytes(str(Body), "utf-8")
+        self._client.request(
+            "PUT",
+            self._client.blob_path(Bucket, Key),
+            headers={"x-ms-blob-type": "BlockBlob", "Content-Type": "application/octet-stream"},
+            body=body,
+        )
+        return {}
+
+    def get_object(self, Bucket: str, Key: str, **_: Any) -> dict[str, Any]:  # noqa: N803
+        _, _, data = self._client.request("GET", self._client.blob_path(Bucket, Key))
+        return {"Body": io.BytesIO(data), "ContentLength": len(data)}
+
+    def delete_object(self, Bucket: str, Key: str, **_: Any) -> dict[str, Any]:  # noqa: N803
+        self._client.request("DELETE", self._client.blob_path(Bucket, Key))
+        return {}
+
+    def delete_objects(self, Bucket: str, Delete: dict[str, Any], **_: Any) -> dict[str, Any]:  # noqa: N803
+        deleted: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for entry in (Delete or {}).get("Objects", []):
+            key = str(entry.get("Key", ""))
+            try:
+                self._client.request("DELETE", self._client.blob_path(Bucket, key))
+                deleted.append({"Key": key})
+            except SidecarError as error:
+                errors.append(
+                    {
+                        "Key": key,
+                        "Code": str(error.details.get("azureCode", error.code)),
+                        "Message": error.message,
+                    }
+                )
+        return {"Deleted": deleted, "Errors": errors}
+
+
+def _handle_azure_request(method: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    """Dispatch a request for an azureBlob profile. Returns None to fall back
+    to the shared (storage-agnostic) handlers, e.g. benchmark orchestration."""
+    if method in _AZURE_UNSUPPORTED_METHODS:
+        raise SidecarError(
+            "unsupported_feature",
+            f"Method {method} is not supported for Azure Blob profiles.",
+        )
+    if method == "testProfile":
+        return _azure_test_profile(dict(params.get("profile") or {}))
+    if method == "listBuckets":
+        return _azure_list_buckets(dict(params.get("profile") or {}))
+    if method == "createBucket":
+        return _azure_create_bucket(params)
+    if method == "deleteBucket":
+        return _azure_delete_bucket(params)
+    if method == "listObjects":
+        return _azure_list_objects(params)
+    if method == "getBucketAdminState":
+        return _azure_get_bucket_admin_state(params)
+    if method == "getObjectDetails":
+        return _azure_get_object_details(params)
+    if method == "createFolder":
+        return _azure_create_folder(params)
+    if method == "copyObject":
+        return _azure_copy_object(params)
+    if method == "moveObject":
+        return _azure_move_object(params)
+    if method == "deleteObjects":
+        return _azure_delete_objects(params)
+    if method == "startUpload":
+        return _azure_start_upload(params)
+    if method == "startDownload":
+        return _azure_start_download(params)
+    if method == "runPutTestData":
+        return _azure_run_put_testdata(params)
+    if method == "runDeleteAll":
+        return _azure_run_delete_all(params)
+    return None
+
+
 def _health() -> dict[str, Any]:
     try:
         _lazy_boto_imports()
@@ -344,7 +1501,7 @@ def _health() -> dict[str, Any]:
 
     return {
         "engine": "python",
-        "version": "2.0.17",
+        "version": "2.1.0",
         "available": available,
         "dependencyState": dependency_state,
         "methods": [
@@ -2118,7 +3275,11 @@ def _materialize_benchmark_state(state: dict[str, Any]) -> dict[str, Any]:
 
     if batch_size > 0:
         profile = _benchmark_profile(dict(state.get("profile") or {}), config)
-        client = _build_client(profile)
+        client = (
+            _AzureBenchmarkClient(profile)
+            if profile.endpoint_type == "azureBlob"
+            else _build_client(profile)
+        )
         try:
             for _ in range(batch_size):
                 if test_mode == "operation-count" and int(state.get("processedCount", 0) or 0) >= operation_count:
@@ -2233,6 +3394,11 @@ def _export_benchmark_results(params: dict[str, Any]) -> dict[str, Any]:
 def handle_request(payload: dict[str, Any]) -> dict[str, Any]:
     method = payload.get("method")
     params = payload.get("params") or {}
+
+    if _is_azure_profile(params.get("profile") if isinstance(params, dict) else None):
+        azure_result = _handle_azure_request(str(method), dict(params))
+        if azure_result is not None:
+            return azure_result
 
     if method == "health":
         return _health()

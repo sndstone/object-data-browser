@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -68,6 +69,7 @@ func (e *sidecarError) Error() string {
 
 type profile struct {
 	EndpointURL           string
+	EndpointType          string
 	Region                string
 	AccessKey             string
 	SecretKey             string
@@ -148,14 +150,20 @@ func writeJSON(value response) {
 }
 
 func handleRequest(req request) (map[string]interface{}, error) {
+	if isAzureProfilePayload(asMap(req.Params["profile"])) {
+		if handled, result, err := handleAzureRequest(req.Method, req.Params); handled {
+			return result, err
+		}
+	}
 	switch req.Method {
 	case "health":
 		return map[string]interface{}{
-			"engine":    "go",
-			"version":   "2.0.7",
-			"available": true,
-			"methods":   supportedMethods,
-			"nativeSdk": "aws-sdk-go-v2",
+			"engine":        "go",
+			"version":       "2.1.0",
+			"available":     true,
+			"methods":       supportedMethods,
+			"nativeSdk":     "aws-sdk-go-v2",
+			"endpointTypes": []string{"s3Compatible", "awsS3", "azureBlob"},
 		}, nil
 	case "getCapabilities":
 		return map[string]interface{}{
@@ -260,13 +268,14 @@ func handleRequest(req request) (map[string]interface{}, error) {
 
 func parseProfile(payload map[string]interface{}) (profile, error) {
 	endpointURL := strings.TrimSpace(asString(payload["endpointUrl"]))
+	endpointType := strings.TrimSpace(asString(payload["endpointType"]))
 	accessKey := strings.TrimSpace(asString(payload["accessKey"]))
 	secretKey := strings.TrimSpace(asString(payload["secretKey"]))
 	region := strings.TrimSpace(asString(payload["region"]))
 	if region == "" {
 		region = "us-east-1"
 	}
-	if endpointURL == "" {
+	if endpointURL == "" && !isAzureProfilePayload(payload) {
 		return profile{}, &sidecarError{Code: "invalid_config", Message: "Endpoint URL is required."}
 	}
 	if accessKey == "" || secretKey == "" {
@@ -274,6 +283,7 @@ func parseProfile(payload map[string]interface{}) (profile, error) {
 	}
 	return profile{
 		EndpointURL:           endpointURL,
+		EndpointType:          endpointType,
 		Region:                region,
 		AccessKey:             accessKey,
 		SecretKey:             secretKey,
@@ -1824,6 +1834,10 @@ func benchmarkPayload(runID, key string, size int, randomData bool) []byte {
 }
 
 func isMissingBenchmarkKeyErr(err error) bool {
+	var sideErr *sidecarError
+	if errors.As(err, &sideErr) && sideErr.Code == "not_found" {
+		return true
+	}
 	code := awsErrorCode(err)
 	message := strings.ToLower(err.Error())
 	return code == "NoSuchKey" || code == "NotFound" || code == "404" || strings.Contains(message, "does not exist")
@@ -2154,8 +2168,15 @@ func materializeBenchmarkState(state map[string]interface{}) (map[string]interfa
 	if durationComplete || operationComplete {
 		batchSize = 0
 	}
-	if batchSize > max(threads*8, 32) {
-		batchSize = max(threads*8, 32)
+	batchCap := threads * 32
+	if batchCap < 32 {
+		batchCap = 32
+	}
+	if batchCap > 8192 {
+		batchCap = 8192
+	}
+	if batchSize > batchCap {
+		batchSize = batchCap
 	}
 	if batchSize == 0 && processedCount == 0 && !durationComplete && !operationComplete {
 		batchSize = 1
@@ -2165,21 +2186,15 @@ func materializeBenchmarkState(state map[string]interface{}) (map[string]interfa
 		if profileErr != nil {
 			return nil, profileErr
 		}
-		client, ctx, clientErr := buildClient(p)
-		if clientErr != nil {
-			return nil, clientErr
+		executor, executorErr := buildBenchmarkExecutor(p, asString(config["bucketName"]))
+		if executorErr != nil {
+			return nil, executorErr
 		}
-		for index := 0; index < batchSize; index++ {
-			if asString(config["testMode"]) == "operation-count" && asInt(state["processedCount"]) >= operationCount {
-				break
-			}
-			if err = runBenchmarkOperation(state, client, ctx); err != nil {
-				mapped := mapError(err)
-				state["status"] = "failed"
-				state["completedAt"] = serializeTimePtr(time.Now().UTC())
-				appendBenchmarkLog(state, "Benchmark failed: "+asString(mapped["message"]))
-				break
-			}
+		if batchErr := runBenchmarkBatch(state, executor, config, batchSize, threads, operationCount); batchErr != nil {
+			mapped := mapError(batchErr)
+			state["status"] = "failed"
+			state["completedAt"] = serializeTimePtr(time.Now().UTC())
+			appendBenchmarkLog(state, "Benchmark failed: "+asString(mapped["message"]))
 		}
 	}
 	refreshBenchmarkSnapshot(state)
@@ -2319,130 +2334,64 @@ func exportBenchmarkResults(params map[string]interface{}) (map[string]interface
 	}, nil
 }
 
-func runBenchmarkOperation(state map[string]interface{}, client *s3.Client, ctx context.Context) error {
-	config := asMap(state["config"])
-	activeObjects := asMapSlice(state["activeObjects"])
-	history := asMapSlice(state["history"])
-	slot := asInt(state["processedCount"]) % 100
-	operation := "PUT"
-	cumulative := 0
-	for _, ratio := range benchmarkRatios(asString(config["workloadType"])) {
-		cumulative += ratio.ratio
-		if slot < cumulative {
-			operation = ratio.name
-			break
-		}
+type benchmarkExecutor struct {
+	put         func(key string, payload []byte) error
+	get         func(key string) ([]byte, error)
+	deleteOne   func(key string) error
+	deleteBatch func(keys []string) (deleted map[string]bool, missing map[string]bool, fatalErrors []string, err error)
+}
+
+func buildBenchmarkExecutor(p profile, bucketName string) (*benchmarkExecutor, error) {
+	if isAzureProfile(p) {
+		return buildAzureBenchmarkExecutor(p, bucketName)
 	}
-	if (operation == "GET" || operation == "DELETE") && len(activeObjects) == 0 {
-		operation = "PUT"
+	return buildS3BenchmarkExecutor(p, bucketName)
+}
+
+func buildS3BenchmarkExecutor(p profile, bucketName string) (*benchmarkExecutor, error) {
+	client, ctx, err := buildClient(p)
+	if err != nil {
+		return nil, err
 	}
-	sizes := benchmarkSizeList(config)
-	nextSizeIndex := asInt(state["nextSizeIndex"])
-	sizeBytes := sizes[nextSizeIndex%len(sizes)]
-	state["nextSizeIndex"] = nextSizeIndex + 1
-	objectLimit := maxInt(asInt(config["objectCount"]), 1, len(sizes))
-	nextActiveIndex := asInt(state["nextActiveIndex"])
-	key := ""
-	bytesTransferred := 0
-	checksumState := "not_used"
-	operationCount := 1
-	var latencyMs float64
-	switch operation {
-	case "PUT":
-		if len(activeObjects) >= objectLimit && len(activeObjects) > 0 {
-			key = asString(activeObjects[nextActiveIndex%len(activeObjects)]["key"])
-			state["nextActiveIndex"] = nextActiveIndex + 1
-		} else {
-			nextObjectIndex := asInt(state["nextObjectIndex"])
-			key = fmt.Sprintf("%sobj-%06d-%d.bin", asString(state["benchmarkPrefix"]), nextObjectIndex, sizeBytes)
-			state["nextObjectIndex"] = nextObjectIndex + 1
-		}
-		payload := benchmarkPayload(asString(state["id"]), key, sizeBytes, asBool(config["randomData"]))
-		started := time.Now()
-		_, err := client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket: aws.String(asString(config["bucketName"])),
-			Key:    aws.String(key),
-			Body:   bytes.NewReader(payload),
-		})
-		if err != nil {
-			return err
-		}
-		latencyMs = float64(time.Since(started).Milliseconds())
-		bytesTransferred = len(payload)
-		updated := false
-		for _, item := range activeObjects {
-			if asString(item["key"]) == key {
-				item["sizeBytes"] = sizeBytes
-				updated = true
-				break
+	return &benchmarkExecutor{
+		put: func(key string, payload []byte) error {
+			_, putErr := client.PutObject(ctx, &s3.PutObjectInput{
+				Bucket: aws.String(bucketName),
+				Key:    aws.String(key),
+				Body:   bytes.NewReader(payload),
+			})
+			return putErr
+		},
+		get: func(key string) ([]byte, error) {
+			output, getErr := client.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String(bucketName),
+				Key:    aws.String(key),
+			})
+			if getErr != nil {
+				return nil, getErr
 			}
-		}
-		if !updated {
-			activeObjects = append(activeObjects, map[string]interface{}{"key": key, "sizeBytes": sizeBytes})
-		}
-	case "GET":
-		target := activeObjects[nextActiveIndex%len(activeObjects)]
-		key = asString(target["key"])
-		sizeBytes = asInt(target["sizeBytes"])
-		state["nextActiveIndex"] = nextActiveIndex + 1
-		started := time.Now()
-		output, err := client.GetObject(ctx, &s3.GetObjectInput{
-			Bucket: aws.String(asString(config["bucketName"])),
-			Key:    aws.String(key),
-		})
-		if err != nil {
-			if isMissingBenchmarkKeyErr(err) {
-				filtered := make([]map[string]interface{}, 0, len(activeObjects))
-				for _, item := range activeObjects {
-					if asString(item["key"]) != key {
-						filtered = append(filtered, item)
-					}
-				}
-				state["activeObjects"] = filtered
-				appendBenchmarkLog(state, fmt.Sprintf("Skipped missing benchmark object %s; rotating to the next object.", key))
-				return runBenchmarkOperation(state, client, ctx)
-			}
-			return err
-		}
-		body, err := io.ReadAll(output.Body)
-		output.Body.Close()
-		if err != nil {
-			return err
-		}
-		latencyMs = float64(time.Since(started).Milliseconds())
-		bytesTransferred = len(body)
-		if asBool(config["validateChecksum"]) {
-			expected := benchmarkPayload(asString(state["id"]), key, sizeBytes, asBool(config["randomData"]))
-			if bytes.Equal(body, expected) {
-				checksumState = "validated_success"
-			} else {
-				checksumState = "validated_failure"
-			}
-		}
-	default:
-		deleteBatchSize := benchmarkDeleteBatchSize(config, len(activeObjects))
-		selectedBatch := make([]map[string]interface{}, 0, deleteBatchSize)
-		selectedKeys := make([]string, 0, deleteBatchSize)
-		for offset := 0; offset < deleteBatchSize; offset++ {
-			selected := activeObjects[(nextActiveIndex+offset)%len(activeObjects)]
-			selectedBatch = append(selectedBatch, selected)
-			selectedKeys = append(selectedKeys, asString(selected["key"]))
-		}
-		state["nextActiveIndex"] = nextActiveIndex + deleteBatchSize
-		started := time.Now()
-		if benchmarkDeleteMode(config) == "multi-object-post" && len(selectedKeys) > 1 {
-			identifiers := make([]types.ObjectIdentifier, 0, len(selectedKeys))
-			for _, selectedKey := range selectedKeys {
+			defer output.Body.Close()
+			return io.ReadAll(output.Body)
+		},
+		deleteOne: func(key string) error {
+			_, deleteErr := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+				Bucket: aws.String(bucketName),
+				Key:    aws.String(key),
+			})
+			return deleteErr
+		},
+		deleteBatch: func(keys []string) (map[string]bool, map[string]bool, []string, error) {
+			identifiers := make([]types.ObjectIdentifier, 0, len(keys))
+			for _, selectedKey := range keys {
 				identifiers = append(identifiers, types.ObjectIdentifier{Key: aws.String(selectedKey)})
 			}
-			output, err := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-				Bucket: aws.String(asString(config["bucketName"])),
+			output, deleteErr := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				Bucket: aws.String(bucketName),
 				Delete: &types.Delete{Objects: identifiers, Quiet: aws.Bool(false)},
 			})
-			if err != nil {
-				return err
+			if deleteErr != nil {
+				return nil, nil, nil, deleteErr
 			}
-			latencyMs = float64(time.Since(started).Milliseconds())
 			deletedKeys := map[string]bool{}
 			for _, item := range output.Deleted {
 				target := strings.TrimSpace(aws.ToString(item.Key))
@@ -2464,99 +2413,317 @@ func runBenchmarkOperation(state map[string]interface{}, client *s3.Client, ctx 
 				}
 				fatalErrors = append(fatalErrors, fmt.Sprintf("%s: %s", nonEmpty(target, "(unknown)"), nonEmpty(message, aws.ToString(item.Code))))
 			}
-			if len(fatalErrors) > 0 {
-				return &sidecarError{Code: "delete_failed", Message: strings.Join(fatalErrors, "; ")}
-			}
-			if len(missingKeys) > 0 {
-				appendBenchmarkLog(state, fmt.Sprintf("Skipped %d missing benchmark object(s) during multi-delete POST.", len(missingKeys)))
-			}
-			filtered := make([]map[string]interface{}, 0, len(activeObjects))
-			for _, item := range activeObjects {
-				itemKey := asString(item["key"])
-				if !deletedKeys[itemKey] && !missingKeys[itemKey] {
-					filtered = append(filtered, item)
-				}
-			}
-			activeObjects = filtered
-			operationCount = len(deletedKeys)
-			if operationCount == 0 {
-				state["activeObjects"] = activeObjects
-				return runBenchmarkOperation(state, client, ctx)
-			}
-			for _, selectedKey := range selectedKeys {
-				if deletedKeys[selectedKey] {
-					key = selectedKey
-					break
-				}
-			}
-			if key == "" {
-				for selectedKey := range deletedKeys {
-					key = selectedKey
-					break
-				}
-			}
-			if operationCount > 1 {
-				key = fmt.Sprintf("%s (+%d more)", key, operationCount-1)
-			}
-			sizeBytes = 0
-		} else {
-			target := selectedBatch[0]
-			key = asString(target["key"])
-			sizeBytes = asInt(target["sizeBytes"])
-			_, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
-				Bucket: aws.String(asString(config["bucketName"])),
-				Key:    aws.String(key),
-			})
-			if err != nil {
-				if isMissingBenchmarkKeyErr(err) {
-					filtered := make([]map[string]interface{}, 0, len(activeObjects))
-					for _, item := range activeObjects {
-						if asString(item["key"]) != key {
-							filtered = append(filtered, item)
-						}
-					}
-					state["activeObjects"] = filtered
-					appendBenchmarkLog(state, fmt.Sprintf("Skipped missing benchmark object %s; rotating to the next object.", key))
-					return runBenchmarkOperation(state, client, ctx)
-				}
-				return err
-			}
-			latencyMs = float64(time.Since(started).Milliseconds())
-			filtered := make([]map[string]interface{}, 0, len(activeObjects))
-			for _, item := range activeObjects {
-				if asString(item["key"]) != key {
-					filtered = append(filtered, item)
-				}
-			}
-			activeObjects = filtered
+			return deletedKeys, missingKeys, fatalErrors, nil
+		},
+	}, nil
+}
+
+type benchmarkOpPlan struct {
+	operation   string
+	key         string
+	sizeBytes   int
+	multiDelete bool
+	batchKeys   []string
+}
+
+type benchmarkOpResult struct {
+	displayKey       string
+	sizeBytes        int
+	latencyMs        float64
+	bytesTransferred int
+	checksumState    string
+	operationCount   int
+	retry            bool
+	logLine          string
+}
+
+func benchmarkPlanExpectedCount(plan benchmarkOpPlan) int {
+	if plan.multiDelete {
+		return len(plan.batchKeys)
+	}
+	return 1
+}
+
+func removeBenchmarkActiveObject(state map[string]interface{}, key string) {
+	activeObjects := asMapSlice(state["activeObjects"])
+	filtered := make([]map[string]interface{}, 0, len(activeObjects))
+	for _, item := range activeObjects {
+		if asString(item["key"]) != key {
+			filtered = append(filtered, item)
 		}
 	}
-	second := int(asFloat(state["activeElapsedSeconds"])) + 1
+	state["activeObjects"] = filtered
+}
+
+// planBenchmarkOperation selects the next operation and reserves the object
+// pool slots it needs. The caller must hold the benchmark state mutex.
+func planBenchmarkOperation(state map[string]interface{}, plannedCount int, supportsBatchDelete bool) benchmarkOpPlan {
+	config := asMap(state["config"])
+	activeObjects := asMapSlice(state["activeObjects"])
+	slot := plannedCount % 100
+	operation := "PUT"
+	cumulative := 0
+	for _, ratio := range benchmarkRatios(asString(config["workloadType"])) {
+		cumulative += ratio.ratio
+		if slot < cumulative {
+			operation = ratio.name
+			break
+		}
+	}
+	if (operation == "GET" || operation == "DELETE") && len(activeObjects) == 0 {
+		operation = "PUT"
+	}
+	sizes := benchmarkSizeList(config)
+	nextSizeIndex := asInt(state["nextSizeIndex"])
+	sizeBytes := sizes[nextSizeIndex%len(sizes)]
+	state["nextSizeIndex"] = nextSizeIndex + 1
+	objectLimit := maxInt(asInt(config["objectCount"]), 1, len(sizes))
+	nextActiveIndex := asInt(state["nextActiveIndex"])
+	plan := benchmarkOpPlan{operation: operation, sizeBytes: sizeBytes}
+	switch operation {
+	case "PUT":
+		if len(activeObjects) >= objectLimit && len(activeObjects) > 0 {
+			plan.key = asString(activeObjects[nextActiveIndex%len(activeObjects)]["key"])
+			state["nextActiveIndex"] = nextActiveIndex + 1
+		} else {
+			nextObjectIndex := asInt(state["nextObjectIndex"])
+			plan.key = fmt.Sprintf("%sobj-%06d-%d.bin", asString(state["benchmarkPrefix"]), nextObjectIndex, sizeBytes)
+			state["nextObjectIndex"] = nextObjectIndex + 1
+		}
+	case "GET":
+		target := activeObjects[nextActiveIndex%len(activeObjects)]
+		plan.key = asString(target["key"])
+		plan.sizeBytes = asInt(target["sizeBytes"])
+		state["nextActiveIndex"] = nextActiveIndex + 1
+	default:
+		deleteBatchSize := benchmarkDeleteBatchSize(config, len(activeObjects))
+		if !supportsBatchDelete {
+			deleteBatchSize = 1
+		}
+		selected := make([]map[string]interface{}, 0, deleteBatchSize)
+		selectedKeys := map[string]bool{}
+		for offset := 0; offset < deleteBatchSize; offset++ {
+			item := activeObjects[(nextActiveIndex+offset)%len(activeObjects)]
+			selected = append(selected, item)
+			selectedKeys[asString(item["key"])] = true
+			plan.batchKeys = append(plan.batchKeys, asString(item["key"]))
+		}
+		state["nextActiveIndex"] = nextActiveIndex + deleteBatchSize
+		filtered := make([]map[string]interface{}, 0, len(activeObjects))
+		for _, item := range activeObjects {
+			if !selectedKeys[asString(item["key"])] {
+				filtered = append(filtered, item)
+			}
+		}
+		state["activeObjects"] = filtered
+		plan.multiDelete = supportsBatchDelete && benchmarkDeleteMode(config) == "multi-object-post" && len(plan.batchKeys) > 1
+		plan.key = asString(selected[0]["key"])
+		plan.sizeBytes = asInt(selected[0]["sizeBytes"])
+		if plan.multiDelete {
+			plan.sizeBytes = 0
+		}
+	}
+	return plan
+}
+
+// executeBenchmarkOperation performs the network call for a planned operation.
+// It must be called without holding the benchmark state mutex.
+func executeBenchmarkOperation(executor *benchmarkExecutor, runID string, config map[string]interface{}, plan benchmarkOpPlan) (benchmarkOpResult, error) {
+	result := benchmarkOpResult{
+		displayKey:     plan.key,
+		sizeBytes:      plan.sizeBytes,
+		checksumState:  "not_used",
+		operationCount: 1,
+	}
+	switch plan.operation {
+	case "PUT":
+		payload := benchmarkPayload(runID, plan.key, plan.sizeBytes, asBool(config["randomData"]))
+		started := time.Now()
+		if err := executor.put(plan.key, payload); err != nil {
+			return result, err
+		}
+		result.latencyMs = float64(time.Since(started).Milliseconds())
+		result.bytesTransferred = len(payload)
+	case "GET":
+		started := time.Now()
+		body, err := executor.get(plan.key)
+		if err != nil {
+			return result, err
+		}
+		result.latencyMs = float64(time.Since(started).Milliseconds())
+		result.bytesTransferred = len(body)
+		if asBool(config["validateChecksum"]) {
+			expected := benchmarkPayload(runID, plan.key, plan.sizeBytes, asBool(config["randomData"]))
+			if bytes.Equal(body, expected) {
+				result.checksumState = "validated_success"
+			} else {
+				result.checksumState = "validated_failure"
+			}
+		}
+	default:
+		started := time.Now()
+		if plan.multiDelete {
+			deletedKeys, missingKeys, fatalErrors, err := executor.deleteBatch(plan.batchKeys)
+			if err != nil {
+				return result, err
+			}
+			result.latencyMs = float64(time.Since(started).Milliseconds())
+			if len(fatalErrors) > 0 {
+				return result, &sidecarError{Code: "delete_failed", Message: strings.Join(fatalErrors, "; ")}
+			}
+			if len(missingKeys) > 0 {
+				result.logLine = fmt.Sprintf("Skipped %d missing benchmark object(s) during multi-delete POST.", len(missingKeys))
+			}
+			result.operationCount = len(deletedKeys)
+			if result.operationCount == 0 {
+				result.retry = true
+				return result, nil
+			}
+			display := ""
+			for _, selectedKey := range plan.batchKeys {
+				if deletedKeys[selectedKey] {
+					display = selectedKey
+					break
+				}
+			}
+			if display == "" {
+				for deletedKey := range deletedKeys {
+					display = deletedKey
+					break
+				}
+			}
+			if result.operationCount > 1 {
+				display = fmt.Sprintf("%s (+%d more)", display, result.operationCount-1)
+			}
+			result.displayKey = display
+			result.sizeBytes = 0
+		} else {
+			if err := executor.deleteOne(plan.key); err != nil {
+				return result, err
+			}
+			result.latencyMs = float64(time.Since(started).Milliseconds())
+		}
+	}
+	return result, nil
+}
+
+// applyBenchmarkResult records a completed operation. The caller must hold
+// the benchmark state mutex.
+func applyBenchmarkResult(state map[string]interface{}, plan benchmarkOpPlan, result benchmarkOpResult, elapsedSeconds float64) {
+	history := asMapSlice(state["history"])
+	second := int(elapsedSeconds) + 1
 	history = append(history, map[string]interface{}{
 		"timestamp":        serializeTimePtr(time.Now().UTC()),
 		"second":           second,
-		"operation":        operation,
-		"key":              key,
-		"sizeBytes":        sizeBytes,
-		"latencyMs":        roundFloat(latencyMs),
-		"bytesTransferred": bytesTransferred,
+		"elapsedMs":        roundFloat(elapsedSeconds * 1000),
+		"operation":        plan.operation,
+		"key":              result.displayKey,
+		"sizeBytes":        result.sizeBytes,
+		"latencyMs":        roundFloat(result.latencyMs),
+		"bytesTransferred": result.bytesTransferred,
 		"success":          true,
-		"checksumState":    checksumState,
-		"operationCount":   operationCount,
+		"checksumState":    result.checksumState,
+		"operationCount":   result.operationCount,
 	})
 	state["history"] = history
-	state["activeObjects"] = activeObjects
-	totalProcessed := 0
-	for _, record := range history {
-		totalProcessed += benchmarkOperationCount(record)
+	if plan.operation == "PUT" {
+		activeObjects := asMapSlice(state["activeObjects"])
+		updated := false
+		for _, item := range activeObjects {
+			if asString(item["key"]) == plan.key {
+				item["sizeBytes"] = plan.sizeBytes
+				updated = true
+				break
+			}
+		}
+		if !updated {
+			state["activeObjects"] = append(activeObjects, map[string]interface{}{"key": plan.key, "sizeBytes": plan.sizeBytes})
+		}
 	}
-	state["processedCount"] = totalProcessed
-	if operation == "DELETE" && operationCount > 1 {
-		appendBenchmarkLog(state, fmt.Sprintf("DELETE POST removed %d object(s) in %.1f ms.", operationCount, roundFloat(latencyMs)))
+	state["processedCount"] = asInt(state["processedCount"]) + result.operationCount
+	if plan.operation == "DELETE" && result.operationCount > 1 {
+		appendBenchmarkLog(state, fmt.Sprintf("DELETE POST removed %d object(s) in %.1f ms.", result.operationCount, roundFloat(result.latencyMs)))
 	} else {
-		appendBenchmarkLog(state, fmt.Sprintf("%s %s completed in %.1f ms.", operation, key, roundFloat(latencyMs)))
+		appendBenchmarkLog(state, fmt.Sprintf("%s %s completed in %.1f ms.", plan.operation, result.displayKey, roundFloat(result.latencyMs)))
 	}
-	return nil
+}
+
+// runBenchmarkBatch executes one tick's worth of operations using a worker
+// pool of up to config.concurrentThreads goroutines sharing one client.
+func runBenchmarkBatch(state map[string]interface{}, executor *benchmarkExecutor, config map[string]interface{}, batchSize, threads, operationCount int) error {
+	workers := threads
+	if workers > batchSize {
+		workers = batchSize
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	operationMode := asString(config["testMode"]) == "operation-count"
+	runID := asString(state["id"])
+	baseElapsed := asFloat(state["activeElapsedSeconds"])
+	tickStart := time.Now()
+	supportsBatchDelete := executor.deleteBatch != nil
+
+	var mu sync.Mutex
+	remaining := batchSize
+	plannedCount := asInt(state["processedCount"])
+	var failure error
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				mu.Lock()
+				if failure != nil || remaining <= 0 || (operationMode && plannedCount >= operationCount) {
+					mu.Unlock()
+					return
+				}
+				remaining--
+				plan := planBenchmarkOperation(state, plannedCount, supportsBatchDelete)
+				expected := benchmarkPlanExpectedCount(plan)
+				plannedCount += expected
+				mu.Unlock()
+
+				result, err := executeBenchmarkOperation(executor, runID, config, plan)
+				if err != nil {
+					if isMissingBenchmarkKeyErr(err) && plan.operation != "PUT" && !plan.multiDelete {
+						mu.Lock()
+						if plan.operation == "GET" {
+							removeBenchmarkActiveObject(state, plan.key)
+						}
+						appendBenchmarkLog(state, fmt.Sprintf("Skipped missing benchmark object %s; rotating to the next object.", plan.key))
+						remaining++
+						plannedCount -= expected
+						mu.Unlock()
+						continue
+					}
+					mu.Lock()
+					if failure == nil {
+						failure = err
+					}
+					mu.Unlock()
+					return
+				}
+				elapsedSeconds := baseElapsed + time.Since(tickStart).Seconds()
+				mu.Lock()
+				if result.logLine != "" {
+					appendBenchmarkLog(state, result.logLine)
+				}
+				if result.retry {
+					remaining++
+					plannedCount -= expected
+					mu.Unlock()
+					continue
+				}
+				plannedCount += result.operationCount - expected
+				applyBenchmarkResult(state, plan, result, elapsedSeconds)
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	return failure
 }
 
 func persistBenchmarkOutputs(state map[string]interface{}) error {

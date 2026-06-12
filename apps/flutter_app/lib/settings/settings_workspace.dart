@@ -724,6 +724,15 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
     );
     _verifyTls = widget.profile.verifyTls;
     _endpointController.addListener(_handleEndpointInputChanged);
+    _accessKeyController.addListener(_handleAccessKeyChanged);
+  }
+
+  void _handleAccessKeyChanged() {
+    // For Azure profiles the access key field holds the storage account name,
+    // which drives the derived endpoint preview.
+    if (_endpointType == EndpointProfileType.azureBlob && mounted) {
+      setState(() {});
+    }
   }
 
   void _syncText(TextEditingController controller, String value) {
@@ -733,7 +742,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   }
 
   void _handleEndpointInputChanged() {
-    if (_endpointType != EndpointProfileType.s3Compatible) {
+    if (_endpointType == EndpointProfileType.awsS3) {
       return;
     }
     final detected = _detectedUseHttps(_endpointController.text);
@@ -769,6 +778,10 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
         if (_regionController.text.trim().isEmpty) {
           _regionController.text = 'us-east-1';
         }
+      } else if (_endpointType == EndpointProfileType.azureBlob) {
+        _useHttps = true;
+        _verifyTls = true;
+        _pathStyle = false;
       }
     });
   }
@@ -785,6 +798,10 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   String get _normalizedEndpointPreview {
     if (_endpointType == EndpointProfileType.awsS3) {
       return awsEndpointForRegion(_regionController.text);
+    }
+    if (_endpointType == EndpointProfileType.azureBlob &&
+        _endpointController.text.trim().isEmpty) {
+      return azureEndpointForAccount(_accessKeyController.text);
     }
     return normalizeEndpointUrl(
       _endpointController.text,
@@ -805,20 +822,31 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
       EndpointProfile(
         id: widget.profile.id,
         name: _nameController.text.trim(),
-        endpointUrl: _endpointType == EndpointProfileType.awsS3
-            ? awsEndpointForRegion(_regionController.text)
-            : normalizeEndpointUrl(
-                _endpointController.text.trim(),
-                preferHttps: _useHttps,
-              ),
+        endpointUrl: switch (_endpointType) {
+          EndpointProfileType.awsS3 =>
+            awsEndpointForRegion(_regionController.text),
+          EndpointProfileType.azureBlob =>
+            _endpointController.text.trim().isEmpty
+                ? ''
+                : normalizeEndpointUrl(
+                    _endpointController.text.trim(),
+                    preferHttps: _useHttps,
+                  ),
+          EndpointProfileType.s3Compatible => normalizeEndpointUrl(
+              _endpointController.text.trim(),
+              preferHttps: _useHttps,
+            ),
+        },
         region: _regionController.text.trim(),
         accessKey: _accessKeyController.text,
         secretKey: _secretKeyController.text,
-        sessionToken: _sessionTokenController.text.trim().isEmpty
+        sessionToken: (_endpointType == EndpointProfileType.azureBlob ||
+                _sessionTokenController.text.trim().isEmpty)
             ? null
             : _sessionTokenController.text.trim(),
-        pathStyle:
-            _endpointType == EndpointProfileType.awsS3 ? false : _pathStyle,
+        pathStyle: _endpointType == EndpointProfileType.s3Compatible
+            ? _pathStyle
+            : false,
         verifyTls: _endpointType == EndpointProfileType.awsS3
             ? true
             : (_useHttps && _verifyTls),
@@ -837,12 +865,14 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
         profile.accessKey.trim().isNotEmpty &&
         profile.secretKey.trim().isNotEmpty &&
         (profile.endpointType == EndpointProfileType.awsS3 ||
+            profile.endpointType == EndpointProfileType.azureBlob ||
             profile.endpointUrl.trim().isNotEmpty);
   }
 
   @override
   void dispose() {
     _endpointController.removeListener(_handleEndpointInputChanged);
+    _accessKeyController.removeListener(_handleAccessKeyChanged);
     _nameController.dispose();
     _endpointController.dispose();
     _regionController.dispose();
@@ -910,6 +940,10 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                   value: EndpointProfileType.awsS3,
                   child: Text('AWS S3'),
                 ),
+                DropdownMenuItem(
+                  value: EndpointProfileType.azureBlob,
+                  child: Text('Azure Blob Storage'),
+                ),
               ],
               onChanged: (value) {
                 if (value != null) {
@@ -942,6 +976,27 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 controller: _regionController,
                 decoration: const InputDecoration(labelText: 'Region'),
               ),
+            ] else if (_endpointType == EndpointProfileType.azureBlob) ...[
+              TextField(
+                controller: _endpointController,
+                decoration: const InputDecoration(
+                  labelText: 'Custom blob endpoint (optional)',
+                  helperText:
+                      'Leave blank to use https://<account>.blob.core.windows.net. '
+                      'Set this for Azurite or sovereign clouds.',
+                ),
+              ),
+              if (_endpointController.text.trim().isNotEmpty)
+                SwitchListTile(
+                  value: _useHttps,
+                  onChanged: _setUseHttps,
+                  title: const Text('Use HTTPS'),
+                  subtitle: Text(
+                    _useHttps
+                        ? 'Use HTTPS for this endpoint.'
+                        : 'Use HTTP for this endpoint. TLS verification is disabled automatically.',
+                  ),
+                ),
             ] else ...[
               DropdownButtonFormField<String>(
                 initialValue:
@@ -975,11 +1030,11 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 leading: Icon(
                   _useHttps ? Icons.lock_outline : Icons.lock_open_outlined,
                 ),
-                title: Text(
-                  _endpointType == EndpointProfileType.awsS3
-                      ? 'AWS endpoint'
-                      : 'Normalized endpoint',
-                ),
+                title: Text(switch (_endpointType) {
+                  EndpointProfileType.awsS3 => 'AWS endpoint',
+                  EndpointProfileType.azureBlob => 'Blob service endpoint',
+                  EndpointProfileType.s3Compatible => 'Normalized endpoint',
+                }),
                 subtitle: Text(_normalizedEndpointPreview),
               ),
             if (_normalizedEndpointPreview.isNotEmpty)
@@ -989,15 +1044,17 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                     children: [
                       TextField(
                         controller: _accessKeyController,
-                        decoration:
-                            const InputDecoration(labelText: 'Access key'),
+                        decoration: InputDecoration(
+                          labelText: _endpointType.accessKeyLabel,
+                        ),
                       ),
                       const SizedBox(height: 8),
                       TextField(
                         controller: _secretKeyController,
                         obscureText: true,
-                        decoration:
-                            const InputDecoration(labelText: 'Secret key'),
+                        decoration: InputDecoration(
+                          labelText: _endpointType.secretKeyLabel,
+                        ),
                       ),
                     ],
                   )
@@ -1006,8 +1063,9 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                       Expanded(
                         child: TextField(
                           controller: _accessKeyController,
-                          decoration:
-                              const InputDecoration(labelText: 'Access key'),
+                          decoration: InputDecoration(
+                            labelText: _endpointType.accessKeyLabel,
+                          ),
                         ),
                       ),
                       const SizedBox(width: 12),
@@ -1015,34 +1073,39 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         child: TextField(
                           controller: _secretKeyController,
                           obscureText: true,
-                          decoration:
-                              const InputDecoration(labelText: 'Secret key'),
+                          decoration: InputDecoration(
+                            labelText: _endpointType.secretKeyLabel,
+                          ),
                         ),
                       ),
                     ],
                   ),
             const SizedBox(height: 12),
-            TextField(
-              controller: _sessionTokenController,
-              decoration: const InputDecoration(
-                labelText: 'Session token (optional)',
+            if (_endpointType != EndpointProfileType.azureBlob)
+              TextField(
+                controller: _sessionTokenController,
+                decoration: const InputDecoration(
+                  labelText: 'Session token (optional)',
+                ),
               ),
-            ),
             SwitchListTile(
               value: _pathStyle,
               onChanged: _endpointType == EndpointProfileType.s3Compatible
                   ? (value) => setState(() => _pathStyle = value)
                   : null,
               title: const Text('Force path-style requests'),
-              subtitle: Text(
-                _endpointType == EndpointProfileType.awsS3
-                    ? 'AWS S3 uses the standard virtual-hosted endpoint layout.'
-                    : 'Useful for MinIO and other S3-compatible endpoints.',
-              ),
+              subtitle: Text(switch (_endpointType) {
+                EndpointProfileType.awsS3 =>
+                  'AWS S3 uses the standard virtual-hosted endpoint layout.',
+                EndpointProfileType.azureBlob =>
+                  'Not applicable to Azure Blob Storage.',
+                EndpointProfileType.s3Compatible =>
+                  'Useful for MinIO and other S3-compatible endpoints.',
+              }),
             ),
             SwitchListTile(
               value: _verifyTls,
-              onChanged: (_endpointType == EndpointProfileType.s3Compatible &&
+              onChanged: (_endpointType != EndpointProfileType.awsS3 &&
                       _useHttps)
                   ? (value) => setState(() => _verifyTls = value)
                   : null,
