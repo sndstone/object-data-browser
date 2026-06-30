@@ -44,6 +44,14 @@ normalize_go_arch() {
   esac
 }
 
+normalize_nfpm_asset_arch() {
+  case "$1" in
+    x86_64|amd64) echo "x86_64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *) echo "$1" ;;
+  esac
+}
+
 normalize_java_arch() {
   case "$1" in
     x86_64|amd64) echo "x64" ;;
@@ -321,7 +329,7 @@ ensure_nFpm() {
     return
   fi
   local nfpm_arch
-  nfpm_arch="$(normalize_go_arch "$TARGET_ARCH")"
+  nfpm_arch="$(normalize_nfpm_asset_arch "$TARGET_ARCH")"
   local nfpm_dir="$TOOLS_DIR/nfpm"
   local nfpm_bin="$nfpm_dir/nfpm"
   if [[ ! -x "$nfpm_bin" ]]; then
