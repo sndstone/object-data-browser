@@ -1,7 +1,7 @@
 name: object-data-browser
 arch: {{ARCH}}
 platform: linux
-version: 2.0.17
+version: 2.1.0
 section: utils
 priority: optional
 maintainer: Object Data Browser
@@ -13,8 +13,3 @@ contents:
     dst: /usr/lib/object-data-browser
   - src: {{ROOT}}/usr/bin/object-data-browser
     dst: /usr/bin/object-data-browser
-overrides:
-  deb:
-    file_name_template: "{{ .ConventionalFileName }}"
-  rpm:
-    file_name_template: "{{ .ConventionalFileName }}"
