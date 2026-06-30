@@ -66,4 +66,4 @@ sed \
   -e "s|{{OUTPUT}}|$OUTPUT_DIR|g" \
   "$ROOT_DIR/packaging/linux/nfpm.yaml.tmpl" >"$NFPM_CONFIG"
 
-nfpm package --config "$NFPM_CONFIG"
+nfpm package --config "$NFPM_CONFIG" --packager "$FORMAT" --target "$OUTPUT_DIR"
