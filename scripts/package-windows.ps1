@@ -310,6 +310,7 @@ if ($null -ne $WixCli) {
         throw "WiX v3 candle compilation failed."
     }
     $LightExitCode = Invoke-NativeTool -FilePath $Light.Source -Arguments @(
+        '-sval',
         '-out',
         $MsiPath,
         $WixObj

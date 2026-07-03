@@ -74,6 +74,13 @@ enum BrowserInspectorLayout {
   right,
 }
 
+enum ObjectPreviewKind {
+  image,
+  video,
+  text,
+  unsupported,
+}
+
 enum BrowserObjectSortField {
   lastModified,
   name,
@@ -642,6 +649,86 @@ class ObjectDetails {
       presignedUrl: presignedUrl ?? this.presignedUrl,
       debugLogExcerpt: debugLogExcerpt ?? this.debugLogExcerpt,
       rawDiagnostics: rawDiagnostics ?? this.rawDiagnostics,
+    );
+  }
+}
+
+class ObjectPreview {
+  const ObjectPreview({
+    required this.key,
+    required this.kind,
+    required this.loading,
+    required this.supported,
+    required this.message,
+    this.contentType,
+    this.url,
+    this.text,
+    this.truncated = false,
+    this.loadedBytes = 0,
+  });
+
+  final String key;
+  final ObjectPreviewKind kind;
+  final bool loading;
+  final bool supported;
+  final String message;
+  final String? contentType;
+  final String? url;
+  final String? text;
+  final bool truncated;
+  final int loadedBytes;
+
+  factory ObjectPreview.loading({
+    required String key,
+    required ObjectPreviewKind kind,
+    String? contentType,
+  }) {
+    return ObjectPreview(
+      key: key,
+      kind: kind,
+      loading: true,
+      supported: true,
+      message: 'Loading preview...',
+      contentType: contentType,
+    );
+  }
+
+  factory ObjectPreview.ready({
+    required String key,
+    required ObjectPreviewKind kind,
+    required String message,
+    String? contentType,
+    String? url,
+    String? text,
+    bool truncated = false,
+    int loadedBytes = 0,
+  }) {
+    return ObjectPreview(
+      key: key,
+      kind: kind,
+      loading: false,
+      supported: true,
+      message: message,
+      contentType: contentType,
+      url: url,
+      text: text,
+      truncated: truncated,
+      loadedBytes: loadedBytes,
+    );
+  }
+
+  factory ObjectPreview.unsupported({
+    required String key,
+    String? contentType,
+    String message = 'Not supported.',
+  }) {
+    return ObjectPreview(
+      key: key,
+      kind: ObjectPreviewKind.unsupported,
+      loading: false,
+      supported: false,
+      message: message,
+      contentType: contentType,
     );
   }
 }
@@ -1304,6 +1391,7 @@ class AppSettings {
     required this.benchmarkLogPath,
     required this.browserInspectorLayout,
     required this.browserInspectorSize,
+    required this.relistObjectsAfterMutation,
     required this.uiScalePercent,
     required this.logTextScalePercent,
   });
@@ -1335,6 +1423,7 @@ class AppSettings {
   final String benchmarkLogPath;
   final BrowserInspectorLayout browserInspectorLayout;
   final int browserInspectorSize;
+  final bool relistObjectsAfterMutation;
   final int uiScalePercent;
   final int logTextScalePercent;
 
@@ -1367,6 +1456,7 @@ class AppSettings {
       'benchmarkLogPath': benchmarkLogPath,
       'browserInspectorLayout': browserInspectorLayout.name,
       'browserInspectorSize': browserInspectorSize,
+      'relistObjectsAfterMutation': relistObjectsAfterMutation,
       'uiScalePercent': uiScalePercent,
       'logTextScalePercent': logTextScalePercent,
     };
@@ -1410,6 +1500,8 @@ class AppSettings {
       ),
       browserInspectorSize:
           (json['browserInspectorSize'] as num?)?.toInt() ?? 360,
+      relistObjectsAfterMutation:
+          json['relistObjectsAfterMutation'] as bool? ?? true,
       uiScalePercent: uiScalePercent,
       logTextScalePercent: (json['logTextScalePercent'] as num?)?.toInt() ?? 80,
     );
@@ -1443,6 +1535,7 @@ class AppSettings {
     String? benchmarkLogPath,
     BrowserInspectorLayout? browserInspectorLayout,
     int? browserInspectorSize,
+    bool? relistObjectsAfterMutation,
     int? uiScalePercent,
     int? logTextScalePercent,
   }) {
@@ -1479,6 +1572,8 @@ class AppSettings {
       browserInspectorLayout:
           browserInspectorLayout ?? this.browserInspectorLayout,
       browserInspectorSize: browserInspectorSize ?? this.browserInspectorSize,
+      relistObjectsAfterMutation:
+          relistObjectsAfterMutation ?? this.relistObjectsAfterMutation,
       uiScalePercent: uiScalePercent ?? this.uiScalePercent,
       logTextScalePercent: logTextScalePercent ?? this.logTextScalePercent,
     );

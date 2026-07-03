@@ -41,6 +41,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   AppController get controller => widget.controller;
   double? _pendingInspectorSize;
   _MobileBrowserSection _mobileSection = _MobileBrowserSection.buckets;
+  bool _desktopInspectorVisible = true;
 
   AppSettings get _settings => controller.settings;
 
@@ -378,14 +379,15 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           return _mobileBrowserShell(context);
         }
 
-        // Tablet range (and a desktop window resized into it): keep the
-        // bucket panel and object list side by side, with the inspector
-        // docked below the objects so it stays reachable.
+        // Tablet range (and a desktop window resized into it): keep buckets
+        // and objects side by side, with inspector access through the info
+        // button used by compact object controls.
         final tablet = !Breakpoints.isDesktop(width);
         final compactRightInspector = desktopCompact && width < 1360;
         final inspectorOnRight = !tablet &&
             !compactRightInspector &&
             _settings.browserInspectorLayout == BrowserInspectorLayout.right;
+        final showDockedInspector = !tablet && _desktopInspectorVisible;
         final inspectorSize =
             _resolveInspectorSize(context, constraints, inspectorOnRight);
         final roomy = width >= Breakpoints.desktopWide;
@@ -394,6 +396,35 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         const panelGap = 8.0;
         final bucketPanelWidth =
             tablet ? 252.0 : (desktopCompact && !roomy ? 264.0 : 272.0);
+        final Widget objectAndInspector;
+        if (tablet) {
+          objectAndInspector = _objectPanel(context, compact: true);
+        } else if (!showDockedInspector) {
+          objectAndInspector = _objectPanel(context, compact: false);
+        } else if (inspectorOnRight) {
+          objectAndInspector = Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(child: _objectPanel(context, compact: false)),
+              _resizeHandle(Axis.horizontal),
+              SizedBox(
+                width: inspectorSize,
+                child: _inspectorPanel(context, compact: false),
+              ),
+            ],
+          );
+        } else {
+          objectAndInspector = Column(
+            children: [
+              Expanded(child: _objectPanel(context, compact: false)),
+              _resizeHandle(Axis.vertical),
+              SizedBox(
+                height: inspectorSize,
+                child: _inspectorPanel(context, compact: false),
+              ),
+            ],
+          );
+        }
 
         return Padding(
           padding: EdgeInsets.all(outerPadding),
@@ -406,30 +437,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               ),
               const SizedBox(width: panelGap),
               Expanded(
-                child: inspectorOnRight
-                    ? Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Expanded(
-                              child: _objectPanel(context, compact: false)),
-                          _resizeHandle(Axis.horizontal),
-                          SizedBox(
-                            width: inspectorSize,
-                            child: _inspectorPanel(context, compact: false),
-                          ),
-                        ],
-                      )
-                    : Column(
-                        children: [
-                          Expanded(
-                              child: _objectPanel(context, compact: tablet)),
-                          _resizeHandle(Axis.vertical),
-                          SizedBox(
-                            height: inspectorSize,
-                            child: _inspectorPanel(context, compact: false),
-                          ),
-                        ],
-                      ),
+                child: objectAndInspector,
               ),
             ],
           ),
@@ -572,6 +580,94 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         ),
       ),
     );
+  }
+
+  Future<void> _showObjectContextMenu(
+    BuildContext context,
+    ObjectEntry object,
+    Offset position,
+  ) async {
+    await controller.setSelectedObject(
+      object,
+      openFolderOnSelect: false,
+      loadArtifacts: false,
+    );
+    if (!context.mounted) {
+      return;
+    }
+    final selected = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        position.dx,
+        position.dy,
+      ),
+      items: [
+        PopupMenuItem(
+          value: object.isFolder ? 'open-folder' : 'inspect',
+          child: ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(
+              object.isFolder ? Icons.folder_open_outlined : Icons.info_outline,
+            ),
+            title: Text(object.isFolder ? 'Open folder' : 'Inspect object'),
+          ),
+        ),
+        if (!object.isFolder) ...[
+          const PopupMenuItem(
+            value: 'download',
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.download_outlined),
+              title: Text('Download'),
+            ),
+          ),
+          const PopupMenuItem(
+            value: 'presign',
+            child: ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(Icons.link),
+              title: Text('Generate presigned URL'),
+            ),
+          ),
+        ],
+        const PopupMenuDivider(),
+        PopupMenuItem(
+          value: 'delete',
+          child: ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(
+              Icons.delete_outline,
+              color: Theme.of(context).colorScheme.error,
+            ),
+            title: Text(
+              object.isFolder ? 'Delete folder marker' : 'Delete object',
+            ),
+          ),
+        ),
+      ],
+    );
+
+    switch (selected) {
+      case 'open-folder':
+        await controller.openFolder(object);
+        return;
+      case 'inspect':
+        await controller.setSelectedObject(object, openFolderOnSelect: false);
+        return;
+      case 'download':
+        await controller.startSampleDownload();
+        return;
+      case 'presign':
+        await controller.generateSelectedPresignedUrl();
+        return;
+      case 'delete':
+        await controller.deleteSelectedObject();
+        return;
+      default:
+        return;
+    }
   }
 
   Future<void> _showInspectorDialog(BuildContext context) async {
@@ -855,6 +951,21 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       );
     }
 
+    Widget desktopInspectorToggle() {
+      return OutlinedButton.icon(
+        onPressed: () {
+          setState(() {
+            _desktopInspectorVisible = !_desktopInspectorVisible;
+          });
+        },
+        icon: Icon(_desktopInspectorVisible
+            ? Icons.visibility_off_outlined
+            : Icons.visibility_outlined),
+        label: Text(
+            _desktopInspectorVisible ? 'Hide inspector' : 'Show inspector'),
+      );
+    }
+
     final Widget listView = objects.isEmpty
         ? Center(
             child: Padding(
@@ -874,6 +985,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               selectedKey: controller.selectedObject?.key,
               contentTypeFor: controller.objectContentType,
               onSelect: controller.setSelectedObject,
+              onShowContextMenu: (object, position) =>
+                  _showObjectContextMenu(context, object, position),
             ),
           );
 
@@ -1026,6 +1139,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                     icon: const Icon(Icons.create_new_folder_outlined),
                     label: const Text('Create prefix'),
                   ),
+                  desktopInspectorToggle(),
                   OutlinedButton.icon(
                     onPressed: hasBucket ? controller.showAllObjectsNow : null,
                     icon: const Icon(Icons.unfold_more),
@@ -1526,6 +1640,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         _inlineStat('Last modified', _formatDateTime(object.modifiedAt)),
         _inlineStat('Size', _formatBytes(object.size)),
         const Divider(height: 16),
+        _objectPreviewSection(context, object),
+        const Divider(height: 16),
         Text('Metadata', style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 8),
         ...details.metadata.entries.map(
@@ -1558,6 +1674,139 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             trailing: Text(entry.value),
           ),
         ),
+      ],
+    );
+  }
+
+  Widget _objectPreviewSection(BuildContext context, ObjectEntry object) {
+    final preview = controller.selectedObjectPreview;
+    final theme = Theme.of(context);
+    final titleRow = Row(
+      children: [
+        Text('Preview', style: theme.textTheme.titleMedium),
+        const Spacer(),
+        IconButton(
+          tooltip: 'Reload preview',
+          onPressed: controller.refreshSelectedObjectPreview,
+          icon: const Icon(Icons.refresh),
+        ),
+      ],
+    );
+    if (preview == null || preview.key != object.key) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          titleRow,
+          const SizedBox(height: 8),
+          const Text('Preview not loaded.'),
+        ],
+      );
+    }
+    if (preview.loading) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          titleRow,
+          const SizedBox(height: 8),
+          const LinearProgressIndicator(),
+          const SizedBox(height: 8),
+          Text(preview.message),
+        ],
+      );
+    }
+
+    final Widget body;
+    if (!preview.supported || preview.kind == ObjectPreviewKind.unsupported) {
+      body = Text(preview.message);
+    } else if (preview.kind == ObjectPreviewKind.image && preview.url != null) {
+      body = ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          constraints: const BoxConstraints(maxHeight: 260),
+          width: double.infinity,
+          color: theme.colorScheme.surfaceContainerHighest,
+          child: Image.network(
+            preview.url!,
+            fit: BoxFit.contain,
+            loadingBuilder: (context, child, loadingProgress) {
+              if (loadingProgress == null) {
+                return child;
+              }
+              return const Center(child: CircularProgressIndicator());
+            },
+            errorBuilder: (context, error, stackTrace) =>
+                const Center(child: Text('Not supported.')),
+          ),
+        ),
+      );
+    } else if (preview.kind == ObjectPreviewKind.text) {
+      final text = preview.text ?? '';
+      final visibleText =
+          text.length > 12000 ? '${text.substring(0, 12000)}\n...' : text;
+      body = Container(
+        width: double.infinity,
+        constraints: const BoxConstraints(maxHeight: 280),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: theme.colorScheme.outlineVariant),
+          color: theme.colorScheme.surface,
+        ),
+        child: SingleChildScrollView(
+          child: SelectableText(
+            visibleText.isEmpty ? '(empty file)' : visibleText,
+            style: theme.textTheme.bodySmall?.copyWith(
+              fontFamily: 'monospace',
+            ),
+          ),
+        ),
+      );
+    } else if (preview.kind == ObjectPreviewKind.video && preview.url != null) {
+      body = Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: theme.colorScheme.outlineVariant),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Icon(Icons.play_circle_outline, size: 32),
+            const SizedBox(height: 8),
+            const Text('Video preview URL generated.'),
+            const SizedBox(height: 8),
+            SelectableText(
+              preview.url!,
+              maxLines: 3,
+            ),
+          ],
+        ),
+      );
+    } else {
+      body = const Text('Not supported.');
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        titleRow,
+        if (preview.contentType != null) ...[
+          const SizedBox(height: 4),
+          Text(
+            preview.contentType!,
+            style: theme.textTheme.bodySmall,
+          ),
+        ],
+        const SizedBox(height: 8),
+        body,
+        if (preview.message.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text(
+            preview.message,
+            style: theme.textTheme.bodySmall,
+          ),
+        ],
       ],
     );
   }
@@ -2528,12 +2777,15 @@ class _ObjectTable extends StatelessWidget {
     required this.selectedKey,
     required this.contentTypeFor,
     required this.onSelect,
+    required this.onShowContextMenu,
   });
 
   final List<ObjectEntry> objects;
   final String? selectedKey;
   final String Function(ObjectEntry object) contentTypeFor;
   final ValueChanged<ObjectEntry> onSelect;
+  final Future<void> Function(ObjectEntry object, Offset position)
+      onShowContextMenu;
 
   @override
   Widget build(BuildContext context) {
@@ -2621,6 +2873,10 @@ class _ObjectTable extends StatelessWidget {
                     child: InkWell(
                       borderRadius: BorderRadius.circular(6),
                       onTap: () => onSelect(object),
+                      onSecondaryTapDown: (details) => onShowContextMenu(
+                        object,
+                        details.globalPosition,
+                      ),
                       child: Container(
                         height: narrow ? 36 : 38,
                         padding:
@@ -3036,69 +3292,74 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
                             .withValues(alpha: 0.72)
                         : Colors.transparent,
                     borderRadius: BorderRadius.circular(8),
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(8),
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
                       onSecondaryTapDown: (details) => _showBucketMenu(
                         context,
                         bucket,
                         details.globalPosition,
                       ),
-                      child: ListTile(
-                        dense: desktopCompact,
-                        leading: Icon(
-                          Icons.folder_rounded,
-                          color: selected
-                              ? Theme.of(context).colorScheme.primary
-                              : Theme.of(context).colorScheme.onSurfaceVariant,
-                          size: 20,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        selected: selected,
-                        title: Text(
-                          bucket.name,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.titleMedium,
-                        ),
-                        subtitle: Text(
-                          '${bucket.region}  -  ${bucket.objectCountHint} objects',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            if (bucket.versioningEnabled)
-                              const Padding(
-                                padding: EdgeInsets.only(right: 4),
-                                child: Icon(Icons.history_toggle_off_rounded),
-                              ),
-                            IconButton(
-                              tooltip: 'Bucket actions',
-                              onPressed: () async {
-                                final box =
-                                    context.findRenderObject() as RenderBox?;
-                                if (box == null) {
-                                  return;
-                                }
-                                await _showBucketMenu(
-                                  context,
-                                  bucket,
-                                  box.localToGlobal(
-                                    Offset(
-                                      box.size.width - 24,
-                                      box.size.height / 2,
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(8),
+                        child: ListTile(
+                          dense: desktopCompact,
+                          leading: Icon(
+                            Icons.folder_rounded,
+                            color: selected
+                                ? Theme.of(context).colorScheme.primary
+                                : Theme.of(context)
+                                    .colorScheme
+                                    .onSurfaceVariant,
+                            size: 20,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          selected: selected,
+                          title: Text(
+                            bucket.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.titleMedium,
+                          ),
+                          subtitle: Text(
+                            '${bucket.region}  -  ${bucket.objectCountHint} objects',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (bucket.versioningEnabled)
+                                const Padding(
+                                  padding: EdgeInsets.only(right: 4),
+                                  child: Icon(Icons.history_toggle_off_rounded),
+                                ),
+                              IconButton(
+                                tooltip: 'Bucket actions',
+                                onPressed: () async {
+                                  final box =
+                                      context.findRenderObject() as RenderBox?;
+                                  if (box == null) {
+                                    return;
+                                  }
+                                  await _showBucketMenu(
+                                    context,
+                                    bucket,
+                                    box.localToGlobal(
+                                      Offset(
+                                        box.size.width - 24,
+                                        box.size.height / 2,
+                                      ),
                                     ),
-                                  ),
-                                );
-                              },
-                              icon: const Icon(Icons.more_horiz),
-                            ),
-                          ],
+                                  );
+                                },
+                                icon: const Icon(Icons.more_horiz),
+                              ),
+                            ],
+                          ),
+                          onTap: () => widget.onOpenBucket(bucket),
                         ),
-                        onTap: () => widget.onOpenBucket(bucket),
                       ),
                     ),
                   ),

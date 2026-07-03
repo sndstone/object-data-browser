@@ -189,6 +189,16 @@ class SettingsWorkspace extends StatelessWidget {
                 settings.copyWith(multipartChunkMiB: value),
               ),
             ),
+            SwitchListTile(
+              value: settings.relistObjectsAfterMutation,
+              onChanged: (value) => controller.updateSettings(
+                settings.copyWith(relistObjectsAfterMutation: value),
+              ),
+              title: const Text('Refresh object list after uploads'),
+              subtitle: const Text(
+                'Relist the current object view after prefix creation or a completed upload.',
+              ),
+            ),
           ],
         ),
         _section(
@@ -1000,12 +1010,11 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 ),
             ] else ...[
               AppSelectField<String>(
-                value:
-                    _awsRegionOptions.contains(_regionController.text.trim())
-                        ? (_regionController.text.trim().isEmpty
-                            ? 'us-east-1'
-                            : _regionController.text.trim())
-                        : 'us-east-1',
+                value: _awsRegionOptions.contains(_regionController.text.trim())
+                    ? (_regionController.text.trim().isEmpty
+                        ? 'us-east-1'
+                        : _regionController.text.trim())
+                    : 'us-east-1',
                 decoration: const InputDecoration(labelText: 'AWS region'),
                 items: _awsRegionOptions
                     .map(
@@ -1106,10 +1115,10 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
             ),
             SwitchListTile(
               value: _verifyTls,
-              onChanged: (_endpointType != EndpointProfileType.awsS3 &&
-                      _useHttps)
-                  ? (value) => setState(() => _verifyTls = value)
-                  : null,
+              onChanged:
+                  (_endpointType != EndpointProfileType.awsS3 && _useHttps)
+                      ? (value) => setState(() => _verifyTls = value)
+                      : null,
               title: const Text('Verify TLS certificates'),
               subtitle: Text(
                 _endpointType == EndpointProfileType.awsS3

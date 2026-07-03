@@ -142,6 +142,32 @@ EndpointProfile normalizeEndpointProfile(EndpointProfile profile) {
   );
 }
 
+class _PendingObjectRelist {
+  const _PendingObjectRelist({
+    required this.profileId,
+    required this.bucketName,
+    required this.prefix,
+    required this.listAll,
+  });
+
+  final String profileId;
+  final String bucketName;
+  final String prefix;
+  final bool listAll;
+}
+
+class _TextPreviewResult {
+  const _TextPreviewResult({
+    required this.text,
+    required this.truncated,
+    required this.loadedBytes,
+  });
+
+  final String text;
+  final bool truncated;
+  final int loadedBytes;
+}
+
 class AppController extends ChangeNotifier {
   AppController({
     required EngineService engineService,
@@ -230,6 +256,9 @@ class AppController extends ChangeNotifier {
   bool _initializeStarted = false;
   bool _engineLogSinkAttached = false;
   bool _listingCancelled = false;
+  int _previewRequestSequence = 0;
+  final Map<String, _PendingObjectRelist> _pendingUploadRelists =
+      <String, _PendingObjectRelist>{};
 
   WorkspaceTab activeTab = WorkspaceTab.browser;
   BrowserInspectorTab inspectorTab = BrowserInspectorTab.bucketInfo;
@@ -249,6 +278,7 @@ class AppController extends ChangeNotifier {
   final Set<String> _busyActions = <String>{};
   BucketAdminState? adminState;
   ObjectDetails? selectedObjectDetails;
+  ObjectPreview? selectedObjectPreview;
   BenchmarkRun? benchmarkRun;
   EndpointProfile? selectedProfile;
   BucketSummary? selectedBucket;
@@ -262,6 +292,8 @@ class AppController extends ChangeNotifier {
   bool flatView = false;
   static const int objectPageSize = 1000;
   static const int eventLogLimit = 5000;
+  static const int objectPreviewTextByteLimit = 64 * 1024;
+  static const int objectPreviewImageMaxBytes = 20 * 1024 * 1024;
 
   Timer? _busyLineNotifyTimer;
   int objectPage = 1;
@@ -544,6 +576,7 @@ class AppController extends ChangeNotifier {
       listAllKeys = false;
       selectedObject = null;
       selectedObjectDetails = null;
+      selectedObjectPreview = null;
       notifyListeners();
       return;
     }
@@ -718,6 +751,7 @@ class AppController extends ChangeNotifier {
       _syncObjectFilterWithPrefix();
       selectedObject = null;
       selectedObjectDetails = null;
+      selectedObjectPreview = null;
       adminState = null;
       benchmarkDraft = benchmarkDraft.copyWith(bucketName: bucket.name);
       testDataConfig = testDataConfig.copyWith(bucketName: bucket.name);
@@ -773,14 +807,19 @@ class AppController extends ChangeNotifier {
     });
   }
 
-  Future<void> setSelectedObject(ObjectEntry object) async {
-    if (object.isFolder && !flatView) {
+  Future<void> setSelectedObject(
+    ObjectEntry object, {
+    bool openFolderOnSelect = true,
+    bool loadArtifacts = true,
+  }) async {
+    if (openFolderOnSelect && object.isFolder && !flatView) {
       await openFolder(object);
       return;
     }
-    await _runBusy(
-        'select-object', 'Loading object details for ${object.name}...',
-        () async {
+    final busyLabel = loadArtifacts && !object.isFolder
+        ? 'Loading object details for ${object.name}...'
+        : 'Selecting ${object.name}...';
+    await _runBusy('select-object', busyLabel, () async {
       selectedObject = object;
       _addEvent(
         level: 'INFO',
@@ -791,7 +830,17 @@ class AppController extends ChangeNotifier {
         source: 'object-browser',
       );
       inspectorTab = BrowserInspectorTab.objectDetails;
-      await _loadSelectionArtifacts();
+      if (loadArtifacts && !object.isFolder) {
+        await _loadSelectionArtifacts();
+      } else {
+        selectedObjectDetails = null;
+        selectedObjectPreview = object.isFolder
+            ? ObjectPreview.unsupported(
+                key: object.key,
+                message: 'Folder preview is not supported.',
+              )
+            : null;
+      }
       notifyListeners();
     });
   }
@@ -1001,7 +1050,9 @@ class AppController extends ChangeNotifier {
           objectKey: folderKey,
           source: 'object-browser',
         );
-        await refreshObjects(prefix: currentPrefix);
+        if (settings.relistObjectsAfterMutation) {
+          await refreshObjects(prefix: currentPrefix);
+        }
       });
     });
   }
@@ -1033,6 +1084,7 @@ class AppController extends ChangeNotifier {
         );
         objects = objects.where((entry) => entry.key != object.key).toList();
         selectedObject = null;
+        selectedObjectPreview = null;
         await _loadSelectionArtifacts();
       });
     });
@@ -1059,8 +1111,15 @@ class AppController extends ChangeNotifier {
           multipartThresholdMiB: settings.multipartThresholdMiB,
           multipartChunkMiB: settings.multipartChunkMiB,
         );
+        _pendingUploadRelists[job.id] = _PendingObjectRelist(
+          profileId: profile.id,
+          bucketName: bucket.name,
+          prefix: currentPrefix,
+          listAll: listAllKeys,
+        );
         transferJobs = [job, ...transferJobs];
         _trackTransferJob(job);
+        _maybeRelistAfterUpload(job);
         bannerTaskId = job.id;
         bannerMessage = _transferBannerMessage(job);
         _addEvent(
@@ -1260,6 +1319,16 @@ class AppController extends ChangeNotifier {
         );
       });
     });
+  }
+
+  Future<void> refreshSelectedObjectPreview() async {
+    final object = selectedObject;
+    if (object == null) {
+      selectedObjectPreview = null;
+      notifyListeners();
+      return;
+    }
+    _primeSelectedObjectPreview(object);
   }
 
   /// Older engine bridges (notably Android) report tool labels with a `.py`
@@ -1794,6 +1863,7 @@ class AppController extends ChangeNotifier {
       selectedBucket = null;
       selectedObject = null;
       selectedObjectDetails = null;
+      selectedObjectPreview = null;
       currentPrefix = '';
       _syncObjectFilterWithPrefix();
       if (selectedProfile != null) {
@@ -2433,6 +2503,7 @@ class AppController extends ChangeNotifier {
       versions = const [];
       versionCursor = const ListCursor(value: null, hasMore: false);
       selectedObjectDetails = null;
+      selectedObjectPreview = null;
       notifyListeners();
       return;
     }
@@ -2447,6 +2518,7 @@ class AppController extends ChangeNotifier {
     versionCursor = versionResult.cursor;
     if (object == null) {
       selectedObjectDetails = null;
+      selectedObjectPreview = null;
       _addEvent(
         level: 'INFO',
         category: 'Versions',
@@ -2464,6 +2536,7 @@ class AppController extends ChangeNotifier {
       bucketName: bucket.name,
       key: object.key,
     );
+    _primeSelectedObjectPreview(object, notify: false);
     _addEvent(
       level: 'INFO',
       category: 'Objects',
@@ -2474,6 +2547,182 @@ class AppController extends ChangeNotifier {
       source: 'events-and-debug',
     );
     notifyListeners();
+  }
+
+  void _primeSelectedObjectPreview(
+    ObjectEntry object, {
+    bool notify = true,
+  }) {
+    final contentType = _objectContentType(object);
+    final kind = _previewKindFor(object, contentType);
+    _previewRequestSequence += 1;
+    final requestId = _previewRequestSequence;
+    if (object.isFolder) {
+      selectedObjectPreview = ObjectPreview.unsupported(
+        key: object.key,
+        contentType: contentType,
+      );
+    } else if (kind == ObjectPreviewKind.unsupported) {
+      selectedObjectPreview = ObjectPreview.unsupported(
+        key: object.key,
+        contentType: contentType,
+      );
+    } else if (kind == ObjectPreviewKind.image &&
+        object.size > objectPreviewImageMaxBytes) {
+      selectedObjectPreview = ObjectPreview.unsupported(
+        key: object.key,
+        contentType: contentType,
+        message: 'Not supported. Image is too large for inline preview.',
+      );
+    } else {
+      selectedObjectPreview = ObjectPreview.loading(
+        key: object.key,
+        kind: kind,
+        contentType: contentType,
+      );
+      unawaited(_loadObjectPreview(object, kind, contentType, requestId));
+    }
+    if (notify) {
+      notifyListeners();
+    }
+  }
+
+  ObjectPreviewKind _previewKindFor(ObjectEntry object, String contentType) {
+    final normalizedType = contentType.toLowerCase();
+    final key = object.key.toLowerCase();
+    if (normalizedType.startsWith('image/')) {
+      return ObjectPreviewKind.image;
+    }
+    if (normalizedType.startsWith('video/') ||
+        key.endsWith('.avi') ||
+        key.endsWith('.mkv')) {
+      return ObjectPreviewKind.video;
+    }
+    if (normalizedType.startsWith('text/') ||
+        normalizedType == 'application/json' ||
+        normalizedType == 'application/xml' ||
+        normalizedType == 'application/x-yaml' ||
+        key.endsWith('.jsonl')) {
+      return ObjectPreviewKind.text;
+    }
+    return ObjectPreviewKind.unsupported;
+  }
+
+  Future<void> _loadObjectPreview(
+    ObjectEntry object,
+    ObjectPreviewKind kind,
+    String contentType,
+    int requestId,
+  ) async {
+    final profile = selectedProfile;
+    final bucket = selectedBucket;
+    if (profile == null || bucket == null) {
+      return;
+    }
+    try {
+      final expirationMinutes =
+          settings.defaultPresignMinutes.clamp(1, 15).toInt();
+      final url = await _engineService.generatePresignedUrl(
+        engineId: activeEngineId,
+        profile: profile,
+        bucketName: bucket.name,
+        key: object.key,
+        expiration: Duration(minutes: expirationMinutes),
+      );
+      if (!_isCurrentPreviewRequest(object.key, requestId)) {
+        return;
+      }
+      if (kind == ObjectPreviewKind.text) {
+        final preview = await _fetchPreviewText(url);
+        if (!_isCurrentPreviewRequest(object.key, requestId)) {
+          return;
+        }
+        selectedObjectPreview = ObjectPreview.ready(
+          key: object.key,
+          kind: kind,
+          contentType: contentType,
+          url: url,
+          text: preview.text,
+          truncated: preview.truncated,
+          loadedBytes: preview.loadedBytes,
+          message: preview.truncated
+              ? 'Showing the first ${preview.loadedBytes} bytes.'
+              : 'Preview loaded.',
+        );
+      } else {
+        selectedObjectPreview = ObjectPreview.ready(
+          key: object.key,
+          kind: kind,
+          contentType: contentType,
+          url: url,
+          message: kind == ObjectPreviewKind.video
+              ? 'Video preview link generated.'
+              : 'Preview loaded.',
+        );
+      }
+    } catch (error) {
+      if (!_isCurrentPreviewRequest(object.key, requestId)) {
+        return;
+      }
+      selectedObjectPreview = ObjectPreview.unsupported(
+        key: object.key,
+        contentType: contentType,
+      );
+      _addEvent(
+        level: 'WARN',
+        category: 'Objects',
+        message: 'Object preview is not supported for ${object.key}: $error',
+        includeSelectionContext: true,
+        objectKey: object.key,
+        source: 'object-preview',
+      );
+    }
+    notifyListeners();
+  }
+
+  bool _isCurrentPreviewRequest(String key, int requestId) {
+    return _previewRequestSequence == requestId && selectedObject?.key == key;
+  }
+
+  Future<_TextPreviewResult> _fetchPreviewText(String url) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null) {
+      throw const FormatException('Invalid preview URL.');
+    }
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+    try {
+      final request = await client.getUrl(uri);
+      request.followRedirects = true;
+      request.headers.set(
+        HttpHeaders.rangeHeader,
+        'bytes=0-${objectPreviewTextByteLimit - 1}',
+      );
+      final response = await request.close().timeout(
+            const Duration(seconds: 15),
+          );
+      final bytes = <int>[];
+      await for (final chunk in response) {
+        final remaining = objectPreviewTextByteLimit - bytes.length;
+        if (remaining <= 0) {
+          break;
+        }
+        bytes.addAll(chunk.take(remaining));
+        if (bytes.length >= objectPreviewTextByteLimit) {
+          break;
+        }
+      }
+      final contentLength = response.contentLength;
+      final truncated = bytes.length >= objectPreviewTextByteLimit ||
+          response.statusCode == HttpStatus.partialContent ||
+          (contentLength > bytes.length && contentLength != -1);
+      return _TextPreviewResult(
+        text: const Utf8Decoder(allowMalformed: true).convert(bytes),
+        truncated: truncated,
+        loadedBytes: bytes.length,
+      );
+    } finally {
+      client.close(force: true);
+    }
   }
 
   Future<void> _guard(
@@ -2834,6 +3083,7 @@ class AppController extends ChangeNotifier {
             versions = const [];
             selectedObject = null;
             selectedObjectDetails = null;
+            selectedObjectPreview = null;
             currentPrefix = '';
             _syncObjectFilterWithPrefix();
             notifyListeners();
@@ -3205,6 +3455,50 @@ class AppController extends ChangeNotifier {
     }
     _replaceTransfer(job);
     _trackTransferJob(job);
+    _maybeRelistAfterUpload(job);
+  }
+
+  void _maybeRelistAfterUpload(TransferJob job) {
+    if (job.direction != 'upload') {
+      return;
+    }
+    final status = job.status.toLowerCase();
+    if (status == 'failed' ||
+        status == 'error' ||
+        status == 'cancelled' ||
+        status == 'canceled') {
+      _pendingUploadRelists.remove(job.id);
+      return;
+    }
+    if (status != 'completed') {
+      return;
+    }
+    final pending = _pendingUploadRelists.remove(job.id);
+    if (pending == null || !settings.relistObjectsAfterMutation) {
+      return;
+    }
+    unawaited(_relistObjectsAfterCompletedUpload(job, pending));
+  }
+
+  Future<void> _relistObjectsAfterCompletedUpload(
+    TransferJob job,
+    _PendingObjectRelist pending,
+  ) async {
+    if (selectedProfile?.id != pending.profileId ||
+        selectedBucket?.name != pending.bucketName) {
+      return;
+    }
+    _addEvent(
+      level: 'INFO',
+      category: 'Objects',
+      message:
+          'Upload job ${job.id} completed; refreshing object list for prefix "${pending.prefix}".',
+      includeSelectionContext: true,
+      source: 'object-browser',
+    );
+    await refreshObjects(prefix: pending.prefix, listAll: pending.listAll);
+    bannerMessage = 'Upload complete. Object list refreshed.';
+    notifyListeners();
   }
 
   void _trackBenchmarkRun(BenchmarkRun run, {required String profileId}) {
@@ -3326,11 +3620,18 @@ class AppController extends ChangeNotifier {
     if (key.endsWith('.csv')) {
       return 'text/csv';
     }
-    if (key.endsWith('.txt') || key.endsWith('.log') || key.endsWith('.md')) {
+    if (key.endsWith('.txt') ||
+        key.endsWith('.log') ||
+        key.endsWith('.md') ||
+        key.endsWith('.yaml') ||
+        key.endsWith('.yml')) {
       return 'text/plain';
     }
     if (key.endsWith('.html') || key.endsWith('.htm')) {
       return 'text/html';
+    }
+    if (key.endsWith('.xml')) {
+      return 'application/xml';
     }
     if (key.endsWith('.png')) {
       return 'image/png';
@@ -3340,6 +3641,18 @@ class AppController extends ChangeNotifier {
     }
     if (key.endsWith('.gif')) {
       return 'image/gif';
+    }
+    if (key.endsWith('.webp')) {
+      return 'image/webp';
+    }
+    if (key.endsWith('.mp4') || key.endsWith('.m4v')) {
+      return 'video/mp4';
+    }
+    if (key.endsWith('.webm')) {
+      return 'video/webm';
+    }
+    if (key.endsWith('.mov')) {
+      return 'video/quicktime';
     }
     if (key.endsWith('.pdf')) {
       return 'application/pdf';

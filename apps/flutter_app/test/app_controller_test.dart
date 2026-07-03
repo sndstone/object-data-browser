@@ -92,6 +92,7 @@ const _settings = AppSettings(
   benchmarkLogPath: '/tmp/benchmark.log',
   browserInspectorLayout: BrowserInspectorLayout.bottom,
   browserInspectorSize: 360,
+  relistObjectsAfterMutation: true,
   uiScalePercent: 70,
   logTextScalePercent: 80,
 );

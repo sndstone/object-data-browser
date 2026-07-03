@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.2.1 - 2026-07-03
+
+### Fixed: bucket and object context menus
+- Restored right-click context menus for bucket rows and object rows so actions are anchored to the element under the pointer.
+- Object row context menus select the target cheaply before offering inspect, folder open, download, presign, and delete actions.
+
 ## 2.2.0 - 2026-07-02
 
 ### Parallel large-file transfers (all engines)

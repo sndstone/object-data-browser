@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:s3_browser_crossplat/app/s3_browser_app.dart';
@@ -73,6 +74,7 @@ Future<TestAppController> _buildController({AppSettings? settings}) async {
           benchmarkLogPath: r'C:\Temp\benchmark.log',
           browserInspectorLayout: BrowserInspectorLayout.bottom,
           browserInspectorSize: 360,
+          relistObjectsAfterMutation: true,
           uiScalePercent: 70,
           logTextScalePercent: 80,
         ),
@@ -248,6 +250,7 @@ void main() {
         benchmarkLogPath: r'C:\Temp\benchmark.log',
         browserInspectorLayout: BrowserInspectorLayout.bottom,
         browserInspectorSize: 360,
+        relistObjectsAfterMutation: true,
         uiScalePercent: 70,
         logTextScalePercent: 80,
       ),
@@ -342,6 +345,26 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('bucket-39'), findsOneWidget);
+  });
+
+  testWidgets('bucket row secondary click opens bucket context menu', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1024));
+
+    final controller = await _buildController();
+    _seedBuckets(controller, count: 4);
+    await tester.pumpWidget(
+      _bucketPanelApp(controller, size: const Size(320, 900)),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('bucket-0'), buttons: kSecondaryButton);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Open bucket'), findsOneWidget);
+    expect(find.text('Delete bucket'), findsOneWidget);
   });
 
   testWidgets('bucket list scroll reaches the last bucket in compact layout', (
@@ -473,6 +496,33 @@ void main() {
         find.widgetWithText(OutlinedButton, 'Create prefix'), findsOneWidget);
     expect(find.widgetWithText(OutlinedButton, 'List all'), findsOneWidget);
     expect(find.text('Flat view'), findsOneWidget);
+  });
+
+  testWidgets('object row secondary click opens object context menu', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1024));
+
+    final controller = await _buildController();
+    await tester.pumpWidget(
+      _browserApp(
+        controller,
+        size: const Size(1440, 1024),
+        compact: false,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('object-0001.bin'), buttons: kSecondaryButton);
+    await tester.pumpAndSettle();
+
+    expect(controller.selectedObject?.key, 'archive/object-0001.bin');
+    expect(find.text('Inspect object'), findsOneWidget);
+    expect(
+        find.widgetWithText(PopupMenuItem<String>, 'Download'), findsOneWidget);
+    expect(find.text('Generate presigned URL'), findsOneWidget);
+    expect(find.text('Delete object'), findsOneWidget);
   });
 
   testWidgets('wide desktop browser keeps persistent inspector and drag bar', (

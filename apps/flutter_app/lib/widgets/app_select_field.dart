@@ -62,16 +62,8 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
   final FocusNode _menuFocusNode = FocusNode(debugLabel: 'AppSelectFieldMenu');
   ScrollController? _menuScrollController;
 
-  late final AnimationController _animationController = AnimationController(
-    vsync: this,
-    duration: const Duration(milliseconds: 180),
-    reverseDuration: const Duration(milliseconds: 120),
-  );
-  late final CurvedAnimation _expandAnimation = CurvedAnimation(
-    parent: _animationController,
-    curve: Curves.easeOutCubic,
-    reverseCurve: Curves.easeInCubic,
-  );
+  late final AnimationController _animationController;
+  late final CurvedAnimation _expandAnimation;
 
   bool _openUpward = false;
   double _menuWidth = 0;
@@ -93,6 +85,16 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
   @override
   void initState() {
     super.initState();
+    _animationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 180),
+      reverseDuration: const Duration(milliseconds: 120),
+    );
+    _expandAnimation = CurvedAnimation(
+      parent: _animationController,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    );
     WidgetsBinding.instance.addObserver(this);
   }
 
@@ -150,9 +152,9 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
     if (renderBox == null || !renderBox.hasSize) {
       return;
     }
-    final overlayBox =
-        Overlay.of(context, rootOverlay: true).context.findRenderObject()
-            as RenderBox?;
+    final overlayBox = Overlay.of(context, rootOverlay: true)
+        .context
+        .findRenderObject() as RenderBox?;
     // Work in the overlay's coordinate space so the flip math stays correct
     // when the overlay does not start at the global origin.
     final overlayHeight =
@@ -346,23 +348,23 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
           orElse: () => null,
         );
     final baseDecoration = widget.decoration ?? const InputDecoration();
-    final decoration = baseDecoration
-        .applyDefaults(theme.inputDecorationTheme)
-        .copyWith(
-          enabled: _enabled,
-          suffixIcon: baseDecoration.suffixIcon ??
-              Icon(
-                _showsOpen && !_openUpward
-                    ? Icons.arrow_drop_up
-                    : Icons.arrow_drop_down,
-                color: _enabled
-                    ? theme.colorScheme.onSurfaceVariant
-                    : theme.colorScheme.onSurfaceVariant
-                        .withValues(alpha: 0.45),
-              ),
-        );
+    final decoration =
+        baseDecoration.applyDefaults(theme.inputDecorationTheme).copyWith(
+              enabled: _enabled,
+              suffixIcon: baseDecoration.suffixIcon ??
+                  Icon(
+                    _showsOpen && !_openUpward
+                        ? Icons.arrow_drop_up
+                        : Icons.arrow_drop_down,
+                    color: _enabled
+                        ? theme.colorScheme.onSurfaceVariant
+                        : theme.colorScheme.onSurfaceVariant
+                            .withValues(alpha: 0.45),
+                  ),
+            );
     final textStyle = widget.style ??
-        theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurface);
+        theme.textTheme.bodyMedium
+            ?.copyWith(color: theme.colorScheme.onSurface);
     final valueText = selected == null
         ? const SizedBox.shrink()
         : Text(
@@ -425,14 +427,12 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
         CompositedTransformFollower(
           link: _layerLink,
           showWhenUnlinked: false,
-          targetAnchor:
-              _openUpward ? Alignment.topLeft : Alignment.bottomLeft,
+          targetAnchor: _openUpward ? Alignment.topLeft : Alignment.bottomLeft,
           followerAnchor:
               _openUpward ? Alignment.bottomLeft : Alignment.topLeft,
           offset: Offset(0, _openUpward ? -_anchorGap : _anchorGap),
           child: Align(
-            alignment:
-                _openUpward ? Alignment.bottomLeft : Alignment.topLeft,
+            alignment: _openUpward ? Alignment.bottomLeft : Alignment.topLeft,
             child: SizedBox(
               width: _menuWidth,
               child: AnimatedBuilder(
@@ -529,8 +529,7 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
                   overflow: TextOverflow.ellipsis,
                   style: theme.textTheme.bodyMedium?.copyWith(
                     color: foreground,
-                    fontWeight:
-                        isSelected ? FontWeight.w700 : FontWeight.w500,
+                    fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
                   ),
                 ),
               ),

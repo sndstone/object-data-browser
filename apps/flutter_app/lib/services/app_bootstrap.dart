@@ -51,6 +51,7 @@ class AppBootstrap {
       benchmarkLogPath: '${tempDir.path}${Platform.pathSeparator}benchmark.log',
       browserInspectorLayout: BrowserInspectorLayout.bottom,
       browserInspectorSize: 360,
+      relistObjectsAfterMutation: true,
       uiScalePercent: 70,
       logTextScalePercent: 80,
     );
