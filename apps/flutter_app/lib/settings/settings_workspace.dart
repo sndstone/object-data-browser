@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import '../app/version_details.dart';
 import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
+import '../widgets/app_select_field.dart';
 import 'profile_import_picker.dart';
 import 'version_details_catalog.dart';
 
@@ -49,14 +50,14 @@ class SettingsWorkspace extends StatelessWidget {
               ),
               title: const Text('Enable animations'),
             ),
-            DropdownButtonFormField<String>(
-              initialValue: settings.defaultEngineId,
+            AppSelectField<String>(
+              value: settings.defaultEngineId,
               decoration: const InputDecoration(labelText: 'Default engine'),
               items: controller.engines
                   .map(
-                    (engine) => DropdownMenuItem(
+                    (engine) => AppSelectItem(
                       value: engine.id,
-                      child: Text(engine.label),
+                      label: engine.label,
                     ),
                   )
                   .toList(),
@@ -226,19 +227,19 @@ class SettingsWorkspace extends StatelessWidget {
                 'Desktop uses a rail; mobile uses segmented navigation. The browser, benchmark, and settings screens keep the same structure across platforms.',
               ),
             ),
-            DropdownButtonFormField<BrowserInspectorLayout>(
-              initialValue: settings.browserInspectorLayout,
+            AppSelectField<BrowserInspectorLayout>(
+              value: settings.browserInspectorLayout,
               decoration: const InputDecoration(
                 labelText: 'Browser inspector placement',
               ),
               items: const [
-                DropdownMenuItem(
+                AppSelectItem(
                   value: BrowserInspectorLayout.bottom,
-                  child: Text('Below object panel'),
+                  label: 'Below object panel',
                 ),
-                DropdownMenuItem(
+                AppSelectItem(
                   value: BrowserInspectorLayout.right,
-                  child: Text('Right of object panel'),
+                  label: 'Right of object panel',
                 ),
               ],
               onChanged: (value) {
@@ -928,21 +929,21 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
               decoration: const InputDecoration(labelText: 'Profile name'),
             ),
             const SizedBox(height: 12),
-            DropdownButtonFormField<EndpointProfileType>(
-              initialValue: _endpointType,
+            AppSelectField<EndpointProfileType>(
+              value: _endpointType,
               decoration: const InputDecoration(labelText: 'Endpoint type'),
               items: const [
-                DropdownMenuItem(
+                AppSelectItem(
                   value: EndpointProfileType.s3Compatible,
-                  child: Text('S3-compatible'),
+                  label: 'S3-compatible',
                 ),
-                DropdownMenuItem(
+                AppSelectItem(
                   value: EndpointProfileType.awsS3,
-                  child: Text('AWS S3'),
+                  label: 'AWS S3',
                 ),
-                DropdownMenuItem(
+                AppSelectItem(
                   value: EndpointProfileType.azureBlob,
-                  child: Text('Azure Blob Storage'),
+                  label: 'Azure Blob Storage',
                 ),
               ],
               onChanged: (value) {
@@ -998,8 +999,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                   ),
                 ),
             ] else ...[
-              DropdownButtonFormField<String>(
-                initialValue:
+              AppSelectField<String>(
+                value:
                     _awsRegionOptions.contains(_regionController.text.trim())
                         ? (_regionController.text.trim().isEmpty
                             ? 'us-east-1'
@@ -1008,9 +1009,9 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 decoration: const InputDecoration(labelText: 'AWS region'),
                 items: _awsRegionOptions
                     .map(
-                      (region) => DropdownMenuItem(
+                      (region) => AppSelectItem(
                         value: region,
-                        child: Text(region),
+                        label: region,
                       ),
                     )
                     .toList(),

@@ -1005,7 +1005,7 @@ class MainActivity : FlutterActivity() {
             }
         }
         return mapOf(
-            "label" to "put-testdata.py",
+            "label" to "put-testdata",
             "running" to false,
             "lastStatus" to "Uploaded ${objectCount * max(1, versions)} object version(s) into $bucketName.",
             "jobId" to "tool-put-testdata-${System.currentTimeMillis()}",
@@ -1061,7 +1061,7 @@ class MainActivity : FlutterActivity() {
         }
 
         return mapOf(
-            "label" to "delete-all.py",
+            "label" to "delete-all",
             "running" to false,
             "lastStatus" to "Deleted $deleted object entry(s) from $bucketName.",
             "jobId" to "tool-delete-all-${System.currentTimeMillis()}",

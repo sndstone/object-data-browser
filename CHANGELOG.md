@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.2.0 - 2026-07-02
+
+### Parallel large-file transfers (all engines)
+- Multipart uploads now upload parts concurrently in the Python, Go, Rust, and Java engines with a bounded worker pool (up to 8 concurrent parts, capped by the profile's max concurrent requests).
+- Ranged downloads fetch byte ranges concurrently and write them at the correct offsets into a pre-sized file.
+- Go and Java no longer read the entire file into memory for multipart uploads; parts are read on demand with positional reads. Rust no longer buffers whole objects in memory on either path — uploads read per-part and downloads stream each range straight to disk.
+- Failed multipart uploads are now aborted server-side (previously the Rust engine leaked incomplete multipart uploads on failure).
+- Progress events, response shapes, and single-part paths are unchanged.
+
+### Fixed: Python engine "token is malformed" on AWS S3
+- When a profile had no session token, the Python engine serialized JSON `null` to the literal string "None" and sent it as `x-amz-security-token`, which AWS rejects with "the provided token is malformed or otherwise invalid". Session tokens are now only passed to the client when actually present, matching the other engines.
+
+### Inspector tools now run natively on the selected engine
+- "Put test data" and "Delete all" are real implementations in all four engines instead of Python-script stubs: put-testdata creates the configured objects/versions with a bounded worker pool; delete-all pages through object versions (falling back to plain listing where versioning is unsupported), batch-deletes with configurable batch size, workers, and delay, and reports counts, durations, and failures.
+- Tool labels changed from "put-testdata.py"/"delete-all.py" to "put-testdata"/"delete-all"; whatever engine is selected performs the work.
+
+### UI: anchored, downward-opening select menus
+- All dropdown selectors (endpoint profile, backend engine, default engine, inspector placement, endpoint type, AWS region, filter/sort modes, page and copy-destination selectors) use a new shared `AppSelectField` widget.
+- Menus now open anchored directly beneath the field and animate downward (fade + top-aligned expansion); when there is not enough room below, they flip and open upward from the field instead. The selected item is highlighted with a check mark and scrolled into view.
+
+### UI: more compact desktop layout
+- Reduced desktop chrome: header margins/padding 14→12, outer panel padding 14→12, panel gaps 10→8, bucket panel width 300→272, inspector section dividers 28→16, lifecycle card padding 12→10, resize handles 14→10.
+- Desktop list tiles are now dense with compact visual density by default.
+
 ## 2.1.0 - 2026-06-12
 
 ### Azure Blob Storage support

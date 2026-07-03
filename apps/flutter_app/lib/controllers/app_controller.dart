@@ -275,12 +275,12 @@ class AppController extends ChangeNotifier {
   late DeleteAllToolConfig deleteAllConfig;
   late BenchmarkConfig benchmarkDraft;
   ToolExecutionState putTestDataState = const ToolExecutionState(
-    label: 'put-testdata.py',
+    label: 'put-testdata',
     running: false,
     lastStatus: 'Idle',
   );
   ToolExecutionState deleteAllState = const ToolExecutionState(
-    label: 'delete-all.py',
+    label: 'delete-all',
     running: false,
     lastStatus: 'Idle',
   );
@@ -1171,9 +1171,10 @@ class AppController extends ChangeNotifier {
       engineId: activeEngineId,
       jobId: task.engineJobId!,
     );
-    if (task.label == putTestDataState.label) {
+    final taskLabel = _normalizeToolLabel(task.label);
+    if (taskLabel == _normalizeToolLabel(putTestDataState.label)) {
       putTestDataState = state;
-    } else if (task.label == deleteAllState.label) {
+    } else if (taskLabel == _normalizeToolLabel(deleteAllState.label)) {
       deleteAllState = state;
     }
     _upsertTask(
@@ -1261,6 +1262,42 @@ class AppController extends ChangeNotifier {
     });
   }
 
+  /// Older engine bridges (notably Android) report tool labels with a `.py`
+  /// suffix ('put-testdata.py'); normalize so matching tolerates both forms.
+  String _normalizeToolLabel(String label) =>
+      label.endsWith('.py') ? label.substring(0, label.length - 3) : label;
+
+  ToolExecutionState _failToolState(
+    ToolExecutionState state,
+    Object error,
+  ) {
+    final message = error is EngineException
+        ? '${error.code.name}: ${error.message}'
+        : error.toString();
+    return state.copyWith(
+      running: false,
+      exitCode: 1,
+      lastStatus: message,
+      cancellable: false,
+    );
+  }
+
+  void _failToolTask(String taskId, ToolExecutionState state) {
+    final task = _taskById(taskId);
+    if (task == null) {
+      return;
+    }
+    _upsertTask(
+      task.copyWith(
+        status: 'failed',
+        completedAt: DateTime.now(),
+        progress: 1,
+        outputLines: state.outputLines,
+        canCancel: false,
+      ),
+    );
+  }
+
   Future<void> runPutTestDataTool() async {
     final profile = selectedProfile;
     if (profile == null) {
@@ -1274,7 +1311,7 @@ class AppController extends ChangeNotifier {
           id: taskId,
           engineJobId: putTestDataState.jobId,
           kind: BrowserTaskKind.tool,
-          label: 'put-testdata.py',
+          label: 'put-testdata',
           status: 'running',
           startedAt: DateTime.now(),
           progress: 0,
@@ -1285,11 +1322,19 @@ class AppController extends ChangeNotifier {
         ),
       );
       notifyListeners();
-      putTestDataState = await _engineService.runPutTestData(
-        engineId: activeEngineId,
-        profile: profile,
-        config: testDataConfig,
-      );
+      try {
+        putTestDataState = await _engineService.runPutTestData(
+          engineId: activeEngineId,
+          profile: profile,
+          config: testDataConfig,
+        );
+      } catch (error) {
+        putTestDataState = _failToolState(putTestDataState, error);
+        _failToolTask(taskId, putTestDataState);
+        notifyListeners();
+        // Rethrow so _guard still surfaces the error banner and event.
+        rethrow;
+      }
       bannerMessage = putTestDataState.lastStatus;
       _upsertTask(
         _taskById(taskId)!.copyWith(
@@ -1327,7 +1372,7 @@ class AppController extends ChangeNotifier {
           id: taskId,
           engineJobId: deleteAllState.jobId,
           kind: BrowserTaskKind.tool,
-          label: 'delete-all.py',
+          label: 'delete-all',
           status: 'running',
           startedAt: DateTime.now(),
           progress: 0,
@@ -1338,11 +1383,19 @@ class AppController extends ChangeNotifier {
         ),
       );
       notifyListeners();
-      deleteAllState = await _engineService.runDeleteAll(
-        engineId: activeEngineId,
-        profile: profile,
-        config: deleteAllConfig,
-      );
+      try {
+        deleteAllState = await _engineService.runDeleteAll(
+          engineId: activeEngineId,
+          profile: profile,
+          config: deleteAllConfig,
+        );
+      } catch (error) {
+        deleteAllState = _failToolState(deleteAllState, error);
+        _failToolTask(taskId, deleteAllState);
+        notifyListeners();
+        // Rethrow so _guard still surfaces the error banner and event.
+        rethrow;
+      }
       bannerMessage = deleteAllState.lastStatus;
       _upsertTask(
         _taskById(taskId)!.copyWith(

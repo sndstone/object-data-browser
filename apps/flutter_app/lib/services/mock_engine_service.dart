@@ -943,7 +943,7 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
   }) async {
     await Future<void>.delayed(const Duration(milliseconds: 300));
     return ToolExecutionState(
-      label: 'put-testdata.py',
+      label: 'put-testdata',
       running: false,
       lastStatus:
           'Queued ${config.objectCount} objects (${config.versions} versions each) for ${config.bucketName}.',
@@ -964,7 +964,7 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
   }) async {
     await Future<void>.delayed(const Duration(milliseconds: 300));
     return ToolExecutionState(
-      label: 'delete-all.py',
+      label: 'delete-all',
       running: false,
       lastStatus:
           'Prepared delete-all sweep for ${config.bucketName} with ${config.maxWorkers} workers.',

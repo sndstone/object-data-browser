@@ -1308,8 +1308,23 @@ func deleteObjectVersions(params map[string]interface{}) (map[string]interface{}
 	}, nil
 }
 
+// maxPartOutputLines caps how many per-part progress lines are appended to a
+// transfer job's output; beyond this a single "omitted" line is added instead,
+// keeping progress events bounded for large multipart transfers.
+const maxPartOutputLines = 64
+
+// transferConcurrency bounds parallel part transfers by the profile's
+// connection pool size, capped at 8.
+func transferConcurrency(p profile) int {
+	limit := p.MaxPoolConnections
+	if limit <= 0 || limit > 8 {
+		limit = 8
+	}
+	return limit
+}
+
 func startUpload(params map[string]interface{}) (map[string]interface{}, error) {
-	_, bucketName, client, ctx, err := bucketClient(params)
+	p, bucketName, client, ctx, err := bucketClient(params)
 	if err != nil {
 		return nil, err
 	}
@@ -1377,44 +1392,100 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 				handle.Close()
 				return nil, createErr
 			}
-			completed := make([]types.CompletedPart, 0)
-			partNumber := int32(1)
-			for {
-				chunk := make([]byte, chunkBytes)
-				readBytes, readErr := io.ReadFull(handle, chunk)
-				if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
-					handle.Close()
-					return nil, readErr
-				}
-				if readBytes == 0 {
+			filePartCount := int((info.Size() + chunkBytes - 1) / chunkBytes)
+			completed := make([]types.CompletedPart, 0, filePartCount)
+			fileName := info.Name()
+			fileSize := info.Size()
+			var (
+				stateMu   sync.Mutex
+				wg        sync.WaitGroup
+				uploadErr error
+			)
+			workerCtx, cancelWorkers := context.WithCancel(ctx)
+			sem := make(chan struct{}, transferConcurrency(p))
+			for partIndex := 0; partIndex < filePartCount; partIndex++ {
+				stateMu.Lock()
+				failed := uploadErr != nil
+				stateMu.Unlock()
+				if failed || workerCtx.Err() != nil {
 					break
 				}
-				chunk = chunk[:readBytes]
-				partOutput, uploadErr := client.UploadPart(ctx, &s3.UploadPartInput{
-					Bucket:     aws.String(bucketName),
-					Key:        aws.String(targetKey),
-					UploadId:   createOutput.UploadId,
-					PartNumber: aws.Int32(partNumber),
-					Body:       bytes.NewReader(chunk),
-				})
-				if uploadErr != nil {
-					handle.Close()
-					return nil, uploadErr
-				}
-				completed = append(completed, types.CompletedPart{
-					ETag:       partOutput.ETag,
-					PartNumber: aws.Int32(partNumber),
-				})
-				bytesTransferred += int64(readBytes)
-				partsCompleted++
-				partDone = partsCompleted
-				outputLines = append(outputLines, fmt.Sprintf("Uploaded part %d for %s.", partNumber, info.Name()))
-				emitTransferEvent(buildTransferJob(jobID, label, "upload", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), info.Name(), len(filePaths), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
-				partNumber++
-				if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
-					break
-				}
+				sem <- struct{}{}
+				wg.Add(1)
+				go func(partIndex int) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					if workerCtx.Err() != nil {
+						return
+					}
+					offset := int64(partIndex) * chunkBytes
+					length := chunkBytes
+					if offset+length > fileSize {
+						length = fileSize - offset
+					}
+					buffer := make([]byte, length)
+					readBytes, readErr := handle.ReadAt(buffer, offset)
+					if readErr != nil && !(errors.Is(readErr, io.EOF) && int64(readBytes) == length) {
+						stateMu.Lock()
+						if uploadErr == nil {
+							uploadErr = readErr
+						}
+						stateMu.Unlock()
+						cancelWorkers()
+						return
+					}
+					partNumber := int32(partIndex + 1)
+					partOutput, partErr := client.UploadPart(workerCtx, &s3.UploadPartInput{
+						Bucket:     aws.String(bucketName),
+						Key:        aws.String(targetKey),
+						UploadId:   createOutput.UploadId,
+						PartNumber: aws.Int32(partNumber),
+						Body:       bytes.NewReader(buffer),
+					})
+					if partErr != nil {
+						stateMu.Lock()
+						if uploadErr == nil {
+							uploadErr = partErr
+						}
+						stateMu.Unlock()
+						cancelWorkers()
+						return
+					}
+					stateMu.Lock()
+					completed = append(completed, types.CompletedPart{
+						ETag:       partOutput.ETag,
+						PartNumber: aws.Int32(partNumber),
+					})
+					bytesTransferred += length
+					partsCompleted++
+					partDone = partsCompleted
+					if partsCompleted <= maxPartOutputLines {
+						outputLines = append(outputLines, fmt.Sprintf("Uploaded part %d for %s.", partNumber, fileName))
+					} else if partsCompleted == maxPartOutputLines+1 {
+						outputLines = append(outputLines, "... further part lines omitted.")
+					}
+					transferredSnapshot := bytesTransferred
+					itemsSnapshot := itemsCompleted
+					partDoneSnapshot := partDone
+					linesSnapshot := append([]string{}, outputLines...)
+					stateMu.Unlock()
+					emitTransferEvent(buildTransferJob(jobID, label, "upload", progressFraction(transferredSnapshot, totalBytes), "running", transferredSnapshot, totalBytes, transferStrategyLabel("upload", usesMultipart), fileName, len(filePaths), itemsSnapshot, partSize, partDoneSnapshot, partCount, true, false, true, linesSnapshot))
+				}(partIndex)
 			}
+			wg.Wait()
+			cancelWorkers()
+			if uploadErr != nil {
+				_, _ = client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+					Bucket:   aws.String(bucketName),
+					Key:      aws.String(targetKey),
+					UploadId: createOutput.UploadId,
+				})
+				handle.Close()
+				return nil, uploadErr
+			}
+			sort.Slice(completed, func(i, j int) bool {
+				return aws.ToInt32(completed[i].PartNumber) < aws.ToInt32(completed[j].PartNumber)
+			})
 			_, err = client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 				Bucket:   aws.String(bucketName),
 				Key:      aws.String(targetKey),
@@ -1444,7 +1515,7 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 }
 
 func startDownload(params map[string]interface{}) (map[string]interface{}, error) {
-	_, bucketName, client, ctx, err := bucketClient(params)
+	p, bucketName, client, ctx, err := bucketClient(params)
 	if err != nil {
 		return nil, err
 	}
@@ -1502,32 +1573,94 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 		}
 		outputLines = append(outputLines, fmt.Sprintf("Downloading %s (%d bytes) to %s.", key, size, target))
 		if size >= thresholdBytes {
-			for start := int64(0); start < size; start += chunkBytes {
-				end := start + chunkBytes - 1
-				if end >= size {
-					end = size - 1
+			if err = handle.Truncate(size); err != nil {
+				handle.Close()
+				return nil, err
+			}
+			filePartCount := int((size + chunkBytes - 1) / chunkBytes)
+			objectKey := key
+			var (
+				stateMu     sync.Mutex
+				wg          sync.WaitGroup
+				downloadErr error
+			)
+			workerCtx, cancelWorkers := context.WithCancel(ctx)
+			sem := make(chan struct{}, transferConcurrency(p))
+			for partIndex := 0; partIndex < filePartCount; partIndex++ {
+				stateMu.Lock()
+				failed := downloadErr != nil
+				stateMu.Unlock()
+				if failed || workerCtx.Err() != nil {
+					break
 				}
-				rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
-				output, getErr := client.GetObject(ctx, &s3.GetObjectInput{
-					Bucket: aws.String(bucketName),
-					Key:    aws.String(key),
-					Range:  aws.String(rangeHeader),
-				})
-				if getErr != nil {
-					handle.Close()
-					return nil, getErr
-				}
-				copied, copyErr := io.Copy(handle, output.Body)
-				output.Body.Close()
-				if copyErr != nil {
-					handle.Close()
-					return nil, copyErr
-				}
-				bytesTransferred += copied
-				partsCompleted++
-				partDone = partsCompleted
-				outputLines = append(outputLines, fmt.Sprintf("Downloaded byte range %d-%d for %s.", start, end, key))
-				emitTransferEvent(buildTransferJob(jobID, label, "download", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), key, len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+				sem <- struct{}{}
+				wg.Add(1)
+				go func(partIndex int) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					if workerCtx.Err() != nil {
+						return
+					}
+					start := int64(partIndex) * chunkBytes
+					end := start + chunkBytes - 1
+					if end >= size {
+						end = size - 1
+					}
+					recordFailure := func(failure error) {
+						stateMu.Lock()
+						if downloadErr == nil {
+							downloadErr = failure
+						}
+						stateMu.Unlock()
+						cancelWorkers()
+					}
+					rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
+					output, getErr := client.GetObject(workerCtx, &s3.GetObjectInput{
+						Bucket: aws.String(bucketName),
+						Key:    aws.String(objectKey),
+						Range:  aws.String(rangeHeader),
+					})
+					if getErr != nil {
+						recordFailure(getErr)
+						return
+					}
+					buffer, readErr := io.ReadAll(output.Body)
+					output.Body.Close()
+					if readErr != nil {
+						recordFailure(readErr)
+						return
+					}
+					expectedLength := end - start + 1
+					if int64(len(buffer)) != expectedLength {
+						recordFailure(fmt.Errorf("short read for byte range %d-%d of %s: expected %d bytes, received %d", start, end, objectKey, expectedLength, len(buffer)))
+						return
+					}
+					if _, writeErr := handle.WriteAt(buffer, start); writeErr != nil {
+						recordFailure(writeErr)
+						return
+					}
+					stateMu.Lock()
+					bytesTransferred += int64(len(buffer))
+					partsCompleted++
+					partDone = partsCompleted
+					if partsCompleted <= maxPartOutputLines {
+						outputLines = append(outputLines, fmt.Sprintf("Downloaded byte range %d-%d for %s.", start, end, objectKey))
+					} else if partsCompleted == maxPartOutputLines+1 {
+						outputLines = append(outputLines, "... further part lines omitted.")
+					}
+					transferredSnapshot := bytesTransferred
+					itemsSnapshot := itemsCompleted
+					partDoneSnapshot := partDone
+					linesSnapshot := append([]string{}, outputLines...)
+					stateMu.Unlock()
+					emitTransferEvent(buildTransferJob(jobID, label, "download", progressFraction(transferredSnapshot, totalBytes), "running", transferredSnapshot, totalBytes, transferStrategyLabel("download", usesMultipart), objectKey, len(keys), itemsSnapshot, partSize, partDoneSnapshot, partCount, true, false, true, linesSnapshot))
+				}(partIndex)
+			}
+			wg.Wait()
+			cancelWorkers()
+			if downloadErr != nil {
+				handle.Close()
+				return nil, downloadErr
 			}
 		} else {
 			output, getErr := client.GetObject(ctx, &s3.GetObjectInput{
@@ -1660,37 +1793,270 @@ func minInt64(left, right int64) int64 {
 	return right
 }
 
-func runPutTestData(params map[string]interface{}) map[string]interface{} {
-	config := asMap(params["config"])
+func toolState(label, lastStatus string, outputLines []string, exitCode int) map[string]interface{} {
 	return map[string]interface{}{
-		"label":       "put-testdata.py",
+		"label":       label,
 		"running":     false,
-		"lastStatus":  fmt.Sprintf("Prepared %d object(s) with %d version(s) each for %s.", asInt(config["objectCount"]), asInt(config["versions"]), asString(config["bucketName"])),
+		"lastStatus":  lastStatus,
 		"jobId":       fmt.Sprintf("tool-%d", time.Now().UnixNano()),
 		"cancellable": false,
-		"outputLines": []string{
-			fmt.Sprintf("Bucket: %s", asString(config["bucketName"])),
-			fmt.Sprintf("Prefix: %s", asString(config["prefix"])),
-			fmt.Sprintf("Threads: %d", asInt(config["threads"])),
-		},
-		"exitCode": 0,
+		"outputLines": outputLines,
+		"exitCode":    exitCode,
 	}
 }
 
-func runDeleteAll(params map[string]interface{}) map[string]interface{} {
-	config := asMap(params["config"])
-	return map[string]interface{}{
-		"label":       "delete-all.py",
-		"running":     false,
-		"lastStatus":  fmt.Sprintf("Prepared delete-all sweep for %s.", asString(config["bucketName"])),
-		"jobId":       fmt.Sprintf("tool-%d", time.Now().UnixNano()),
-		"cancellable": false,
-		"outputLines": []string{
-			fmt.Sprintf("Batch size: %d", asInt(config["batchSize"])),
-			fmt.Sprintf("Workers: %d", asInt(config["maxWorkers"])),
-		},
-		"exitCode": 0,
+func toolFailure(label string, err error) map[string]interface{} {
+	message := "Unknown tool error."
+	if err != nil {
+		message = err.Error()
 	}
+	return toolState(label, message, []string{"Error: " + message}, 1)
+}
+
+func runPutTestData(params map[string]interface{}) map[string]interface{} {
+	const label = "put-testdata"
+	config := asMap(params["config"])
+	bucketName := strings.TrimSpace(asString(config["bucketName"]))
+	if bucketName == "" {
+		return toolFailure(label, &sidecarError{Code: "invalid_config", Message: "Bucket name is required."})
+	}
+	prefix := asString(config["prefix"])
+	objectCount := max(asInt(config["objectCount"]), 0)
+	versions := maxInt(asInt(config["versions"]), 1, 1)
+	threads := maxInt(asInt(config["threads"]), 1, 1)
+	if threads > 16 {
+		threads = 16
+	}
+	sizeBytes := max(asInt(config["objectSizeBytes"]), 0)
+	p, err := parseProfile(asMap(params["profile"]))
+	if err != nil {
+		return toolFailure(label, err)
+	}
+	client, ctx, err := buildClient(p)
+	if err != nil {
+		return toolFailure(label, err)
+	}
+	payload := bytes.Repeat([]byte{'A'}, sizeBytes)
+	started := time.Now()
+	var (
+		wg           sync.WaitGroup
+		countMu      sync.Mutex
+		putCount     int
+		failureCount int
+		firstFailure error
+	)
+	sem := make(chan struct{}, threads)
+	for objectIndex := 0; objectIndex < objectCount; objectIndex++ {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(objectIndex int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			key := fmt.Sprintf("%stestdata-%06d.bin", prefix, objectIndex)
+			for versionIndex := 0; versionIndex < versions; versionIndex++ {
+				_, putErr := client.PutObject(ctx, &s3.PutObjectInput{
+					Bucket:      aws.String(bucketName),
+					Key:         aws.String(key),
+					Body:        bytes.NewReader(payload),
+					ContentType: aws.String("application/octet-stream"),
+				})
+				countMu.Lock()
+				if putErr != nil {
+					failureCount++
+					if firstFailure == nil {
+						firstFailure = putErr
+					}
+				} else {
+					putCount++
+				}
+				countMu.Unlock()
+			}
+		}(objectIndex)
+	}
+	wg.Wait()
+	duration := time.Since(started)
+	outputLines := []string{
+		fmt.Sprintf("Bucket: %s", bucketName),
+		fmt.Sprintf("Prefix: %s", prefix),
+		fmt.Sprintf("Threads: %d", threads),
+		fmt.Sprintf("Objects: %d (%d version(s) each, %d bytes)", objectCount, versions, sizeBytes),
+		fmt.Sprintf("Puts completed: %d", putCount),
+		fmt.Sprintf("Failures: %d", failureCount),
+		fmt.Sprintf("Duration: %s", duration.Round(time.Millisecond)),
+	}
+	if firstFailure != nil {
+		outputLines = append(outputLines, fmt.Sprintf("First error: %s", firstFailure.Error()))
+		return toolState(label, fmt.Sprintf("Completed with %d failure(s) writing test data to %s.", failureCount, bucketName), outputLines, 1)
+	}
+	return toolState(label, fmt.Sprintf("Created %d object(s) with %d version(s) each in %s.", objectCount, versions, bucketName), outputLines, 0)
+}
+
+func runDeleteAll(params map[string]interface{}) map[string]interface{} {
+	const label = "delete-all"
+	config := asMap(params["config"])
+	bucketName := strings.TrimSpace(asString(config["bucketName"]))
+	if bucketName == "" {
+		return toolFailure(label, &sidecarError{Code: "invalid_config", Message: "Bucket name is required."})
+	}
+	listMaxKeys := maxInt(asInt(config["listMaxKeys"]), 1, 1000)
+	if listMaxKeys > 1000 {
+		listMaxKeys = 1000
+	}
+	batchSize := maxInt(asInt(config["batchSize"]), 1, 1000)
+	if batchSize > 1000 {
+		batchSize = 1000
+	}
+	maxWorkers := maxInt(asInt(config["maxWorkers"]), 1, 4)
+	if maxWorkers > 16 {
+		maxWorkers = 16
+	}
+	deletionDelay := time.Duration(max(asInt(config["deletionDelayMs"]), 0)) * time.Millisecond
+	p, err := parseProfile(asMap(params["profile"]))
+	if err != nil {
+		return toolFailure(label, err)
+	}
+	client, ctx, err := buildClient(p)
+	if err != nil {
+		return toolFailure(label, err)
+	}
+	started := time.Now()
+	var (
+		wg           sync.WaitGroup
+		countMu      sync.Mutex
+		deletedCount int
+		failureCount int
+		firstFailure error
+	)
+	sem := make(chan struct{}, maxWorkers)
+	dispatchedBatches := 0
+	dispatchBatch := func(identifiers []types.ObjectIdentifier) {
+		if len(identifiers) == 0 {
+			return
+		}
+		if dispatchedBatches > 0 && deletionDelay > 0 {
+			time.Sleep(deletionDelay)
+		}
+		dispatchedBatches++
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(identifiers []types.ObjectIdentifier) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			output, deleteErr := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				Bucket: aws.String(bucketName),
+				Delete: &types.Delete{Objects: identifiers, Quiet: aws.Bool(true)},
+			})
+			countMu.Lock()
+			defer countMu.Unlock()
+			if deleteErr != nil {
+				failureCount += len(identifiers)
+				if firstFailure == nil {
+					firstFailure = deleteErr
+				}
+				return
+			}
+			failed := len(output.Errors)
+			failureCount += failed
+			deletedCount += len(identifiers) - failed
+			if failed > 0 && firstFailure == nil {
+				firstFailure = fmt.Errorf("%s: %s", aws.ToString(output.Errors[0].Code), aws.ToString(output.Errors[0].Message))
+			}
+		}(identifiers)
+	}
+	dispatchIdentifiers := func(identifiers []types.ObjectIdentifier) {
+		for start := 0; start < len(identifiers); start += batchSize {
+			end := start + batchSize
+			if end > len(identifiers) {
+				end = len(identifiers)
+			}
+			dispatchBatch(identifiers[start:end])
+		}
+	}
+	listedCount := 0
+	listMode := "versions"
+	var keyMarker, versionMarker *string
+	for {
+		versionOutput, listErr := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
+			Bucket:          aws.String(bucketName),
+			MaxKeys:         aws.Int32(int32(listMaxKeys)),
+			KeyMarker:       keyMarker,
+			VersionIdMarker: versionMarker,
+		})
+		if listErr != nil {
+			if keyMarker == nil && versionMarker == nil {
+				listMode = "objects"
+				break
+			}
+			wg.Wait()
+			return toolFailure(label, listErr)
+		}
+		identifiers := make([]types.ObjectIdentifier, 0, listMaxKeys)
+		for _, version := range versionOutput.Versions {
+			identifiers = append(identifiers, types.ObjectIdentifier{Key: version.Key, VersionId: version.VersionId})
+		}
+		for _, marker := range versionOutput.DeleteMarkers {
+			identifiers = append(identifiers, types.ObjectIdentifier{Key: marker.Key, VersionId: marker.VersionId})
+		}
+		listedCount += len(identifiers)
+		dispatchIdentifiers(identifiers)
+		if !aws.ToBool(versionOutput.IsTruncated) {
+			break
+		}
+		nextKeyMarker := versionOutput.NextKeyMarker
+		nextVersionMarker := versionOutput.NextVersionIdMarker
+		if aws.ToString(nextKeyMarker) == "" && aws.ToString(nextVersionMarker) == "" {
+			// Non-strict S3-compatible servers may report truncation without
+			// returning continuation markers; stop instead of looping forever.
+			break
+		}
+		if aws.ToString(nextKeyMarker) == aws.ToString(keyMarker) && aws.ToString(nextVersionMarker) == aws.ToString(versionMarker) {
+			wg.Wait()
+			return toolFailure(label, fmt.Errorf("version listing made no progress (markers did not advance); aborting delete-all"))
+		}
+		keyMarker = nextKeyMarker
+		versionMarker = nextVersionMarker
+	}
+	if listMode == "objects" {
+		var continuationToken *string
+		for {
+			listOutput, listErr := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+				Bucket:            aws.String(bucketName),
+				MaxKeys:           aws.Int32(int32(listMaxKeys)),
+				ContinuationToken: continuationToken,
+			})
+			if listErr != nil {
+				wg.Wait()
+				return toolFailure(label, listErr)
+			}
+			identifiers := make([]types.ObjectIdentifier, 0, listMaxKeys)
+			for _, object := range listOutput.Contents {
+				identifiers = append(identifiers, types.ObjectIdentifier{Key: object.Key})
+			}
+			listedCount += len(identifiers)
+			dispatchIdentifiers(identifiers)
+			if !aws.ToBool(listOutput.IsTruncated) {
+				break
+			}
+			continuationToken = listOutput.NextContinuationToken
+		}
+	}
+	wg.Wait()
+	duration := time.Since(started)
+	outputLines := []string{
+		fmt.Sprintf("Bucket: %s", bucketName),
+		fmt.Sprintf("Listing mode: %s (page size %d)", listMode, listMaxKeys),
+		fmt.Sprintf("Batch size: %d", batchSize),
+		fmt.Sprintf("Workers: %d", maxWorkers),
+		fmt.Sprintf("Listed: %d", listedCount),
+		fmt.Sprintf("Deleted: %d", deletedCount),
+		fmt.Sprintf("Failures: %d", failureCount),
+		fmt.Sprintf("Duration: %s", duration.Round(time.Millisecond)),
+	}
+	if firstFailure != nil {
+		outputLines = append(outputLines, fmt.Sprintf("First error: %s", firstFailure.Error()))
+		return toolState(label, fmt.Sprintf("Deleted %d object version(s) from %s with %d failure(s).", deletedCount, bucketName, failureCount), outputLines, 1)
+	}
+	return toolState(label, fmt.Sprintf("Deleted %d object version(s) from %s.", deletedCount, bucketName), outputLines, 0)
 }
 
 func cancelToolExecution(params map[string]interface{}) map[string]interface{} {

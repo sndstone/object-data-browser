@@ -12,6 +12,7 @@ import '../settings/settings_workspace.dart';
 import '../tasks/tasks_workspace.dart';
 import '../theme/app_theme.dart';
 import '../theme/breakpoints.dart';
+import '../widgets/app_select_field.dart';
 import '../widgets/compact_selector.dart';
 
 class S3BrowserApp extends StatefulWidget {
@@ -401,15 +402,15 @@ class _AppHeader extends StatelessWidget {
     final desktopCompact = AppTheme.isDesktopPlatform(theme.platform);
     final desktopWide = !phone && !compact;
     final margin = EdgeInsets.fromLTRB(
-      phone ? 12 : (desktopCompact ? 10 : 14),
-      phone ? 8 : (desktopCompact ? 10 : 14),
-      phone ? 12 : (desktopCompact ? 10 : 14),
+      phone ? 12 : (desktopCompact ? 10 : 12),
+      phone ? 8 : (desktopCompact ? 10 : 12),
+      phone ? 12 : (desktopCompact ? 10 : 12),
       phone ? 8 : (desktopCompact ? 8 : 10),
     );
     final padding = EdgeInsets.fromLTRB(
-      desktopCompact && !phone ? 12 : (phone ? 18 : 14),
+      desktopCompact && !phone ? 12 : (phone ? 18 : 12),
       phone ? 14 : (desktopCompact ? 8 : (compact ? 10 : 12)),
-      desktopCompact && !phone ? 12 : (phone ? 18 : 14),
+      desktopCompact && !phone ? 12 : (phone ? 18 : 12),
       desktopCompact && !phone ? 8 : (phone ? 14 : 10),
     );
     return Container(
@@ -771,10 +772,9 @@ class _HeaderControlStrip extends StatelessWidget {
     final selectedId = controller.selectedProfile?.id;
     final validProfileValue =
         profiles.any((p) => p.id == selectedId) ? selectedId : null;
-    return DropdownButtonFormField<String>(
-      initialValue: validProfileValue,
+    return AppSelectField<String>(
+      value: validProfileValue,
       isExpanded: true,
-      dropdownColor: Theme.of(context).colorScheme.surface,
       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
             color: onSurface,
           ),
@@ -788,9 +788,9 @@ class _HeaderControlStrip extends StatelessWidget {
       ),
       items: profiles
           .map(
-            (profile) => DropdownMenuItem(
+            (profile) => AppSelectItem(
               value: profile.id,
-              child: Text(profile.name),
+              label: profile.name,
             ),
           )
           .toList(),
@@ -812,8 +812,8 @@ class _HeaderControlStrip extends StatelessWidget {
     final activeId = controller.activeEngineId;
     final validEngineValue =
         engines.any((e) => e.id == activeId) ? activeId : null;
-    return DropdownButtonFormField<String>(
-      initialValue: validEngineValue,
+    return AppSelectField<String>(
+      value: validEngineValue,
       isExpanded: true,
       decoration: InputDecoration(
         labelText: phone ? null : 'Backend engine',
@@ -824,9 +824,9 @@ class _HeaderControlStrip extends StatelessWidget {
       ),
       items: engines
           .map(
-            (engine) => DropdownMenuItem(
+            (engine) => AppSelectItem(
               value: engine.id,
-              child: Text(engine.label),
+              label: engine.label,
             ),
           )
           .toList(),

@@ -64,6 +64,15 @@ Legend:
 | CSV export | Required | Required | Required | Required | Rust/Go | Planned |
 | In-app charts input schema | Required | Required | Required | Required | Rust/Go | Stubbed |
 
+## Inspector Tools
+
+| Feature | Python | Go | Rust | Java | Android | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| Put test data (`runPutTestData`) | Required | Required | Required | Required | Rust/Go | Implemented (native, all desktop engines) |
+| Delete all (`runDeleteAll`) | Required | Required | Required | Required | Rust/Go | Implemented (native, all desktop engines) |
+
+Both tools execute directly inside the selected engine (no external scripts): put-testdata creates the configured object count/size/versions with a bounded worker pool; delete-all pages object versions (falling back to plain listing when versioning is unsupported) and batch-deletes with configurable batch size, workers, and delay.
+
 ## Error and Reliability Requirements
 
 Every engine must return typed error codes for:

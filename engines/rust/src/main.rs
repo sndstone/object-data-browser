@@ -17,6 +17,7 @@ use aws_sdk_s3::types::{
     VersioningConfiguration,
 };
 use aws_sdk_s3::Client;
+use bytes::Bytes;
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -24,10 +25,15 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 const SUPPORTED_METHODS: &[&str] = &[
@@ -292,8 +298,8 @@ async fn handle_request(request: Request) -> SidecarResult {
         "resumeTransfer" => Ok(transfer_control(&request.params, "running")),
         "cancelTransfer" => Ok(transfer_control(&request.params, "cancelled")),
         "generatePresignedUrl" => generate_presigned_url(request.params).await,
-        "runPutTestData" => Ok(run_put_test_data(&request.params)),
-        "runDeleteAll" => Ok(run_delete_all(&request.params)),
+        "runPutTestData" => run_put_test_data(request.params).await,
+        "runDeleteAll" => run_delete_all(request.params).await,
         "cancelToolExecution" => Ok(cancel_tool_execution(&request.params)),
         "startBenchmark" => start_benchmark(request.params).await,
         "getBenchmarkStatus" => get_benchmark_status(request.params).await,
@@ -1196,8 +1202,226 @@ async fn delete_object_versions(params: Value) -> SidecarResult {
     }))
 }
 
+struct TransferProgress {
+    job_id: String,
+    label: String,
+    direction: &'static str,
+    total_bytes: u64,
+    strategy_label: String,
+    item_count: usize,
+    part_size_bytes: Option<u64>,
+    parts_total: Option<u64>,
+    state: Mutex<TransferProgressState>,
+}
+
+const MAX_PART_OUTPUT_LINES: u64 = 64;
+
+struct TransferProgressState {
+    bytes_transferred: u64,
+    parts_completed: u64,
+    items_completed: usize,
+    part_lines_recorded: u64,
+    output_lines: Vec<String>,
+}
+
+impl TransferProgressState {
+    fn push_part_line(&mut self, line: String) {
+        if self.part_lines_recorded < MAX_PART_OUTPUT_LINES {
+            self.output_lines.push(line);
+        } else if self.part_lines_recorded == MAX_PART_OUTPUT_LINES {
+            self.output_lines
+                .push("… further part updates omitted.".to_string());
+        }
+        self.part_lines_recorded += 1;
+    }
+}
+
+impl TransferProgress {
+    fn emit(&self, status: &str, current_item: Option<String>) {
+        let (bytes_transferred, parts_completed, items_completed, output_lines) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.bytes_transferred,
+                state.parts_completed,
+                state.items_completed,
+                state.output_lines.clone(),
+            )
+        };
+        emit_transfer_event(&transfer_job(
+            self.job_id.clone(),
+            self.label.clone(),
+            self.direction,
+            progress_fraction(bytes_transferred, self.total_bytes),
+            status,
+            bytes_transferred,
+            self.total_bytes,
+            Some(self.strategy_label.clone()),
+            current_item,
+            self.item_count,
+            items_completed,
+            self.part_size_bytes,
+            if self.parts_total.is_some() {
+                Some(parts_completed)
+            } else {
+                None
+            },
+            self.parts_total,
+            true,
+            false,
+            true,
+            output_lines,
+        ));
+    }
+}
+
+fn transfer_concurrency(profile: &Profile) -> usize {
+    profile.max_pool_connections.clamp(1, 8)
+}
+
+async fn upload_file_multipart(
+    client: &Client,
+    bucket_name: &str,
+    key: &str,
+    path: &Path,
+    file_size: u64,
+    chunk_bytes: u64,
+    concurrency: usize,
+    progress: &Arc<TransferProgress>,
+    file_name: &str,
+) -> Result<(), SidecarError> {
+    let upload_id = client
+        .create_multipart_upload()
+        .bucket(bucket_name)
+        .key(key)
+        .send()
+        .await
+        .map_err(map_sdk_error)?
+        .upload_id()
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            SidecarError::new(
+                "engine_unavailable",
+                "Multipart upload did not return an upload ID.",
+            )
+        })?;
+    let part_count = file_size.div_ceil(chunk_bytes);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut join_set = JoinSet::new();
+    for index in 0..part_count {
+        let part_number = (index + 1) as i32;
+        let offset = index * chunk_bytes;
+        let length = chunk_bytes.min(file_size - offset);
+        let client = client.clone();
+        let bucket_name = bucket_name.to_string();
+        let key = key.to_string();
+        let upload_id = upload_id.clone();
+        let path = path.to_path_buf();
+        let semaphore = Arc::clone(&semaphore);
+        let progress = Arc::clone(progress);
+        let file_name = file_name.to_string();
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
+            let mut file = tokio::fs::File::open(&path)
+                .await
+                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+            file.seek(SeekFrom::Start(offset))
+                .await
+                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+            let mut buffer = vec![0_u8; length as usize];
+            file.read_exact(&mut buffer)
+                .await
+                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+            let output = client
+                .upload_part()
+                .bucket(&bucket_name)
+                .key(&key)
+                .upload_id(&upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(buffer))
+                .send()
+                .await
+                .map_err(map_sdk_error)?;
+            {
+                let mut state = progress.state.lock().unwrap();
+                state.bytes_transferred += length;
+                state.parts_completed += 1;
+                state.push_part_line(format!("Uploaded part {part_number} for {file_name}."));
+            }
+            progress.emit("running", Some(file_name));
+            Ok::<(i32, Option<String>), SidecarError>((
+                part_number,
+                output.e_tag().map(str::to_owned),
+            ))
+        });
+    }
+    let mut parts: Vec<(i32, Option<String>)> = Vec::with_capacity(part_count as usize);
+    let mut failure: Option<SidecarError> = None;
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok(Ok(part)) => parts.push(part),
+            Ok(Err(error)) => {
+                if failure.is_none() {
+                    failure = Some(error);
+                }
+                join_set.abort_all();
+            }
+            Err(join_error) => {
+                if !join_error.is_cancelled() && failure.is_none() {
+                    failure = Some(SidecarError::new(
+                        "engine_unavailable",
+                        join_error.to_string(),
+                    ));
+                    join_set.abort_all();
+                }
+            }
+        }
+    }
+    let complete_result = match failure {
+        Some(error) => Err(error),
+        None => {
+            parts.sort_by_key(|(part_number, _)| *part_number);
+            let completed_parts = parts
+                .into_iter()
+                .map(|(part_number, e_tag)| {
+                    CompletedPart::builder()
+                        .set_e_tag(e_tag)
+                        .part_number(part_number)
+                        .build()
+                })
+                .collect::<Vec<_>>();
+            client
+                .complete_multipart_upload()
+                .bucket(bucket_name)
+                .key(key)
+                .upload_id(&upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(completed_parts))
+                        .build(),
+                )
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(map_sdk_error)
+        }
+    };
+    if complete_result.is_err() {
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(bucket_name)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+    }
+    complete_result
+}
+
 async fn start_upload(params: Value) -> SidecarResult {
-    let (_, bucket_name, client) = bucket_context(&params).await?;
+    let (profile, bucket_name, client) = bucket_context(&params).await?;
     let prefix = params["prefix"].as_str().unwrap_or_default();
     let file_paths = string_array(params.get("filePaths").unwrap_or(&Value::Null));
     let object_key_by_path = string_map(params.get("objectKeyByPath").unwrap_or(&Value::Null));
@@ -1228,6 +1452,7 @@ async fn start_upload(params: Value) -> SidecarResult {
             parts_total += metadata.len().div_ceil(multipart_chunk_bytes);
         }
     }
+    let concurrency = transfer_concurrency(&profile);
     let job_id = format!("upload-{}", short_uuid());
     let label = format!("Upload {} file(s) to {bucket_name}", paths.len());
     let strategy_label = transfer_strategy_label("upload", uses_multipart);
@@ -1241,41 +1466,34 @@ async fn start_upload(params: Value) -> SidecarResult {
     } else {
         None
     };
-    let mut output_lines = vec![format!(
-        "Queued {} file(s) for upload to {bucket_name}.",
-        paths.len()
-    )];
-    let mut bytes_transferred = 0_u64;
-    let mut items_completed = 0_usize;
-    let mut parts_completed = 0_u64;
-    emit_transfer_event(&transfer_job(
-        job_id.clone(),
-        label.clone(),
-        "upload",
-        0.0,
-        "queued",
-        0,
+    let progress = Arc::new(TransferProgress {
+        job_id: job_id.clone(),
+        label: label.clone(),
+        direction: "upload",
         total_bytes,
-        Some(strategy_label.clone()),
+        strategy_label: strategy_label.clone(),
+        item_count: paths.len(),
+        part_size_bytes,
+        parts_total: part_total_value,
+        state: Mutex::new(TransferProgressState {
+            bytes_transferred: 0,
+            parts_completed: 0,
+            items_completed: 0,
+            part_lines_recorded: 0,
+            output_lines: vec![format!(
+                "Queued {} file(s) for upload to {bucket_name}.",
+                paths.len()
+            )],
+        }),
+    });
+    progress.emit(
+        "queued",
         paths
             .first()
             .and_then(|path| path.file_name())
             .and_then(|value| value.to_str())
             .map(str::to_owned),
-        paths.len(),
-        items_completed,
-        part_size_bytes,
-        if part_total_value.is_some() {
-            Some(parts_completed)
-        } else {
-            None
-        },
-        part_total_value,
-        true,
-        false,
-        true,
-        output_lines.clone(),
-    ));
+    );
     for path in &paths {
         let default_name = path
             .file_name()
@@ -1297,91 +1515,32 @@ async fn start_upload(params: Value) -> SidecarResult {
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_string();
-        let file_bytes = fs::read(path)
-            .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
-        let file_size = file_bytes.len() as u64;
-        output_lines.push(format!(
-            "Uploading {file_name} ({file_size} bytes) to {key}."
-        ));
+        let file_size = fs::metadata(path)
+            .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?
+            .len();
+        {
+            let mut state = progress.state.lock().unwrap();
+            state.output_lines.push(format!(
+                "Uploading {file_name} ({file_size} bytes) to {key}."
+            ));
+        }
         if file_size >= multipart_threshold_bytes {
-            let upload_id = client
-                .create_multipart_upload()
-                .bucket(&bucket_name)
-                .key(&key)
-                .send()
-                .await
-                .map_err(map_sdk_error)?
-                .upload_id()
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    SidecarError::new(
-                        "engine_unavailable",
-                        "Multipart upload did not return an upload ID.",
-                    )
-                })?;
-            let mut completed_parts = Vec::new();
-            let mut offset = 0_usize;
-            let mut part_number = 1_i32;
-            while offset < file_bytes.len() {
-                let end = (offset + multipart_chunk_bytes as usize).min(file_bytes.len());
-                let chunk = file_bytes[offset..end].to_vec();
-                let output = client
-                    .upload_part()
-                    .bucket(&bucket_name)
-                    .key(&key)
-                    .upload_id(&upload_id)
-                    .part_number(part_number)
-                    .body(ByteStream::from(chunk.clone()))
-                    .send()
-                    .await
-                    .map_err(map_sdk_error)?;
-                completed_parts.push(
-                    CompletedPart::builder()
-                        .set_e_tag(output.e_tag().map(str::to_owned))
-                        .part_number(part_number)
-                        .build(),
-                );
-                bytes_transferred += chunk.len() as u64;
-                parts_completed += 1;
-                output_lines.push(format!("Uploaded part {part_number} for {file_name}."));
-                emit_transfer_event(&transfer_job(
-                    job_id.clone(),
-                    label.clone(),
-                    "upload",
-                    progress_fraction(bytes_transferred, total_bytes),
-                    "running",
-                    bytes_transferred,
-                    total_bytes,
-                    Some(strategy_label.clone()),
-                    Some(file_name.clone()),
-                    paths.len(),
-                    items_completed,
-                    part_size_bytes,
-                    Some(parts_completed),
-                    part_total_value,
-                    true,
-                    false,
-                    true,
-                    output_lines.clone(),
-                ));
-                offset = end;
-                part_number += 1;
-            }
-            client
-                .complete_multipart_upload()
-                .bucket(&bucket_name)
-                .key(&key)
-                .upload_id(upload_id)
-                .multipart_upload(
-                    CompletedMultipartUpload::builder()
-                        .set_parts(Some(completed_parts))
-                        .build(),
-                )
-                .send()
-                .await
-                .map_err(map_sdk_error)?;
+            upload_file_multipart(
+                &client,
+                &bucket_name,
+                &key,
+                path,
+                file_size,
+                multipart_chunk_bytes,
+                concurrency,
+                &progress,
+                &file_name,
+            )
+            .await?;
         } else {
-            let body = ByteStream::from(file_bytes);
+            let body = ByteStream::from_path(path)
+                .await
+                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
             client
                 .put_object()
                 .bucket(&bucket_name)
@@ -1390,39 +1549,31 @@ async fn start_upload(params: Value) -> SidecarResult {
                 .send()
                 .await
                 .map_err(map_sdk_error)?;
-            bytes_transferred += file_size;
+            let mut state = progress.state.lock().unwrap();
+            state.bytes_transferred += file_size;
         }
-        items_completed += 1;
-        output_lines.push(format!("Finished uploading {file_name}."));
-        emit_transfer_event(&transfer_job(
-            job_id.clone(),
-            label.clone(),
-            "upload",
-            progress_fraction(bytes_transferred, total_bytes),
-            "running",
-            bytes_transferred,
-            total_bytes,
-            Some(strategy_label.clone()),
-            Some(file_name),
-            paths.len(),
-            items_completed,
-            part_size_bytes,
-            if part_total_value.is_some() {
-                Some(parts_completed)
-            } else {
-                None
-            },
-            part_total_value,
-            true,
-            false,
-            true,
-            output_lines.clone(),
-        ));
+        {
+            let mut state = progress.state.lock().unwrap();
+            state.items_completed += 1;
+            state
+                .output_lines
+                .push(format!("Finished uploading {file_name}."));
+        }
+        progress.emit("running", Some(file_name));
     }
-    output_lines.push(format!(
-        "Uploaded {} file(s) into {bucket_name}.",
-        paths.len()
-    ));
+    let (bytes_transferred, items_completed, parts_completed, output_lines) = {
+        let mut state = progress.state.lock().unwrap();
+        state.output_lines.push(format!(
+            "Uploaded {} file(s) into {bucket_name}.",
+            paths.len()
+        ));
+        (
+            state.bytes_transferred,
+            state.items_completed,
+            state.parts_completed,
+            state.output_lines.clone(),
+        )
+    };
     Ok(transfer_job(
         job_id,
         label,
@@ -1453,8 +1604,120 @@ async fn start_upload(params: Value) -> SidecarResult {
     ))
 }
 
+async fn download_object_ranged(
+    client: &Client,
+    bucket_name: &str,
+    key: &str,
+    target: &Path,
+    object_size: u64,
+    chunk_bytes: u64,
+    concurrency: usize,
+    progress: &Arc<TransferProgress>,
+) -> Result<(), SidecarError> {
+    {
+        let file = tokio::fs::File::create(target)
+            .await
+            .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+        file.set_len(object_size)
+            .await
+            .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+    }
+    let part_count = object_size.div_ceil(chunk_bytes);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut join_set = JoinSet::new();
+    for index in 0..part_count {
+        let start = index * chunk_bytes;
+        let end = (start + chunk_bytes - 1).min(object_size.saturating_sub(1));
+        let client = client.clone();
+        let bucket_name = bucket_name.to_string();
+        let key = key.to_string();
+        let target = target.to_path_buf();
+        let semaphore = Arc::clone(&semaphore);
+        let progress = Arc::clone(progress);
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
+            let output = client
+                .get_object()
+                .bucket(&bucket_name)
+                .key(&key)
+                .range(format!("bytes={start}-{end}"))
+                .send()
+                .await
+                .map_err(map_sdk_error)?;
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&target)
+                .await
+                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+            file.seek(SeekFrom::Start(start))
+                .await
+                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+            let mut body = output.body;
+            let mut range_bytes = 0_u64;
+            while let Some(chunk) = body
+                .try_next()
+                .await
+                .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?
+            {
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+                range_bytes += chunk.len() as u64;
+            }
+            file.flush()
+                .await
+                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+            let expected_bytes = end - start + 1;
+            if range_bytes != expected_bytes {
+                return Err(SidecarError::new(
+                    "engine_unavailable",
+                    format!(
+                        "Ranged download for {key} bytes {start}-{end} returned {range_bytes} byte(s); expected {expected_bytes}."
+                    ),
+                ));
+            }
+            {
+                let mut state = progress.state.lock().unwrap();
+                state.bytes_transferred += range_bytes;
+                state.parts_completed += 1;
+                state.push_part_line(format!("Downloaded byte range {start}-{end} for {key}."));
+            }
+            progress.emit("running", Some(key));
+            Ok::<(), SidecarError>(())
+        });
+    }
+    let mut failure: Option<SidecarError> = None;
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if failure.is_none() {
+                    failure = Some(error);
+                }
+                join_set.abort_all();
+            }
+            Err(join_error) => {
+                if !join_error.is_cancelled() && failure.is_none() {
+                    failure = Some(SidecarError::new(
+                        "engine_unavailable",
+                        join_error.to_string(),
+                    ));
+                    join_set.abort_all();
+                }
+            }
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 async fn start_download(params: Value) -> SidecarResult {
-    let (_, bucket_name, client) = bucket_context(&params).await?;
+    let (profile, bucket_name, client) = bucket_context(&params).await?;
     let keys = string_array(params.get("keys").unwrap_or(&Value::Null));
     let destination_path = required_text(
         &params,
@@ -1498,6 +1761,7 @@ async fn start_download(params: Value) -> SidecarResult {
             parts_total += size.div_ceil(multipart_chunk_bytes);
         }
     }
+    let concurrency = transfer_concurrency(&profile);
     let job_id = format!("download-{}", short_uuid());
     let label = format!("Download {} object(s) from {bucket_name}", keys.len());
     let strategy_label = transfer_strategy_label("download", uses_multipart);
@@ -1511,92 +1775,49 @@ async fn start_download(params: Value) -> SidecarResult {
     } else {
         None
     };
-    let mut output_lines = vec![format!(
-        "Queued {} object(s) for download to {destination_path}.",
-        keys.len()
-    )];
-    let mut bytes_transferred = 0_u64;
-    let mut items_completed = 0_usize;
-    let mut parts_completed = 0_u64;
-    emit_transfer_event(&transfer_job(
-        job_id.clone(),
-        label.clone(),
-        "download",
-        0.0,
-        "queued",
-        0,
+    let progress = Arc::new(TransferProgress {
+        job_id: job_id.clone(),
+        label: label.clone(),
+        direction: "download",
         total_bytes,
-        Some(strategy_label.clone()),
-        keys.first().cloned(),
-        keys.len(),
-        items_completed,
+        strategy_label: strategy_label.clone(),
+        item_count: keys.len(),
         part_size_bytes,
-        if part_total_value.is_some() {
-            Some(parts_completed)
-        } else {
-            None
-        },
-        part_total_value,
-        true,
-        false,
-        true,
-        output_lines.clone(),
-    ));
+        parts_total: part_total_value,
+        state: Mutex::new(TransferProgressState {
+            bytes_transferred: 0,
+            parts_completed: 0,
+            items_completed: 0,
+            part_lines_recorded: 0,
+            output_lines: vec![format!(
+                "Queued {} object(s) for download to {destination_path}.",
+                keys.len()
+            )],
+        }),
+    });
+    progress.emit("queued", keys.first().cloned());
     for key in &keys {
         let target = destination.join(Path::new(key).file_name().unwrap_or_default());
         let object_size = *object_sizes.get(key).unwrap_or(&0);
-        output_lines.push(format!(
-            "Downloading {key} ({object_size} bytes) to {:?}.",
-            target
-        ));
+        {
+            let mut state = progress.state.lock().unwrap();
+            state.output_lines.push(format!(
+                "Downloading {key} ({object_size} bytes) to {:?}.",
+                target
+            ));
+        }
         if object_size >= multipart_threshold_bytes {
-            let mut downloaded = Vec::new();
-            let mut start = 0_u64;
-            while start < object_size {
-                let end = (start + multipart_chunk_bytes - 1).min(object_size.saturating_sub(1));
-                let output = client
-                    .get_object()
-                    .bucket(&bucket_name)
-                    .key(key)
-                    .range(format!("bytes={start}-{end}"))
-                    .send()
-                    .await
-                    .map_err(map_sdk_error)?;
-                let chunk = output
-                    .body
-                    .collect()
-                    .await
-                    .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?
-                    .into_bytes()
-                    .to_vec();
-                bytes_transferred += chunk.len() as u64;
-                downloaded.extend_from_slice(&chunk);
-                parts_completed += 1;
-                output_lines.push(format!("Downloaded byte range {start}-{end} for {key}."));
-                emit_transfer_event(&transfer_job(
-                    job_id.clone(),
-                    label.clone(),
-                    "download",
-                    progress_fraction(bytes_transferred, total_bytes),
-                    "running",
-                    bytes_transferred,
-                    total_bytes,
-                    Some(strategy_label.clone()),
-                    Some(key.clone()),
-                    keys.len(),
-                    items_completed,
-                    part_size_bytes,
-                    Some(parts_completed),
-                    part_total_value,
-                    true,
-                    false,
-                    true,
-                    output_lines.clone(),
-                ));
-                start = end + 1;
-            }
-            fs::write(&target, downloaded)
-                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+            download_object_ranged(
+                &client,
+                &bucket_name,
+                key,
+                &target,
+                object_size,
+                multipart_chunk_bytes,
+                concurrency,
+                &progress,
+            )
+            .await?;
         } else {
             let output = client
                 .get_object()
@@ -1605,48 +1826,51 @@ async fn start_download(params: Value) -> SidecarResult {
                 .send()
                 .await
                 .map_err(map_sdk_error)?;
-            let bytes = output
-                .body
-                .collect()
+            let mut file = tokio::fs::File::create(&target)
+                .await
+                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+            let mut body = output.body;
+            let mut object_bytes = 0_u64;
+            while let Some(chunk) = body
+                .try_next()
                 .await
                 .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?
-                .into_bytes()
-                .to_vec();
-            bytes_transferred += bytes.len() as u64;
-            fs::write(&target, bytes)
+            {
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+                object_bytes += chunk.len() as u64;
+            }
+            file.flush()
+                .await
                 .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
-            emit_transfer_event(&transfer_job(
-                job_id.clone(),
-                label.clone(),
-                "download",
-                progress_fraction(bytes_transferred, total_bytes),
-                "running",
-                bytes_transferred,
-                total_bytes,
-                Some(strategy_label.clone()),
-                Some(key.clone()),
-                keys.len(),
-                items_completed,
-                part_size_bytes,
-                if part_total_value.is_some() {
-                    Some(parts_completed)
-                } else {
-                    None
-                },
-                part_total_value,
-                true,
-                false,
-                true,
-                output_lines.clone(),
-            ));
+            {
+                let mut state = progress.state.lock().unwrap();
+                state.bytes_transferred += object_bytes;
+            }
+            progress.emit("running", Some(key.clone()));
         }
-        items_completed += 1;
-        output_lines.push(format!("Finished downloading {key}."));
+        {
+            let mut state = progress.state.lock().unwrap();
+            state.items_completed += 1;
+            state
+                .output_lines
+                .push(format!("Finished downloading {key}."));
+        }
     }
-    output_lines.push(format!(
-        "Downloaded {} object(s) into {destination_path}.",
-        keys.len()
-    ));
+    let (bytes_transferred, items_completed, parts_completed, output_lines) = {
+        let mut state = progress.state.lock().unwrap();
+        state.output_lines.push(format!(
+            "Downloaded {} object(s) into {destination_path}.",
+            keys.len()
+        ));
+        (
+            state.bytes_transferred,
+            state.items_completed,
+            state.parts_completed,
+            state.output_lines.clone(),
+        )
+    };
     Ok(transfer_job(
         job_id,
         label,
@@ -1695,42 +1919,356 @@ async fn generate_presigned_url(params: Value) -> SidecarResult {
     Ok(json!({"url": presigned.uri().to_string()}))
 }
 
-fn run_put_test_data(params: &Value) -> Value {
-    let config = &params["config"];
+fn tool_state(label: &str, status: String, output_lines: Vec<String>, exit_code: i64) -> Value {
     json!({
-        "label": "put-testdata.py",
+        "label": label,
         "running": false,
-        "lastStatus": format!(
-            "Prepared {} object(s) with {} version(s) each for {}.",
-            config["objectCount"].as_i64().unwrap_or(0),
-            config["versions"].as_i64().unwrap_or(0),
-            config["bucketName"].as_str().unwrap_or_default()
-        ),
+        "lastStatus": status,
         "jobId": format!("tool-{}", short_uuid()),
         "cancellable": false,
-        "outputLines": [
-            format!("Bucket: {}", config["bucketName"].as_str().unwrap_or_default()),
-            format!("Prefix: {}", config["prefix"].as_str().unwrap_or_default()),
-            format!("Threads: {}", config["threads"].as_i64().unwrap_or(1))
-        ],
-        "exitCode": 0
+        "outputLines": output_lines,
+        "exitCode": exit_code,
     })
 }
 
-fn run_delete_all(params: &Value) -> Value {
+async fn run_put_test_data(params: Value) -> SidecarResult {
+    let profile = parse_profile(&params["profile"])?;
     let config = &params["config"];
-    json!({
-        "label": "delete-all.py",
-        "running": false,
-        "lastStatus": format!("Prepared delete-all sweep for {}.", config["bucketName"].as_str().unwrap_or_default()),
-        "jobId": format!("tool-{}", short_uuid()),
-        "cancellable": false,
-        "outputLines": [
-            format!("Batch size: {}", config["batchSize"].as_i64().unwrap_or(1000)),
-            format!("Workers: {}", config["maxWorkers"].as_i64().unwrap_or(1))
-        ],
-        "exitCode": 0
-    })
+    let bucket_name = config["bucketName"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if bucket_name.is_empty() {
+        return Err(SidecarError::new(
+            "invalid_config",
+            "Bucket name is required.",
+        ));
+    }
+    let object_count = config["objectCount"].as_u64().unwrap_or(0) as usize;
+    let versions = config["versions"].as_u64().unwrap_or(1).max(1) as usize;
+    let prefix = config["prefix"].as_str().unwrap_or_default().to_string();
+    let threads = config["threads"].as_u64().unwrap_or(1).clamp(1, 16) as usize;
+    let size_bytes = config["objectSizeBytes"]
+        .as_u64()
+        .or_else(|| config["sizeBytes"].as_u64())
+        .unwrap_or(4096) as usize;
+    let client = build_client(&profile).await?;
+    let payload = Bytes::from(vec![b'A'; size_bytes]);
+
+    let semaphore = Arc::new(Semaphore::new(threads));
+    let mut join_set = JoinSet::new();
+    for index in 0..object_count {
+        let client = client.clone();
+        let bucket = bucket_name.clone();
+        let key = format!("{prefix}testdata-{index:06}.bin");
+        let payload = payload.clone();
+        let semaphore = Arc::clone(&semaphore);
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
+            for _ in 0..versions {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(ByteStream::from(payload.clone()))
+                    .send()
+                    .await
+                    .map_err(map_sdk_error)?;
+            }
+            Ok::<usize, SidecarError>(versions)
+        });
+    }
+    let mut created_versions = 0_usize;
+    let mut failure: Option<SidecarError> = None;
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok(Ok(count)) => created_versions += count,
+            Ok(Err(error)) => {
+                if failure.is_none() {
+                    failure = Some(error);
+                }
+                join_set.abort_all();
+            }
+            Err(join_error) => {
+                if !join_error.is_cancelled() && failure.is_none() {
+                    failure = Some(SidecarError::new(
+                        "engine_unavailable",
+                        join_error.to_string(),
+                    ));
+                    join_set.abort_all();
+                }
+            }
+        }
+    }
+    let mut output_lines = vec![
+        format!("Bucket: {bucket_name}"),
+        format!("Prefix: {prefix}"),
+        format!("Threads: {threads}"),
+        format!("Object size: {size_bytes} bytes"),
+    ];
+    if let Some(error) = failure {
+        output_lines.push(format!(
+            "Created {created_versions} object version(s) before failing."
+        ));
+        output_lines.push(format!("Error: {}", error.message));
+        return Ok(tool_state(
+            "put-testdata",
+            format!("put-testdata failed: {}", error.message),
+            output_lines,
+            1,
+        ));
+    }
+    output_lines.push(format!("Created {created_versions} object version(s)."));
+    Ok(tool_state(
+        "put-testdata",
+        format!(
+            "Created {object_count} object(s) with {versions} version(s) each in {bucket_name}."
+        ),
+        output_lines,
+        0,
+    ))
+}
+
+async fn run_delete_all(params: Value) -> SidecarResult {
+    let profile = parse_profile(&params["profile"])?;
+    let config = &params["config"];
+    let bucket_name = config["bucketName"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if bucket_name.is_empty() {
+        return Err(SidecarError::new(
+            "invalid_config",
+            "Bucket name is required.",
+        ));
+    }
+    let batch_size = config["batchSize"].as_u64().unwrap_or(1000).clamp(1, 1000) as usize;
+    let max_workers = config["maxWorkers"].as_u64().unwrap_or(4).clamp(1, 16) as usize;
+    let list_max_keys = config["listMaxKeys"].as_i64().unwrap_or(1000).clamp(1, 1000) as i32;
+    let deletion_delay_ms = config["deletionDelayMs"].as_u64().unwrap_or(0);
+    let client = build_client(&profile).await?;
+
+    let deleted_count = Arc::new(AtomicU64::new(0));
+    let failure_count = Arc::new(AtomicU64::new(0));
+    let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let semaphore = Arc::new(Semaphore::new(max_workers));
+
+    let mut use_versions = true;
+    let mut key_marker: Option<String> = None;
+    let mut version_id_marker: Option<String> = None;
+    let mut continuation_token: Option<String> = None;
+    let mut fatal: Option<SidecarError> = None;
+    let mut first_page = true;
+
+    loop {
+        let mut identifiers: Vec<ObjectIdentifier> = Vec::new();
+        let has_more;
+        if use_versions {
+            let mut request = client
+                .list_object_versions()
+                .bucket(&bucket_name)
+                .max_keys(list_max_keys);
+            if let Some(marker) = &key_marker {
+                request = request.key_marker(marker);
+            }
+            if let Some(marker) = &version_id_marker {
+                request = request.version_id_marker(marker);
+            }
+            match request.send().await {
+                Ok(output) => {
+                    for version in output.versions() {
+                        let mut builder =
+                            ObjectIdentifier::builder().key(version.key().unwrap_or_default());
+                        if let Some(version_id) = version.version_id() {
+                            if !version_id.is_empty() {
+                                builder = builder.version_id(version_id);
+                            }
+                        }
+                        if let Ok(identifier) = builder.build() {
+                            identifiers.push(identifier);
+                        }
+                    }
+                    for marker in output.delete_markers() {
+                        let mut builder =
+                            ObjectIdentifier::builder().key(marker.key().unwrap_or_default());
+                        if let Some(version_id) = marker.version_id() {
+                            if !version_id.is_empty() {
+                                builder = builder.version_id(version_id);
+                            }
+                        }
+                        if let Ok(identifier) = builder.build() {
+                            identifiers.push(identifier);
+                        }
+                    }
+                    has_more = output.is_truncated().unwrap_or(false);
+                    key_marker = output
+                        .next_key_marker()
+                        .filter(|marker| !marker.is_empty())
+                        .map(str::to_owned);
+                    version_id_marker = output
+                        .next_version_id_marker()
+                        .filter(|marker| !marker.is_empty())
+                        .map(str::to_owned);
+                    if has_more && key_marker.is_none() && version_id_marker.is_none() {
+                        fatal = Some(SidecarError::new(
+                            "engine_unavailable",
+                            "Version listing reported more results without pagination markers; aborting to avoid relisting from the start.",
+                        ));
+                        break;
+                    }
+                }
+                Err(error) => {
+                    if first_page {
+                        use_versions = false;
+                        continue;
+                    }
+                    fatal = Some(map_sdk_error(error));
+                    break;
+                }
+            }
+        } else {
+            let mut request = client
+                .list_objects_v2()
+                .bucket(&bucket_name)
+                .max_keys(list_max_keys);
+            if let Some(token) = &continuation_token {
+                request = request.continuation_token(token);
+            }
+            match request.send().await {
+                Ok(output) => {
+                    for object in output.contents() {
+                        if let Ok(identifier) = ObjectIdentifier::builder()
+                            .key(object.key().unwrap_or_default())
+                            .build()
+                        {
+                            identifiers.push(identifier);
+                        }
+                    }
+                    has_more = output.is_truncated().unwrap_or(false);
+                    continuation_token = output
+                        .next_continuation_token()
+                        .filter(|token| !token.is_empty())
+                        .map(str::to_owned);
+                    if has_more && continuation_token.is_none() {
+                        fatal = Some(SidecarError::new(
+                            "engine_unavailable",
+                            "Object listing reported more results without a continuation token; aborting to avoid relisting from the start.",
+                        ));
+                        break;
+                    }
+                }
+                Err(error) => {
+                    fatal = Some(map_sdk_error(error));
+                    break;
+                }
+            }
+        }
+        first_page = false;
+        if identifiers.is_empty() && !has_more {
+            break;
+        }
+        let mut join_set = JoinSet::new();
+        let mut batches = identifiers.chunks(batch_size).peekable();
+        while let Some(batch) = batches.next() {
+            let batch = batch.to_vec();
+            let batch_len = batch.len() as u64;
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let semaphore = Arc::clone(&semaphore);
+            let deleted_count = Arc::clone(&deleted_count);
+            let failure_count = Arc::clone(&failure_count);
+            let last_error = Arc::clone(&last_error);
+            join_set.spawn(async move {
+                let Ok(_permit) = semaphore.acquire_owned().await else {
+                    return;
+                };
+                let delete = match Delete::builder()
+                    .set_objects(Some(batch))
+                    .quiet(false)
+                    .build()
+                {
+                    Ok(delete) => delete,
+                    Err(error) => {
+                        failure_count.fetch_add(batch_len, AtomicOrdering::Relaxed);
+                        *last_error.lock().unwrap() = Some(error.to_string());
+                        return;
+                    }
+                };
+                match client
+                    .delete_objects()
+                    .bucket(&bucket)
+                    .delete(delete)
+                    .send()
+                    .await
+                {
+                    Ok(output) => {
+                        deleted_count
+                            .fetch_add(output.deleted().len() as u64, AtomicOrdering::Relaxed);
+                        let errors = output.errors();
+                        if !errors.is_empty() {
+                            failure_count
+                                .fetch_add(errors.len() as u64, AtomicOrdering::Relaxed);
+                            if let Some(first) = errors.first() {
+                                *last_error.lock().unwrap() = Some(
+                                    first
+                                        .message()
+                                        .unwrap_or("Unknown delete error.")
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        failure_count.fetch_add(batch_len, AtomicOrdering::Relaxed);
+                        *last_error.lock().unwrap() = Some(map_sdk_error(error).message);
+                    }
+                }
+            });
+            if deletion_delay_ms > 0 && batches.peek().is_some() {
+                tokio::time::sleep(Duration::from_millis(deletion_delay_ms)).await;
+            }
+        }
+        while join_set.join_next().await.is_some() {}
+        if deletion_delay_ms > 0 && has_more {
+            tokio::time::sleep(Duration::from_millis(deletion_delay_ms)).await;
+        }
+        if !has_more {
+            break;
+        }
+    }
+
+    let deleted = deleted_count.load(AtomicOrdering::Relaxed);
+    let failures = failure_count.load(AtomicOrdering::Relaxed);
+    let mut output_lines = vec![
+        format!("Bucket: {bucket_name}"),
+        format!("Batch size: {batch_size}"),
+        format!("Workers: {max_workers}"),
+        format!("Deleted: {deleted}"),
+        format!("Failures: {failures}"),
+    ];
+    if let Some(message) = last_error.lock().unwrap().clone() {
+        output_lines.push(format!("Last error: {message}"));
+    }
+    if let Some(error) = fatal {
+        output_lines.push(format!("Error: {}", error.message));
+        return Ok(tool_state(
+            "delete-all",
+            format!("delete-all failed: {}", error.message),
+            output_lines,
+            1,
+        ));
+    }
+    Ok(tool_state(
+        "delete-all",
+        format!("Deleted {deleted} object version(s) from {bucket_name}."),
+        output_lines,
+        if failures > 0 { 1 } else { 0 },
+    ))
 }
 
 fn cancel_tool_execution(params: &Value) -> Value {

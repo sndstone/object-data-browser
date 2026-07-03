@@ -10,6 +10,7 @@ import '../logs/structured_log_list.dart';
 import '../models/domain_models.dart';
 import '../theme/app_theme.dart';
 import '../theme/breakpoints.dart';
+import '../widgets/app_select_field.dart';
 import '../widgets/compact_selector.dart';
 
 const _bucketActionBarKey = ValueKey('bucket-panel-actions');
@@ -56,10 +57,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     final rawSize =
         _pendingInspectorSize ?? _settings.browserInspectorSize.toDouble();
     if (inspectorOnRight) {
-      final minSize = desktopCompact ? 260.0 : 280.0;
+      final minSize = desktopCompact ? 220.0 : 280.0;
       final maxSize = math.max(
         minSize,
-        constraints.maxWidth * (desktopCompact ? 0.38 : 0.42),
+        constraints.maxWidth * (desktopCompact ? 0.32 : 0.42),
       );
       return rawSize.clamp(
         minSize,
@@ -381,16 +382,18 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         // bucket panel and object list side by side, with the inspector
         // docked below the objects so it stays reachable.
         final tablet = !Breakpoints.isDesktop(width);
+        final compactRightInspector = desktopCompact && width < 1360;
         final inspectorOnRight = !tablet &&
+            !compactRightInspector &&
             _settings.browserInspectorLayout == BrowserInspectorLayout.right;
         final inspectorSize =
             _resolveInspectorSize(context, constraints, inspectorOnRight);
         final roomy = width >= Breakpoints.desktopWide;
         final outerPadding =
-            tablet ? 10.0 : (desktopCompact && !roomy ? 10.0 : 14.0);
-        final panelGap = tablet ? 8.0 : (desktopCompact && !roomy ? 8.0 : 10.0);
+            tablet ? 10.0 : (desktopCompact && !roomy ? 10.0 : 12.0);
+        const panelGap = 8.0;
         final bucketPanelWidth =
-            tablet ? 252.0 : (desktopCompact && !roomy ? 284.0 : 300.0);
+            tablet ? 252.0 : (desktopCompact && !roomy ? 264.0 : 272.0);
 
         return Padding(
           padding: EdgeInsets.all(outerPadding),
@@ -401,7 +404,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                 width: bucketPanelWidth,
                 child: _bucketPanel(context, compact: false),
               ),
-              SizedBox(width: panelGap),
+              const SizedBox(width: panelGap),
               Expanded(
                 child: inspectorOnRight
                     ? Row(
@@ -419,8 +422,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                     : Column(
                         children: [
                           Expanded(
-                              child:
-                                  _objectPanel(context, compact: tablet)),
+                              child: _objectPanel(context, compact: tablet)),
                           _resizeHandle(Axis.vertical),
                           SizedBox(
                             height: inspectorSize,
@@ -607,8 +609,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         },
         onPanEnd: (_) => _persistInspectorSize(),
         child: SizedBox(
-          width: isHorizontal ? (desktopCompact ? 10 : 14) : double.infinity,
-          height: isHorizontal ? double.infinity : (desktopCompact ? 10 : 14),
+          width: isHorizontal ? 10.0 : double.infinity,
+          height: isHorizontal ? double.infinity : 10.0,
           child: Center(
             child: Container(
               width: isHorizontal ? (desktopCompact ? 3 : 4) : 48,
@@ -702,24 +704,24 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     final mobileFilterWidth = (availableWidth * 0.34).clamp(112.0, 156.0);
 
     Widget filterModeControl({double? width}) {
-      final child = DropdownButtonFormField<BrowserFilterMode>(
-        initialValue: controller.objectFilterMode,
+      final child = AppSelectField<BrowserFilterMode>(
+        value: controller.objectFilterMode,
         isExpanded: true,
         decoration: const InputDecoration(
           labelText: 'Filter',
         ),
         items: const [
-          DropdownMenuItem(
+          AppSelectItem(
             value: BrowserFilterMode.prefix,
-            child: Text('Prefix'),
+            label: 'Prefix',
           ),
-          DropdownMenuItem(
+          AppSelectItem(
             value: BrowserFilterMode.text,
-            child: Text('Text'),
+            label: 'Text',
           ),
-          DropdownMenuItem(
+          AppSelectItem(
             value: BrowserFilterMode.regex,
-            child: Text('Regex'),
+            label: 'Regex',
           ),
         ],
         onChanged: hasBucket
@@ -762,28 +764,28 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     }
 
     Widget sortFieldControl({double? width}) {
-      final child = DropdownButtonFormField<BrowserObjectSortField>(
-        initialValue: controller.objectSortField,
+      final child = AppSelectField<BrowserObjectSortField>(
+        value: controller.objectSortField,
         isExpanded: true,
         decoration: const InputDecoration(
           labelText: 'Sort by',
         ),
         items: const [
-          DropdownMenuItem(
+          AppSelectItem(
             value: BrowserObjectSortField.lastModified,
-            child: Text('Last modified'),
+            label: 'Last modified',
           ),
-          DropdownMenuItem(
+          AppSelectItem(
             value: BrowserObjectSortField.name,
-            child: Text('Name'),
+            label: 'Name',
           ),
-          DropdownMenuItem(
+          AppSelectItem(
             value: BrowserObjectSortField.size,
-            child: Text('Object size'),
+            label: 'Object size',
           ),
-          DropdownMenuItem(
+          AppSelectItem(
             value: BrowserObjectSortField.contentType,
-            child: Text('Content type'),
+            label: 'Content type',
           ),
         ],
         onChanged: hasBucket
@@ -1100,19 +1102,17 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                           controller.objectPageCount > 1) ...[
                         SizedBox(
                           width: 180,
-                          child: DropdownButtonFormField<int>(
-                            initialValue: controller.objectPage
+                          child: AppSelectField<int>(
+                            value: controller.objectPage
                                 .clamp(1, controller.objectPageCount)
                                 .toInt(),
                             decoration:
                                 const InputDecoration(labelText: 'Page'),
-                            items: List<DropdownMenuItem<int>>.generate(
+                            items: List<AppSelectItem<int>>.generate(
                               controller.objectPageCount,
-                              (index) => DropdownMenuItem<int>(
+                              (index) => AppSelectItem<int>(
                                 value: index + 1,
-                                child: Text(
-                                  'Page ${index + 1}',
-                                ),
+                                label: 'Page ${index + 1}',
                               ),
                             ),
                             onChanged: (value) {
@@ -1347,7 +1347,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           'Action surface',
           'Right-click the bucket or use the overflow menu in the bucket list.',
         ),
-        const Divider(height: 28),
+        const Divider(height: 16),
         Text('Lifecycle JSON', style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 8),
         _jsonBlock(admin.lifecycleJson),
@@ -1440,7 +1440,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               style: Theme.of(context).textTheme.bodyMedium,
             ),
           ),
-        const Divider(height: 28),
+        const Divider(height: 16),
         Text('Bucket tags', style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 8),
         if (admin == null)
@@ -1456,7 +1456,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               trailing: Text(entry.value),
             ),
           ),
-        const Divider(height: 28),
+        const Divider(height: 16),
         Text('Lifecycle rules', style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 8),
         if (admin == null)
@@ -1467,7 +1467,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           ...admin.lifecycleRules.map(
             (rule) => Card(
               child: Padding(
-                padding: const EdgeInsets.all(12),
+                padding: const EdgeInsets.all(10),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -1525,7 +1525,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         _inlineStat('Storage class', object.storageClass),
         _inlineStat('Last modified', _formatDateTime(object.modifiedAt)),
         _inlineStat('Size', _formatBytes(object.size)),
-        const Divider(height: 28),
+        const Divider(height: 16),
         Text('Metadata', style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 8),
         ...details.metadata.entries.map(
@@ -1536,7 +1536,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             trailing: Text(entry.value),
           ),
         ),
-        const Divider(height: 28),
+        const Divider(height: 16),
         Text('Headers', style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 8),
         ...details.headers.entries.map(
@@ -1547,7 +1547,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             trailing: Text(entry.value),
           ),
         ),
-        const Divider(height: 28),
+        const Divider(height: 16),
         Text('Tags', style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 8),
         ...details.tags.entries.map(
@@ -1617,21 +1617,21 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           children: [
             Expanded(
               flex: 2,
-              child: DropdownButtonFormField<BrowserFilterMode>(
-                initialValue: options.filterMode,
+              child: AppSelectField<BrowserFilterMode>(
+                value: options.filterMode,
                 decoration: const InputDecoration(labelText: 'Filter mode'),
                 items: const [
-                  DropdownMenuItem(
+                  AppSelectItem(
                     value: BrowserFilterMode.prefix,
-                    child: Text('Prefix'),
+                    label: 'Prefix',
                   ),
-                  DropdownMenuItem(
+                  AppSelectItem(
                     value: BrowserFilterMode.text,
-                    child: Text('Text'),
+                    label: 'Text',
                   ),
-                  DropdownMenuItem(
+                  AppSelectItem(
                     value: BrowserFilterMode.regex,
-                    child: Text('Regex'),
+                    label: 'Regex',
                   ),
                 ],
                 onChanged: (value) {
@@ -1761,6 +1761,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       key: const ValueKey('tools'),
       children: [
         Text('Put test data', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          'Generates test objects on the selected engine.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
         const SizedBox(height: 8),
         _textField(
           label: 'Bucket',
@@ -1825,15 +1830,20 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         FilledButton.icon(
           onPressed: controller.runPutTestDataTool,
           icon: const Icon(Icons.data_object),
-          label: const Text('Run put-testdata.py'),
+          label: const Text('Run put test data'),
         ),
         ListTile(
           contentPadding: EdgeInsets.zero,
           title: Text(controller.putTestDataState.label),
           subtitle: Text(controller.putTestDataState.lastStatus),
         ),
-        const Divider(height: 28),
+        const Divider(height: 16),
         Text('Delete all', style: Theme.of(context).textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          'Deletes every object in the bucket, running on the selected engine.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
         const SizedBox(height: 8),
         _textField(
           label: 'Bucket',
@@ -1935,7 +1945,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         FilledButton.icon(
           onPressed: controller.runDeleteAllTool,
           icon: const Icon(Icons.delete_sweep_outlined),
-          label: const Text('Run delete-all.py'),
+          label: const Text('Run delete all'),
         ),
         ListTile(
           contentPadding: EdgeInsets.zero,
@@ -1991,7 +2001,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           emptyMessage: 'No bucket-scoped trace events recorded yet.',
           embedded: true,
         ),
-        const Divider(height: 28),
+        const Divider(height: 16),
         Text('Object debug events',
             style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 8),
@@ -2007,7 +2017,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             ),
           ),
         if ((details?.debugLogExcerpt ?? const <String>[]).isNotEmpty) ...[
-          const Divider(height: 28),
+          const Divider(height: 16),
           Text('Debug excerpt', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 8),
           _jsonBlock((details?.debugLogExcerpt ?? const <String>[]).join('\n')),
@@ -2278,8 +2288,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    DropdownButtonFormField<String>(
-                      initialValue: destinations.contains(selectedDestination)
+                    AppSelectField<String>(
+                      value: destinations.contains(selectedDestination)
                           ? selectedDestination
                           : null,
                       decoration: const InputDecoration(
@@ -2287,9 +2297,9 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                       ),
                       items: destinations
                           .map(
-                            (bucketName) => DropdownMenuItem(
+                            (bucketName) => AppSelectItem(
                               value: bucketName,
-                              child: Text(bucketName),
+                              label: bucketName,
                             ),
                           )
                           .toList(),
@@ -2700,8 +2710,7 @@ class _ObjectTable extends StatelessWidget {
                               SizedBox(
                                 width: storageClassWidth,
                                 child: Text(
-                                  object.isFolder ||
-                                          object.storageClass.isEmpty
+                                  object.isFolder || object.storageClass.isEmpty
                                       ? '--'
                                       : object.storageClass,
                                   maxLines: 1,

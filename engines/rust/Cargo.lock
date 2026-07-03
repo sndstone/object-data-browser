@@ -1346,6 +1346,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "bytes",
  "chrono",
  "serde",
  "serde_json",

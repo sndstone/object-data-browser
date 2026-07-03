@@ -17,6 +17,7 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
 import software.amazon.awssdk.services.s3.model.AbortIncompleteMultipartUpload;
+import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.Bucket;
 import software.amazon.awssdk.services.s3.model.BucketLocationConstraint;
 import software.amazon.awssdk.services.s3.model.BucketVersioningStatus;
@@ -84,24 +85,37 @@ import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignReques
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.net.URI;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class Main {
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -917,9 +931,11 @@ public final class Main {
         List<String> outputLines = new ArrayList<>(List.of(
             "Queued " + filePaths.size() + " file(s) for upload to " + context.bucketName() + "."
         ));
-        long bytesTransferred = 0L;
-        int itemsCompleted = 0;
-        int partsCompleted = 0;
+        AtomicLong bytesTransferred = new AtomicLong();
+        AtomicInteger itemsCompleted = new AtomicInteger();
+        AtomicInteger partsCompleted = new AtomicInteger();
+        AtomicInteger partOutputLineCount = new AtomicInteger();
+        Object progressLock = new Object();
         emitTransferEvent(transferJob(
             jobId,
             label,
@@ -931,15 +947,16 @@ public final class Main {
             strategyLabel,
             paths.getFirst().getFileName().toString(),
             filePaths.size(),
-            itemsCompleted,
+            itemsCompleted.get(),
             partSizeBytes,
-            partCount == null ? null : partsCompleted,
+            partCount == null ? null : partsCompleted.get(),
             partCount,
             true,
             false,
             true,
             List.copyOf(outputLines)
         ));
+        ExecutorService executor = Executors.newFixedThreadPool(transferPoolSize(context.profile()));
         try (S3Client client = context.client()) {
             for (Path path : paths) {
                 long fileSize = Files.size(path);
@@ -948,64 +965,97 @@ public final class Main {
                     path.getFileName().toString()
                 ).replace('\\', '/').replaceFirst("^/+", "");
                 String key = prefix.isBlank() ? targetName : prefix + targetName;
-                outputLines.add("Uploading " + path.getFileName() + " (" + fileSize + " bytes) to " + key + ".");
+                synchronized (progressLock) {
+                    outputLines.add("Uploading " + path.getFileName() + " (" + fileSize + " bytes) to " + key + ".");
+                }
                 if (fileSize >= multipartThresholdBytes) {
                     String uploadId = client.createMultipartUpload(CreateMultipartUploadRequest.builder()
                         .bucket(context.bucketName())
                         .key(key)
                         .build()).uploadId();
-                    byte[] fileBytes = Files.readAllBytes(path);
-                    List<CompletedPart> completedParts = new ArrayList<>();
-                    int partNumber = 1;
-                    for (int offset = 0; offset < fileBytes.length; offset += multipartChunkBytes) {
-                        int length = Math.min(multipartChunkBytes, fileBytes.length - offset);
-                        byte[] chunk = java.util.Arrays.copyOfRange(fileBytes, offset, offset + length);
-                        var partResult = client.uploadPart(
-                            UploadPartRequest.builder()
-                                .bucket(context.bucketName())
-                                .key(key)
-                                .uploadId(uploadId)
-                                .partNumber(partNumber)
-                                .build(),
-                            RequestBody.fromBytes(chunk)
-                        );
-                        completedParts.add(
-                            CompletedPart.builder()
-                                .eTag(partResult.eTag())
-                                .partNumber(partNumber)
-                                .build()
-                        );
-                        bytesTransferred += length;
-                        partsCompleted += 1;
-                        outputLines.add("Uploaded part " + partNumber + " for " + path.getFileName() + ".");
-                        emitTransferEvent(transferJob(
-                            jobId,
-                            label,
-                            "upload",
-                            progressFraction(bytesTransferred, totalBytes),
-                            "running",
-                            bytesTransferred,
-                            totalBytes,
-                            strategyLabel,
-                            path.getFileName().toString(),
-                            filePaths.size(),
-                            itemsCompleted,
-                            partSizeBytes,
-                            partsCompleted,
-                            partCount,
-                            true,
-                            false,
-                            true,
-                            List.copyOf(outputLines)
-                        ));
-                        partNumber += 1;
+                    int filePartCount = (int) ((fileSize + multipartChunkBytes - 1L) / multipartChunkBytes);
+                    try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
+                        List<Future<CompletedPart>> futures = new ArrayList<>(filePartCount);
+                        for (int index = 0; index < filePartCount; index += 1) {
+                            final int partNumber = index + 1;
+                            final long partOffset = (long) index * multipartChunkBytes;
+                            final int partLength = (int) Math.min(multipartChunkBytes, fileSize - partOffset);
+                            futures.add(executor.submit(() -> {
+                                byte[] chunk = readChunk(channel, partOffset, partLength);
+                                var partResult = client.uploadPart(
+                                    UploadPartRequest.builder()
+                                        .bucket(context.bucketName())
+                                        .key(key)
+                                        .uploadId(uploadId)
+                                        .partNumber(partNumber)
+                                        .build(),
+                                    RequestBody.fromBytes(chunk)
+                                );
+                                long transferredNow = bytesTransferred.addAndGet(partLength);
+                                int partsCompletedNow = partsCompleted.incrementAndGet();
+                                List<String> linesSnapshot;
+                                int itemsCompletedNow;
+                                synchronized (progressLock) {
+                                    addPartOutputLine(outputLines, partOutputLineCount,
+                                        "Uploaded part " + partNumber + " for " + path.getFileName() + ".");
+                                    linesSnapshot = List.copyOf(outputLines);
+                                    itemsCompletedNow = itemsCompleted.get();
+                                }
+                                emitTransferEvent(transferJob(
+                                    jobId,
+                                    label,
+                                    "upload",
+                                    progressFraction(transferredNow, totalBytes),
+                                    "running",
+                                    transferredNow,
+                                    totalBytes,
+                                    strategyLabel,
+                                    path.getFileName().toString(),
+                                    filePaths.size(),
+                                    itemsCompletedNow,
+                                    partSizeBytes,
+                                    partsCompletedNow,
+                                    partCount,
+                                    true,
+                                    false,
+                                    true,
+                                    linesSnapshot
+                                ));
+                                return CompletedPart.builder()
+                                    .eTag(partResult.eTag())
+                                    .partNumber(partNumber)
+                                    .build();
+                            }));
+                        }
+                        List<CompletedPart> completedParts = new ArrayList<>(filePartCount);
+                        try {
+                            for (Future<CompletedPart> future : futures) {
+                                completedParts.add(future.get());
+                            }
+                        } catch (InterruptedException | ExecutionException error) {
+                            futures.forEach(future -> future.cancel(true));
+                            try {
+                                client.abortMultipartUpload(AbortMultipartUploadRequest.builder()
+                                    .bucket(context.bucketName())
+                                    .key(key)
+                                    .uploadId(uploadId)
+                                    .build());
+                            } catch (RuntimeException ignored) {
+                            }
+                            if (error instanceof InterruptedException) {
+                                Thread.currentThread().interrupt();
+                                throw new RuntimeException(error);
+                            }
+                            throw unwrapTransferFailure(error.getCause());
+                        }
+                        completedParts.sort(Comparator.comparingInt(CompletedPart::partNumber));
+                        client.completeMultipartUpload(CompleteMultipartUploadRequest.builder()
+                            .bucket(context.bucketName())
+                            .key(key)
+                            .uploadId(uploadId)
+                            .multipartUpload(CompletedMultipartUpload.builder().parts(completedParts).build())
+                            .build());
                     }
-                    client.completeMultipartUpload(CompleteMultipartUploadRequest.builder()
-                        .bucket(context.bucketName())
-                        .key(key)
-                        .uploadId(uploadId)
-                        .multipartUpload(CompletedMultipartUpload.builder().parts(completedParts).build())
-                        .build());
                 } else {
                     client.putObject(
                         PutObjectRequest.builder()
@@ -1014,36 +1064,40 @@ public final class Main {
                             .build(),
                         RequestBody.fromFile(path)
                     );
-                    bytesTransferred += fileSize;
+                    bytesTransferred.addAndGet(fileSize);
                 }
-                itemsCompleted += 1;
-                outputLines.add("Finished uploading " + path.getFileName() + ".");
-                emitTransferEvent(transferJob(
-                    jobId,
-                    label,
-                    "upload",
-                    progressFraction(bytesTransferred, totalBytes),
-                    "running",
-                    bytesTransferred,
-                    totalBytes,
-                    strategyLabel,
-                    path.getFileName().toString(),
-                    filePaths.size(),
-                    itemsCompleted,
-                    partSizeBytes,
-                    partCount == null ? null : partsCompleted,
-                    partCount,
-                    true,
-                    false,
-                    true,
-                    List.copyOf(outputLines)
-                ));
+                itemsCompleted.incrementAndGet();
+                synchronized (progressLock) {
+                    outputLines.add("Finished uploading " + path.getFileName() + ".");
+                    emitTransferEvent(transferJob(
+                        jobId,
+                        label,
+                        "upload",
+                        progressFraction(bytesTransferred.get(), totalBytes),
+                        "running",
+                        bytesTransferred.get(),
+                        totalBytes,
+                        strategyLabel,
+                        path.getFileName().toString(),
+                        filePaths.size(),
+                        itemsCompleted.get(),
+                        partSizeBytes,
+                        partCount == null ? null : partsCompleted.get(),
+                        partCount,
+                        true,
+                        false,
+                        true,
+                        List.copyOf(outputLines)
+                    ));
+                }
             }
         } catch (RuntimeException error) {
             if (error.getCause() instanceof IOException ioError) {
                 throw ioError;
             }
             throw error;
+        } finally {
+            executor.shutdownNow();
         }
         outputLines.add("Uploaded " + filePaths.size() + " file(s) into " + context.bucketName() + ".");
         return transferJob(
@@ -1052,20 +1106,58 @@ public final class Main {
             "upload",
             1.0,
             "completed",
-            bytesTransferred,
+            bytesTransferred.get(),
             totalBytes,
             strategyLabel,
             paths.getLast().getFileName().toString(),
             filePaths.size(),
-            itemsCompleted,
+            itemsCompleted.get(),
             partSizeBytes,
-            partCount == null ? null : partsCompleted,
+            partCount == null ? null : partsCompleted.get(),
             partCount,
             false,
             false,
             false,
             outputLines
         );
+    }
+
+    private static int transferPoolSize(Profile profile) {
+        return Math.min(8, Math.max(profile.maxPoolConnections(), 1));
+    }
+
+    private static final int MAX_PART_OUTPUT_LINES = 64;
+
+    private static void addPartOutputLine(List<String> outputLines, AtomicInteger partOutputLineCount, String line) {
+        int count = partOutputLineCount.incrementAndGet();
+        if (count <= MAX_PART_OUTPUT_LINES) {
+            outputLines.add(line);
+        } else if (count == MAX_PART_OUTPUT_LINES + 1) {
+            outputLines.add("... further part progress lines omitted.");
+        }
+    }
+
+    private static byte[] readChunk(FileChannel channel, long offset, int length) throws IOException {
+        ByteBuffer buffer = ByteBuffer.allocate(length);
+        long position = offset;
+        while (buffer.hasRemaining()) {
+            int read = channel.read(buffer, position);
+            if (read < 0) {
+                throw new IOException("Unexpected end of file at offset " + position + ".");
+            }
+            position += read;
+        }
+        return buffer.array();
+    }
+
+    private static RuntimeException unwrapTransferFailure(Throwable cause) throws IOException {
+        if (cause instanceof IOException ioCause) {
+            throw ioCause;
+        }
+        if (cause instanceof RuntimeException runtimeCause) {
+            return runtimeCause;
+        }
+        return new RuntimeException(cause);
     }
 
     private static Map<String, Object> startDownload(JsonNode params) throws IOException {
@@ -1086,12 +1178,15 @@ public final class Main {
         List<String> outputLines = new ArrayList<>(List.of(
             "Queued " + keys.size() + " object(s) for download to " + destinationPath + "."
         ));
-        long bytesTransferred = 0L;
-        int itemsCompleted = 0;
-        int partsCompleted = 0;
+        AtomicLong bytesTransferred = new AtomicLong();
+        AtomicInteger itemsCompleted = new AtomicInteger();
+        AtomicInteger partsCompleted = new AtomicInteger();
+        AtomicInteger partOutputLineCount = new AtomicInteger();
+        Object progressLock = new Object();
+        ExecutorService executor = Executors.newFixedThreadPool(transferPoolSize(context.profile()));
         try (S3Client client = context.client()) {
             Map<String, Long> sizes = new LinkedHashMap<>();
-            long totalBytes = 0L;
+            long totalBytesTally = 0L;
             for (String key : keys) {
                 long size = client.headObject(
                     HeadObjectRequest.builder()
@@ -1100,8 +1195,9 @@ public final class Main {
                         .build()
                 ).contentLength();
                 sizes.put(key, size);
-                totalBytes += size;
+                totalBytesTally += size;
             }
+            final long totalBytes = totalBytesTally;
             boolean usesMultipart = sizes.values().stream().anyMatch(size -> size >= multipartThresholdBytes);
             int partsTotal = sizes.values().stream()
                 .mapToInt(size -> size >= multipartThresholdBytes
@@ -1122,9 +1218,9 @@ public final class Main {
                 strategyLabel,
                 keys.getFirst(),
                 keys.size(),
-                itemsCompleted,
+                itemsCompleted.get(),
                 partSizeBytes,
-                partCount == null ? null : partsCompleted,
+                partCount == null ? null : partsCompleted.get(),
                 partCount,
                 true,
                 false,
@@ -1134,66 +1230,109 @@ public final class Main {
             for (String key : keys) {
                 long size = sizes.getOrDefault(key, 0L);
                 Path target = destination.resolve(Path.of(key).getFileName());
-                outputLines.add("Downloading " + key + " (" + size + " bytes) to " + target + ".");
-                try (OutputStream outputStream = Files.newOutputStream(target)) {
-                    if (size >= multipartThresholdBytes) {
+                synchronized (progressLock) {
+                    outputLines.add("Downloading " + key + " (" + size + " bytes) to " + target + ".");
+                }
+                if (size >= multipartThresholdBytes) {
+                    try (RandomAccessFile file = new RandomAccessFile(target.toFile(), "rw")) {
+                        file.setLength(size);
+                        FileChannel channel = file.getChannel();
+                        List<Future<?>> futures = new ArrayList<>();
                         for (long start = 0; start < size; start += multipartChunkBytes) {
-                            long end = Math.min(start + multipartChunkBytes - 1L, size - 1L);
-                            try (ResponseInputStream<?> stream = client.getObject(GetObjectRequest.builder()
-                                .bucket(context.bucketName())
-                                .key(key)
-                                .range("bytes=" + start + "-" + end)
-                                .build())) {
-                                stream.transferTo(outputStream);
-                            }
-                            bytesTransferred += end - start + 1L;
-                            partsCompleted += 1;
-                            outputLines.add("Downloaded byte range " + start + "-" + end + " for " + key + ".");
-                            emitTransferEvent(transferJob(
-                                jobId,
-                                label,
-                                "download",
-                                progressFraction(bytesTransferred, totalBytes),
-                                "running",
-                                bytesTransferred,
-                                totalBytes,
-                                strategyLabel,
-                                key,
-                                keys.size(),
-                                itemsCompleted,
-                                partSizeBytes,
-                                partsCompleted,
-                                partCount,
-                                true,
-                                false,
-                                true,
-                                List.copyOf(outputLines)
-                            ));
-                        }
-                    } else {
-                        try (ResponseInputStream<?> stream = client.getObject(GetObjectRequest.builder()
-                            .bucket(context.bucketName())
-                            .key(key)
-                            .build())) {
-                            byte[] buffer = new byte[Math.min(multipartChunkBytes, 1024 * 1024)];
-                            int read;
-                            while ((read = stream.read(buffer)) != -1) {
-                                outputStream.write(buffer, 0, read);
-                                bytesTransferred += read;
+                            final long rangeStart = start;
+                            final long rangeEnd = Math.min(start + multipartChunkBytes - 1L, size - 1L);
+                            futures.add(executor.submit(() -> {
+                                byte[] bytes;
+                                try (ResponseInputStream<?> stream = client.getObject(GetObjectRequest.builder()
+                                    .bucket(context.bucketName())
+                                    .key(key)
+                                    .range("bytes=" + rangeStart + "-" + rangeEnd)
+                                    .build())) {
+                                    bytes = stream.readAllBytes();
+                                }
+                                long expectedLength = rangeEnd - rangeStart + 1L;
+                                if (bytes.length != expectedLength) {
+                                    throw new IOException("Short read for byte range " + rangeStart + "-" + rangeEnd
+                                        + " of " + key + ": expected " + expectedLength + " byte(s), received "
+                                        + bytes.length + ".");
+                                }
+                                ByteBuffer buffer = ByteBuffer.wrap(bytes);
+                                long position = rangeStart;
+                                while (buffer.hasRemaining()) {
+                                    position += channel.write(buffer, position);
+                                }
+                                long transferredNow = bytesTransferred.addAndGet(bytes.length);
+                                int partsCompletedNow = partsCompleted.incrementAndGet();
+                                List<String> linesSnapshot;
+                                int itemsCompletedNow;
+                                synchronized (progressLock) {
+                                    addPartOutputLine(outputLines, partOutputLineCount,
+                                        "Downloaded byte range " + rangeStart + "-" + rangeEnd + " for " + key + ".");
+                                    linesSnapshot = List.copyOf(outputLines);
+                                    itemsCompletedNow = itemsCompleted.get();
+                                }
                                 emitTransferEvent(transferJob(
                                     jobId,
                                     label,
                                     "download",
-                                    progressFraction(bytesTransferred, totalBytes),
+                                    progressFraction(transferredNow, totalBytes),
                                     "running",
-                                    bytesTransferred,
+                                    transferredNow,
                                     totalBytes,
                                     strategyLabel,
                                     key,
                                     keys.size(),
-                                    itemsCompleted,
+                                    itemsCompletedNow,
                                     partSizeBytes,
-                                    partCount == null ? null : partsCompleted,
+                                    partsCompletedNow,
+                                    partCount,
+                                    true,
+                                    false,
+                                    true,
+                                    linesSnapshot
+                                ));
+                                return null;
+                            }));
+                        }
+                        try {
+                            for (Future<?> future : futures) {
+                                future.get();
+                            }
+                        } catch (InterruptedException | ExecutionException error) {
+                            futures.forEach(future -> future.cancel(true));
+                            if (error instanceof InterruptedException) {
+                                Thread.currentThread().interrupt();
+                                throw new RuntimeException(error);
+                            }
+                            throw unwrapTransferFailure(error.getCause());
+                        }
+                    }
+                } else {
+                    try (OutputStream outputStream = Files.newOutputStream(target);
+                         ResponseInputStream<?> stream = client.getObject(GetObjectRequest.builder()
+                             .bucket(context.bucketName())
+                             .key(key)
+                             .build())) {
+                        byte[] buffer = new byte[Math.min(multipartChunkBytes, 1024 * 1024)];
+                        int read;
+                        while ((read = stream.read(buffer)) != -1) {
+                            outputStream.write(buffer, 0, read);
+                            long transferredNow = bytesTransferred.addAndGet(read);
+                            synchronized (progressLock) {
+                                emitTransferEvent(transferJob(
+                                    jobId,
+                                    label,
+                                    "download",
+                                    progressFraction(transferredNow, totalBytes),
+                                    "running",
+                                    transferredNow,
+                                    totalBytes,
+                                    strategyLabel,
+                                    key,
+                                    keys.size(),
+                                    itemsCompleted.get(),
+                                    partSizeBytes,
+                                    partCount == null ? null : partsCompleted.get(),
                                     partCount,
                                     true,
                                     false,
@@ -1204,8 +1343,10 @@ public final class Main {
                         }
                     }
                 }
-                itemsCompleted += 1;
-                outputLines.add("Finished downloading " + key + ".");
+                itemsCompleted.incrementAndGet();
+                synchronized (progressLock) {
+                    outputLines.add("Finished downloading " + key + ".");
+                }
             }
             outputLines.add("Downloaded " + keys.size() + " object(s) into " + destinationPath + ".");
             return transferJob(
@@ -1214,20 +1355,22 @@ public final class Main {
                 "download",
                 1.0,
                 "completed",
-                bytesTransferred,
+                bytesTransferred.get(),
                 totalBytes,
                 strategyLabel,
                 keys.getLast(),
                 keys.size(),
-                itemsCompleted,
+                itemsCompleted.get(),
                 partSizeBytes,
-                partCount == null ? null : partsCompleted,
+                partCount == null ? null : partsCompleted.get(),
                 partCount,
                 false,
                 false,
                 false,
                 outputLines
             );
+        } finally {
+            executor.shutdownNow();
         }
     }
 
@@ -1277,28 +1420,244 @@ public final class Main {
     }
 
     private static Map<String, Object> runPutTestData(JsonNode params) {
+        Profile profile = parseProfile(params.path("profile"));
         JsonNode config = params.path("config");
-        return toolState(
-            "put-testdata.py",
-            "Prepared " + config.path("objectCount").asInt(0) + " object(s) with " + config.path("versions").asInt(0)
-                + " version(s) each for " + text(config, "bucketName") + ".",
-            List.of(
-                "Bucket: " + text(config, "bucketName"),
-                "Prefix: " + text(config, "prefix"),
-                "Threads: " + config.path("threads").asInt(1)
-            )
+        String bucketName = requiredText(config, "bucketName", "Bucket name is required for put-testdata.");
+        String rawPrefix = text(config, "prefix").trim();
+        String prefix = rawPrefix.isBlank() || rawPrefix.endsWith("/") ? rawPrefix : rawPrefix + "/";
+        int objectCount = Math.max(config.path("objectCount").asInt(1), 0);
+        int objectSizeBytes = Math.max(config.path("objectSizeBytes").asInt(1024), 0);
+        int versions = Math.max(config.path("versions").asInt(1), 1);
+        int threads = Math.min(Math.max(config.path("threads").asInt(4), 1), 16);
+        long started = System.nanoTime();
+        AtomicInteger putsCompleted = new AtomicInteger();
+        AtomicInteger objectsCompleted = new AtomicInteger();
+        AtomicInteger failedObjects = new AtomicInteger();
+        List<String> failures = Collections.synchronizedList(new ArrayList<>());
+        byte[] payload = new byte[objectSizeBytes];
+        for (int index = 0; index < payload.length; index += 1) {
+            payload[index] = (byte) ('A' + (index % 26));
+        }
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        try (S3Client client = buildClient(profile)) {
+            List<Future<?>> futures = new ArrayList<>(objectCount);
+            for (int index = 0; index < objectCount; index += 1) {
+                final String key = prefix + "testdata-" + String.format("%06d", index) + ".bin";
+                futures.add(executor.submit(() -> {
+                    try {
+                        for (int version = 0; version < versions; version += 1) {
+                            client.putObject(
+                                PutObjectRequest.builder().bucket(bucketName).key(key).build(),
+                                RequestBody.fromContentProvider(
+                                    () -> new ByteArrayInputStream(payload),
+                                    payload.length,
+                                    "application/octet-stream"
+                                )
+                            );
+                            putsCompleted.incrementAndGet();
+                        }
+                        objectsCompleted.incrementAndGet();
+                    } catch (Exception error) {
+                        failedObjects.incrementAndGet();
+                        if (failures.size() < 10) {
+                            failures.add("Failed " + key + ": " + mapException(error).message);
+                        }
+                    }
+                }));
+            }
+            for (Future<?> future : futures) {
+                future.get();
+            }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            failedObjects.incrementAndGet();
+            failures.add("Interrupted while writing test data.");
+        } catch (ExecutionException error) {
+            failedObjects.incrementAndGet();
+            failures.add("Worker failed: " + (error.getCause() instanceof Exception cause
+                ? mapException(cause).message
+                : String.valueOf(error.getCause())));
+        } finally {
+            executor.shutdownNow();
+        }
+        double durationSeconds = (System.nanoTime() - started) / 1_000_000_000.0;
+        boolean failed = failedObjects.get() > 0;
+        List<String> outputLines = new ArrayList<>(List.of(
+            "Bucket: " + bucketName,
+            "Prefix: " + prefix,
+            "Threads: " + threads,
+            "Object size: " + objectSizeBytes + " byte(s), versions per object: " + versions + ".",
+            "Created " + objectsCompleted.get() + "/" + objectCount + " object(s) with "
+                + putsCompleted.get() + " put(s) total.",
+            String.format(java.util.Locale.US, "Duration: %.2fs.", durationSeconds)
+        ));
+        synchronized (failures) {
+            outputLines.addAll(failures);
+        }
+        if (failed && failedObjects.get() > failures.size()) {
+            outputLines.add("... plus " + (failedObjects.get() - failures.size()) + " more failed object(s).");
+        }
+        return orderedMap(
+            "label", "put-testdata",
+            "running", false,
+            "lastStatus", failed
+                ? "put-testdata completed with " + failedObjects.get() + " failed object(s)."
+                : "Created " + objectsCompleted.get() + " object(s) with " + versions
+                    + " version(s) each in " + bucketName + ".",
+            "jobId", "tool-" + UUID.randomUUID().toString().substring(0, 8),
+            "cancellable", false,
+            "outputLines", outputLines,
+            "exitCode", failed ? 1 : 0
         );
     }
 
     private static Map<String, Object> runDeleteAll(JsonNode params) {
+        Profile profile = parseProfile(params.path("profile"));
         JsonNode config = params.path("config");
-        return toolState(
-            "delete-all.py",
-            "Prepared delete-all sweep for " + text(config, "bucketName") + ".",
-            List.of(
-                "Batch size: " + config.path("batchSize").asInt(1000),
-                "Workers: " + config.path("maxWorkers").asInt(1)
-            )
+        String bucketName = requiredText(config, "bucketName", "Bucket name is required for delete-all.");
+        String prefix = text(config, "prefix").trim();
+        int listMaxKeys = Math.min(Math.max(config.path("listMaxKeys").asInt(1000), 1), 1000);
+        int batchSize = Math.min(Math.max(config.path("batchSize").asInt(1000), 1), 1000);
+        int maxWorkers = Math.min(Math.max(config.path("maxWorkers").asInt(4), 1), 16);
+        long deletionDelayMs = Math.max(config.path("deletionDelayMs").asLong(0), 0L);
+        long started = System.nanoTime();
+        AtomicLong deletedCount = new AtomicLong();
+        AtomicLong errorCount = new AtomicLong();
+        List<String> failures = Collections.synchronizedList(new ArrayList<>());
+        boolean versionListingSupported = true;
+        boolean versionListingSucceeded = false;
+        long listedTotal = 0;
+        int pageCount = 0;
+        ExecutorService executor = Executors.newFixedThreadPool(maxWorkers);
+        try (S3Client client = buildClient(profile)) {
+            while (true) {
+                List<ObjectIdentifier> identifiers = new ArrayList<>();
+                if (versionListingSupported) {
+                    try {
+                        var output = client.listObjectVersions(ListObjectVersionsRequest.builder()
+                            .bucket(bucketName)
+                            .prefix(prefix)
+                            .maxKeys(listMaxKeys)
+                            .build());
+                        output.versions().forEach(version -> identifiers.add(ObjectIdentifier.builder()
+                            .key(version.key())
+                            .versionId(version.versionId())
+                            .build()));
+                        output.deleteMarkers().forEach(marker -> identifiers.add(ObjectIdentifier.builder()
+                            .key(marker.key())
+                            .versionId(marker.versionId())
+                            .build()));
+                        versionListingSucceeded = true;
+                    } catch (S3Exception | SdkClientException error) {
+                        if (versionListingSucceeded) {
+                            // Version listing worked before, so this is a transient failure rather than a
+                            // capability gap. Falling back to listObjectsV2 here would delete without
+                            // VersionId and report success while versions remain; fail the run instead.
+                            errorCount.incrementAndGet();
+                            failures.add("Version listing failed mid-run: " + mapException(error).message);
+                            break;
+                        }
+                        versionListingSupported = false;
+                    }
+                }
+                if (!versionListingSupported) {
+                    var output = client.listObjectsV2(ListObjectsV2Request.builder()
+                        .bucket(bucketName)
+                        .prefix(prefix)
+                        .maxKeys(listMaxKeys)
+                        .build());
+                    output.contents().forEach(object -> identifiers.add(ObjectIdentifier.builder()
+                        .key(object.key())
+                        .build()));
+                }
+                if (identifiers.isEmpty()) {
+                    break;
+                }
+                listedTotal += identifiers.size();
+                pageCount += 1;
+                long deletedBefore = deletedCount.get();
+                List<Future<?>> futures = new ArrayList<>();
+                for (int offset = 0; offset < identifiers.size(); offset += batchSize) {
+                    if (offset > 0 && deletionDelayMs > 0) {
+                        Thread.sleep(deletionDelayMs);
+                    }
+                    final List<ObjectIdentifier> batch = List.copyOf(
+                        identifiers.subList(offset, Math.min(offset + batchSize, identifiers.size()))
+                    );
+                    futures.add(executor.submit(() -> {
+                        try {
+                            var response = client.deleteObjects(DeleteObjectsRequest.builder()
+                                .bucket(bucketName)
+                                .delete(Delete.builder().objects(batch).quiet(true).build())
+                                .build());
+                            int errors = response.errors().size();
+                            deletedCount.addAndGet(batch.size() - errors);
+                            if (errors > 0) {
+                                errorCount.addAndGet(errors);
+                                response.errors().stream().limit(3).forEach(deleteError -> {
+                                    if (failures.size() < 10) {
+                                        failures.add("Failed " + deleteError.key() + ": "
+                                            + blankToDefault(deleteError.message(),
+                                                blankToDefault(deleteError.code(), "delete error")));
+                                    }
+                                });
+                            }
+                        } catch (Exception error) {
+                            errorCount.addAndGet(batch.size());
+                            if (failures.size() < 10) {
+                                failures.add("Batch delete failed: " + mapException(error).message);
+                            }
+                        }
+                    }));
+                }
+                for (Future<?> future : futures) {
+                    future.get();
+                }
+                if (deletedCount.get() == deletedBefore) {
+                    failures.add("No progress on the last pass; aborting to avoid an endless loop.");
+                    break;
+                }
+                if (deletionDelayMs > 0) {
+                    Thread.sleep(deletionDelayMs);
+                }
+            }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            errorCount.incrementAndGet();
+            failures.add("Interrupted while deleting objects.");
+        } catch (ExecutionException error) {
+            errorCount.incrementAndGet();
+            failures.add("Worker failed: " + (error.getCause() instanceof Exception cause
+                ? mapException(cause).message
+                : String.valueOf(error.getCause())));
+        } finally {
+            executor.shutdownNow();
+        }
+        double durationSeconds = (System.nanoTime() - started) / 1_000_000_000.0;
+        boolean failed = errorCount.get() > 0 || !failures.isEmpty();
+        List<String> outputLines = new ArrayList<>(List.of(
+            "Bucket: " + bucketName,
+            "Prefix: " + (prefix.isBlank() ? "(entire bucket)" : prefix),
+            "Listing mode: " + (versionListingSupported ? "object versions" : "objects (versions unsupported)"),
+            "Page size: " + listMaxKeys + ", batch size: " + batchSize + ", workers: " + maxWorkers
+                + ", delay: " + deletionDelayMs + "ms.",
+            "Deleted " + deletedCount.get() + " of " + listedTotal + " listed entrie(s) across "
+                + pageCount + " page(s).",
+            String.format(java.util.Locale.US, "Duration: %.2fs.", durationSeconds)
+        ));
+        synchronized (failures) {
+            outputLines.addAll(failures);
+        }
+        return orderedMap(
+            "label", "delete-all",
+            "running", false,
+            "lastStatus", failed
+                ? "delete-all completed with " + errorCount.get() + " failure(s)."
+                : "Deleted " + deletedCount.get() + " entrie(s) from " + bucketName + ".",
+            "jobId", "tool-" + UUID.randomUUID().toString().substring(0, 8),
+            "cancellable", false,
+            "outputLines", outputLines,
+            "exitCode", failed ? 1 : 0
         );
     }
 
@@ -1800,18 +2159,6 @@ public final class Main {
             return 1.0;
         }
         return (double) bytesTransferred / (double) totalBytes;
-    }
-
-    private static Map<String, Object> toolState(String label, String status, List<String> lines) {
-        return orderedMap(
-            "label", label,
-            "running", false,
-            "lastStatus", status,
-            "jobId", "tool-" + UUID.randomUUID().toString().substring(0, 8),
-            "cancellable", false,
-            "outputLines", lines,
-            "exitCode", 0
-        );
     }
 
     private static Path runtimeDir() throws IOException {

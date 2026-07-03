@@ -9,6 +9,7 @@ import 'package:flutter/rendering.dart';
 import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
 import '../theme/app_theme.dart';
+import '../widgets/app_select_field.dart';
 import '../widgets/compact_selector.dart';
 
 enum _BenchmarkPreviewSection {
@@ -380,22 +381,19 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
           const SizedBox(height: 14),
           Text('Workload', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 6),
-          DropdownButtonFormField<String>(
+          AppSelectField<String>(
             key: ValueKey('benchmark-workload-${config.workloadType}'),
-            initialValue: config.workloadType,
+            value: config.workloadType,
             decoration: _fieldDecoration(label: 'Workload'),
             items: const [
-              DropdownMenuItem(
-                  value: 'mixed', child: Text('Mixed (PUT/GET/DELETE)')),
-              DropdownMenuItem(
-                  value: 'write-heavy', child: Text('Write-heavy')),
-              DropdownMenuItem(value: 'read-heavy', child: Text('Read-heavy')),
-              DropdownMenuItem(value: 'delete', child: Text('Delete')),
-              DropdownMenuItem(
-                  value: 'write-only', child: Text('Write-only (PUT only)')),
-              DropdownMenuItem(
-                  value: 'read-only', child: Text('Read-only (GET only)')),
-              DropdownMenuItem(value: 'custom', child: Text('Custom mix (%)')),
+              AppSelectItem(value: 'mixed', label: 'Mixed (PUT/GET/DELETE)'),
+              AppSelectItem(value: 'write-heavy', label: 'Write-heavy'),
+              AppSelectItem(value: 'read-heavy', label: 'Read-heavy'),
+              AppSelectItem(value: 'delete', label: 'Delete'),
+              AppSelectItem(
+                  value: 'write-only', label: 'Write-only (PUT only)'),
+              AppSelectItem(value: 'read-only', label: 'Read-only (GET only)'),
+              AppSelectItem(value: 'custom', label: 'Custom mix (%)'),
             ],
             onChanged: (value) {
               if (value != null) {
@@ -409,17 +407,17 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             _customMixCard(context, config),
           ],
           const SizedBox(height: 8),
-          DropdownButtonFormField<String>(
-            initialValue: config.deleteMode,
+          AppSelectField<String>(
+            value: config.deleteMode,
             decoration: _fieldDecoration(label: 'Delete mode'),
             items: const [
-              DropdownMenuItem(
+              AppSelectItem(
                 value: 'single',
-                child: Text('Single-object DELETE'),
+                label: 'Single-object DELETE',
               ),
-              DropdownMenuItem(
+              AppSelectItem(
                 value: 'multi-object-post',
-                child: Text('Multi-object delete (POST)'),
+                label: 'Multi-object delete (POST)',
               ),
             ],
             onChanged: (value) {
@@ -444,15 +442,15 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             ),
           ),
           const SizedBox(height: 8),
-          DropdownButtonFormField<String>(
+          AppSelectField<String>(
             key: ValueKey('benchmark-test-mode-${config.testMode}'),
-            initialValue: config.testMode,
+            value: config.testMode,
             decoration: _fieldDecoration(label: 'Run mode'),
             items: const [
-              DropdownMenuItem(value: 'duration', child: Text('Duration')),
-              DropdownMenuItem(
+              AppSelectItem(value: 'duration', label: 'Duration'),
+              AppSelectItem(
                 value: 'operation-count',
-                child: Text('Operation count'),
+                label: 'Operation count',
               ),
             ],
             onChanged: (value) {
@@ -476,16 +474,16 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             ),
           ),
           const SizedBox(height: 8),
-          DropdownButtonFormField<String>(
-            initialValue: bucketOptions.contains(config.bucketName)
+          AppSelectField<String>(
+            value: bucketOptions.contains(config.bucketName)
                 ? config.bucketName
                 : null,
             decoration: _fieldDecoration(label: 'Bucket'),
             items: bucketOptions
                 .map(
-                  (bucketName) => DropdownMenuItem(
+                  (bucketName) => AppSelectItem(
                     value: bucketName,
-                    child: Text(bucketName),
+                    label: bucketName,
                   ),
                 )
                 .toList(),
@@ -3022,30 +3020,34 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     required ValueChanged<T> onSelected,
     String Function(T value)? itemLabel,
   }) {
-    return PopupMenuButton<T>(
-      onSelected: onSelected,
-      itemBuilder: (context) => values
-          .map(
-            (value) => PopupMenuItem<T>(
-              value: value,
-              child: Text(itemLabel?.call(value) ?? value.toString()),
-            ),
-          )
-          .toList(),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(999),
-          border: Border.all(color: Theme.of(context).colorScheme.outline),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.tune, size: 18),
-            const SizedBox(width: 8),
-            Text('$label: $currentLabel'),
-          ],
-        ),
+    T? selectedValue;
+    for (final value in values) {
+      final optionLabel = itemLabel?.call(value) ?? value.toString();
+      if (optionLabel == currentLabel) {
+        selectedValue = value;
+        break;
+      }
+    }
+    return SizedBox(
+      width: 184,
+      child: AppSelectField<T>(
+        value: selectedValue,
+        decoration: _fieldDecoration(label: label),
+        menuMaxHeight: 240,
+        items: values
+            .map(
+              (value) => AppSelectItem<T>(
+                value: value,
+                label: itemLabel?.call(value) ?? value.toString(),
+                icon: Icons.tune,
+              ),
+            )
+            .toList(),
+        onChanged: (value) {
+          if (value != null) {
+            onSelected(value);
+          }
+        },
       ),
     );
   }

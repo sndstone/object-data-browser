@@ -12,6 +12,7 @@ import socket
 import ssl
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -99,7 +100,7 @@ def _parse_profile(payload: dict[str, Any]) -> Profile:
         region=region,
         access_key=access_key,
         secret_key=secret_key,
-        session_token=str(payload.get("sessionToken", "")).strip() or None,
+        session_token=str(payload.get("sessionToken") or "").strip() or None,
         path_style=bool(payload.get("pathStyle", False)),
         verify_tls=bool(payload.get("verifyTls", True)),
         connect_timeout_seconds=max(int(payload.get("connectTimeoutSeconds", 5) or 5), 1),
@@ -130,16 +131,17 @@ def _build_client(profile: Profile):
     )
     session = imports["boto3"].session.Session()
 
-    client = session.client(
-        "s3",
-        endpoint_url=profile.endpoint_url,
-        aws_access_key_id=profile.access_key,
-        aws_secret_access_key=profile.secret_key,
-        aws_session_token=profile.session_token,
-        region_name=profile.region,
-        verify=profile.verify_tls,
-        config=config,
-    )
+    client_kwargs: dict[str, Any] = {
+        "endpoint_url": profile.endpoint_url,
+        "aws_access_key_id": profile.access_key,
+        "aws_secret_access_key": profile.secret_key,
+        "region_name": profile.region,
+        "verify": profile.verify_tls,
+        "config": config,
+    }
+    if profile.session_token:
+        client_kwargs["aws_session_token"] = profile.session_token
+    client = session.client("s3", **client_kwargs)
     if profile.enable_api_logging or profile.enable_debug_logging:
         events = client.meta.events
         events.register(
@@ -2324,51 +2326,102 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
             upload_id = response.get("UploadId")
             if not upload_id:
                 raise SidecarError("engine_unavailable", "Multipart upload did not return an upload ID.")
+            file_parts_total = max(
+                (file_size + multipart_chunk_bytes - 1) // multipart_chunk_bytes, 1
+            )
+            max_workers = min(8, max(profile.max_pool_connections, 1))
+
+            # One open file handle per worker thread instead of open/close per part.
+            part_handle_local = threading.local()
+            part_handles: list[Any] = []
+            part_handles_lock = threading.Lock()
+
+            def _get_part_handle():
+                handle = getattr(part_handle_local, "handle", None)
+                if handle is None:
+                    handle = path.open("rb")
+                    part_handle_local.handle = handle
+                    with part_handles_lock:
+                        part_handles.append(handle)
+                return handle
+
+            def _upload_one_part(part_number: int) -> tuple[int, Any, int]:
+                offset = (part_number - 1) * multipart_chunk_bytes
+                length = min(multipart_chunk_bytes, file_size - offset)
+                handle = _get_part_handle()
+                handle.seek(offset)
+                chunk = handle.read(length)
+                part_response = client.upload_part(
+                    Bucket=bucket_name,
+                    Key=target_key,
+                    UploadId=upload_id,
+                    PartNumber=part_number,
+                    Body=chunk,
+                )
+                return part_number, part_response.get("ETag"), len(chunk)
+
             completed_parts: list[dict[str, Any]] = []
-            part_number = 1
-            with path.open("rb") as handle:
-                while True:
-                    chunk = handle.read(multipart_chunk_bytes)
-                    if not chunk:
-                        break
-                    part_response = client.upload_part(
+            try:
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = [
+                        pool.submit(_upload_one_part, part_number)
+                        for part_number in range(1, file_parts_total + 1)
+                    ]
+                    try:
+                        for future in as_completed(futures):
+                            part_number, etag, chunk_length = future.result()
+                            completed_parts.append(
+                                {
+                                    "ETag": etag,
+                                    "PartNumber": part_number,
+                                }
+                            )
+                            bytes_transferred += chunk_length
+                            parts_completed += 1
+                            output_lines.append(f"Uploaded part {part_number} for {path.name}.")
+                            _emit_transfer_event(
+                                _build_transfer_job(
+                                    job_id=job_id,
+                                    label=label,
+                                    direction="upload",
+                                    progress=bytes_transferred / total_bytes if total_bytes else 1,
+                                    status="running",
+                                    bytes_transferred=bytes_transferred,
+                                    total_bytes=total_bytes,
+                                    output_lines=list(output_lines),
+                                    strategy_label=strategy_label,
+                                    current_item_label=path.name,
+                                    item_count=len(paths),
+                                    items_completed=items_completed,
+                                    part_size_bytes=part_size_bytes,
+                                    parts_completed=parts_completed,
+                                    parts_total=parts_total,
+                                    can_pause=True,
+                                    can_cancel=True,
+                                )
+                            )
+                    except BaseException:
+                        for pending in futures:
+                            pending.cancel()
+                        raise
+            except BaseException:
+                try:
+                    client.abort_multipart_upload(
                         Bucket=bucket_name,
                         Key=target_key,
                         UploadId=upload_id,
-                        PartNumber=part_number,
-                        Body=chunk,
                     )
-                    completed_parts.append(
-                        {
-                            "ETag": part_response.get("ETag"),
-                            "PartNumber": part_number,
-                        }
-                    )
-                    bytes_transferred += len(chunk)
-                    parts_completed += 1
-                    output_lines.append(f"Uploaded part {part_number} for {path.name}.")
-                    _emit_transfer_event(
-                        _build_transfer_job(
-                            job_id=job_id,
-                            label=label,
-                            direction="upload",
-                            progress=bytes_transferred / total_bytes if total_bytes else 1,
-                            status="running",
-                            bytes_transferred=bytes_transferred,
-                            total_bytes=total_bytes,
-                            output_lines=list(output_lines),
-                            strategy_label=strategy_label,
-                            current_item_label=path.name,
-                            item_count=len(paths),
-                            items_completed=items_completed,
-                            part_size_bytes=part_size_bytes,
-                            parts_completed=parts_completed,
-                            parts_total=parts_total,
-                            can_pause=True,
-                            can_cancel=True,
-                        )
-                    )
-                    part_number += 1
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+            finally:
+                # Worker threads have exited with the executor; close their handles.
+                for handle in part_handles:
+                    try:
+                        handle.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+            completed_parts.sort(key=lambda part: part["PartNumber"])
             client.complete_multipart_upload(
                 Bucket=bucket_name,
                 Key=target_key,
@@ -2480,43 +2533,72 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
         output_lines.append(f"Downloading {key} ({object_size} bytes) to {target}.")
         with target.open("wb") as handle:
             if object_size >= multipart_threshold_bytes:
+                handle.truncate(object_size)
+                write_lock = threading.Lock()
+                ranges: list[tuple[int, int]] = []
                 start = 0
                 while start < object_size:
                     end = min(start + multipart_chunk_bytes - 1, object_size - 1)
+                    ranges.append((start, end))
+                    start = end + 1
+                max_workers = min(8, max(profile.max_pool_connections, 1))
+
+                def _download_one_range(
+                    start: int,
+                    end: int,
+                    handle=handle,
+                    write_lock=write_lock,
+                    key=key,
+                ) -> tuple[int, int, int]:
                     response = client.get_object(
                         Bucket=bucket_name,
                         Key=key,
                         Range=f"bytes={start}-{end}",
                     )
-                    handle.write(response["Body"].read())
-                    chunk_size = end - start + 1
-                    bytes_transferred += chunk_size
-                    parts_completed += 1
-                    output_lines.append(
-                        f"Downloaded byte range {start}-{end} for {key}."
-                    )
-                    _emit_transfer_event(
-                        _build_transfer_job(
-                            job_id=job_id,
-                            label=label,
-                            direction="download",
-                            progress=bytes_transferred / total_bytes if total_bytes else 1,
-                            status="running",
-                            bytes_transferred=bytes_transferred,
-                            total_bytes=total_bytes,
-                            output_lines=list(output_lines),
-                            strategy_label=strategy_label,
-                            current_item_label=key,
-                            item_count=len(keys),
-                            items_completed=items_completed,
-                            part_size_bytes=part_size_bytes,
-                            parts_completed=parts_completed,
-                            parts_total=parts_total,
-                            can_pause=True,
-                            can_cancel=True,
-                        )
-                    )
-                    start = end + 1
+                    data = response["Body"].read()
+                    with write_lock:
+                        handle.seek(start)
+                        handle.write(data)
+                    return start, end, end - start + 1
+
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = [
+                        pool.submit(_download_one_range, range_start, range_end)
+                        for range_start, range_end in ranges
+                    ]
+                    try:
+                        for future in as_completed(futures):
+                            range_start, range_end, chunk_size = future.result()
+                            bytes_transferred += chunk_size
+                            parts_completed += 1
+                            output_lines.append(
+                                f"Downloaded byte range {range_start}-{range_end} for {key}."
+                            )
+                            _emit_transfer_event(
+                                _build_transfer_job(
+                                    job_id=job_id,
+                                    label=label,
+                                    direction="download",
+                                    progress=bytes_transferred / total_bytes if total_bytes else 1,
+                                    status="running",
+                                    bytes_transferred=bytes_transferred,
+                                    total_bytes=total_bytes,
+                                    output_lines=list(output_lines),
+                                    strategy_label=strategy_label,
+                                    current_item_label=key,
+                                    item_count=len(keys),
+                                    items_completed=items_completed,
+                                    part_size_bytes=part_size_bytes,
+                                    parts_completed=parts_completed,
+                                    parts_total=parts_total,
+                                    can_pause=True,
+                                    can_cancel=True,
+                                )
+                            )
+                    except BaseException:
+                        for pending in futures:
+                            pending.cancel()
+                        raise
             else:
                 response = client.get_object(Bucket=bucket_name, Key=key)
                 while True:
@@ -2595,32 +2677,226 @@ def _tool_state(label: str, status: str, lines: list[str]) -> dict[str, Any]:
 
 
 def _run_put_testdata(params: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(params.get("profile", {}))
     config = params.get("config") or {}
-    object_count = int(config.get("objectCount", 0) or 0)
-    versions = int(config.get("versions", 0) or 0)
+    object_count = max(int(config.get("objectCount", 0) or 0), 0)
+    versions = max(int(config.get("versions", 1) or 1), 1)
     bucket_name = str(config.get("bucketName", "")).strip()
-    return _tool_state(
-        "put-testdata.py",
-        f"Prepared {object_count} object(s) with {versions} version(s) each for {bucket_name}.",
-        [
-            f"Bucket: {bucket_name}",
-            f"Prefix: {config.get('prefix', '')}",
-            f"Threads: {config.get('threads', 1)}",
-        ],
+    prefix = str(config.get("prefix", "") or "")
+    threads = max(int(config.get("threads", 1) or 1), 1)
+    size_bytes = max(
+        int(config.get("objectSizeBytes", config.get("sizeBytes", 4096)) or 4096), 0
     )
+    if not bucket_name:
+        raise SidecarError("invalid_config", "Bucket name is required.")
+    client = _build_client(profile)
+    payload = b"A" * size_bytes
+
+    failure_count = 0
+    errors: list[str] = []
+    started = time.monotonic()
+
+    def put_one(index: int) -> None:
+        key = f"{prefix}testdata-{index:06d}.bin"
+        for _ in range(versions):
+            client.put_object(
+                Bucket=bucket_name,
+                Key=key,
+                Body=payload,
+                ContentType="application/octet-stream",
+            )
+
+    with ThreadPoolExecutor(max_workers=min(threads, 16)) as pool:
+        futures = [pool.submit(put_one, index) for index in range(object_count)]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as error:  # noqa: BLE001
+                failure_count += 1
+                if len(errors) < 5:
+                    errors.append(str(error))
+
+    duration_seconds = time.monotonic() - started
+    created_count = object_count - failure_count
+    lines = [
+        f"Bucket: {bucket_name}",
+        f"Prefix: {prefix}",
+        f"Threads: {threads}",
+        f"Object size: {size_bytes} byte(s)",
+        f"Created: {created_count} object(s) with {versions} version(s) each",
+        f"Failures: {failure_count}",
+        f"Duration: {duration_seconds:.2f}s",
+    ]
+    lines.extend(f"Error: {message}" for message in errors)
+    state = _tool_state(
+        "put-testdata",
+        f"Created {created_count} object(s) with {versions} version(s) each in {bucket_name}."
+        if failure_count == 0
+        else f"Created {created_count} object(s) in {bucket_name} with {failure_count} failure(s).",
+        lines,
+    )
+    if failure_count > 0:
+        state["exitCode"] = 1
+    return state
 
 
 def _run_delete_all(params: dict[str, Any]) -> dict[str, Any]:
+    profile = _parse_profile(params.get("profile", {}))
     config = params.get("config") or {}
     bucket_name = str(config.get("bucketName", "")).strip()
-    return _tool_state(
-        "delete-all.py",
-        f"Prepared delete-all sweep for {bucket_name}.",
-        [
-            f"Batch size: {config.get('batchSize', 1000)}",
-            f"Workers: {config.get('maxWorkers', 1)}",
-        ],
+    prefix = str(config.get("prefix", "") or "")
+    batch_size = max(1, min(int(config.get("batchSize", 1000) or 1000), 1000))
+    max_workers = max(1, min(int(config.get("maxWorkers", 4) or 4), 16))
+    deletion_delay_ms = max(int(config.get("deletionDelayMs", 0) or 0), 0)
+    list_max_keys = max(1, min(int(config.get("listMaxKeys", 1000) or 1000), 1000))
+    if not bucket_name:
+        raise SidecarError("invalid_config", "Bucket name is required.")
+    client = _build_client(profile)
+
+    used_versions = True
+    abort_message: str | None = None
+
+    def _iter_entries():
+        nonlocal used_versions, abort_message
+        base_kwargs: dict[str, Any] = {"Bucket": bucket_name, "MaxKeys": list_max_keys}
+        if prefix:
+            base_kwargs["Prefix"] = prefix
+        try:
+            page = client.list_object_versions(**dict(base_kwargs))
+        except Exception:  # noqa: BLE001
+            page = None
+            used_versions = False
+        if page is not None:
+            prev_markers: tuple[str, str] | None = None
+            prev_processed: int | None = None
+            while True:
+                for group in ("Versions", "DeleteMarkers"):
+                    for item in page.get(group) or []:
+                        key = str(item.get("Key", ""))
+                        if not key:
+                            continue
+                        entry: dict[str, Any] = {"Key": key}
+                        version_id = item.get("VersionId")
+                        # Pass VersionId through verbatim whenever the listing
+                        # returned one. The literal "null" is a real version id
+                        # (objects created before versioning was enabled);
+                        # omitting it would only stack a delete marker.
+                        if version_id:
+                            entry["VersionId"] = version_id
+                        yield entry
+                if not page.get("IsTruncated"):
+                    return
+                next_key_marker = str(page.get("NextKeyMarker") or "")
+                next_version_marker = str(page.get("NextVersionIdMarker") or "")
+                if not next_key_marker and not next_version_marker:
+                    # Truncated page without continuation markers: continuing
+                    # would refetch page 1 forever, so stop listing here.
+                    return
+                markers = (next_key_marker, next_version_marker)
+                with counter_lock:
+                    processed = deleted_count + failure_count
+                if markers == prev_markers and processed == prev_processed:
+                    abort_message = (
+                        "Aborting: listing made no progress "
+                        f"(markers repeated at key marker '{next_key_marker}' "
+                        "with no new deletions or failures)."
+                    )
+                    return
+                prev_markers = markers
+                prev_processed = processed
+                next_kwargs = dict(base_kwargs)
+                if next_key_marker:
+                    next_kwargs["KeyMarker"] = next_key_marker
+                if next_version_marker:
+                    next_kwargs["VersionIdMarker"] = next_version_marker
+                page = client.list_object_versions(**next_kwargs)
+            return
+        continuation: str | None = None
+        while True:
+            v2_kwargs = dict(base_kwargs)
+            if continuation:
+                v2_kwargs["ContinuationToken"] = continuation
+            page = client.list_objects_v2(**v2_kwargs)
+            for item in page.get("Contents") or []:
+                key = str(item.get("Key", ""))
+                if key:
+                    yield {"Key": key}
+            if not page.get("IsTruncated"):
+                return
+            continuation = page.get("NextContinuationToken")
+            if not continuation:
+                # Truncated page without a continuation token: stop rather
+                # than refetching page 1 forever.
+                return
+
+    deleted_count = 0
+    failure_count = 0
+    errors: list[str] = []
+    counter_lock = threading.Lock()
+    started = time.monotonic()
+
+    def delete_batch(batch: list[dict[str, Any]]) -> None:
+        nonlocal deleted_count, failure_count
+        try:
+            response = client.delete_objects(
+                Bucket=bucket_name,
+                Delete={"Objects": batch, "Quiet": True},
+            )
+            batch_errors = response.get("Errors") or []
+            with counter_lock:
+                failure_count += len(batch_errors)
+                deleted_count += len(batch) - len(batch_errors)
+                for item in batch_errors:
+                    if len(errors) >= 5:
+                        break
+                    errors.append(
+                        f"{item.get('Key', '')}: {item.get('Message') or item.get('Code') or 'delete failed'}"
+                    )
+        except Exception as error:  # noqa: BLE001
+            with counter_lock:
+                failure_count += len(batch)
+                if len(errors) < 5:
+                    errors.append(str(error))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = []
+        batch: list[dict[str, Any]] = []
+        for entry in _iter_entries():
+            batch.append(entry)
+            if len(batch) >= batch_size:
+                futures.append(pool.submit(delete_batch, list(batch)))
+                batch.clear()
+                if deletion_delay_ms > 0:
+                    time.sleep(deletion_delay_ms / 1000.0)
+        if batch:
+            futures.append(pool.submit(delete_batch, list(batch)))
+        for future in as_completed(futures):
+            future.result()
+
+    duration_seconds = time.monotonic() - started
+    lines = [
+        f"Bucket: {bucket_name}",
+        f"Prefix: {prefix}",
+        f"Listing mode: {'versions' if used_versions else 'objects'}",
+        f"Batch size: {batch_size}",
+        f"Workers: {max_workers}",
+        f"Deleted: {deleted_count}",
+        f"Failures: {failure_count}",
+        f"Duration: {duration_seconds:.2f}s",
+    ]
+    lines.extend(f"Error: {message}" for message in errors)
+    if abort_message:
+        lines.append(f"Error: {abort_message}")
+    state = _tool_state(
+        "delete-all",
+        f"Deleted {deleted_count} object version(s) from {bucket_name}."
+        if failure_count == 0
+        else f"Deleted {deleted_count} object version(s) from {bucket_name} with {failure_count} failure(s).",
+        lines,
     )
+    if failure_count > 0 or abort_message:
+        state["exitCode"] = 1
+    return state
 
 
 def _cancel_tool_execution(params: dict[str, Any]) -> dict[str, Any]:
