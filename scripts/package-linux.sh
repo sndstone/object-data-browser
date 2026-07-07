@@ -58,12 +58,22 @@ case "$FORMAT-$ARCH" in
   rpm-aarch64|rpm-arm64) NATIVE_ARCH="aarch64" ;;
 esac
 
+PUBSPEC_PATH="$ROOT_DIR/apps/flutter_app/pubspec.yaml"
+APP_VERSION="0.0.0"
+if [[ -f "$PUBSPEC_PATH" ]]; then
+  PUBSPEC_VERSION="$(sed -n 's/^version:[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' "$PUBSPEC_PATH" | head -n 1)"
+  if [[ -n "$PUBSPEC_VERSION" ]]; then
+    APP_VERSION="$PUBSPEC_VERSION"
+  fi
+fi
+
 NFPM_CONFIG="$ROOT_DIR/packaging/linux/nfpm.generated.yaml"
 sed \
   -e "s|{{ROOT}}|$STAGE_DIR|g" \
   -e "s|{{ARCH}}|$NATIVE_ARCH|g" \
   -e "s|{{FORMAT}}|$FORMAT|g" \
   -e "s|{{OUTPUT}}|$OUTPUT_DIR|g" \
+  -e "s|{{VERSION}}|$APP_VERSION|g" \
   "$ROOT_DIR/packaging/linux/nfpm.yaml.tmpl" >"$NFPM_CONFIG"
 
 nfpm package --config "$NFPM_CONFIG" --packager "$FORMAT" --target "$OUTPUT_DIR"

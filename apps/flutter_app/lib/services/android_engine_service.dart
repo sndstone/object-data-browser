@@ -35,6 +35,14 @@ class AndroidEngineService
   }
 
   @override
+  bool get isMock => false;
+
+  @override
+  void shutdown() {
+    _fallback.shutdown();
+  }
+
+  @override
   void setLogSink(EngineLogCallback? sink) {
     _logSink = sink;
   }
@@ -60,7 +68,7 @@ class AndroidEngineService
           id: value['id'] as String? ?? 'android',
           label: value['label'] as String? ?? 'Android Engine',
           language: value['language'] as String? ?? 'native',
-          version: value['version'] as String? ?? '2.0.17',
+          version: value['version'] as String? ?? '2.2.2',
           available: value['available'] as bool? ?? true,
           desktopSupported: false,
           androidSupported: true,
@@ -857,11 +865,9 @@ class AndroidEngineService
     final requestId =
         'android-${DateTime.now().microsecondsSinceEpoch}-$method-$engineId';
     final startedAt = DateTime.now();
-    final requestHead = {
-      'engineId': engineId,
-      'method': method,
-    };
-    final requestBody = _sanitizeForLogging(params);
+    // Building sanitized trace bodies + jsonEncode is expensive; only do it
+    // when API logging is enabled (the app drops API events otherwise).
+    final apiLoggingEnabled = _diagnosticsOptions.enableApiLogging;
 
     _emitLog(
       level: 'DEBUG',
@@ -874,23 +880,30 @@ class AndroidEngineService
       method: method,
     );
 
-    _emitLog(
-      level: 'API',
-      category: 'HttpSend',
-      message: _stringifyForLogging({
+    if (apiLoggingEnabled) {
+      final requestHead = {
         'engineId': engineId,
         'method': method,
-        'params': requestBody,
-      }),
-      source: 'api',
-      params: params,
-      requestId: requestId,
-      tracePhase: 'send',
-      engineId: engineId,
-      method: method,
-      traceHead: requestHead,
-      traceBody: requestBody,
-    );
+      };
+      final requestBody = _sanitizeForLogging(params);
+      _emitLog(
+        level: 'API',
+        category: 'HttpSend',
+        message: _stringifyForLogging({
+          'engineId': engineId,
+          'method': method,
+          'params': requestBody,
+        }),
+        source: 'api',
+        params: params,
+        requestId: requestId,
+        tracePhase: 'send',
+        engineId: engineId,
+        method: method,
+        traceHead: requestHead,
+        traceBody: requestBody,
+      );
+    }
 
     try {
       final result = await _channel.invokeMethod<Object?>(
@@ -903,28 +916,30 @@ class AndroidEngineService
       );
       final payload = _stringKeyedMap(result);
       final latencyMs = DateTime.now().difference(startedAt).inMilliseconds;
-      final responseHead = {
-        'engineId': engineId,
-        'method': method,
-        'status': payload.containsKey('error') ? 'error' : 'ok',
-      };
-      final responseBody = _sanitizeForLogging(payload);
 
-      _emitLog(
-        level: 'API',
-        category: 'HttpReceive',
-        message: _stringifyForLogging(payload),
-        source: 'api',
-        params: params,
-        requestId: requestId,
-        tracePhase: 'response',
-        engineId: engineId,
-        method: method,
-        responseStatus: payload.containsKey('error') ? 'error' : 'ok',
-        latencyMs: latencyMs,
-        traceHead: responseHead,
-        traceBody: responseBody,
-      );
+      if (apiLoggingEnabled) {
+        final responseHead = {
+          'engineId': engineId,
+          'method': method,
+          'status': payload.containsKey('error') ? 'error' : 'ok',
+        };
+        final responseBody = _sanitizeForLogging(payload);
+        _emitLog(
+          level: 'API',
+          category: 'HttpReceive',
+          message: _stringifyForLogging(payload),
+          source: 'api',
+          params: params,
+          requestId: requestId,
+          tracePhase: 'response',
+          engineId: engineId,
+          method: method,
+          responseStatus: payload.containsKey('error') ? 'error' : 'ok',
+          latencyMs: latencyMs,
+          traceHead: responseHead,
+          traceBody: responseBody,
+        );
+      }
 
       _emitLog(
         level: 'DEBUG',
@@ -941,15 +956,24 @@ class AndroidEngineService
       );
 
       final error = payload['error'];
-      if (error is Map) {
-        final mappedError = _stringKeyedMap(error);
+      if (error != null) {
+        // Any non-null error value is a failure. Structured (Map) errors carry
+        // a code/message/details; a non-Map value is coerced to a message with
+        // an unknown code so it can never be swallowed as success.
+        if (error is Map) {
+          final mappedError = _stringKeyedMap(error);
+          throw EngineException(
+            code: _parseErrorCode(mappedError['code'] as String?),
+            message:
+                (mappedError['message'] as String?) ?? 'Unknown engine error.',
+            details: mappedError['details'] is Map
+                ? _stringKeyedMap(mappedError['details'])
+                : null,
+          );
+        }
         throw EngineException(
-          code: _parseErrorCode(mappedError['code'] as String?),
-          message:
-              (mappedError['message'] as String?) ?? 'Unknown engine error.',
-          details: mappedError['details'] is Map
-              ? _stringKeyedMap(mappedError['details'])
-              : null,
+          code: ErrorCode.unknown,
+          message: error.toString(),
         );
       }
 

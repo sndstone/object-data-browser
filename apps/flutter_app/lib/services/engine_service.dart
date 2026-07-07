@@ -67,6 +67,13 @@ abstract interface class TransferJobSinkRegistrant {
 abstract class EngineService {
   void configureDiagnostics(DiagnosticsOptions options) {}
 
+  /// Whether this is the in-process mock service (no real backend wired).
+  bool get isMock => false;
+
+  /// Releases long-lived engine resources (e.g. desktop sidecar processes).
+  /// Safe to call multiple times; the default implementation is a no-op.
+  void shutdown() {}
+
   Future<List<EngineDescriptor>> listEngines();
   Future<List<CapabilityDescriptor>> getCapabilities({
     required String engineId,

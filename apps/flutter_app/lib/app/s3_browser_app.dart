@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'dart:ui' show AppExitResponse;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
@@ -29,6 +31,7 @@ class S3BrowserApp extends StatefulWidget {
 
 class _S3BrowserAppState extends State<S3BrowserApp> {
   Timer? _benchmarkTimer;
+  AppLifecycleListener? _lifecycleListener;
   static const List<WorkspaceTab> _allNavTabs = [
     WorkspaceTab.browser,
     WorkspaceTab.tasks,
@@ -52,6 +55,14 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
   void initState() {
     super.initState();
     widget.controller.addListener(_handleControllerChange);
+    // Shut down long-lived engine sidecar processes before the desktop app
+    // exits so they do not outlive the UI process.
+    _lifecycleListener = AppLifecycleListener(
+      onExitRequested: () async {
+        widget.controller.shutdownEngines();
+        return AppExitResponse.exit;
+      },
+    );
     WidgetsBinding.instance.addPostFrameCallback((_) {
       widget.controller.initialize();
     });
@@ -60,6 +71,7 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
   @override
   void dispose() {
     _benchmarkTimer?.cancel();
+    _lifecycleListener?.dispose();
     widget.controller.removeListener(_handleControllerChange);
     super.dispose();
   }

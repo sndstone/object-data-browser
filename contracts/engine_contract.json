@@ -18,6 +18,7 @@
         "getCapabilities",
         "testProfile",
         "listBuckets",
+        "createBucket",
         "deleteBucket",
         "setBucketVersioning",
         "putBucketLifecycle",

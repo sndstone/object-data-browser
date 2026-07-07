@@ -117,7 +117,8 @@ class LocalAppStateRepository implements AppStateRepository {
     await file.writeAsString(
       const JsonEncoder.withIndent('  ').convert({
         'exportedAt': DateTime.now().toIso8601String(),
-        'profiles': profiles.map((profile) => profile.toJson()).toList(),
+        'profiles':
+            profiles.map((profile) => _profileToExportJson(profile)).toList(),
       }),
     );
     return file;
@@ -160,29 +161,38 @@ class LocalAppStateRepository implements AppStateRepository {
 
   Future<EndpointProfile> _hydrateProfile(Map<String, Object?> metadata) async {
     final id = (metadata['id'] as String?) ?? '';
-    final inlineSecrets = Map<String, Object?>.from(
-        metadata['inlineSecrets'] as Map? ?? const {});
     final accessKey = await _readSecret(
           profileId: id,
           field: 'accessKey',
         ) ??
-        (inlineSecrets['accessKey'] as String? ?? '');
+        '';
     final secretKey = await _readSecret(
           profileId: id,
           field: 'secretKey',
         ) ??
-        (inlineSecrets['secretKey'] as String? ?? '');
+        '';
     final sessionToken = await _readSecret(
-          profileId: id,
-          field: 'sessionToken',
-        ) ??
-        (inlineSecrets['sessionToken'] as String?);
+      profileId: id,
+      field: 'sessionToken',
+    );
     return EndpointProfile.fromJson({
       ...metadata,
       'accessKey': accessKey,
       'secretKey': secretKey,
       'sessionToken': sessionToken,
     });
+  }
+
+  /// Serializes a profile for an exported file with all credentials stripped.
+  /// Secrets are never written to a shareable export; keys stay present but
+  /// empty so an exported file can be re-imported without crashing. Users
+  /// re-enter credentials after importing.
+  Map<String, Object?> _profileToExportJson(EndpointProfile profile) {
+    final json = profile.toJson();
+    json['accessKey'] = '';
+    json['secretKey'] = '';
+    json['sessionToken'] = null;
+    return json;
   }
 
   Future<bool> _writeProfileSecrets(EndpointProfile profile) async {

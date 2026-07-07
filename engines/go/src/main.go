@@ -28,6 +28,8 @@ import (
 	"github.com/aws/smithy-go"
 )
 
+const engineVersion = "2.2.2"
+
 var supportedMethods = []string{
 	"health", "getCapabilities", "testProfile", "listBuckets",
 	"createBucket", "deleteBucket", "setBucketVersioning",
@@ -111,6 +113,7 @@ func emitStructuredLog(level, category, message, source string) {
 
 func main() {
 	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -125,7 +128,7 @@ func main() {
 			req.Params = map[string]interface{}{}
 		}
 
-		result, err := handleRequest(req)
+		result, err := dispatchRequest(req)
 		if err != nil {
 			mapped := mapError(err)
 			writeJSON(response{
@@ -142,6 +145,27 @@ func main() {
 			Result:    result,
 		})
 	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "S3_BROWSER_FATAL failed to read from stdin: "+err.Error())
+		os.Exit(1)
+	}
+}
+
+// dispatchRequest wraps handleRequest with panic recovery so a panic in one
+// request is converted into a normal error response instead of crashing the
+// process. The recovered failure is surfaced as an internal_error sidecarError
+// so mapError renders it in the standard error-response shape.
+func dispatchRequest(req request) (result map[string]interface{}, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			result = nil
+			err = &sidecarError{
+				Code:    "internal_error",
+				Message: fmt.Sprintf("panic recovered while handling request: %v", r),
+			}
+		}
+	}()
+	return handleRequest(req)
 }
 
 func writeJSON(value response) {
@@ -159,7 +183,7 @@ func handleRequest(req request) (map[string]interface{}, error) {
 	case "health":
 		return map[string]interface{}{
 			"engine":        "go",
-			"version":       "2.1.0",
+			"version":       engineVersion,
 			"available":     true,
 			"methods":       supportedMethods,
 			"nativeSdk":     "aws-sdk-go-v2",
@@ -3272,7 +3296,17 @@ func mapError(err error) map[string]interface{} {
 		case "SlowDown":
 			return map[string]interface{}{"code": "throttled", "message": message, "details": map[string]interface{}{"awsCode": code}}
 		default:
-			return map[string]interface{}{"code": "unknown", "message": message, "details": map[string]interface{}{"awsCode": code}}
+			lowered := strings.ToLower(message)
+			switch {
+			case messageIndicatesAuthFailure(lowered):
+				return map[string]interface{}{"code": "auth_failed", "message": message, "details": map[string]interface{}{"awsCode": code}}
+			case messageIndicatesTimeout(lowered):
+				return map[string]interface{}{"code": "timeout", "message": message, "details": map[string]interface{}{"awsCode": code}}
+			case messageIndicatesTLSFailure(lowered):
+				return map[string]interface{}{"code": "tls_error", "message": message, "details": map[string]interface{}{"awsCode": code}}
+			default:
+				return map[string]interface{}{"code": "unknown", "message": message, "details": map[string]interface{}{"awsCode": code}}
+			}
 		}
 	}
 
@@ -3289,7 +3323,42 @@ func mapError(err error) map[string]interface{} {
 	if timeoutErr, ok := err.(interface{ Timeout() bool }); ok && timeoutErr.Timeout() {
 		return map[string]interface{}{"code": "timeout", "message": err.Error()}
 	}
-	return map[string]interface{}{"code": "unknown", "message": err.Error()}
+
+	lowered := strings.ToLower(err.Error())
+	switch {
+	case messageIndicatesAuthFailure(lowered):
+		return map[string]interface{}{"code": "auth_failed", "message": err.Error()}
+	case messageIndicatesTimeout(lowered):
+		return map[string]interface{}{"code": "timeout", "message": err.Error()}
+	case messageIndicatesTLSFailure(lowered):
+		return map[string]interface{}{"code": "tls_error", "message": err.Error()}
+	default:
+		return map[string]interface{}{"code": "unknown", "message": err.Error()}
+	}
+}
+
+// messageIndicatesAuthFailure, messageIndicatesTimeout, and
+// messageIndicatesTLSFailure mirror the lowercase message heuristics used by the
+// Rust engine (engines/rust/src/main.rs) so both engines classify auth, timeout,
+// and TLS failures consistently when no explicit APIError code is available.
+func messageIndicatesAuthFailure(message string) bool {
+	return strings.Contains(message, "accessdenied") ||
+		strings.Contains(message, "invalidaccesskeyid") ||
+		strings.Contains(message, "signaturedoesnotmatch") ||
+		strings.Contains(message, "forbidden") ||
+		strings.Contains(message, "authorization") ||
+		strings.Contains(message, "credentials")
+}
+
+func messageIndicatesTimeout(message string) bool {
+	return strings.Contains(message, "timed out") || strings.Contains(message, "timeout")
+}
+
+func messageIndicatesTLSFailure(message string) bool {
+	return strings.Contains(message, "certificate") ||
+		strings.Contains(message, "tls") ||
+		strings.Contains(message, "ssl") ||
+		strings.Contains(message, "x509")
 }
 
 func awsErrorCode(err error) string {

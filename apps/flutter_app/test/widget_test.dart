@@ -446,8 +446,9 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    // Tablet-width windows keep the inspector docked below the object list.
-    expect(find.text('Inspector'), findsOneWidget);
+    // Tablet-width windows keep the inspector available on demand instead of
+    // docking it below the object list.
+    expect(find.text('Inspector'), findsNothing);
     expect(
       find.text(
         'Drag and drop files here to upload them into the current bucket prefix.',
@@ -461,12 +462,12 @@ void main() {
         tester.getSize(find.byKey(const ValueKey('object-panel-list')));
     expect(objectListSize.height, greaterThan(240));
 
-    // The on-demand inspector dialog still works for a larger view.
+    // The on-demand inspector dialog opens the inspector for this view.
     await tester.tap(find.byTooltip('Inspector'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Inspector'), findsNWidgets(2));
-    expect(find.text('Bucket info'), findsNWidgets(2));
+    expect(find.text('Inspector'), findsOneWidget);
+    expect(find.text('Bucket info'), findsOneWidget);
   });
 
   testWidgets('compact desktop browser exposes lesser actions in menu', (

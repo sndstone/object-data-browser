@@ -18,7 +18,7 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
       id: 'python',
       label: 'Python Engine',
       language: 'Python',
-      version: '2.0.17',
+      version: '2.2.2',
       available: true,
       desktopSupported: true,
       androidSupported: false,
@@ -27,7 +27,7 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
       id: 'go',
       label: 'Go Engine',
       language: 'Go',
-      version: '2.0.17',
+      version: '2.2.2',
       available: true,
       desktopSupported: true,
       androidSupported: true,
@@ -36,7 +36,7 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
       id: 'rust',
       label: 'Rust Engine',
       language: 'Rust',
-      version: '2.0.17',
+      version: '2.2.2',
       available: true,
       desktopSupported: true,
       androidSupported: true,
@@ -45,7 +45,7 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
       id: 'java',
       label: 'Java Engine',
       language: 'Java',
-      version: '2.0.17',
+      version: '2.2.2',
       available: true,
       desktopSupported: true,
       androidSupported: false,
@@ -54,6 +54,12 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
 
   @override
   void configureDiagnostics(DiagnosticsOptions options) {}
+
+  @override
+  bool get isMock => true;
+
+  @override
+  void shutdown() {}
 
   @override
   void setTransferSink(TransferJobCallback? sink) {
@@ -628,10 +634,10 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
   }) async {
-    final totalBytes = filePaths.fold<int>(
-      0,
-      (sum, filePath) => sum + _fileLengthOrFallback(filePath),
-    );
+    var totalBytes = 0;
+    for (final filePath in filePaths) {
+      totalBytes += await _fileLengthOrFallback(filePath);
+    }
     final strategyLabel = _transferStrategyLabel(
       direction: 'upload',
       totalBytes: totalBytes,
@@ -890,10 +896,10 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     _transferSink?.call(job);
   }
 
-  int _fileLengthOrFallback(String path) {
+  Future<int> _fileLengthOrFallback(String path) async {
     final file = File(path);
-    if (file.existsSync()) {
-      return file.lengthSync();
+    if (await file.exists()) {
+      return file.length();
     }
     return 12 * 1024 * 1024;
   }

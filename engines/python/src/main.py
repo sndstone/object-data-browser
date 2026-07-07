@@ -27,6 +27,184 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 
+ENGINE_VERSION = "2.2.2"
+
+# Serialize every write to stdout so transferProgress events emitted from worker
+# threads never interleave with request/response lines.
+_STDOUT_LOCK = threading.Lock()
+_STDERR_LOCK = threading.Lock()
+
+
+def _write_stdout_line(text: str) -> None:
+    with _STDOUT_LOCK:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+
+
+class _TransferCancelled(Exception):
+    """Raised inside a transfer loop when the job has been cancelled."""
+
+    def __init__(self, job_id: str):
+        super().__init__(f"Transfer {job_id} cancelled.")
+        self.job_id = job_id
+
+
+class TransferControl:
+    """Thread-safe live state for an in-flight transfer job."""
+
+    def __init__(
+        self,
+        *,
+        job_id: str,
+        label: str,
+        direction: str,
+        total_bytes: int,
+        item_count: int,
+        strategy_label: str | None,
+        part_size_bytes: int | None,
+        parts_total: int | None,
+    ) -> None:
+        self.job_id = job_id
+        self.label = label
+        self.direction = direction
+        self.total_bytes = total_bytes
+        self.item_count = item_count
+        self.strategy_label = strategy_label
+        self.part_size_bytes = part_size_bytes
+        self.parts_total = parts_total
+        self.status = "running"
+        self.bytes_transferred = 0
+        self.items_completed = 0
+        self.parts_completed = 0
+        self.current_item_label: str | None = None
+        self.lock = threading.Lock()
+        # Set == running/allowed to proceed; cleared == paused.
+        self.resume_event = threading.Event()
+        self.resume_event.set()
+
+
+_TRANSFER_REGISTRY: dict[str, TransferControl] = {}
+_TRANSFER_REGISTRY_LOCK = threading.Lock()
+# Tracks the job id registered by the transfer running on the current worker
+# thread so the dispatch wrapper can clean up regardless of how it exits.
+_CURRENT_TRANSFER = threading.local()
+
+
+def _register_transfer(control: TransferControl) -> TransferControl:
+    with _TRANSFER_REGISTRY_LOCK:
+        _TRANSFER_REGISTRY[control.job_id] = control
+    _CURRENT_TRANSFER.job_id = control.job_id
+    return control
+
+
+def _unregister_transfer(job_id: str) -> None:
+    with _TRANSFER_REGISTRY_LOCK:
+        _TRANSFER_REGISTRY.pop(job_id, None)
+
+
+def _lookup_transfer(job_id: str) -> TransferControl | None:
+    with _TRANSFER_REGISTRY_LOCK:
+        return _TRANSFER_REGISTRY.get(job_id)
+
+
+def _control_update(control: TransferControl | None, **fields: Any) -> None:
+    if control is None:
+        return
+    with control.lock:
+        for name, value in fields.items():
+            setattr(control, name, value)
+
+
+def _transfer_gate(control: TransferControl | None) -> None:
+    """Block while the job is paused; raise _TransferCancelled if cancelled."""
+    if control is None:
+        return
+    while True:
+        with control.lock:
+            status = control.status
+        if status == "cancelled":
+            raise _TransferCancelled(control.job_id)
+        if status != "paused":
+            return
+        # Wait to be resumed or cancelled; re-check on a short timeout so a
+        # cancel that arrives while paused is observed promptly.
+        control.resume_event.wait(timeout=0.5)
+
+
+def _transfer_checkpoint(
+    control: TransferControl | None,
+    *,
+    bytes_transferred: int,
+    items_completed: int,
+    parts_completed: int,
+    current_item_label: str | None,
+) -> None:
+    """Publish live progress into the registry, then honor pause/cancel."""
+    _control_update(
+        control,
+        bytes_transferred=bytes_transferred,
+        items_completed=items_completed,
+        parts_completed=parts_completed,
+        current_item_label=current_item_label,
+    )
+    _transfer_gate(control)
+
+
+def _cancelled_job_from_control(job_id: str) -> dict[str, Any]:
+    control = _lookup_transfer(job_id)
+    if control is None:
+        return _build_transfer_job(
+            job_id=job_id,
+            label=f"Transfer {job_id}",
+            direction="transfer",
+            progress=0.0,
+            status="cancelled",
+            bytes_transferred=0,
+            total_bytes=0,
+            output_lines=["Transfer cancelled."],
+        )
+    with control.lock:
+        total = control.total_bytes
+        transferred = control.bytes_transferred
+        progress = (transferred / total) if total else 0.0
+        return _build_transfer_job(
+            job_id=control.job_id,
+            label=control.label,
+            direction=control.direction,
+            progress=progress,
+            status="cancelled",
+            bytes_transferred=transferred,
+            total_bytes=total,
+            output_lines=[f"Transfer {control.job_id} cancelled."],
+            strategy_label=control.strategy_label,
+            current_item_label=control.current_item_label,
+            item_count=control.item_count,
+            items_completed=control.items_completed,
+            part_size_bytes=control.part_size_bytes,
+            parts_completed=(
+                control.parts_completed if control.part_size_bytes is not None else None
+            ),
+            parts_total=(
+                control.parts_total if control.part_size_bytes is not None else None
+            ),
+        )
+
+
+def _run_transfer(fn: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch wrapper that converts a mid-flight cancel into a cancelled job
+    and always removes the job from the registry when the transfer ends."""
+    _CURRENT_TRANSFER.job_id = None
+    try:
+        return fn(params)
+    except _TransferCancelled as cancelled:
+        return _cancelled_job_from_control(cancelled.job_id)
+    finally:
+        job_id = getattr(_CURRENT_TRANSFER, "job_id", None)
+        if job_id:
+            _unregister_transfer(job_id)
+        _CURRENT_TRANSFER.job_id = None
+
+
 class SidecarError(Exception):
     def __init__(self, code: str, message: str, details: dict[str, Any] | None = None):
         super().__init__(message)
@@ -141,6 +319,13 @@ def _build_client(profile: Profile):
     }
     if profile.session_token:
         client_kwargs["aws_session_token"] = profile.session_token
+    if not profile.verify_tls:
+        _emit_structured_log(
+            "WARN",
+            "tls",
+            f"TLS certificate verification is disabled for endpoint {profile.endpoint_url}.",
+            "python-engine",
+        )
     client = session.client("s3", **client_kwargs)
     if profile.enable_api_logging or profile.enable_debug_logging:
         events = client.meta.events
@@ -182,7 +367,8 @@ def _emit_structured_log(level: str, category: str, message: str, source: str) -
         },
         sort_keys=True,
     )
-    print(f"S3_BROWSER_LOG {payload}", file=sys.stderr, flush=True)
+    with _STDERR_LOCK:
+        print(f"S3_BROWSER_LOG {payload}", file=sys.stderr, flush=True)
 
 
 def _sanitize_headers(headers: Any) -> dict[str, str]:
@@ -317,6 +503,13 @@ def _map_exception(error: Exception) -> SidecarError:
     if isinstance(error, SidecarError):
         return error
 
+    if isinstance(error, json.JSONDecodeError):
+        return SidecarError(
+            "invalid_request",
+            "Malformed JSON request.",
+            {"message": str(error)},
+        )
+
     imports = _lazy_boto_imports()
     client_error = imports["ClientError"]
     connect_timeout_error = imports["ConnectTimeoutError"]
@@ -423,6 +616,12 @@ class _AzureBlobClient:
             if not profile.verify_tls:
                 context.check_hostname = False
                 context.verify_mode = ssl.CERT_NONE
+                _emit_structured_log(
+                    "WARN",
+                    "tls",
+                    f"TLS certificate verification is disabled for endpoint {self.base_url}.",
+                    "python-engine",
+                )
             self.context = context
 
     def blob_path(self, container: str, key: str | None = None) -> str:
@@ -1069,7 +1268,20 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
             can_cancel=True,
         )
     )
+    control = _register_transfer(
+        TransferControl(
+            job_id=job_id,
+            label=label,
+            direction="upload",
+            total_bytes=total_bytes,
+            item_count=len(paths),
+            strategy_label=strategy_label,
+            part_size_bytes=part_size_bytes,
+            parts_total=parts_total if part_size_bytes is not None else None,
+        )
+    )
     for path in paths:
+        _transfer_gate(control)
         target_name = object_key_by_path.get(str(path), path.name)
         target_key = f"{prefix}{target_name}" if prefix else target_name
         blob_path = client.blob_path(bucket_name, target_key)
@@ -1093,6 +1305,13 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
                     block_ids.append(block_id)
                     bytes_transferred += len(chunk)
                     parts_completed += 1
+                    _transfer_checkpoint(
+                        control,
+                        bytes_transferred=bytes_transferred,
+                        items_completed=items_completed,
+                        parts_completed=parts_completed,
+                        current_item_label=path.name,
+                    )
                     output_lines.append(f"Uploaded part {block_index + 1} for {path.name}.")
                     _emit_transfer_event(
                         _build_transfer_job(
@@ -1136,6 +1355,13 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
             )
             bytes_transferred += file_size
         items_completed += 1
+        _transfer_checkpoint(
+            control,
+            bytes_transferred=bytes_transferred,
+            items_completed=items_completed,
+            parts_completed=parts_completed,
+            current_item_label=path.name,
+        )
         output_lines.append(f"Finished uploading {path.name}.")
         _emit_transfer_event(
             _build_transfer_job(
@@ -1230,7 +1456,20 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
             can_cancel=True,
         )
     )
+    control = _register_transfer(
+        TransferControl(
+            job_id=job_id,
+            label=label,
+            direction="download",
+            total_bytes=total_bytes,
+            item_count=len(keys),
+            strategy_label=strategy_label,
+            part_size_bytes=part_size_bytes,
+            parts_total=parts_total if part_size_bytes is not None else None,
+        )
+    )
     for key in keys:
+        _transfer_gate(control)
         target = destination / Path(key).name
         object_size = sizes[key]
         blob_path = client.blob_path(bucket_name, key)
@@ -1249,6 +1488,13 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
                     chunk_size = end - start + 1
                     bytes_transferred += chunk_size
                     parts_completed += 1
+                    _transfer_checkpoint(
+                        control,
+                        bytes_transferred=bytes_transferred,
+                        items_completed=items_completed,
+                        parts_completed=parts_completed,
+                        current_item_label=key,
+                    )
                     output_lines.append(f"Downloaded byte range {start}-{end} for {key}.")
                     _emit_transfer_event(
                         _build_transfer_job(
@@ -1281,6 +1527,13 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
                             break
                         handle.write(chunk)
                         bytes_transferred += len(chunk)
+                        _transfer_checkpoint(
+                            control,
+                            bytes_transferred=bytes_transferred,
+                            items_completed=items_completed,
+                            parts_completed=parts_completed,
+                            current_item_label=key,
+                        )
                         _emit_transfer_event(
                             _build_transfer_job(
                                 job_id=job_id,
@@ -1482,9 +1735,9 @@ def _handle_azure_request(method: str, params: dict[str, Any]) -> dict[str, Any]
     if method == "deleteObjects":
         return _azure_delete_objects(params)
     if method == "startUpload":
-        return _azure_start_upload(params)
+        return _run_transfer(_azure_start_upload, params)
     if method == "startDownload":
-        return _azure_start_download(params)
+        return _run_transfer(_azure_start_download, params)
     if method == "runPutTestData":
         return _azure_run_put_testdata(params)
     if method == "runDeleteAll":
@@ -1503,7 +1756,7 @@ def _health() -> dict[str, Any]:
 
     return {
         "engine": "python",
-        "version": "2.1.0",
+        "version": ENGINE_VERSION,
         "available": available,
         "dependencyState": dependency_state,
         "methods": [
@@ -1972,8 +2225,36 @@ def _list_object_versions(params: dict[str, Any]) -> dict[str, Any]:
     if not bucket_name:
         raise SidecarError("invalid_config", "Bucket name is required for version listing.")
 
+    # The desktop ListCursor carries a single opaque string `value`, but the S3
+    # list_object_versions API paginates on two markers. Encode both into the
+    # cursor value as JSON and decode them back on the next request.
+    cursor = params.get("cursor") or {}
+    cursor_value = cursor.get("value") if isinstance(cursor, dict) else None
+    key_marker = ""
+    version_id_marker = ""
+    if cursor_value:
+        try:
+            decoded = json.loads(cursor_value)
+            if isinstance(decoded, dict):
+                key_marker = str(decoded.get("keyMarker", "") or "")
+                version_id_marker = str(decoded.get("versionIdMarker", "") or "")
+            else:
+                key_marker = str(cursor_value)
+        except (TypeError, ValueError):
+            # Older cursor shape: a bare key marker string.
+            key_marker = str(cursor_value)
+
     client = _build_client(profile)
-    response = client.list_object_versions(Bucket=bucket_name, Prefix=effective_prefix, MaxKeys=1000)
+    request: dict[str, Any] = {
+        "Bucket": bucket_name,
+        "Prefix": effective_prefix,
+        "MaxKeys": 1000,
+    }
+    if key_marker:
+        request["KeyMarker"] = key_marker
+    if version_id_marker:
+        request["VersionIdMarker"] = version_id_marker
+    response = client.list_object_versions(**request)
     items: list[dict[str, Any]] = []
 
     for version in response.get("Versions", []):
@@ -2009,9 +2290,25 @@ def _list_object_versions(params: dict[str, Any]) -> dict[str, Any]:
         )
 
     items.sort(key=lambda item: item["modifiedAt"], reverse=True)
+
+    has_more = bool(response.get("IsTruncated", False))
+    next_key_marker = str(response.get("NextKeyMarker") or "")
+    next_version_id_marker = str(response.get("NextVersionIdMarker") or "")
+    if has_more and (next_key_marker or next_version_id_marker):
+        next_cursor_value: str | None = json.dumps(
+            {
+                "keyMarker": next_key_marker,
+                "versionIdMarker": next_version_id_marker,
+            }
+        )
+    else:
+        # No continuation markers means there is nothing more to fetch.
+        has_more = False
+        next_cursor_value = None
+
     return {
         "items": items,
-        "cursor": {"value": None, "hasMore": False},
+        "cursor": {"value": next_cursor_value, "hasMore": has_more},
         "totalCount": len(items),
         "versionCount": len([item for item in items if not item["deleteMarker"]]),
         "deleteMarkerCount": len([item for item in items if item["deleteMarker"]]),
@@ -2141,6 +2438,15 @@ def _move_object(params: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+# S3's DeleteObjects API rejects requests with more than 1000 keys per call.
+_S3_DELETE_BATCH_LIMIT = 1000
+
+
+def _chunked(items: list[Any], size: int):
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
 def _delete_objects(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     bucket_name = str(params.get("bucketName", "")).strip()
@@ -2148,23 +2454,44 @@ def _delete_objects(params: dict[str, Any]) -> dict[str, Any]:
     if not bucket_name or not keys:
         raise SidecarError("invalid_config", "Bucket name and keys are required.")
     client = _build_client(profile)
-    response = client.delete_objects(
-        Bucket=bucket_name,
-        Delete={"Objects": [{"Key": key} for key in keys], "Quiet": False},
-    )
-    deleted = response.get("Deleted", [])
-    errors = response.get("Errors", [])
+
+    success_count = 0
+    failures: list[dict[str, Any]] = []
+    for chunk in _chunked(keys, _S3_DELETE_BATCH_LIMIT):
+        try:
+            response = client.delete_objects(
+                Bucket=bucket_name,
+                Delete={"Objects": [{"Key": key} for key in chunk], "Quiet": False},
+            )
+        except Exception as error:  # noqa: BLE001
+            # Convert a chunk-level failure into per-key failures so the rest of
+            # the operation can still proceed (partial-failure contract).
+            mapped = _map_exception(error)
+            for key in chunk:
+                failures.append(
+                    {
+                        "target": key,
+                        "code": mapped.code,
+                        "message": mapped.message,
+                    }
+                )
+            continue
+        deleted = response.get("Deleted", [])
+        errors = response.get("Errors", [])
+        success_count += len(deleted)
+        for item in errors:
+            failures.append(
+                {
+                    "target": str(item.get("Key", "")),
+                    "code": str(item.get("Code", "unknown")),
+                    "message": str(item.get("Message", "Unknown delete error.")),
+                }
+            )
+
     return {
-        "successCount": len(deleted),
-        "failureCount": len(errors),
-        "failures": [
-            {
-                "target": str(item.get("Key", "")),
-                "code": str(item.get("Code", "unknown")),
-                "message": str(item.get("Message", "Unknown delete error.")),
-            }
-            for item in errors
-        ],
+        "successCount": success_count,
+        "failureCount": len(failures),
+        "failures": failures,
     }
 
 
@@ -2175,30 +2502,54 @@ def _delete_object_versions(params: dict[str, Any]) -> dict[str, Any]:
     if not bucket_name or not versions:
         raise SidecarError("invalid_config", "Bucket name and versions are required.")
     client = _build_client(profile)
-    response = client.delete_objects(
-        Bucket=bucket_name,
-        Delete={
-            "Objects": [
-                {"Key": str(item.get("key", "")), "VersionId": str(item.get("versionId", ""))}
-                for item in versions
-            ],
-            "Quiet": False,
-        },
-    )
-    deleted = response.get("Deleted", [])
-    errors = response.get("Errors", [])
+
+    objects = [
+        {
+            "Key": str(item.get("key", "")),
+            "VersionId": str(item.get("versionId", "")),
+        }
+        for item in versions
+    ]
+
+    success_count = 0
+    failures: list[dict[str, Any]] = []
+    for chunk in _chunked(objects, _S3_DELETE_BATCH_LIMIT):
+        try:
+            response = client.delete_objects(
+                Bucket=bucket_name,
+                Delete={"Objects": chunk, "Quiet": False},
+            )
+        except Exception as error:  # noqa: BLE001
+            # Convert a chunk-level failure into per-version failures so the rest
+            # of the operation can still proceed (partial-failure contract).
+            mapped = _map_exception(error)
+            for obj in chunk:
+                failures.append(
+                    {
+                        "target": obj["Key"],
+                        "versionId": obj["VersionId"] or None,
+                        "code": mapped.code,
+                        "message": mapped.message,
+                    }
+                )
+            continue
+        deleted = response.get("Deleted", [])
+        errors = response.get("Errors", [])
+        success_count += len(deleted)
+        for item in errors:
+            failures.append(
+                {
+                    "target": str(item.get("Key", "")),
+                    "versionId": str(item.get("VersionId", "")) or None,
+                    "code": str(item.get("Code", "unknown")),
+                    "message": str(item.get("Message", "Unknown delete error.")),
+                }
+            )
+
     return {
-        "successCount": len(deleted),
-        "failureCount": len(errors),
-        "failures": [
-            {
-                "target": str(item.get("Key", "")),
-                "versionId": str(item.get("VersionId", "")) or None,
-                "code": str(item.get("Code", "unknown")),
-                "message": str(item.get("Message", "Unknown delete error.")),
-            }
-            for item in errors
-        ],
+        "successCount": success_count,
+        "failureCount": len(failures),
+        "failures": failures,
     }
 
 
@@ -2258,7 +2609,7 @@ def _build_transfer_job(
 
 
 def _emit_transfer_event(job: dict[str, Any]) -> None:
-    print(json.dumps({"event": "transferProgress", "job": job}), flush=True)
+    _write_stdout_line(json.dumps({"event": "transferProgress", "job": job}))
 
 
 def _transfer_strategy_label(direction: str, uses_multipart: bool) -> str:
@@ -2296,6 +2647,18 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
     bytes_transferred = 0
     items_completed = 0
     parts_completed = 0
+    control = _register_transfer(
+        TransferControl(
+            job_id=job_id,
+            label=label,
+            direction="upload",
+            total_bytes=total_bytes,
+            item_count=len(paths),
+            strategy_label=strategy_label,
+            part_size_bytes=part_size_bytes,
+            parts_total=parts_total if part_size_bytes is not None else None,
+        )
+    )
     queued_job = _build_transfer_job(
         job_id=job_id,
         label=label,
@@ -2317,6 +2680,7 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
     )
     _emit_transfer_event(queued_job)
     for path in paths:
+        _transfer_gate(control)
         target_name = object_key_by_path.get(str(path), path.name)
         target_key = f"{prefix}{target_name}" if prefix else target_name
         file_size = path.stat().st_size
@@ -2378,6 +2742,13 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
                             )
                             bytes_transferred += chunk_length
                             parts_completed += 1
+                            _transfer_checkpoint(
+                                control,
+                                bytes_transferred=bytes_transferred,
+                                items_completed=items_completed,
+                                parts_completed=parts_completed,
+                                current_item_label=path.name,
+                            )
                             output_lines.append(f"Uploaded part {part_number} for {path.name}.")
                             _emit_transfer_event(
                                 _build_transfer_job(
@@ -2433,6 +2804,13 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
                 client.put_object(Bucket=bucket_name, Key=target_key, Body=handle)
             bytes_transferred += file_size
         items_completed += 1
+        _transfer_checkpoint(
+            control,
+            bytes_transferred=bytes_transferred,
+            items_completed=items_completed,
+            parts_completed=parts_completed,
+            current_item_label=path.name,
+        )
         output_lines.append(f"Finished uploading {path.name}.")
         _emit_transfer_event(
             _build_transfer_job(
@@ -2527,7 +2905,20 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
             can_cancel=True,
         )
     )
+    control = _register_transfer(
+        TransferControl(
+            job_id=job_id,
+            label=label,
+            direction="download",
+            total_bytes=total_bytes,
+            item_count=len(keys),
+            strategy_label=strategy_label,
+            part_size_bytes=part_size_bytes,
+            parts_total=parts_total if part_size_bytes is not None else None,
+        )
+    )
     for key in keys:
+        _transfer_gate(control)
         target = destination / Path(key).name
         object_size = sizes[key]
         output_lines.append(f"Downloading {key} ({object_size} bytes) to {target}.")
@@ -2571,6 +2962,13 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
                             range_start, range_end, chunk_size = future.result()
                             bytes_transferred += chunk_size
                             parts_completed += 1
+                            _transfer_checkpoint(
+                                control,
+                                bytes_transferred=bytes_transferred,
+                                items_completed=items_completed,
+                                parts_completed=parts_completed,
+                                current_item_label=key,
+                            )
                             output_lines.append(
                                 f"Downloaded byte range {range_start}-{range_end} for {key}."
                             )
@@ -2607,6 +3005,13 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
                         break
                     handle.write(chunk)
                     bytes_transferred += len(chunk)
+                    _transfer_checkpoint(
+                        control,
+                        bytes_transferred=bytes_transferred,
+                        items_completed=items_completed,
+                        parts_completed=parts_completed,
+                        current_item_label=key,
+                    )
                     _emit_transfer_event(
                         _build_transfer_job(
                             job_id=job_id,
@@ -2652,16 +3057,64 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
 
 def _transfer_control(params: dict[str, Any], action: str) -> dict[str, Any]:
     job_id = str(params.get("jobId", "")).strip()
-    return _build_transfer_job(
-        job_id=job_id or f"transfer-{uuid.uuid4().hex[:8]}",
-        label=f"Transfer {action}",
-        direction="transfer",
-        progress=1.0 if action == "cancelled" else 0.0,
-        status=action,
-        bytes_transferred=0,
-        total_bytes=0,
-        output_lines=[f"Transfer {action}."],
-    )
+    control = _lookup_transfer(job_id) if job_id else None
+    if control is None:
+        # No active transfer with this id: report an honest error instead of a
+        # fabricated success. There is no dedicated "not found" code in the
+        # contract, so reuse invalid_config (the jobId parameter is invalid).
+        raise SidecarError(
+            "invalid_config",
+            f"No active transfer with job id '{job_id}'.",
+            {"jobId": job_id},
+        )
+
+    with control.lock:
+        if action == "cancelled":
+            control.status = "cancelled"
+            # Wake a paused transfer so it observes the cancellation.
+            control.resume_event.set()
+        elif action == "paused":
+            if control.status != "cancelled":
+                control.status = "paused"
+                control.resume_event.clear()
+        elif action == "running":
+            if control.status != "cancelled":
+                control.status = "running"
+                control.resume_event.set()
+
+        status = control.status
+        total = control.total_bytes
+        transferred = control.bytes_transferred
+        progress = (transferred / total) if total else (1.0 if status == "cancelled" else 0.0)
+        output_line = {
+            "cancelled": "Transfer cancelled.",
+            "paused": "Transfer paused.",
+            "running": "Transfer resumed.",
+        }.get(action, f"Transfer {action}.")
+        return _build_transfer_job(
+            job_id=control.job_id,
+            label=control.label,
+            direction=control.direction,
+            progress=progress,
+            status=status,
+            bytes_transferred=transferred,
+            total_bytes=total,
+            output_lines=[output_line],
+            strategy_label=control.strategy_label,
+            current_item_label=control.current_item_label,
+            item_count=control.item_count,
+            items_completed=control.items_completed,
+            part_size_bytes=control.part_size_bytes,
+            parts_completed=(
+                control.parts_completed if control.part_size_bytes is not None else None
+            ),
+            parts_total=(
+                control.parts_total if control.part_size_bytes is not None else None
+            ),
+            can_pause=status == "running",
+            can_resume=status == "paused",
+            can_cancel=status in ("running", "paused"),
+        )
 
 
 def _tool_state(label: str, status: str, lines: list[str]) -> dict[str, Any]:
@@ -2900,15 +3353,21 @@ def _run_delete_all(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _cancel_tool_execution(params: dict[str, Any]) -> dict[str, Any]:
+    # Tool executions (runPutTestData / runDeleteAll) run synchronously and have
+    # already returned their final state by the time the desktop host can send a
+    # cancel. The job id is only minted at completion, so there is no live loop
+    # to interrupt. Report an honest no-op rather than fabricating a cancel.
     job_id = str(params.get("jobId", "")).strip()
     return {
         "label": job_id or "tool",
         "running": False,
-        "lastStatus": f"Cancelled tool execution {job_id}.",
+        "lastStatus": "Tool execution is not cancellable; it runs to completion synchronously.",
         "jobId": job_id,
         "cancellable": False,
-        "outputLines": [f"Tool execution {job_id} cancelled."],
-        "exitCode": 130,
+        "outputLines": [
+            f"No running tool execution to cancel for job id '{job_id}'.",
+        ],
+        "exitCode": 0,
     }
 
 
@@ -3729,9 +4188,9 @@ def handle_request(payload: dict[str, Any]) -> dict[str, Any]:
     if method == "deleteObjectVersions":
         return _delete_object_versions(dict(params))
     if method == "startUpload":
-        return _start_upload(dict(params))
+        return _run_transfer(_start_upload, dict(params))
     if method == "startDownload":
-        return _start_download(dict(params))
+        return _run_transfer(_start_download, dict(params))
     if method == "pauseTransfer":
         return _transfer_control(dict(params), "paused")
     if method == "resumeTransfer":
@@ -3765,35 +4224,70 @@ def handle_request(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _process_line(line: str) -> None:
+    request_id = None
+    try:
+        payload = json.loads(line)
+        request_id = payload.get("requestId")
+        result = handle_request(payload)
+        response = {
+            "requestId": request_id,
+            "ok": True,
+            "result": result,
+        }
+    except Exception as error:  # noqa: BLE001
+        mapped = _map_exception(error)
+        response = {
+            "requestId": request_id,
+            "ok": False,
+            "error": {
+                "code": mapped.code,
+                "message": mapped.message,
+                "details": mapped.details,
+            },
+        }
+
+    _write_stdout_line(json.dumps(response))
+
+
+_CONTROL_PLANE_METHODS = frozenset(
+    {"pauseTransfer", "resumeTransfer", "cancelTransfer", "cancelToolExecution"}
+)
+
+
+def _is_control_plane_request(line: str) -> bool:
+    """Cheap check so control requests never queue behind blocked workers.
+
+    A paused transfer blocks its worker thread in _transfer_gate; if every
+    worker is blocked, a resume/cancel submitted to the pool would never run.
+    Control requests are therefore handled on the reader thread instead.
+    """
+    try:
+        payload = json.loads(line)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("method") in _CONTROL_PLANE_METHODS
+
+
 def main() -> int:
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-
-        request_id = None
-        try:
-            payload = json.loads(line)
-            request_id = payload.get("requestId")
-            result = handle_request(payload)
-            response = {
-                "requestId": request_id,
-                "ok": True,
-                "result": result,
-            }
-        except Exception as error:  # noqa: BLE001
-            mapped = _map_exception(error)
-            response = {
-                "requestId": request_id,
-                "ok": False,
-                "error": {
-                    "code": mapped.code,
-                    "message": mapped.message,
-                    "details": mapped.details,
-                },
-            }
-
-        print(json.dumps(response), flush=True)
+    # Read requests on the main thread but handle each on a worker so that
+    # control requests (pause/resume/cancel) can be processed while a transfer
+    # is still streaming. stdout writes are serialized by _write_stdout_line.
+    # Control-plane requests run on the reader thread itself: they are quick
+    # registry mutations, and running them here guarantees they land even when
+    # every worker is blocked in a paused transfer.
+    executor = ThreadPoolExecutor(max_workers=8)
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            if _is_control_plane_request(line):
+                _process_line(line)
+            else:
+                executor.submit(_process_line, line)
+    finally:
+        executor.shutdown(wait=True)
 
     return 0
 

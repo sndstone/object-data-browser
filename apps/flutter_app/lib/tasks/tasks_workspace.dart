@@ -4,7 +4,7 @@ import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
 import '../widgets/compact_selector.dart';
 
-class TasksWorkspace extends StatefulWidget {
+class TasksWorkspace extends StatelessWidget {
   const TasksWorkspace({
     super.key,
     required this.controller,
@@ -13,14 +13,9 @@ class TasksWorkspace extends StatefulWidget {
   final AppController controller;
 
   @override
-  State<TasksWorkspace> createState() => _TasksWorkspaceState();
-}
-
-class _TasksWorkspaceState extends State<TasksWorkspace> {
-  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final view = widget.controller.taskView;
+    final view = controller.taskView;
     return Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
@@ -51,7 +46,7 @@ class _TasksWorkspaceState extends State<TasksWorkspace> {
           const SizedBox(height: 16),
           CompactSelector<BrowserTaskView>(
             selected: view,
-            onChanged: widget.controller.setTaskView,
+            onChanged: controller.setTaskView,
             options: const [
               CompactSelectorOption(
                 value: BrowserTaskView.running,
@@ -73,7 +68,7 @@ class _TasksWorkspaceState extends State<TasksWorkspace> {
           const SizedBox(height: 16),
           Expanded(
             child: _TaskList(
-              controller: widget.controller,
+              controller: controller,
               view: view,
             ),
           ),

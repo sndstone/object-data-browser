@@ -29,8 +29,7 @@ This repository now includes:
 - Unified responsive breakpoints (phone < 700 px, tablet < 1200 px, desktop >= 1200 px) that apply equally to resized desktop windows
 - Persistent sidecar engine processes (one long-lived process per engine instead of one per request)
 - The shared domain models and engine interface expected by all backends
-- Mock engine wiring so the UI shell is functional before the real engines are completed
-- Language-specific engine stubs for Python, Go, Rust, and Java
+- Fully implemented Python, Go, Rust, and Java engines behind a shared contract, with parallel multipart transfers and native inspector tools (see `CHANGELOG.md` 2.1.0-2.2.2)
 - Build/bootstrap scripts that stage dependencies into `.tmp` under the repo root
 
 ## Bootstrap
@@ -58,6 +57,8 @@ Windows builds now handle the symlink prerequisite in the same script. If Develo
 Windows desktop packaging also stages the Python, Go, Rust, and Java sidecars into the app bundle, so those toolchains are bootstrapped during a Windows build by default. Use `-IncludeEngineToolchains` when you want those extra backend toolchains staged for other targets too.
 
 Windows Android builds also stage an Android SDK under `.tmp/toolchains/android-sdk`, accept licenses, sign the release output with the debug key for sideloading, and copy the primary arm64 APK to `dist/android/object-data-browser-android-<version>-arm64.apk`. The Android App Bundle remains available as a secondary artifact in `dist/android/`.
+
+Linux Android builds (`./scripts/build.sh android`) do not provision an Android SDK — `scripts/bootstrap.sh` only stages Flutter, Python, Go, Rust, Java, and nfpm. You must have a preinstalled Android SDK with `ANDROID_HOME` or `ANDROID_SDK_ROOT` set before running a Linux Android build; the script fails fast with an actionable error if neither is set. CI relies on the GitHub-hosted runner image's preinstalled SDK.
 
 ## Immediate Next Steps
 

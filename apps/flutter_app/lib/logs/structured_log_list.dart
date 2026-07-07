@@ -4,7 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../models/domain_models.dart';
 
-class StructuredLogList extends StatelessWidget {
+class StructuredLogList extends StatefulWidget {
   const StructuredLogList({
     super.key,
     required this.entries,
@@ -19,20 +19,41 @@ class StructuredLogList extends StatelessWidget {
   final bool embedded;
 
   @override
-  Widget build(BuildContext context) {
+  State<StructuredLogList> createState() => _StructuredLogListState();
+}
+
+class _StructuredLogListState extends State<StructuredLogList> {
+  List<EventLogEntry>? _cachedEntries;
+  List<_StructuredLogItem>? _cachedItems;
+
+  List<_StructuredLogItem> _itemsFor(List<EventLogEntry> entries) {
+    final cached = _cachedItems;
+    if (cached != null &&
+        identical(_cachedEntries, entries) &&
+        _cachedEntries!.length == entries.length) {
+      return cached;
+    }
     final items = _buildItems(entries);
+    _cachedEntries = entries;
+    _cachedItems = items;
+    return items;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final items = _itemsFor(widget.entries);
     final scaledChild = MediaQuery(
       data: MediaQuery.of(context).copyWith(
-        textScaler: TextScaler.linear(textScalePercent / 100),
+        textScaler: TextScaler.linear(widget.textScalePercent / 100),
       ),
       child: items.isEmpty
           ? Padding(
               padding: const EdgeInsets.symmetric(vertical: 12),
-              child: Text(emptyMessage),
+              child: Text(widget.emptyMessage),
             )
           : ListView.separated(
-              shrinkWrap: embedded,
-              physics: embedded
+              shrinkWrap: widget.embedded,
+              physics: widget.embedded
                   ? const NeverScrollableScrollPhysics()
                   : const AlwaysScrollableScrollPhysics(),
               itemCount: items.length,

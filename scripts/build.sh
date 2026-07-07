@@ -103,6 +103,13 @@ case "$PLATFORM" in
     "$ROOT_DIR/scripts/package-macos.sh" --app-bundle "$MACOS_APP_DIR" --arch "$ARCH"
     ;;
   android)
+    if [[ -z "${ANDROID_HOME:-}" && -z "${ANDROID_SDK_ROOT:-}" ]]; then
+      popd >/dev/null
+      echo "ANDROID_HOME/ANDROID_SDK_ROOT is not set and no Android SDK was found." >&2
+      echo "Linux Android builds require a preinstalled Android SDK; scripts/bootstrap.sh does not provision one." >&2
+      echo "Install the Android SDK and set ANDROID_HOME (or ANDROID_SDK_ROOT) to its location, then rerun ./scripts/build.sh android." >&2
+      exit 1
+    fi
     ensure_flutter_project "android"
     flutter pub get
     flutter build apk --release --target-platform android-arm64 --split-per-abi

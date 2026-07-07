@@ -16,3 +16,5 @@ __pycache__/
 target/
 bin/
 packaging/windows/Product.generated.wxs
+**/.gradle/
+engines/**/*.exe

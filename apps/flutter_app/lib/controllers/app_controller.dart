@@ -255,7 +255,15 @@ class AppController extends ChangeNotifier {
   bool _benchmarkLifecycleActionInFlight = false;
   bool _initializeStarted = false;
   bool _engineLogSinkAttached = false;
+  // Monotonic token controlling listing-loop cancellation. Each listing loop
+  // captures the current value at start; a mismatch means the loop was
+  // superseded or cancelled and must stop. Using a generation (rather than a
+  // shared bool) ensures a cancellation of run A can never be undone by run B.
+  int _listingGeneration = 0;
+  // Cosmetic flag reflecting whether the most recent listing run stopped due to
+  // cancellation; drives the task summary only, not loop control.
   bool _listingCancelled = false;
+  bool _benchmarkPollErrorReported = false;
   int _previewRequestSequence = 0;
   final Map<String, _PendingObjectRelist> _pendingUploadRelists =
       <String, _PendingObjectRelist>{};
@@ -292,6 +300,7 @@ class AppController extends ChangeNotifier {
   bool flatView = false;
   static const int objectPageSize = 1000;
   static const int eventLogLimit = 5000;
+  static const int _taskOutputLineLimit = 500;
   static const int objectPreviewTextByteLimit = 64 * 1024;
   static const int objectPreviewImageMaxBytes = 20 * 1024 * 1024;
 
@@ -328,7 +337,9 @@ class AppController extends ChangeNotifier {
   /// The loop will stop after the current page completes and partial results
   /// will be displayed immediately.
   void cancelListing() {
-    _listingCancelled = true;
+    // Invalidate whatever listing loop is currently running. The loop notices
+    // the generation change and sets [_listingCancelled] for its summary.
+    _listingGeneration++;
     _markListingTasksCancelling();
     notifyListeners();
   }
@@ -340,46 +351,57 @@ class AppController extends ChangeNotifier {
     _initializeStarted = true;
     loading = true;
     notifyListeners();
-    _attachEngineLogSink();
-    _syncDiagnosticsOptions();
-    _addEvent(
-      level: 'INFO',
-      category: 'App',
-      message: 'Initializing application controller.',
-      source: 'app',
-    );
-    engines = await _engineService.listEngines();
-    selectedProfile = _selectBootstrapProfile();
-    activeEngineId = settings.defaultEngineId;
-    _addEvent(
-      level: 'INFO',
-      category: 'Engine',
-      message:
-          'Loaded ${engines.length} engine descriptor(s). Active engine is $activeEngineId.',
-      source: 'engine',
-    );
-    if (_engineService.runtimeType.toString().contains('Mock')) {
-      _addEvent(
-        level: 'WARN',
-        category: 'Engine',
-        message:
-            'The app is currently using the mock engine service. Real S3 bucket and object operations are not wired yet, so button actions only trace local app behavior.',
-        source: 'engine',
-      );
-    }
-    if (selectedProfile != null) {
-      await refreshBuckets();
-      await refreshCapabilities();
-    } else {
+    try {
+      _attachEngineLogSink();
+      _syncDiagnosticsOptions();
       _addEvent(
         level: 'INFO',
-        category: 'Profiles',
-        message: 'No endpoint profiles configured at startup.',
-        source: 'profiles',
+        category: 'App',
+        message: 'Initializing application controller.',
+        source: 'app',
       );
+      engines = await _engineService.listEngines();
+      selectedProfile = _selectBootstrapProfile();
+      activeEngineId = settings.defaultEngineId;
+      _addEvent(
+        level: 'INFO',
+        category: 'Engine',
+        message:
+            'Loaded ${engines.length} engine descriptor(s). Active engine is $activeEngineId.',
+        source: 'engine',
+      );
+      if (_engineService.isMock) {
+        _addEvent(
+          level: 'WARN',
+          category: 'Engine',
+          message:
+              'The app is currently using the mock engine service. Real S3 bucket and object operations are not wired yet, so button actions only trace local app behavior.',
+          source: 'engine',
+        );
+      }
+      if (selectedProfile != null) {
+        await refreshBuckets();
+        await refreshCapabilities();
+      } else {
+        _addEvent(
+          level: 'INFO',
+          category: 'Profiles',
+          message: 'No endpoint profiles configured at startup.',
+          source: 'profiles',
+        );
+      }
+    } catch (error) {
+      bannerMessage = 'Initialization failed: $error';
+      _addEvent(
+        level: 'ERROR',
+        category: 'App',
+        message: 'Initialization failed: $error',
+        source: 'app',
+      );
+    } finally {
+      loading = false;
+      notifyListeners();
     }
-    loading = false;
-    notifyListeners();
   }
 
   void _syncDiagnosticsOptions() {
@@ -498,6 +520,7 @@ class AppController extends ChangeNotifier {
         () async {
       await _guard('Buckets', () async {
         _listingCancelled = false;
+        final listingGeneration = ++_listingGeneration;
         final previousBucketName = selectedBucket?.name;
         _addEvent(
           level: 'INFO',
@@ -507,12 +530,16 @@ class AppController extends ChangeNotifier {
           profileId: profile.id,
           source: 'bucket-browser',
         );
-        if (_listingCancelled) return;
+        if (listingGeneration != _listingGeneration) {
+          _listingCancelled = true;
+          return;
+        }
         buckets = await _engineService.listBuckets(
           engineId: activeEngineId,
           profile: profile,
         );
-        if (_listingCancelled) {
+        if (listingGeneration != _listingGeneration) {
+          _listingCancelled = true;
           _appendBusyTaskLine(
             'refresh-buckets',
             'Bucket listing cancelled by user after the current request completed.',
@@ -601,46 +628,18 @@ class AppController extends ChangeNotifier {
           objectKey: previousSelectionKey,
           source: 'object-browser',
         );
-        _listingCancelled = false;
-        final allItems = <ObjectEntry>[];
-        var cursor = const ListCursor(value: null, hasMore: false);
-        var pageNumber = 0;
-        while (true) {
-          if (_listingCancelled) {
-            _appendBusyTaskLine(
-              'refresh-objects',
-              'Listing cancelled by user after $pageNumber page(s). Showing ${allItems.length} partial results.',
-            );
-            break;
-          }
-          final objectResult = await _engineService.listObjects(
-            engineId: activeEngineId,
-            profile: profile,
-            bucketName: bucket.name,
-            prefix: currentPrefix,
-            flat: flatView,
-            cursor: pageNumber == 0 ? null : cursor,
-          );
-          pageNumber += 1;
-          allItems.addAll(objectResult.items);
-          cursor = objectResult.cursor;
-          _appendBusyTaskLine(
-            'refresh-objects',
-            'Fetched page $pageNumber with ${objectResult.items.length} objects.',
-          );
-          if (!objectResult.cursor.hasMore) {
-            break;
-          }
-          if (!listAll) {
-            _appendBusyTaskLine(
-              'refresh-objects',
-              'More objects are available. Use List all to continue listing this bucket.',
-            );
-            break;
-          }
-        }
-        objects = allItems;
-        objectCursor = cursor;
+        final page = await _pageThroughObjects(
+          profile: profile,
+          bucket: bucket,
+          initialItems: <ObjectEntry>[],
+          initialCursor: const ListCursor(value: null, hasMore: false),
+          initialPageNumber: 0,
+          listAll: listAll,
+          fetchFirstPageWithoutCursor: true,
+        );
+        objects = page.items;
+        objectCursor = page.cursor;
+        final pageNumber = page.pageNumber;
         _resetObjectPagination();
         selectedObject = previousSelectionKey == null
             ? null
@@ -690,37 +689,20 @@ class AppController extends ChangeNotifier {
       'Listing all objects for ${bucket.name}${currentPrefix.isEmpty ? '' : ' at $currentPrefix'}...',
       () async {
         await _guard('Objects', () async {
-          _listingCancelled = false;
           listAllKeys = true;
-          final allItems = objects.toList();
-          var cursor = objectCursor;
-          var pageNumber = (allItems.length / objectPageSize).ceil();
-          while (cursor.hasMore) {
-            if (_listingCancelled) {
-              _appendBusyTaskLine(
-                'refresh-objects',
-                'Listing cancelled by user after $pageNumber page(s). Showing ${allItems.length} partial results.',
-              );
-              break;
-            }
-            final objectResult = await _engineService.listObjects(
-              engineId: activeEngineId,
-              profile: profile,
-              bucketName: bucket.name,
-              prefix: currentPrefix,
-              flat: flatView,
-              cursor: cursor,
-            );
-            pageNumber += 1;
-            allItems.addAll(objectResult.items);
-            cursor = objectResult.cursor;
-            _appendBusyTaskLine(
-              'refresh-objects',
-              'Fetched page $pageNumber with ${objectResult.items.length} objects.',
-            );
-          }
-          objects = allItems;
-          objectCursor = cursor;
+          final page = await _pageThroughObjects(
+            profile: profile,
+            bucket: bucket,
+            initialItems: objects.toList(),
+            initialCursor: objectCursor,
+            initialPageNumber: (objects.length / objectPageSize).ceil(),
+            listAll: true,
+            fetchFirstPageWithoutCursor: false,
+          );
+          objects = page.items;
+          objectCursor = page.cursor;
+          final cursor = page.cursor;
+          final pageNumber = page.pageNumber;
           _resetObjectPagination();
           selectedObject = previousSelectionKey == null
               ? null
@@ -741,6 +723,68 @@ class AppController extends ChangeNotifier {
         });
       },
     );
+  }
+
+  /// Shared object-listing page loop used by [refreshObjects] and
+  /// [listAllObjectsForCurrentBucket]. Captures a cancellation generation at
+  /// start so a cancel of this run cannot be undone by a later run, appends
+  /// per-page progress lines to the active 'refresh-objects' task, and returns
+  /// the accumulated items with the final cursor.
+  Future<({List<ObjectEntry> items, ListCursor cursor, int pageNumber})>
+      _pageThroughObjects({
+    required EndpointProfile profile,
+    required BucketSummary bucket,
+    required List<ObjectEntry> initialItems,
+    required ListCursor initialCursor,
+    required int initialPageNumber,
+    required bool listAll,
+    required bool fetchFirstPageWithoutCursor,
+  }) async {
+    _listingCancelled = false;
+    final listingGeneration = ++_listingGeneration;
+    final allItems = initialItems;
+    var cursor = initialCursor;
+    var pageNumber = initialPageNumber;
+    var isFirstIteration = true;
+    while (fetchFirstPageWithoutCursor || cursor.hasMore) {
+      if (listingGeneration != _listingGeneration) {
+        _listingCancelled = true;
+        _appendBusyTaskLine(
+          'refresh-objects',
+          'Listing cancelled by user after $pageNumber page(s). Showing ${allItems.length} partial results.',
+        );
+        break;
+      }
+      final useCursor =
+          fetchFirstPageWithoutCursor && isFirstIteration ? null : cursor;
+      final objectResult = await _engineService.listObjects(
+        engineId: activeEngineId,
+        profile: profile,
+        bucketName: bucket.name,
+        prefix: currentPrefix,
+        flat: flatView,
+        cursor: useCursor,
+      );
+      isFirstIteration = false;
+      pageNumber += 1;
+      allItems.addAll(objectResult.items);
+      cursor = objectResult.cursor;
+      _appendBusyTaskLine(
+        'refresh-objects',
+        'Fetched page $pageNumber with ${objectResult.items.length} objects.',
+      );
+      if (!cursor.hasMore) {
+        break;
+      }
+      if (!listAll) {
+        _appendBusyTaskLine(
+          'refresh-objects',
+          'More objects are available. Use List all to continue listing this bucket.',
+        );
+        break;
+      }
+    }
+    return (items: allItems, cursor: cursor, pageNumber: pageNumber);
   }
 
   Future<void> setSelectedBucket(BucketSummary bucket) async {
@@ -1533,10 +1577,7 @@ class AppController extends ChangeNotifier {
     );
     benchmarkRun = optimisticRun;
     selectedBenchmarkRunId = optimisticId;
-    benchmarkHistory = [
-      optimisticRun,
-      ...benchmarkHistory.where((item) => item.id != optimisticId),
-    ];
+    _upsertBenchmarkHistory(optimisticRun);
     notifyListeners();
 
     await _runBusy(
@@ -1583,6 +1624,14 @@ class AppController extends ChangeNotifier {
     );
   }
 
+  /// Inserts or replaces [run] at the head of [benchmarkHistory], keyed by id.
+  void _upsertBenchmarkHistory(BenchmarkRun run) {
+    benchmarkHistory = [
+      run,
+      ...benchmarkHistory.where((item) => item.id != run.id),
+    ];
+  }
+
   Future<void> pollBenchmark() async {
     final run = benchmarkRun;
     if (run == null ||
@@ -1593,10 +1642,8 @@ class AppController extends ChangeNotifier {
     _benchmarkPollInFlight = true;
     try {
       benchmarkRun = await _engineService.getBenchmarkStatus(run.id);
-      benchmarkHistory = [
-        benchmarkRun!,
-        ...benchmarkHistory.where((item) => item.id != benchmarkRun!.id),
-      ];
+      _benchmarkPollErrorReported = false;
+      _upsertBenchmarkHistory(benchmarkRun!);
       _trackBenchmarkRun(
         benchmarkRun!,
         profileId: benchmarkRun!.config.profileId,
@@ -1610,6 +1657,21 @@ class AppController extends ChangeNotifier {
         source: 'benchmark',
       );
       notifyListeners();
+    } catch (error) {
+      // Poll runs on a 1s timer; surface the failure once rather than spamming
+      // a banner/event every tick. Reset on the next successful poll.
+      if (!_benchmarkPollErrorReported) {
+        _benchmarkPollErrorReported = true;
+        bannerMessage = 'Benchmark status polling failed: $error';
+        _addEvent(
+          level: 'ERROR',
+          category: 'Benchmark',
+          message: 'Benchmark status polling failed for ${run.id}: $error',
+          includeSelectionContext: true,
+          source: 'benchmark',
+        );
+        notifyListeners();
+      }
     } finally {
       _benchmarkPollInFlight = false;
     }
@@ -1624,28 +1686,26 @@ class AppController extends ChangeNotifier {
       status: 'pausing',
       liveLog: [...run.liveLog, 'Pause requested...'],
     );
-    benchmarkHistory = [
-      benchmarkRun!,
-      ...benchmarkHistory.where((item) => item.id != benchmarkRun!.id),
-    ];
+    _upsertBenchmarkHistory(benchmarkRun!);
     bannerMessage = 'Pausing benchmark ${run.id}...';
     notifyListeners();
     _benchmarkLifecycleActionInFlight = true;
     try {
-      await _engineService.pauseBenchmark(run.id);
-      benchmarkRun = run.copyWith(status: 'paused');
-      benchmarkHistory = [
-        benchmarkRun!,
-        ...benchmarkHistory.where((item) => item.id != benchmarkRun!.id),
-      ];
-      _addEvent(
-        level: 'INFO',
-        category: 'Benchmark',
-        message: 'Paused benchmark ${run.id}.',
-        includeSelectionContext: true,
-        source: 'benchmark',
-      );
-      notifyListeners();
+      await _guard('Benchmark', () async {
+        await _engineService.pauseBenchmark(run.id);
+        // Rebuild from the current run rather than the pre-await snapshot so a
+        // concurrent poll update is not clobbered.
+        benchmarkRun = (benchmarkRun ?? run).copyWith(status: 'paused');
+        _upsertBenchmarkHistory(benchmarkRun!);
+        _addEvent(
+          level: 'INFO',
+          category: 'Benchmark',
+          message: 'Paused benchmark ${run.id}.',
+          includeSelectionContext: true,
+          source: 'benchmark',
+        );
+        notifyListeners();
+      });
     } finally {
       _benchmarkLifecycleActionInFlight = false;
     }
@@ -1661,28 +1721,24 @@ class AppController extends ChangeNotifier {
       status: 'resuming',
       liveLog: [...run.liveLog, 'Resume requested...'],
     );
-    benchmarkHistory = [
-      benchmarkRun!,
-      ...benchmarkHistory.where((item) => item.id != benchmarkRun!.id),
-    ];
+    _upsertBenchmarkHistory(benchmarkRun!);
     bannerMessage = 'Resuming benchmark ${run.id}...';
     notifyListeners();
     _benchmarkLifecycleActionInFlight = true;
     try {
-      await _engineService.resumeBenchmark(run.id);
-      benchmarkRun = run.copyWith(status: 'running');
-      benchmarkHistory = [
-        benchmarkRun!,
-        ...benchmarkHistory.where((item) => item.id != benchmarkRun!.id),
-      ];
-      _addEvent(
-        level: 'INFO',
-        category: 'Benchmark',
-        message: 'Resumed benchmark ${run.id}.',
-        includeSelectionContext: true,
-        source: 'benchmark',
-      );
-      notifyListeners();
+      await _guard('Benchmark', () async {
+        await _engineService.resumeBenchmark(run.id);
+        benchmarkRun = (benchmarkRun ?? run).copyWith(status: 'running');
+        _upsertBenchmarkHistory(benchmarkRun!);
+        _addEvent(
+          level: 'INFO',
+          category: 'Benchmark',
+          message: 'Resumed benchmark ${run.id}.',
+          includeSelectionContext: true,
+          source: 'benchmark',
+        );
+        notifyListeners();
+      });
     } finally {
       _benchmarkLifecycleActionInFlight = false;
     }
@@ -1698,31 +1754,27 @@ class AppController extends ChangeNotifier {
       status: 'stopping',
       liveLog: [...run.liveLog, 'Stop requested...'],
     );
-    benchmarkHistory = [
-      benchmarkRun!,
-      ...benchmarkHistory.where((item) => item.id != benchmarkRun!.id),
-    ];
+    _upsertBenchmarkHistory(benchmarkRun!);
     bannerMessage = 'Stopping benchmark ${run.id}...';
     notifyListeners();
     _benchmarkLifecycleActionInFlight = true;
     try {
-      await _engineService.stopBenchmark(run.id);
-      benchmarkRun = run.copyWith(
-        status: 'stopped',
-        completedAt: DateTime.now(),
-      );
-      benchmarkHistory = [
-        benchmarkRun!,
-        ...benchmarkHistory.where((item) => item.id != benchmarkRun!.id),
-      ];
-      _addEvent(
-        level: 'INFO',
-        category: 'Benchmark',
-        message: 'Stopped benchmark ${run.id}.',
-        includeSelectionContext: true,
-        source: 'benchmark',
-      );
-      notifyListeners();
+      await _guard('Benchmark', () async {
+        await _engineService.stopBenchmark(run.id);
+        benchmarkRun = (benchmarkRun ?? run).copyWith(
+          status: 'stopped',
+          completedAt: DateTime.now(),
+        );
+        _upsertBenchmarkHistory(benchmarkRun!);
+        _addEvent(
+          level: 'INFO',
+          category: 'Benchmark',
+          message: 'Stopped benchmark ${run.id}.',
+          includeSelectionContext: true,
+          source: 'benchmark',
+        );
+        notifyListeners();
+      });
     } finally {
       _benchmarkLifecycleActionInFlight = false;
     }
@@ -2225,7 +2277,26 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
+  List<ObjectEntry>? _visibleObjectsCache;
+  List<ObjectEntry>? _visibleObjectsInputObjects;
+  String? _visibleObjectsInputFilterValue;
+  BrowserFilterMode? _visibleObjectsInputFilterMode;
+  BrowserObjectSortField? _visibleObjectsInputSortField;
+  bool? _visibleObjectsInputSortDescending;
+
+  /// Filtered + sorted view of [objects]. A single build pass reads this
+  /// getter several times, so the O(n log n) result is memoized and only
+  /// recomputed when the objects list identity or the filter/sort inputs
+  /// change.
   List<ObjectEntry> get visibleObjects {
+    if (_visibleObjectsCache != null &&
+        identical(_visibleObjectsInputObjects, objects) &&
+        _visibleObjectsInputFilterValue == objectFilterValue &&
+        _visibleObjectsInputFilterMode == objectFilterMode &&
+        _visibleObjectsInputSortField == objectSortField &&
+        _visibleObjectsInputSortDescending == objectSortDescending) {
+      return _visibleObjectsCache!;
+    }
     List<ObjectEntry> results;
     if (objectFilterMode == BrowserFilterMode.prefix ||
         objectFilterValue.trim().isEmpty) {
@@ -2244,6 +2315,12 @@ class AppController extends ChangeNotifier {
           .toList();
     }
     results.sort(_compareObjectsForDisplay);
+    _visibleObjectsCache = results;
+    _visibleObjectsInputObjects = objects;
+    _visibleObjectsInputFilterValue = objectFilterValue;
+    _visibleObjectsInputFilterMode = objectFilterMode;
+    _visibleObjectsInputSortField = objectSortField;
+    _visibleObjectsInputSortDescending = objectSortDescending;
     return results;
   }
 
@@ -2334,10 +2411,23 @@ class AppController extends ChangeNotifier {
   int get visibleDeleteMarkerCount =>
       visibleVersions.where((item) => item.deleteMarker).length;
 
+  List<EventLogEntry>? _bucketScopedEventsCache;
+  List<EventLogEntry>? _bucketScopedEventsInputLog;
+  int _bucketScopedEventsInputLogLength = -1;
+  String? _bucketScopedEventsInputProfileId;
+  String? _bucketScopedEventsInputBucketName;
+
   List<EventLogEntry> get bucketScopedEvents {
     final profileId = selectedProfile?.id;
     final bucketName = selectedBucket?.name;
-    return eventLog.where((entry) {
+    if (_bucketScopedEventsCache != null &&
+        identical(_bucketScopedEventsInputLog, eventLog) &&
+        _bucketScopedEventsInputLogLength == eventLog.length &&
+        _bucketScopedEventsInputProfileId == profileId &&
+        _bucketScopedEventsInputBucketName == bucketName) {
+      return _bucketScopedEventsCache!;
+    }
+    final results = eventLog.where((entry) {
       if (profileId != null && entry.profileId != profileId) {
         return false;
       }
@@ -2346,6 +2436,12 @@ class AppController extends ChangeNotifier {
       }
       return entry.bucketName != null;
     }).toList();
+    _bucketScopedEventsCache = results;
+    _bucketScopedEventsInputLog = eventLog;
+    _bucketScopedEventsInputLogLength = eventLog.length;
+    _bucketScopedEventsInputProfileId = profileId;
+    _bucketScopedEventsInputBucketName = bucketName;
+    return results;
   }
 
   List<BrowserTaskRecord> tasksForView(BrowserTaskView view) {
@@ -2759,6 +2855,19 @@ class AppController extends ChangeNotifier {
   Future<void> _runBusy(
       String actionKey, String busyMessage, Future<void> Function() operation,
       {bool trackTask = true}) async {
+    // Guard against the same action running twice concurrently. There is no
+    // handle to await the in-flight run, so short-circuiting is the safe UX:
+    // it avoids double execution and never clobbers the shared busy
+    // bookkeeping (_busyActions / _busyTaskIds) for this key mid-flight.
+    // Cancellation of an in-flight listing remains robust via the listing
+    // generation token, so a superseding run can never undo a cancel.
+    if (_busyActions.contains(actionKey)) {
+      _debug(
+        category: 'Action',
+        message: 'Skipped duplicate action $actionKey; already in progress.',
+      );
+      return;
+    }
     final taskId = _nextTaskId(actionKey);
     final startedAt = DateTime.now();
     final guardMarker = _guardErrorSequence;
@@ -2844,13 +2953,14 @@ class AppController extends ChangeNotifier {
     if (task == null) {
       return;
     }
+    // Keep only the most recent lines; a long-running listing can otherwise
+    // grow a task's output unbounded (mirrors how eventLog is capped).
+    final nextLines = <String>[...task.outputLines, line];
+    if (nextLines.length > _taskOutputLineLimit) {
+      nextLines.removeRange(0, nextLines.length - _taskOutputLineLimit);
+    }
     _upsertTask(
-      task.copyWith(
-        outputLines: <String>[
-          ...task.outputLines,
-          line,
-        ],
-      ),
+      task.copyWith(outputLines: nextLines),
     );
     _notifyBusyLineAppended();
   }
@@ -2858,7 +2968,14 @@ class AppController extends ChangeNotifier {
   @override
   void dispose() {
     _busyLineNotifyTimer?.cancel();
+    shutdownEngines();
     super.dispose();
+  }
+
+  /// Releases long-lived engine resources (desktop sidecar processes). Safe to
+  /// call multiple times; also invoked on desktop app-exit requests.
+  void shutdownEngines() {
+    _engineService.shutdown();
   }
 
   // Progress lines can arrive per listing page; coalesce the resulting

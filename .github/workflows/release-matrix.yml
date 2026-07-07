@@ -6,6 +6,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
 jobs:
   windows:
     strategy:
@@ -19,6 +22,11 @@ jobs:
     runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: .tmp/toolchains
+          key: toolchains-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('scripts/bootstrap.*') }}
       - name: Build Windows MSI
         shell: pwsh
         run: .\scripts\build.ps1 -Platform windows -Arch ${{ matrix.arch }} -Installer msi
@@ -47,6 +55,11 @@ jobs:
     runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: .tmp/toolchains
+          key: toolchains-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('scripts/bootstrap.*') }}
       - name: Build Linux package
         run: ./scripts/build.sh linux ${{ matrix.arch }} ${{ matrix.package }}
       - uses: actions/upload-artifact@v4
@@ -58,6 +71,11 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: .tmp/toolchains
+          key: toolchains-${{ runner.os }}-${{ hashFiles('scripts/bootstrap.*') }}
       - name: Build macOS arm64 bundle
         run: ./scripts/build.sh macos arm64
       - uses: actions/upload-artifact@v4
@@ -69,6 +87,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: .tmp/toolchains
+          key: toolchains-${{ runner.os }}-${{ hashFiles('scripts/bootstrap.*') }}
       - name: Build Android arm64 artifacts
         run: ./scripts/build.sh android arm64
       - uses: actions/upload-artifact@v4

@@ -202,7 +202,7 @@ function Enable-EmbeddedPythonSite {
 
 function Get-AppVersion {
     $PubspecPath = Join-Path $RootDir "apps\flutter_app\pubspec.yaml"
-    $Version = "2.0.17"
+    $Version = "0.0.0"
     if (Test-Path $PubspecPath) {
         $VersionMatch = Select-String -Path $PubspecPath -Pattern '^version:\s*([0-9]+\.[0-9]+\.[0-9]+)'
         if ($VersionMatch) {

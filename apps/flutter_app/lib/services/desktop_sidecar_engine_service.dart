@@ -30,9 +30,14 @@ class DesktopSidecarEngineService
   String? _cachedEngineRoot;
   final Map<String, String> _benchmarkEngines = <String, String>{};
 
+  @override
+  bool get isMock => false;
+
   /// Shuts down the long-lived sidecar engine processes owned by the host.
-  void dispose() {
+  @override
+  void shutdown() {
     _host.dispose();
+    _fallback.shutdown();
   }
 
   @override
@@ -932,18 +937,46 @@ class DesktopSidecarEngineService
 
   @override
   Future<BenchmarkRun> getBenchmarkStatus(String runId) {
-    final engineId = _benchmarkEngines[runId] ?? 'rust';
+    final engineId = _benchmarkEngines[runId];
+    if (engineId == null) {
+      throw EngineException(
+        code: ErrorCode.invalidConfig,
+        message:
+            'Unknown benchmark run "$runId". It was not started by this engine service.',
+      );
+    }
     return _sendWithFallback(
       engineId: engineId,
       method: 'getBenchmarkStatus',
       params: {'runId': runId},
       onSuccess: (json) {
         final run = _benchmarkRunFromJson(json);
-        _benchmarkEngines[run.id] = run.config.engineId;
+        // Evict once the run reaches a terminal state so the map cannot grow
+        // without bound over a long-lived session.
+        if (_isTerminalBenchmarkStatus(run.status)) {
+          _benchmarkEngines.remove(run.id);
+        } else {
+          _benchmarkEngines[run.id] = run.config.engineId;
+        }
         return run;
       },
       onFallback: () => _fallback.getBenchmarkStatus(runId),
     );
+  }
+
+  static bool _isTerminalBenchmarkStatus(String status) {
+    switch (status.toLowerCase()) {
+      case 'completed':
+      case 'complete':
+      case 'stopped':
+      case 'failed':
+      case 'error':
+      case 'cancelled':
+      case 'canceled':
+        return true;
+      default:
+        return false;
+    }
   }
 
   @override
@@ -1114,26 +1147,31 @@ class DesktopSidecarEngineService
       'method': method,
       'params': params ?? const <String, Object?>{},
     };
-    final requestHead = <String, Object?>{
-      'engine': entry.id,
-      'method': method,
-      'requestId': requestId,
-    };
-    final requestBody = _sanitizeForLogging(request['params']);
-    _log(
-      level: 'API',
-      category: 'EngineRequest',
-      message:
-          'REQUEST ${entry.id}.$method HEAD=${_stringifyForLogging(requestHead)} BODY=${_stringifyForLogging(requestBody)}',
-      source: 'api',
-      params: params,
-      requestId: requestId,
-      tracePhase: 'send',
-      engineId: entry.id,
-      method: method,
-      traceHead: requestHead,
-      traceBody: requestBody,
-    );
+    // Building sanitized trace bodies + jsonEncode is expensive; only do it
+    // when API logging is enabled (the app drops API events otherwise).
+    final apiLoggingEnabled = _diagnosticsOptions.enableApiLogging;
+    if (apiLoggingEnabled) {
+      final requestHead = <String, Object?>{
+        'engine': entry.id,
+        'method': method,
+        'requestId': requestId,
+      };
+      final requestBody = _sanitizeForLogging(request['params']);
+      _log(
+        level: 'API',
+        category: 'EngineRequest',
+        message:
+            'REQUEST ${entry.id}.$method HEAD=${_stringifyForLogging(requestHead)} BODY=${_stringifyForLogging(requestBody)}',
+        source: 'api',
+        params: params,
+        requestId: requestId,
+        tracePhase: 'send',
+        engineId: entry.id,
+        method: method,
+        traceHead: requestHead,
+        traceBody: requestBody,
+      );
+    }
     final startedAt = DateTime.now();
     final response = await _host.send(
       executablePath: _join(engineRoot, entry.executable),
@@ -1146,27 +1184,29 @@ class DesktopSidecarEngineService
     );
     final latencyMs = DateTime.now().difference(startedAt).inMilliseconds;
     _handleStructuredLogs(response.stderrOutput, params: params);
-    final responseHead = <String, Object?>{
-      'ok': response.payload['ok'],
-      'requestId': requestId,
-    };
-    final responseBody = _sanitizeForLogging(response.payload);
-    _log(
-      level: 'API',
-      category: 'EngineResponse',
-      message:
-          'RESPONSE ${entry.id}.$method HEAD=${_stringifyForLogging(responseHead)} BODY=${_stringifyForLogging(responseBody)}',
-      source: 'api',
-      params: params,
-      requestId: requestId,
-      tracePhase: 'response',
-      engineId: entry.id,
-      method: method,
-      responseStatus: _responseStatusLabel(response.payload),
-      latencyMs: latencyMs,
-      traceHead: responseHead,
-      traceBody: responseBody,
-    );
+    if (apiLoggingEnabled) {
+      final responseHead = <String, Object?>{
+        'ok': response.payload['ok'],
+        'requestId': requestId,
+      };
+      final responseBody = _sanitizeForLogging(response.payload);
+      _log(
+        level: 'API',
+        category: 'EngineResponse',
+        message:
+            'RESPONSE ${entry.id}.$method HEAD=${_stringifyForLogging(responseHead)} BODY=${_stringifyForLogging(responseBody)}',
+        source: 'api',
+        params: params,
+        requestId: requestId,
+        tracePhase: 'response',
+        engineId: entry.id,
+        method: method,
+        responseStatus: _responseStatusLabel(response.payload),
+        latencyMs: latencyMs,
+        traceHead: responseHead,
+        traceBody: responseBody,
+      );
+    }
 
     final payload = response.payload;
     final ok = payload['ok'] as bool? ?? false;
@@ -2000,7 +2040,7 @@ class _EngineManifestEntry {
   factory _EngineManifestEntry.fromJson(Map<String, Object?> json) {
     return _EngineManifestEntry(
       id: json['id'] as String? ?? '',
-      version: json['version'] as String? ?? '2.0.17',
+      version: json['version'] as String? ?? '2.2.2',
       executable: json['executable'] as String? ?? '',
       arguments: (json['arguments'] as List<Object?>? ?? const [])
           .map((item) => item.toString())

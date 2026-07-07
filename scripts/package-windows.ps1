@@ -180,7 +180,7 @@ if ($null -eq $WixCli -and ($null -eq $Candle -or $null -eq $Light)) {
     throw "Neither WiX v4 CLI nor WiX v3 candle/light were found after bootstrap."
 }
 
-$Version = "2.0.10"
+$Version = "0.0.0"
 $PubspecPath = Join-Path $FlutterDir "pubspec.yaml"
 if (Test-Path $PubspecPath) {
     $VersionMatch = Select-String -Path $PubspecPath -Pattern '^version:\s*([0-9]+\.[0-9]+\.[0-9]+)'

@@ -36,6 +36,8 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
+const ENGINE_VERSION: &str = "2.2.2";
+
 const SUPPORTED_METHODS: &[&str] = &[
     "health",
     "getCapabilities",
@@ -199,14 +201,17 @@ fn main() {
         let response = match serde_json::from_str::<Request>(trimmed) {
             Ok(request) => {
                 let request_id = request.request_id.clone();
-                match runtime.block_on(handle_request(request)) {
-                    Ok(result) => Response {
+                let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.block_on(handle_request(request))
+                }));
+                match panic_result {
+                    Ok(Ok(result)) => Response {
                         request_id: request_id.clone(),
                         ok: true,
                         result: Some(result),
                         error: None,
                     },
-                    Err(error) => Response {
+                    Ok(Err(error)) => Response {
                         request_id,
                         ok: false,
                         result: None,
@@ -216,6 +221,25 @@ fn main() {
                             "details": error.details,
                         })),
                     },
+                    Err(panic_payload) => {
+                        let message = panic_payload_message(&panic_payload);
+                        emit_structured_log(
+                            "ERROR",
+                            "PanicRecovery",
+                            format!("Request handler panicked: {message}"),
+                            "sidecar",
+                        );
+                        Response {
+                            request_id,
+                            ok: false,
+                            result: None,
+                            error: Some(json!({
+                                "code": "internal_error",
+                                "message": message,
+                                "details": Value::Object(Map::new()),
+                            })),
+                        }
+                    }
                 }
             }
             Err(_) => continue,
@@ -227,14 +251,25 @@ fn main() {
     }
 }
 
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "Request handler panicked with a non-string payload.".to_string()
+    }
+}
+
 async fn handle_request(request: Request) -> SidecarResult {
     match request.method.as_str() {
         "health" => Ok(json!({
             "engine": "rust",
-            "version": "2.1.0",
+            "version": ENGINE_VERSION,
             "available": true,
             "methods": SUPPORTED_METHODS,
             "nativeSdk": "aws-sdk-rust",
+            "endpointTypes": ["s3Compatible", "awsS3"],
         })),
         "getCapabilities" => Ok(json!({
             "items": [

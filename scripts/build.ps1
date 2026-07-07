@@ -296,7 +296,7 @@ $BuildLog = Join-Path $LogDir "flutter-build-$Platform-$Arch.log"
 
 function Get-AppVersion {
     $PubspecPath = Join-Path $FlutterDir "pubspec.yaml"
-    $Version = "2.0.10"
+    $Version = "0.0.0"
     if (Test-Path $PubspecPath) {
         $VersionMatch = Select-String -Path $PubspecPath -Pattern '^version:\s*([0-9]+\.[0-9]+\.[0-9]+)'
         if ($VersionMatch) {

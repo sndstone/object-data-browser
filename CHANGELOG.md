@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.2.2 - 2026-07-07
+
+### Fixed: release version metadata
+- Updated the in-app version details, engine version fallbacks, and bundled engine catalog so the Settings version panel matches the packaged release.
+- Bumped all engine-reported versions to 2.2.2 for this release.
+
 ## 2.2.1 - 2026-07-03
 
 ### Fixed: bucket and object context menus

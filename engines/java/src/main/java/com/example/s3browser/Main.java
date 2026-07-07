@@ -110,14 +110,21 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class Main {
+    private static final String ENGINE_VERSION = "2.2.2";
+    private static final int REQUEST_POOL_SIZE = 8;
+    private static final int DELETE_BATCH_LIMIT = 1000;
+    private static final Object STDOUT_LOCK = new Object();
+    private static final ConcurrentHashMap<String, JobControl> TRANSFER_REGISTRY = new ConcurrentHashMap<>();
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final DateTimeFormatter ISO = DateTimeFormatter.ISO_OFFSET_DATE_TIME.withZone(ZoneOffset.UTC);
     private static final TrustManager[] TRUST_ALL_MANAGERS = new TrustManager[] {
@@ -199,40 +206,88 @@ public final class Main {
 
     public static void main(String[] args) throws Exception {
         var reader = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+        ExecutorService requestPool = Executors.newFixedThreadPool(REQUEST_POOL_SIZE);
         String line;
-        while ((line = reader.readLine()) != null) {
-            line = line.trim();
-            if (line.isEmpty()) {
-                continue;
+        try {
+            // Read requests on the main thread and dispatch each to a bounded worker pool so the
+            // engine stays responsive to control requests (pause/resume/cancel) while long-running
+            // transfers execute. All stdout writes are serialized through writeLine, and the desktop
+            // host correlates responses by requestId, so out-of-order responses are expected.
+            while ((line = reader.readLine()) != null) {
+                final String request = line.trim();
+                if (request.isEmpty()) {
+                    continue;
+                }
+                if (isControlPlaneRequest(request)) {
+                    // Handle control requests (pause/resume/cancel) synchronously on the reader
+                    // thread. They only mutate the in-memory registry and must never queue behind a
+                    // saturated worker pool -- in particular a paused transfer holds its worker thread
+                    // blocked, so routing control here guarantees a resume/cancel can always land.
+                    processRequest(request);
+                } else {
+                    requestPool.submit(() -> processRequest(request));
+                }
             }
-
-            String requestId = null;
-            try {
-                JsonNode payload = MAPPER.readTree(line);
-                requestId = text(payload, "requestId");
-                Map<String, Object> result = handleRequest(payload);
-                writeResponse(orderedMap(
-                    "requestId", requestId,
-                    "ok", true,
-                    "result", result
-                ));
-            } catch (Exception error) {
-                SidecarException mapped = mapException(error);
-                writeResponse(orderedMap(
-                    "requestId", requestId,
-                    "ok", false,
-                    "error", orderedMap(
-                        "code", mapped.code,
-                        "message", mapped.message,
-                        "details", mapped.details
-                    )
-                ));
+        } finally {
+            requestPool.shutdown();
+            if (!requestPool.awaitTermination(60, TimeUnit.SECONDS)) {
+                requestPool.shutdownNow();
             }
         }
     }
 
-    private static void writeResponse(Map<String, Object> response) throws IOException {
-        System.out.println(MAPPER.writeValueAsString(response));
+    private static boolean isControlPlaneRequest(String line) {
+        try {
+            String method = text(MAPPER.readTree(line), "method");
+            return "pauseTransfer".equals(method)
+                || "resumeTransfer".equals(method)
+                || "cancelTransfer".equals(method)
+                || "cancelToolExecution".equals(method);
+        } catch (IOException error) {
+            // Malformed JSON: let the worker path parse it and emit the proper error response.
+            return false;
+        }
+    }
+
+    private static void processRequest(String line) {
+        String requestId = null;
+        try {
+            JsonNode payload = MAPPER.readTree(line);
+            requestId = text(payload, "requestId");
+            Map<String, Object> result = handleRequest(payload);
+            writeResponse(orderedMap(
+                "requestId", requestId,
+                "ok", true,
+                "result", result
+            ));
+        } catch (Exception error) {
+            SidecarException mapped = mapException(error);
+            writeResponse(orderedMap(
+                "requestId", requestId,
+                "ok", false,
+                "error", orderedMap(
+                    "code", mapped.code,
+                    "message", mapped.message,
+                    "details", mapped.details
+                )
+            ));
+        }
+    }
+
+    private static void writeLine(String json) {
+        synchronized (STDOUT_LOCK) {
+            System.out.println(json);
+            System.out.flush();
+        }
+    }
+
+    private static void writeResponse(Map<String, Object> response) {
+        try {
+            writeLine(MAPPER.writeValueAsString(response));
+        } catch (IOException error) {
+            emitStructuredLog("ERROR", "Transport",
+                "Failed to serialize response: " + error.getMessage(), "engine");
+        }
     }
 
     private static Map<String, Object> handleRequest(JsonNode payload) throws Exception {
@@ -290,7 +345,7 @@ public final class Main {
     private static Map<String, Object> health() {
         return orderedMap(
             "engine", "java",
-            "version", "2.1.0",
+            "version", ENGINE_VERSION,
             "available", true,
             "methods", SUPPORTED_METHODS,
             "nativeSdk", "aws-sdk-java-v2"
@@ -675,7 +730,7 @@ public final class Main {
         }
     }
 
-    private static Map<String, Object> listObjectVersions(JsonNode params) {
+    private static Map<String, Object> listObjectVersions(JsonNode params) throws IOException {
         BucketContext context = bucketContext(params);
         String key = params.path("key").asText("");
         String filterValue = params.path("options").path("filterValue").asText("");
@@ -683,12 +738,34 @@ public final class Main {
         String effectivePrefix = key.isBlank()
             ? ("prefix".equals(filterMode) ? filterValue : "")
             : key;
+        // Decode the incoming cursor. listObjectVersions paginates on two markers (key + versionId),
+        // so the opaque cursor value carries both encoded as JSON. Mirrors listObjects' cursor shape
+        // of {value, hasMore}, but the value is a compound token rather than a single string.
+        String cursorValue = params.path("cursor").path("value").asText("");
+        String keyMarker = null;
+        String versionIdMarker = null;
+        if (!cursorValue.isBlank()) {
+            try {
+                JsonNode marker = MAPPER.readTree(cursorValue);
+                keyMarker = blankToNull(marker.path("keyMarker").asText(""));
+                versionIdMarker = blankToNull(marker.path("versionIdMarker").asText(""));
+            } catch (IOException ignored) {
+                // Tolerate a legacy/plain cursor value by treating it as a bare key marker.
+                keyMarker = cursorValue;
+            }
+        }
         try (S3Client client = context.client()) {
-            var output = client.listObjectVersions(ListObjectVersionsRequest.builder()
+            ListObjectVersionsRequest.Builder request = ListObjectVersionsRequest.builder()
                 .bucket(context.bucketName())
                 .prefix(effectivePrefix)
-                .maxKeys(1000)
-                .build());
+                .maxKeys(1000);
+            if (keyMarker != null) {
+                request.keyMarker(keyMarker);
+            }
+            if (versionIdMarker != null) {
+                request.versionIdMarker(versionIdMarker);
+            }
+            var output = client.listObjectVersions(request.build());
             List<Map<String, Object>> items = new ArrayList<>();
             for (ObjectVersion version : output.versions()) {
                 if (!key.isBlank() && !Objects.equals(version.key(), key)) {
@@ -720,9 +797,16 @@ public final class Main {
             }
             items.sort((left, right) -> String.valueOf(right.get("modifiedAt")).compareTo(String.valueOf(left.get("modifiedAt"))));
             long deleteMarkerCount = items.stream().filter(item -> Boolean.TRUE.equals(item.get("deleteMarker"))).count();
+            String nextCursorValue = null;
+            if (output.isTruncated()) {
+                nextCursorValue = MAPPER.writeValueAsString(orderedMap(
+                    "keyMarker", output.nextKeyMarker(),
+                    "versionIdMarker", output.nextVersionIdMarker()
+                ));
+            }
             return orderedMap(
                 "items", items,
-                "cursor", orderedMap("value", null, "hasMore", false),
+                "cursor", orderedMap("value", nextCursorValue, "hasMore", output.isTruncated()),
                 "totalCount", items.size(),
                 "versionCount", items.size() - (int) deleteMarkerCount,
                 "deleteMarkerCount", (int) deleteMarkerCount
@@ -837,24 +921,49 @@ public final class Main {
         if (keys.isEmpty()) {
             throw new SidecarException("invalid_config", "Bucket name and keys are required.");
         }
+        int successCount = 0;
+        int failureCount = 0;
+        List<Map<String, Object>> failures = new ArrayList<>();
         try (S3Client client = context.client()) {
-            var output = client.deleteObjects(DeleteObjectsRequest.builder()
-                .bucket(context.bucketName())
-                .delete(Delete.builder()
-                    .objects(keys.stream().map(key -> ObjectIdentifier.builder().key(key).build()).toList())
-                    .quiet(false)
-                    .build())
-                .build());
-            return orderedMap(
-                "successCount", output.deleted().size(),
-                "failureCount", output.errors().size(),
-                "failures", output.errors().stream().map(error -> orderedMap(
-                    "target", error.key(),
-                    "code", blankToDefault(error.code(), "unknown"),
-                    "message", blankToDefault(error.message(), "Unknown delete error.")
-                )).toList()
-            );
+            // S3 DeleteObjects accepts at most 1000 keys per request; chunk larger requests and
+            // aggregate results so callers can delete arbitrarily large selections in one call.
+            for (int offset = 0; offset < keys.size(); offset += DELETE_BATCH_LIMIT) {
+                List<String> batch = keys.subList(offset, Math.min(offset + DELETE_BATCH_LIMIT, keys.size()));
+                try {
+                    var output = client.deleteObjects(DeleteObjectsRequest.builder()
+                        .bucket(context.bucketName())
+                        .delete(Delete.builder()
+                            .objects(batch.stream().map(key -> ObjectIdentifier.builder().key(key).build()).toList())
+                            .quiet(false)
+                            .build())
+                        .build());
+                    successCount += output.deleted().size();
+                    failureCount += output.errors().size();
+                    output.errors().forEach(error -> failures.add(orderedMap(
+                        "target", error.key(),
+                        "code", blankToDefault(error.code(), "unknown"),
+                        "message", blankToDefault(error.message(), "Unknown delete error.")
+                    )));
+                } catch (Exception batchError) {
+                    // A batch-level failure (e.g. network/auth) must not fail the whole call: record
+                    // each key in the failed batch as an individual failure entry instead.
+                    SidecarException mapped = mapException(batchError);
+                    failureCount += batch.size();
+                    for (String key : batch) {
+                        failures.add(orderedMap(
+                            "target", key,
+                            "code", mapped.code,
+                            "message", mapped.message
+                        ));
+                    }
+                }
+            }
         }
+        return orderedMap(
+            "successCount", successCount,
+            "failureCount", failureCount,
+            "failures", failures
+        );
     }
 
     private static Map<String, Object> deleteObjectVersions(JsonNode params) {
@@ -868,22 +977,48 @@ public final class Main {
             .key(text(item, "key"))
             .versionId(blankToNull(text(item, "versionId")))
             .build()));
+        int successCount = 0;
+        int failureCount = 0;
+        List<Map<String, Object>> failures = new ArrayList<>();
         try (S3Client client = context.client()) {
-            var output = client.deleteObjects(DeleteObjectsRequest.builder()
-                .bucket(context.bucketName())
-                .delete(Delete.builder().objects(identifiers).quiet(false).build())
-                .build());
-            return orderedMap(
-                "successCount", output.deleted().size(),
-                "failureCount", output.errors().size(),
-                "failures", output.errors().stream().map(error -> orderedMap(
-                    "target", error.key(),
-                    "versionId", blankToNull(error.versionId()),
-                    "code", blankToDefault(error.code(), "unknown"),
-                    "message", blankToDefault(error.message(), "Unknown delete error.")
-                )).toList()
-            );
+            // S3 DeleteObjects accepts at most 1000 versions per request; chunk and aggregate.
+            for (int offset = 0; offset < identifiers.size(); offset += DELETE_BATCH_LIMIT) {
+                List<ObjectIdentifier> batch =
+                    identifiers.subList(offset, Math.min(offset + DELETE_BATCH_LIMIT, identifiers.size()));
+                try {
+                    var output = client.deleteObjects(DeleteObjectsRequest.builder()
+                        .bucket(context.bucketName())
+                        .delete(Delete.builder().objects(batch).quiet(false).build())
+                        .build());
+                    successCount += output.deleted().size();
+                    failureCount += output.errors().size();
+                    output.errors().forEach(error -> failures.add(orderedMap(
+                        "target", error.key(),
+                        "versionId", blankToNull(error.versionId()),
+                        "code", blankToDefault(error.code(), "unknown"),
+                        "message", blankToDefault(error.message(), "Unknown delete error.")
+                    )));
+                } catch (Exception batchError) {
+                    // Convert a batch-level failure into per-version failure entries rather than
+                    // failing the entire call.
+                    SidecarException mapped = mapException(batchError);
+                    failureCount += batch.size();
+                    for (ObjectIdentifier identifier : batch) {
+                        failures.add(orderedMap(
+                            "target", identifier.key(),
+                            "versionId", identifier.versionId(),
+                            "code", mapped.code,
+                            "message", mapped.message
+                        ));
+                    }
+                }
+            }
         }
+        return orderedMap(
+            "successCount", successCount,
+            "failureCount", failureCount,
+            "failures", failures
+        );
     }
 
     private static Map<String, Object> startUpload(JsonNode params) throws IOException {
@@ -926,6 +1061,8 @@ public final class Main {
         Integer partSizeBytes = partsTotal > 0 ? multipartChunkBytes : null;
         Integer partCount = partsTotal > 0 ? partsTotal : null;
         String jobId = "upload-" + UUID.randomUUID().toString().substring(0, 8);
+        JobControl control = new JobControl();
+        TRANSFER_REGISTRY.put(jobId, control);
         String label = "Upload " + filePaths.size() + " file(s) to " + context.bucketName();
         String strategyLabel = transferStrategyLabel("upload", usesMultipart);
         List<String> outputLines = new ArrayList<>(List.of(
@@ -956,9 +1093,15 @@ public final class Main {
             true,
             List.copyOf(outputLines)
         ));
+        boolean cancelled = false;
         ExecutorService executor = Executors.newFixedThreadPool(transferPoolSize(context.profile()));
         try (S3Client client = context.client()) {
+            uploadLoop:
             for (Path path : paths) {
+                if (!control.awaitRunnable()) {
+                    cancelled = true;
+                    break;
+                }
                 long fileSize = Files.size(path);
                 String targetName = objectKeyByPath.getOrDefault(
                     path.toString(),
@@ -981,6 +1124,9 @@ public final class Main {
                             final long partOffset = (long) index * multipartChunkBytes;
                             final int partLength = (int) Math.min(multipartChunkBytes, fileSize - partOffset);
                             futures.add(executor.submit(() -> {
+                                if (!control.awaitRunnable()) {
+                                    throw new TransferCancelledException();
+                                }
                                 byte[] chunk = readChunk(channel, partOffset, partLength);
                                 var partResult = client.uploadPart(
                                     UploadPartRequest.builder()
@@ -1042,6 +1188,10 @@ public final class Main {
                                     .build());
                             } catch (RuntimeException ignored) {
                             }
+                            if (isTransferCancellation(error)) {
+                                cancelled = true;
+                                break uploadLoop;
+                            }
                             if (error instanceof InterruptedException) {
                                 Thread.currentThread().interrupt();
                                 throw new RuntimeException(error);
@@ -1098,6 +1248,31 @@ public final class Main {
             throw error;
         } finally {
             executor.shutdownNow();
+            TRANSFER_REGISTRY.remove(jobId);
+        }
+        if (cancelled) {
+            outputLines.add("Upload cancelled after " + itemsCompleted.get() + " of "
+                + filePaths.size() + " file(s).");
+            return transferJob(
+                jobId,
+                label,
+                "upload",
+                progressFraction(bytesTransferred.get(), totalBytes),
+                "cancelled",
+                bytesTransferred.get(),
+                totalBytes,
+                strategyLabel,
+                paths.getLast().getFileName().toString(),
+                filePaths.size(),
+                itemsCompleted.get(),
+                partSizeBytes,
+                partCount == null ? null : partsCompleted.get(),
+                partCount,
+                false,
+                false,
+                false,
+                outputLines
+            );
         }
         outputLines.add("Uploaded " + filePaths.size() + " file(s) into " + context.bucketName() + ".");
         return transferJob(
@@ -1174,6 +1349,8 @@ public final class Main {
         long multipartThresholdBytes = multipartThresholdMiB * 1024L * 1024L;
         int multipartChunkBytes = multipartChunkMiB * 1024 * 1024;
         String jobId = "download-" + UUID.randomUUID().toString().substring(0, 8);
+        JobControl control = new JobControl();
+        TRANSFER_REGISTRY.put(jobId, control);
         String label = "Download " + keys.size() + " object(s) from " + context.bucketName();
         List<String> outputLines = new ArrayList<>(List.of(
             "Queued " + keys.size() + " object(s) for download to " + destinationPath + "."
@@ -1227,7 +1404,13 @@ public final class Main {
                 true,
                 List.copyOf(outputLines)
             ));
+            boolean cancelled = false;
+            downloadLoop:
             for (String key : keys) {
+                if (!control.awaitRunnable()) {
+                    cancelled = true;
+                    break;
+                }
                 long size = sizes.getOrDefault(key, 0L);
                 Path target = destination.resolve(Path.of(key).getFileName());
                 synchronized (progressLock) {
@@ -1242,6 +1425,9 @@ public final class Main {
                             final long rangeStart = start;
                             final long rangeEnd = Math.min(start + multipartChunkBytes - 1L, size - 1L);
                             futures.add(executor.submit(() -> {
+                                if (!control.awaitRunnable()) {
+                                    throw new TransferCancelledException();
+                                }
                                 byte[] bytes;
                                 try (ResponseInputStream<?> stream = client.getObject(GetObjectRequest.builder()
                                     .bucket(context.bucketName())
@@ -1300,6 +1486,10 @@ public final class Main {
                             }
                         } catch (InterruptedException | ExecutionException error) {
                             futures.forEach(future -> future.cancel(true));
+                            if (isTransferCancellation(error)) {
+                                cancelled = true;
+                                break downloadLoop;
+                            }
                             if (error instanceof InterruptedException) {
                                 Thread.currentThread().interrupt();
                                 throw new RuntimeException(error);
@@ -1316,6 +1506,10 @@ public final class Main {
                         byte[] buffer = new byte[Math.min(multipartChunkBytes, 1024 * 1024)];
                         int read;
                         while ((read = stream.read(buffer)) != -1) {
+                            if (!control.awaitRunnable()) {
+                                cancelled = true;
+                                break;
+                            }
                             outputStream.write(buffer, 0, read);
                             long transferredNow = bytesTransferred.addAndGet(read);
                             synchronized (progressLock) {
@@ -1343,10 +1537,37 @@ public final class Main {
                         }
                     }
                 }
+                if (cancelled) {
+                    break;
+                }
                 itemsCompleted.incrementAndGet();
                 synchronized (progressLock) {
                     outputLines.add("Finished downloading " + key + ".");
                 }
+            }
+            if (cancelled) {
+                outputLines.add("Download cancelled after " + itemsCompleted.get() + " of "
+                    + keys.size() + " object(s).");
+                return transferJob(
+                    jobId,
+                    label,
+                    "download",
+                    progressFraction(bytesTransferred.get(), totalBytes),
+                    "cancelled",
+                    bytesTransferred.get(),
+                    totalBytes,
+                    strategyLabel,
+                    keys.getLast(),
+                    keys.size(),
+                    itemsCompleted.get(),
+                    partSizeBytes,
+                    partCount == null ? null : partsCompleted.get(),
+                    partCount,
+                    false,
+                    false,
+                    false,
+                    outputLines
+                );
             }
             outputLines.add("Downloaded " + keys.size() + " object(s) into " + destinationPath + ".");
             return transferJob(
@@ -1371,17 +1592,38 @@ public final class Main {
             );
         } finally {
             executor.shutdownNow();
+            TRANSFER_REGISTRY.remove(jobId);
         }
     }
 
     private static Map<String, Object> transferControl(JsonNode params, String action) {
-        String jobId = blankToDefault(text(params, "jobId"), "transfer-" + UUID.randomUUID().toString().substring(0, 8));
+        String jobId = text(params, "jobId").trim();
+        if (jobId.isBlank()) {
+            throw new SidecarException("invalid_config", "A transfer job ID is required.");
+        }
+        JobControl control = TRANSFER_REGISTRY.get(jobId);
+        if (control == null) {
+            // The transfer has already finished or was never registered; do not fabricate success.
+            throw new SidecarException(
+                "invalid_config",
+                "Transfer " + jobId + " is not active; it may have already completed or been cancelled."
+            );
+        }
+        switch (action) {
+            case "paused" -> control.pause();
+            case "running" -> control.resume();
+            case "cancelled" -> control.cancel();
+            default -> throw new SidecarException("invalid_config", "Unknown transfer action: " + action + ".");
+        }
+        String status = control.status();
+        boolean cancelled = "cancelled".equals(status);
+        boolean paused = "paused".equals(status);
         return transferJob(
             jobId,
-            "Transfer " + action,
+            "Transfer " + status,
             "transfer",
-            "cancelled".equals(action) ? 1.0 : 0.0,
-            action,
+            cancelled ? 1.0 : 0.0,
+            status,
             0,
             0,
             "",
@@ -1391,10 +1633,10 @@ public final class Main {
             null,
             null,
             null,
-            false,
-            false,
-            false,
-            List.of("Transfer " + action + ".")
+            !paused && !cancelled,
+            paused,
+            !cancelled,
+            List.of("Transfer " + status + ".")
         );
     }
 
@@ -1663,14 +1905,20 @@ public final class Main {
 
     private static Map<String, Object> cancelToolExecution(JsonNode params) {
         String jobId = text(params, "jobId");
+        // The maintenance tools (put-testdata, delete-all) run synchronously within a single request
+        // and only return their jobId once finished, so the host never holds a live handle to cancel
+        // mid-run. There is genuinely nothing addressable to cancel here; report that honestly rather
+        // than fabricating a successful cancellation.
         return orderedMap(
             "label", blankToDefault(jobId, "tool"),
             "running", false,
-            "lastStatus", "Cancelled tool execution " + jobId + ".",
+            "lastStatus", "Tool executions run synchronously and cannot be cancelled once started.",
             "jobId", jobId,
             "cancellable", false,
-            "outputLines", List.of("Tool execution " + jobId + " cancelled."),
-            "exitCode", 130
+            "outputLines", List.of(
+                "No cancellable tool execution is registered for " + blankToDefault(jobId, "(none)") + "."
+            ),
+            "exitCode", 0
         );
     }
 
@@ -1811,6 +2059,10 @@ public final class Main {
             .maxConnections(profile.maxPoolConnections);
         if (!profile.verifyTls) {
             httpClient.tlsTrustManagersProvider(() -> TRUST_ALL_MANAGERS);
+            emitStructuredLog("WARN", "Security",
+                "TLS certificate verification is DISABLED for endpoint " + profile.endpointUrl
+                    + "; server certificates are not validated.",
+                "engine");
         }
         ClientOverrideConfiguration overrides = ClientOverrideConfiguration.builder()
             .retryPolicy(RetryPolicy.builder().numRetries(Math.max(profile.maxAttempts - 1, 0)).build())
@@ -2141,11 +2393,10 @@ public final class Main {
 
     private static void emitTransferEvent(Map<String, Object> job) {
         try {
-            System.out.println(MAPPER.writeValueAsString(orderedMap(
+            writeLine(MAPPER.writeValueAsString(orderedMap(
                 "event", "transferProgress",
                 "job", job
             )));
-            System.out.flush();
         } catch (IOException ignored) {
         }
     }
@@ -3058,6 +3309,78 @@ public final class Main {
     }
 
     private record BucketContext(Profile profile, String bucketName, S3Client client) {
+    }
+
+    /**
+     * Thread-safe control handle for an in-flight transfer. Registered in TRANSFER_REGISTRY while a
+     * transfer runs so that pause/resume/cancel requests arriving on other worker threads can steer
+     * it. Transfer worker threads call {@link #awaitRunnable()} at each part/file boundary.
+     */
+    private static final class JobControl {
+        private volatile String status = "running"; // running | paused | cancelled
+        private final Object monitor = new Object();
+
+        void pause() {
+            synchronized (monitor) {
+                if (!"cancelled".equals(status)) {
+                    status = "paused";
+                }
+            }
+        }
+
+        void resume() {
+            synchronized (monitor) {
+                if ("paused".equals(status)) {
+                    status = "running";
+                    monitor.notifyAll();
+                }
+            }
+        }
+
+        void cancel() {
+            synchronized (monitor) {
+                status = "cancelled";
+                monitor.notifyAll();
+            }
+        }
+
+        String status() {
+            return status;
+        }
+
+        /**
+         * Blocks the calling worker while the transfer is paused.
+         *
+         * @return true if the transfer should continue, false if it has been cancelled.
+         */
+        boolean awaitRunnable() {
+            synchronized (monitor) {
+                while ("paused".equals(status)) {
+                    try {
+                        monitor.wait();
+                    } catch (InterruptedException error) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                }
+                return !"cancelled".equals(status);
+            }
+        }
+    }
+
+    private static final class TransferCancelledException extends RuntimeException {
+        private TransferCancelledException() {
+            super("Transfer cancelled by request.");
+        }
+    }
+
+    private static boolean isTransferCancellation(Throwable error) {
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            if (cause instanceof TransferCancelledException) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static final class SidecarException extends RuntimeException {

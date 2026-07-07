@@ -266,26 +266,42 @@ EOF
   chmod +x "$java_dest/run-java-engine.sh"
 }
 
+get_app_version() {
+  local pubspec_path="$ROOT_DIR/apps/flutter_app/pubspec.yaml"
+  local version="0.0.0"
+  if [[ -f "$pubspec_path" ]]; then
+    local match
+    match="$(sed -n 's/^version:[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' "$pubspec_path" | head -n 1)"
+    if [[ -n "$match" ]]; then
+      version="$match"
+    fi
+  fi
+  printf '%s\n' "$version"
+}
+
 write_manifest() {
   local manifest_path="$STAGE_ROOT/manifest.json"
   local manifest_python="$TOOLS_DIR/python/bin/python3"
   if [[ ! -x "$manifest_python" ]]; then
     manifest_python="$(command -v python3)"
   fi
-  "$manifest_python" - "$manifest_path" "$ARCH" <<'PY'
+  local app_version
+  app_version="$(get_app_version)"
+  "$manifest_python" - "$manifest_path" "$ARCH" "$app_version" <<'PY'
 import json
 import sys
 
 manifest_path = sys.argv[1]
 arch = sys.argv[2]
+app_version = sys.argv[3]
 manifest = {
-    "version": "2.0.17",
+    "version": app_version,
     "architecture": arch,
     "generatedAt": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
     "engines": [
         {
             "id": "python",
-            "version": "2.0.17",
+            "version": app_version,
             "executable": "python/run-python-engine.sh",
             "arguments": [],
             "workingDirectory": "python",
@@ -296,7 +312,7 @@ manifest = {
         },
         {
             "id": "go",
-            "version": "2.0.17",
+            "version": app_version,
             "executable": "go/s3-browser-go-engine",
             "arguments": [],
             "workingDirectory": "go",
@@ -306,7 +322,7 @@ manifest = {
         },
         {
             "id": "rust",
-            "version": "2.0.17",
+            "version": app_version,
             "executable": "rust/s3-browser-rust-engine",
             "arguments": [],
             "workingDirectory": "rust",
@@ -316,7 +332,7 @@ manifest = {
         },
         {
             "id": "java",
-            "version": "2.0.17",
+            "version": app_version,
             "executable": "java/run-java-engine.sh",
             "arguments": [],
             "workingDirectory": "java",
