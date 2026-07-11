@@ -118,8 +118,11 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
           ),
           child: LayoutBuilder(
             builder: (context, constraints) {
-              final phone = Breakpoints.isPhone(constraints.maxWidth);
-              final compact = !Breakpoints.isDesktop(constraints.maxWidth);
+              final sizeClass = Breakpoints.sizeClass(constraints.maxWidth);
+              final phone = sizeClass == WindowSizeClass.phone;
+              final tablet = sizeClass == WindowSizeClass.tablet;
+              final compact = phone || tablet;
+              final compactRail = sizeClass == WindowSizeClass.smallDesktop;
               final navTabs = _visibleNavTabs();
               final activeTab = navTabs.contains(controller.activeTab)
                   ? controller.activeTab
@@ -163,8 +166,19 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
               );
 
               return Scaffold(
-                bottomNavigationBar:
-                    phone ? _buildBottomNav(controller, navTabs) : null,
+                bottomNavigationBar: AnimatedSwitcher(
+                  duration: controller.settings.enableAnimations
+                      ? const Duration(milliseconds: 220)
+                      : Duration.zero,
+                  child: phone
+                      ? KeyedSubtree(
+                          key: const ValueKey('phone-navigation'),
+                          child: _buildBottomNav(controller, navTabs),
+                        )
+                      : const SizedBox.shrink(
+                          key: ValueKey('no-phone-navigation'),
+                        ),
+                ),
                 body: ColoredBox(
                   color: controller.settings.darkMode
                       ? AppTheme.darkRail
@@ -174,8 +188,24 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
                       children: [
                         Row(
                           children: [
-                            if (!compact)
-                              _buildRail(context, controller, navTabs),
+                            AnimatedContainer(
+                              key: const ValueKey('workspace-navigation-rail'),
+                              duration: controller.settings.enableAnimations
+                                  ? const Duration(milliseconds: 220)
+                                  : Duration.zero,
+                              curve: Curves.easeOutCubic,
+                              width: compact ? 0 : (compactRail ? 72 : 126),
+                              child: ClipRect(
+                                child: compact
+                                    ? const SizedBox.shrink()
+                                    : _buildRail(
+                                        context,
+                                        controller,
+                                        navTabs,
+                                        collapsed: compactRail,
+                                      ),
+                              ),
+                            ),
                             Expanded(
                               child: Container(
                                 decoration: BoxDecoration(
@@ -191,11 +221,56 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
                                   children: [
                                     _AppHeader(
                                       controller: controller,
-                                      compact: compact,
+                                      compact: compact || compactRail,
                                       phone: phone,
                                     ),
-                                    if (compact && !phone)
-                                      _buildTopTabs(controller, navTabs),
+                                    AnimatedSize(
+                                      duration: controller
+                                              .settings.enableAnimations
+                                          ? const Duration(milliseconds: 220)
+                                          : Duration.zero,
+                                      curve: Curves.easeOutCubic,
+                                      child: AnimatedSwitcher(
+                                        duration: controller
+                                                .settings.enableAnimations
+                                            ? const Duration(milliseconds: 220)
+                                            : Duration.zero,
+                                        switchInCurve: Curves.easeOutCubic,
+                                        switchOutCurve: Curves.easeInCubic,
+                                        transitionBuilder: (child, animation) {
+                                          final curved = CurvedAnimation(
+                                            parent: animation,
+                                            curve: Curves.easeOutCubic,
+                                            reverseCurve: Curves.easeInCubic,
+                                          );
+                                          return FadeTransition(
+                                            opacity: curved,
+                                            child: SlideTransition(
+                                              position: Tween<Offset>(
+                                                begin: const Offset(-0.06, 0),
+                                                end: Offset.zero,
+                                              ).animate(curved),
+                                              child: child,
+                                            ),
+                                          );
+                                        },
+                                        child: tablet
+                                            ? KeyedSubtree(
+                                                key: const ValueKey(
+                                                  'tablet-navigation',
+                                                ),
+                                                child: _buildTopTabs(
+                                                  controller,
+                                                  navTabs,
+                                                ),
+                                              )
+                                            : const SizedBox.shrink(
+                                                key: ValueKey(
+                                                  'no-tablet-navigation',
+                                                ),
+                                              ),
+                                      ),
+                                    ),
                                     Expanded(child: body),
                                   ],
                                 ),
@@ -224,12 +299,13 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
   Widget _buildRail(
     BuildContext context,
     AppController controller,
-    List<WorkspaceTab> navTabs,
-  ) {
+    List<WorkspaceTab> navTabs, {
+    required bool collapsed,
+  }) {
     final theme = Theme.of(context);
     return Container(
-      width: 126,
-      padding: const EdgeInsets.fromLTRB(10, 18, 10, 12),
+      padding:
+          EdgeInsets.fromLTRB(collapsed ? 8 : 10, 18, collapsed ? 8 : 10, 12),
       color: controller.settings.darkMode
           ? AppTheme.darkRail
           : theme.colorScheme.inverseSurface,
@@ -262,6 +338,7 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
               icon: _tabIcon(tab, selected: false),
               selectedIcon: _tabIcon(tab, selected: true),
               label: _tabLabel(tab),
+              collapsed: collapsed,
               onTap: () => controller.selectTab(tab),
             ),
           ),
@@ -276,10 +353,12 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
     List<WorkspaceTab> navTabs,
   ) {
     return Padding(
+      key: const ValueKey('workspace-top-tabs'),
       padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
       child: CompactSelector<WorkspaceTab>(
         selected: controller.activeTab,
         onChanged: controller.selectTab,
+        expand: true,
         options: navTabs
             .map(
               (tab) => CompactSelectorOption(
@@ -346,6 +425,7 @@ class _RailDestination extends StatelessWidget {
     required this.selectedIcon,
     required this.label,
     required this.onTap,
+    required this.collapsed,
   });
 
   final bool selected;
@@ -353,45 +433,52 @@ class _RailDestination extends StatelessWidget {
   final IconData selectedIcon;
   final String label;
   final VoidCallback onTap;
+  final bool collapsed;
 
   @override
   Widget build(BuildContext context) {
     final textColor = selected ? Colors.white : const Color(0xFFD4DED7);
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
-      child: Material(
-        color: selected ? const Color(0xFF075D31) : Colors.transparent,
-        borderRadius: BorderRadius.circular(8),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(8),
-          onTap: onTap,
-          child: SizedBox(
-            height: 48,
-            child: Row(
-              children: [
-                const SizedBox(width: 12),
-                Icon(
-                  selected ? selectedIcon : icon,
-                  color: textColor,
-                  size: 20,
+      child: Tooltip(
+        message: collapsed ? label : '',
+        child: Material(
+            color: selected ? const Color(0xFF075D31) : Colors.transparent,
+            borderRadius: BorderRadius.circular(8),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(8),
+              onTap: onTap,
+              child: SizedBox(
+                height: 48,
+                child: Row(
+                  mainAxisAlignment: collapsed
+                      ? MainAxisAlignment.center
+                      : MainAxisAlignment.start,
+                  children: [
+                    SizedBox(width: collapsed ? 0 : 12),
+                    Icon(
+                      selected ? selectedIcon : icon,
+                      color: textColor,
+                      size: 20,
+                    ),
+                    if (!collapsed) ...[
+                      const SizedBox(width: 10),
+                      Expanded(
+                          child: Text(
+                        label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                              color: textColor,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w800,
+                            ),
+                      )),
+                    ],
+                  ],
                 ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    label,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                          color: textColor,
-                          fontSize: 12,
-                          fontWeight: FontWeight.w800,
-                        ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
+              ),
+            )),
       ),
     );
   }

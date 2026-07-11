@@ -374,17 +374,19 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       builder: (context, constraints) {
         final width = constraints.maxWidth;
         final desktopCompact = _desktopCompact(context);
-        if (width < Breakpoints.phone ||
-            (!desktopCompact && width < Breakpoints.touchPhone)) {
+        final sizeClass = Breakpoints.sizeClass(width);
+        if (sizeClass == WindowSizeClass.phone) {
           return _mobileBrowserShell(context);
         }
 
         // Tablet range (and a desktop window resized into it): keep buckets
         // and objects side by side, with inspector access through the info
         // button used by compact object controls.
-        final tablet = !Breakpoints.isDesktop(width);
-        final compactRightInspector = desktopCompact && width < 1360;
+        final tablet = sizeClass == WindowSizeClass.tablet;
+        final smallDesktop = sizeClass == WindowSizeClass.smallDesktop;
+        final compactRightInspector = desktopCompact && smallDesktop;
         final inspectorOnRight = !tablet &&
+            !smallDesktop &&
             !compactRightInspector &&
             _settings.browserInspectorLayout == BrowserInspectorLayout.right;
         final showDockedInspector = !tablet && _desktopInspectorVisible;
@@ -426,7 +428,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           );
         }
 
-        return Padding(
+        return AnimatedPadding(
+          duration: controller.settings.enableAnimations
+              ? const Duration(milliseconds: 220)
+              : Duration.zero,
+          curve: Curves.easeOutCubic,
           padding: EdgeInsets.all(outerPadding),
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.stretch,
