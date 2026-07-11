@@ -9,6 +9,7 @@ import 'package:s3_browser_crossplat/browser/browser_workspace.dart';
 import 'package:s3_browser_crossplat/controllers/app_controller.dart';
 import 'package:s3_browser_crossplat/models/domain_models.dart';
 import 'package:s3_browser_crossplat/services/mock_engine_service.dart';
+import 'package:s3_browser_crossplat/theme/breakpoints.dart';
 
 class TestAppController extends AppController {
   TestAppController({
@@ -214,6 +215,15 @@ EventLogEntry _apiTraceEntry({
 }
 
 void main() {
+  test('window sizes use one shared four-class breakpoint model', () {
+    expect(Breakpoints.sizeClass(699), WindowSizeClass.phone);
+    expect(Breakpoints.sizeClass(700), WindowSizeClass.tablet);
+    expect(Breakpoints.sizeClass(999), WindowSizeClass.tablet);
+    expect(Breakpoints.sizeClass(1000), WindowSizeClass.smallDesktop);
+    expect(Breakpoints.sizeClass(1359), WindowSizeClass.smallDesktop);
+    expect(Breakpoints.sizeClass(1360), WindowSizeClass.desktop);
+  });
+
   testWidgets('app shell renders before deferred initialization completes', (
     WidgetTester tester,
   ) async {
@@ -470,17 +480,17 @@ void main() {
     expect(find.text('Bucket info'), findsOneWidget);
   });
 
-  testWidgets('compact desktop browser exposes lesser actions in menu', (
+  testWidgets('tablet browser exposes lesser actions in menu', (
     WidgetTester tester,
   ) async {
     addTearDown(() => tester.binding.setSurfaceSize(null));
-    await tester.binding.setSurfaceSize(const Size(1199, 800));
+    await tester.binding.setSurfaceSize(const Size(999, 800));
 
     final controller = await _buildController();
     await tester.pumpWidget(
       _browserApp(
         controller,
-        size: const Size(1199, 800),
+        size: const Size(999, 800),
         compact: true,
       ),
     );
@@ -1199,5 +1209,52 @@ void main() {
 
     expect(find.byType(NavigationBar), findsOneWidget);
     expect(find.byType(SegmentedButton<WorkspaceTab>), findsNothing);
+  });
+
+  testWidgets('shell moves smoothly through tablet and desktop navigation', (
+    WidgetTester tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    addTearDown(() {
+      debugDefaultTargetPlatformOverride = null;
+      tester.binding.setSurfaceSize(null);
+    });
+    final controller = await _buildController();
+
+    await tester.binding.setSurfaceSize(const Size(900, 900));
+    await tester.pumpWidget(S3BrowserApp(controller: controller));
+    await tester.pumpAndSettle();
+    expect(find.byType(NavigationBar), findsNothing);
+    final tabletTabs = find.byKey(const ValueKey('workspace-top-tabs'));
+    expect(tabletTabs, findsOneWidget);
+    expect(
+      tester.getSize(tabletTabs).width,
+      greaterThan(850),
+    );
+    expect(
+      tester
+          .getSize(find.byKey(const ValueKey('workspace-navigation-rail')))
+          .width,
+      0,
+    );
+
+    await tester.binding.setSurfaceSize(const Size(1100, 900));
+    await tester.pumpAndSettle();
+    expect(
+      tester
+          .getSize(find.byKey(const ValueKey('workspace-navigation-rail')))
+          .width,
+      72,
+    );
+
+    await tester.binding.setSurfaceSize(const Size(1440, 900));
+    await tester.pumpAndSettle();
+    expect(
+      tester
+          .getSize(find.byKey(const ValueKey('workspace-navigation-rail')))
+          .width,
+      126,
+    );
+    debugDefaultTargetPlatformOverride = null;
   });
 }
