@@ -28,7 +28,7 @@ import (
 	"github.com/aws/smithy-go"
 )
 
-const engineVersion = "2.2.2"
+const engineVersion = "2.2.3"
 
 var supportedMethods = []string{
 	"health", "getCapabilities", "testProfile", "listBuckets",

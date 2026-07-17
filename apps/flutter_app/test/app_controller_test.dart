@@ -9,6 +9,7 @@ import 'package:s3_browser_crossplat/services/mock_engine_service.dart';
 
 class MemoryAppStateRepository implements AppStateRepository {
   StoredAppState? storedState;
+  bool lastAllowCredentialStoreRecovery = false;
 
   @override
   Future<StoredAppState?> loadState() async => storedState;
@@ -18,7 +19,9 @@ class MemoryAppStateRepository implements AppStateRepository {
     required AppSettings settings,
     required List<EndpointProfile> profiles,
     required String? selectedProfileId,
+    bool allowCredentialStoreRecovery = false,
   }) async {
+    lastAllowCredentialStoreRecovery = allowCredentialStoreRecovery;
     storedState = StoredAppState(
       settings: settings,
       profiles: profiles,
@@ -56,11 +59,54 @@ class MemoryAppStateRepository implements AppStateRepository {
 
 class RecordingMockEngineService extends MockEngineService {
   DiagnosticsOptions? lastDiagnostics;
+  int? lastUploadChunkMiB;
 
   @override
   void configureDiagnostics(DiagnosticsOptions options) {
     lastDiagnostics = options;
     super.configureDiagnostics(options);
+  }
+
+  @override
+  Future<TransferJob> startUpload({
+    required String engineId,
+    required EndpointProfile profile,
+    required String bucketName,
+    required String prefix,
+    required List<String> filePaths,
+    required Map<String, String> objectKeyByPath,
+    required int multipartThresholdMiB,
+    required int multipartChunkMiB,
+  }) {
+    lastUploadChunkMiB = multipartChunkMiB;
+    return super.startUpload(
+      engineId: engineId,
+      profile: profile,
+      bucketName: bucketName,
+      prefix: prefix,
+      filePaths: filePaths,
+      objectKeyByPath: objectKeyByPath,
+      multipartThresholdMiB: multipartThresholdMiB,
+      multipartChunkMiB: multipartChunkMiB,
+    );
+  }
+}
+
+class MetadataOnlyImportRepository extends MemoryAppStateRepository {
+  @override
+  Future<List<EndpointProfile>> importProfiles(String path) async {
+    return const [
+      EndpointProfile(
+        id: 'test',
+        name: 'Updated metadata',
+        endpointUrl: 'http://localhost:9000',
+        region: 'us-east-1',
+        accessKey: '',
+        secretKey: '',
+        pathStyle: true,
+        verifyTls: false,
+      ),
+    ];
   }
 }
 
@@ -72,6 +118,7 @@ const _settings = AppSettings(
   transferConcurrency: 8,
   multipartThresholdMiB: 32,
   multipartChunkMiB: 8,
+  dynamicMultipartSizing: true,
   enableAnimations: true,
   enableDiagnostics: true,
   enableApiLogging: false,
@@ -108,7 +155,112 @@ const _profile = EndpointProfile(
   verifyTls: false,
 );
 
+const _secondProfile = EndpointProfile(
+  id: 'second',
+  name: 'Second endpoint',
+  endpointUrl: 'http://localhost:9001',
+  region: 'us-east-1',
+  accessKey: 'second-key',
+  secretKey: 'second-secret',
+  pathStyle: true,
+  verifyTls: false,
+);
+
 void main() {
+  test('controller uses dynamic upload sizing or the manual override',
+      () async {
+    final tempDir = await Directory.systemTemp.createTemp('multipart-sizing');
+    addTearDown(() => tempDir.delete(recursive: true));
+    final uploadFile = File('${tempDir.path}/ten-gib.bin');
+    await uploadFile.open(mode: FileMode.write).then((file) async {
+      await file.truncate(10 * 1024 * 1024 * 1024);
+      await file.close();
+    });
+    final engine = RecordingMockEngineService();
+    final controller = AppController(
+      engineService: engine,
+      initialSettings: _settings,
+      initialProfiles: const [_profile],
+    );
+    await controller.initialize();
+
+    await controller.startSampleUpload([uploadFile.path]);
+    expect(engine.lastUploadChunkMiB, 128);
+
+    await controller.updateSettings(
+      controller.settings.copyWith(
+        dynamicMultipartSizing: false,
+        multipartChunkMiB: 64,
+      ),
+    );
+    await controller.startSampleUpload([uploadFile.path]);
+    expect(engine.lastUploadChunkMiB, 64);
+  });
+
+  test('metadata-only profile imports preserve existing credentials', () async {
+    final repository = MetadataOnlyImportRepository();
+    final controller = AppController(
+      engineService: MockEngineService(),
+      appStateRepository: repository,
+      initialSettings: _settings,
+      initialProfiles: const [_profile],
+      initialSelectedProfileId: _profile.id,
+    );
+
+    await controller.importProfilesFromPath('/tmp/profiles.json');
+
+    expect(controller.profiles.single.name, 'Updated metadata');
+    expect(controller.profiles.single.accessKey, _profile.accessKey);
+    expect(controller.profiles.single.secretKey, _profile.secretKey);
+    expect(
+        repository.storedState?.profiles.single.accessKey, _profile.accessKey);
+    expect(
+        repository.storedState?.profiles.single.secretKey, _profile.secretKey);
+    expect(repository.lastAllowCredentialStoreRecovery, isFalse);
+  });
+
+  test('credential-bearing profile imports recover secure persistence',
+      () async {
+    final repository = MemoryAppStateRepository();
+    final controller = AppController(
+      engineService: MockEngineService(),
+      appStateRepository: repository,
+      initialSettings: _settings,
+      initialProfiles: const [],
+      initialCredentialStoreError: 'Credential recovery required.',
+    );
+
+    await controller.importProfilesFromPath('/tmp/credential-bundle.json');
+
+    expect(repository.lastAllowCredentialStoreRecovery, isTrue);
+    expect(repository.storedState?.profiles.single.accessKey, 'import-key');
+    expect(repository.storedState?.profiles.single.secretKey, 'import-secret');
+    expect(
+      controller.bannerMessage,
+      contains('securely stored credentials for 1 profile'),
+    );
+  });
+
+  test('configured default endpoint wins over the previous runtime selection',
+      () async {
+    final repository = MemoryAppStateRepository();
+    final controller = AppController(
+      engineService: MockEngineService(),
+      appStateRepository: repository,
+      initialSettings: _settings.copyWith(defaultProfileId: _secondProfile.id),
+      initialProfiles: const [_profile, _secondProfile],
+      initialSelectedProfileId: _profile.id,
+    );
+
+    await controller.initialize();
+    expect(controller.selectedProfile?.id, _secondProfile.id);
+
+    await controller.setDefaultProfile(_profile.id);
+    expect(controller.settings.defaultProfileId, _profile.id);
+    expect(controller.selectedProfile?.id, _profile.id);
+    expect(repository.storedState?.settings.defaultProfileId, _profile.id);
+  });
+
   test(
       'controller initializes with parity-shaped mock data and exports benchmark results',
       () async {
@@ -180,6 +332,7 @@ void main() {
     expect(repository.storedState, isNotNull);
     expect(repository.storedState!.settings.defaultPresignMinutes, 15);
     expect(repository.storedState!.profiles.first.name, 'Updated profile');
+    expect(repository.lastAllowCredentialStoreRecovery, isTrue);
     expect(controller.selectedObject, isNull);
     expect(controller.visibleVersions, isNotEmpty);
 
@@ -320,6 +473,10 @@ void main() {
 
   test('controller receives streamed transfer updates before upload completion',
       () async {
+    final tempDir = await Directory.systemTemp.createTemp('upload-test');
+    addTearDown(() => tempDir.delete(recursive: true));
+    final uploadFile = File('${tempDir.path}/large-file.bin');
+    await uploadFile.writeAsBytes(List<int>.filled(64, 0));
     final controller = AppController(
       engineService: MockEngineService(),
       initialSettings: _settings,
@@ -327,8 +484,7 @@ void main() {
     );
     await controller.initialize();
 
-    final uploadFuture =
-        controller.startSampleUpload(const ['missing-large-file.bin']);
+    final uploadFuture = controller.startSampleUpload([uploadFile.path]);
     await Future<void>.delayed(const Duration(milliseconds: 25));
 
     final runningTransfer = controller.browserTasks.firstWhere(

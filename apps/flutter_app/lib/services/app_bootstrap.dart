@@ -31,6 +31,7 @@ class AppBootstrap {
       transferConcurrency: 8,
       multipartThresholdMiB: 32,
       multipartChunkMiB: 8,
+      dynamicMultipartSizing: true,
       enableAnimations: true,
       enableDiagnostics: true,
       enableApiLogging: false,
@@ -85,6 +86,7 @@ class AppBootstrap {
       initialSettings: settings,
       initialProfiles: storedState?.profiles ?? const [],
       initialSelectedProfileId: storedState?.selectedProfileId,
+      initialCredentialStoreError: storedState?.credentialStoreError,
       appStateRepository: repository,
     );
     return controller;

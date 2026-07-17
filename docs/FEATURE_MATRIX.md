@@ -53,6 +53,12 @@ Legend:
 | Resumable transfer jobs | Desktop Only | Desktop Only | Desktop Only | Desktop Only | Optional | Planned |
 | Drag and drop ingest | Desktop Only | Desktop Only | Desktop Only | Desktop Only | N/A | App shell ready |
 
+Transfer notes:
+
+- The Flutter shell selects an automatic S3 multipart upload size from the largest file in each batch and sends that effective size through the existing engine contract.
+- Python, Go, Rust, and Java upload parts concurrently with bounded workers. Automatic sizing remains within S3's 5 MiB–5 GiB part range and 10 000-part maximum.
+- Users can disable automatic sizing and supply the manual upload part size in Settings. The manual value also remains the download range size.
+
 ## Benchmark Features
 
 | Feature | Python | Go | Rust | Java | Android | Status |
@@ -94,4 +100,3 @@ Every engine must:
 - Return structured partial-failure payloads for batch operations
 - Provide progress events for long-running transfers and benchmark runs
 - Respect cancellation requests from the UI shell
-

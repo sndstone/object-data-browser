@@ -14,11 +14,15 @@ class DesktopSidecarEngineService
   DesktopSidecarEngineService({
     DesktopEngineHost? host,
     EngineService? fallback,
+    String? engineRoot,
   })  : _host = host ?? DesktopEngineHost(),
-        _fallback = fallback ?? MockEngineService();
+        _fallback = fallback ?? MockEngineService(),
+        _allowFallback = fallback != null,
+        _cachedEngineRoot = engineRoot;
 
   final DesktopEngineHost _host;
   final EngineService _fallback;
+  final bool _allowFallback;
   EngineLogCallback? _logSink;
   TransferJobCallback? _transferSink;
   DiagnosticsOptions _diagnosticsOptions = const DiagnosticsOptions(
@@ -70,7 +74,7 @@ class DesktopSidecarEngineService
         label: engine.label,
         language: engine.language,
         version: entry?.version ?? engine.version,
-        available: entry != null || engine.available,
+        available: entry != null || (_allowFallback && engine.available),
         desktopSupported: engine.desktopSupported,
         androidSupported: engine.androidSupported,
       );
@@ -84,6 +88,9 @@ class DesktopSidecarEngineService
   }) async {
     final entry = await _tryGetEngine(engineId);
     if (entry == null) {
+      if (!_allowFallback) {
+        throw _engineUnavailable(engineId, 'getCapabilities');
+      }
       return _fallback.getCapabilities(engineId: engineId, profile: profile);
     }
 
@@ -99,7 +106,7 @@ class DesktopSidecarEngineService
               _capabilityFromJson(Map<String, Object?>.from(item as Map)))
           .toList();
     } on EngineException catch (error) {
-      if (error.code != ErrorCode.unsupportedFeature) {
+      if (error.code != ErrorCode.unsupportedFeature || !_allowFallback) {
         rethrow;
       }
       return _fallback.getCapabilities(engineId: engineId, profile: profile);
@@ -1084,6 +1091,9 @@ class DesktopSidecarEngineService
   }) async {
     final entry = await _tryGetEngine(engineId);
     if (entry == null) {
+      if (!_allowFallback) {
+        throw _engineUnavailable(engineId, method);
+      }
       _log(
         level: 'DEBUG',
         category: 'EngineFallback',
@@ -1106,6 +1116,9 @@ class DesktopSidecarEngineService
     } on EngineException catch (error) {
       if (error.code == ErrorCode.unsupportedFeature ||
           error.code == ErrorCode.engineUnavailable) {
+        if (!_allowFallback) {
+          rethrow;
+        }
         _log(
           level: 'DEBUG',
           category: 'EngineFallback',
@@ -1125,8 +1138,23 @@ class DesktopSidecarEngineService
         source: 'engine-host',
         params: params,
       );
-      return onFallback();
+      if (_allowFallback) {
+        return onFallback();
+      }
+      throw EngineException(
+        code: ErrorCode.engineUnavailable,
+        message:
+            'The $engineId engine could not start for $method: ${error.message}',
+      );
     }
+  }
+
+  EngineException _engineUnavailable(String engineId, String method) {
+    return EngineException(
+      code: ErrorCode.engineUnavailable,
+      message:
+          'The $engineId desktop engine is not installed, so $method cannot run.',
+    );
   }
 
   Future<_EngineManifestEntry?> _tryGetEngine(String engineId) async {
@@ -2040,7 +2068,7 @@ class _EngineManifestEntry {
   factory _EngineManifestEntry.fromJson(Map<String, Object?> json) {
     return _EngineManifestEntry(
       id: json['id'] as String? ?? '',
-      version: json['version'] as String? ?? '2.2.2',
+      version: json['version'] as String? ?? '2.2.3',
       executable: json['executable'] as String? ?? '',
       arguments: (json['arguments'] as List<Object?>? ?? const [])
           .map((item) => item.toString())

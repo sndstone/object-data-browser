@@ -55,6 +55,7 @@ Future<TestAppController> _buildController({AppSettings? settings}) async {
           transferConcurrency: 8,
           multipartThresholdMiB: 32,
           multipartChunkMiB: 8,
+          dynamicMultipartSizing: true,
           enableAnimations: true,
           enableDiagnostics: true,
           enableApiLogging: false,
@@ -240,6 +241,7 @@ void main() {
         transferConcurrency: 8,
         multipartThresholdMiB: 32,
         multipartChunkMiB: 8,
+        dynamicMultipartSizing: true,
         enableAnimations: true,
         enableDiagnostics: true,
         enableApiLogging: false,
@@ -563,6 +565,130 @@ void main() {
         find.widgetWithText(OutlinedButton, 'Create prefix'), findsOneWidget);
   });
 
+  testWidgets('text preview opens in an expanded selectable dialog', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1024));
+    final controller = await _buildController();
+    final object = ObjectEntry(
+      key: 'reports/output.txt',
+      name: 'output.txt',
+      size: 24,
+      storageClass: 'STANDARD',
+      modifiedAt: DateTime(2026, 7, 16),
+      isFolder: false,
+    );
+    controller.selectedObject = object;
+    controller.inspectorTab = BrowserInspectorTab.objectDetails;
+    controller.selectedObjectDetails = const ObjectDetails(
+      key: 'reports/output.txt',
+      metadata: {},
+      headers: {},
+      tags: {},
+      debugEvents: [],
+      apiCalls: [],
+    );
+    controller.selectedObjectPreview = ObjectPreview.ready(
+      key: object.key,
+      kind: ObjectPreviewKind.text,
+      contentType: 'text/plain',
+      text: 'Expanded preview contents',
+      message: 'Preview loaded.',
+    );
+    controller.emitChange();
+
+    await tester.pumpWidget(
+      _browserApp(
+        controller,
+        size: const Size(1440, 1024),
+        compact: false,
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Open preview'));
+    await tester.pumpAndSettle();
+
+    expect(find.byTooltip('Close preview'), findsOneWidget);
+    expect(find.text('reports/output.txt'), findsOneWidget);
+    expect(find.text('Expanded preview contents'), findsNWidgets(2));
+    expect(find.byType(SelectableText), findsWidgets);
+  });
+
+  testWidgets(
+      'HTML preview defaults to highlighted source and renders on demand', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1024));
+    final controller = await _buildController();
+    final object = ObjectEntry(
+      key: 'site/index.html',
+      name: 'index.html',
+      size: 64,
+      storageClass: 'STANDARD',
+      modifiedAt: DateTime(2026, 7, 16),
+      isFolder: false,
+    );
+    controller.selectedObject = object;
+    controller.inspectorTab = BrowserInspectorTab.objectDetails;
+    controller.selectedObjectDetails = const ObjectDetails(
+      key: 'site/index.html',
+      metadata: {},
+      headers: {},
+      tags: {},
+      debugEvents: [],
+      apiCalls: [],
+    );
+    controller.selectedObjectPreview = ObjectPreview.ready(
+      key: object.key,
+      kind: ObjectPreviewKind.text,
+      contentType: 'text/html',
+      text: '<h1>Rendered heading</h1><p>Preview body</p>',
+      message: 'Preview loaded.',
+    );
+    controller.emitChange();
+
+    await tester.pumpWidget(
+      _browserApp(
+        controller,
+        size: const Size(1440, 1024),
+        compact: false,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Render page'), findsNothing);
+    expect(find.byKey(const ValueKey('source-code-xml')), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Open preview'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Render page'), findsOneWidget);
+    expect(
+        find.byKey(const ValueKey('expanded-source-preview')), findsOneWidget);
+    expect(find.byKey(const ValueKey('rendered-html-page')), findsNothing);
+
+    await tester.tap(find.text('Render page'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('View source'), findsOneWidget);
+    expect(find.byKey(const ValueKey('rendered-html-page')), findsOneWidget);
+    expect(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is RichText &&
+            widget.text.toPlainText().contains('Rendered heading'),
+      ),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.text('View source'));
+    await tester.pumpAndSettle();
+    expect(
+        find.byKey(const ValueKey('expanded-source-preview')), findsOneWidget);
+  });
+
   testWidgets('tasks workspace renders top-level running task details', (
     WidgetTester tester,
   ) async {
@@ -862,12 +988,21 @@ void main() {
     await tester.pumpWidget(S3BrowserApp(controller: controller));
     await tester.pumpAndSettle();
 
+    expect(find.text('Default engine'), findsOneWidget);
+    expect(find.text('Default endpoint'), findsOneWidget);
+
     await tester.tap(find.byType(ExpansionTile).first);
     await tester.pumpAndSettle();
 
     expect(find.text('Endpoint type'), findsOneWidget);
     expect(find.text('Use HTTPS'), findsOneWidget);
     expect(find.text('Normalized endpoint'), findsOneWidget);
+    await tester.scrollUntilVisible(
+      find.text('Automatically size upload parts'),
+      400,
+      scrollable: find.byType(Scrollable).first,
+    );
+    expect(find.text('Automatically size upload parts'), findsOneWidget);
   });
 
   testWidgets(

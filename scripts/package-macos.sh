@@ -70,5 +70,6 @@ hdiutil create \
   -format UDZO \
   "$TMP_DMG" >/dev/null
 
+hdiutil verify "$TMP_DMG" >/dev/null
 mv "$TMP_DMG" "$FINAL_DMG"
 echo "Packaged macOS DMG at $FINAL_DMG"

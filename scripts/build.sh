@@ -91,7 +91,13 @@ case "$PLATFORM" in
     require_macos_project
     clean_macos_release_artifacts
     flutter pub get
-    flutter build macos --release
+    if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
+      flutter build macos --release \
+        --dart-define=OBJECT_BROWSER_MAC_KEYCHAIN_MODE=data-protection
+    else
+      flutter build macos --release \
+        --dart-define=OBJECT_BROWSER_MAC_KEYCHAIN_MODE=legacy
+    fi
     MACOS_APP_DIR="$(resolve_macos_app_dir)"
     popd >/dev/null
     if [[ -z "$MACOS_APP_DIR" || ! -d "$MACOS_APP_DIR" ]]; then
@@ -99,8 +105,45 @@ case "$PLATFORM" in
       exit 1
     fi
     "$ROOT_DIR/scripts/stage-engines.sh" --release-dir "$MACOS_APP_DIR" --tools-dir "$TOOLS_DIR" --arch "$ARCH"
-    codesign --force --sign - "$MACOS_APP_DIR"
+    if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
+      "$ROOT_DIR/scripts/sign-macos.sh" "$MACOS_APP_DIR"
+    else
+      # Ad-hoc artifacts are development builds only. Their identity changes
+      # on every build, so they cannot provide update-stable Keychain access.
+      codesign --force --sign - "$MACOS_APP_DIR"
+    fi
+    codesign --verify --deep --strict --verbose=2 "$MACOS_APP_DIR"
+    if [[ -z "${MACOS_SIGNING_IDENTITY:-}" ]] && \
+      codesign -d --entitlements :- "$MACOS_APP_DIR" 2>&1 | \
+        grep -q 'com.apple.security.app-sandbox'; then
+      echo "The ad-hoc macOS artifact unexpectedly retained App Sandbox; Keychain access would fail." >&2
+      exit 1
+    fi
     "$ROOT_DIR/scripts/package-macos.sh" --app-bundle "$MACOS_APP_DIR" --arch "$ARCH"
+    MACOS_DMG="$ROOT_DIR/dist/macos/Object Data Browser-$ARCH.dmg"
+    if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
+      codesign --force --timestamp --sign "$MACOS_SIGNING_IDENTITY" "$MACOS_DMG"
+      codesign --verify --verbose=2 "$MACOS_DMG"
+    fi
+    if [[ -n "${MACOS_NOTARY_KEYCHAIN_PROFILE:-}" ]]; then
+      xcrun notarytool submit \
+        "$MACOS_DMG" \
+        --keychain-profile "$MACOS_NOTARY_KEYCHAIN_PROFILE" \
+        --wait
+      xcrun stapler staple "$MACOS_DMG"
+      xcrun stapler validate "$MACOS_DMG"
+    elif [[ -n "${MACOS_NOTARY_KEY_FILE:-}" ]]; then
+      : "${MACOS_NOTARY_KEY_ID:?MACOS_NOTARY_KEY_ID is required}"
+      : "${MACOS_NOTARY_ISSUER_ID:?MACOS_NOTARY_ISSUER_ID is required}"
+      xcrun notarytool submit \
+        "$MACOS_DMG" \
+        --key "$MACOS_NOTARY_KEY_FILE" \
+        --key-id "$MACOS_NOTARY_KEY_ID" \
+        --issuer "$MACOS_NOTARY_ISSUER_ID" \
+        --wait
+      xcrun stapler staple "$MACOS_DMG"
+      xcrun stapler validate "$MACOS_DMG"
+    fi
     ;;
   android)
     if [[ -z "${ANDROID_HOME:-}" && -z "${ANDROID_SDK_ROOT:-}" ]]; then

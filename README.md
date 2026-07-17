@@ -26,10 +26,12 @@ This repository now includes:
 
 - The initial Flutter application scaffold with adaptive Browser, Benchmark, and Settings workspaces
 - Endpoint profiles for S3-compatible targets, AWS S3, and Azure Blob Storage (account name + access key; implemented in the Go and Python engines, see `docs/FEATURE_MATRIX.md`)
-- Unified responsive breakpoints (phone < 700 px, tablet < 1200 px, desktop >= 1200 px) that apply equally to resized desktop windows
+- Unified responsive breakpoints (phone < 700 px, tablet < 1 000 px, compact desktop < 1 360 px, desktop >= 1 360 px) that apply equally to resized desktop windows
 - Persistent sidecar engine processes (one long-lived process per engine instead of one per request)
 - The shared domain models and engine interface expected by all backends
-- Fully implemented Python, Go, Rust, and Java engines behind a shared contract, with parallel multipart transfers and native inspector tools (see `CHANGELOG.md` 2.1.0-2.2.2)
+- Fully implemented Python, Go, Rust, and Java engines behind a shared contract, with parallel multipart transfers and native inspector tools (see `CHANGELOG.md` 2.1.0-2.2.3)
+- Dynamic S3 upload part sizing that keeps parallel uploads within the 5 MiB–5 GiB part range and 10 000-part limit, with a manual override in Settings
+- Update-stable, Developer ID-backed macOS credential persistence with a migration path from older Keychain items, plus expandable previews with selectable syntax highlighting, image pan/zoom, and static HTML page rendering
 - Build/bootstrap scripts that stage dependencies into `.tmp` under the repo root
 
 ## Bootstrap
@@ -64,4 +66,4 @@ Linux Android builds (`./scripts/build.sh android`) do not provision an Android 
 
 1. Replace the mock engine with the first real desktop sidecar implementation.
 2. Flesh out the contract test runner against MinIO and AWS S3.
-3. Wire the desktop build scripts to signed packaging infrastructure for your target environments.
+3. Configure the documented Apple Developer certificate, provisioning profile, and notarization secrets for signed macOS releases.

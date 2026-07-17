@@ -69,6 +69,30 @@ class SettingsWorkspace extends StatelessWidget {
                       }
                     },
             ),
+            const SizedBox(height: 12),
+            AppSelectField<String>(
+              value: controller.profiles.any(
+                (profile) => profile.id == settings.defaultProfileId,
+              )
+                  ? settings.defaultProfileId
+                  : null,
+              decoration: const InputDecoration(labelText: 'Default endpoint'),
+              items: controller.profiles
+                  .map(
+                    (profile) => AppSelectItem(
+                      value: profile.id,
+                      label: profile.name,
+                    ),
+                  )
+                  .toList(),
+              onChanged: controller.profiles.isEmpty
+                  ? null
+                  : (value) async {
+                      if (value != null) {
+                        await controller.setDefaultProfile(value);
+                      }
+                    },
+            ),
           ],
         ),
         _section(
@@ -130,6 +154,11 @@ class SettingsWorkspace extends StatelessWidget {
                 ),
               ],
             ),
+            const SizedBox(height: 8),
+            Text(
+              'App-generated profile exports contain endpoint settings only, never credentials. When an imported JSON file contains access and secret keys, they are moved into secure storage.',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
             const SizedBox(height: 12),
             if (controller.profiles.isEmpty)
               const ListTile(
@@ -182,8 +211,22 @@ class SettingsWorkspace extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 12),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              value: settings.dynamicMultipartSizing,
+              onChanged: (value) => controller.updateSettings(
+                settings.copyWith(dynamicMultipartSizing: value),
+              ),
+              title: const Text('Automatically size upload parts'),
+              subtitle: const Text(
+                'Choose an S3-compliant part size from the largest selected file. Disable this to use the manual chunk size for uploads.',
+              ),
+            ),
+            const SizedBox(height: 4),
             _numberField(
-              label: 'Multipart chunk size (MiB)',
+              label: settings.dynamicMultipartSizing
+                  ? 'Manual chunk size (MiB, downloads and fallback)'
+                  : 'Manual multipart chunk size (MiB)',
               initialValue: settings.multipartChunkMiB,
               onSubmitted: (value) => controller.updateSettings(
                 settings.copyWith(multipartChunkMiB: value),

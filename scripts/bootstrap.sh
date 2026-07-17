@@ -203,8 +203,8 @@ ensure_macos_host_tools() {
   local developer_dir=""
   developer_dir="$(xcode-select -p 2>/dev/null || true)"
   if [[ -z "$developer_dir" || ! -d "$developer_dir" || "$developer_dir" == "/Library/Developer/CommandLineTools" ]]; then
-    attempt_xcode_install
-    cat >&2 <<'EOF'
+    if ! attempt_xcode_install; then
+      cat >&2 <<'EOF'
 Full Xcode is required for macOS Flutter builds. The active developer directory is not a full Xcode install.
 
 Install Xcode from the App Store, then run:
@@ -215,12 +215,18 @@ Install Xcode from the App Store, then run:
 To let bootstrap attempt the App Store install for you first, rerun with:
   AUTO_INSTALL_XCODE=1 ./scripts/bootstrap.sh --os darwin --arch arm64
 EOF
-    exit 1
+      exit 1
+    fi
+    developer_dir="$(xcode-select -p 2>/dev/null || true)"
+    if [[ -z "$developer_dir" || ! -d "$developer_dir" || "$developer_dir" == "/Library/Developer/CommandLineTools" ]]; then
+      echo "Xcode setup completed, but the active developer directory is still not a full Xcode install." >&2
+      exit 1
+    fi
   fi
 
   if ! xcodebuild -version >/dev/null 2>&1; then
-    attempt_xcode_install
-    cat >&2 <<'EOF'
+    if ! attempt_xcode_install; then
+      cat >&2 <<'EOF'
 Full Xcode is required for macOS Flutter builds, but 'xcodebuild' is not available from the active developer directory.
 
 Verify that Xcode is installed, then run:
@@ -231,7 +237,12 @@ Verify that Xcode is installed, then run:
 To let bootstrap attempt the App Store install for you first, rerun with:
   AUTO_INSTALL_XCODE=1 ./scripts/bootstrap.sh --os darwin --arch arm64
 EOF
-    exit 1
+      exit 1
+    fi
+    if ! xcodebuild -version >/dev/null 2>&1; then
+      echo "Xcode setup completed, but 'xcodebuild' is still unavailable." >&2
+      exit 1
+    fi
   fi
 
   ensure_homebrew

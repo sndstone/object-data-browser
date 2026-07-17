@@ -4,14 +4,17 @@ import 'dart:math' as math;
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_widget_from_html_core/flutter_widget_from_html_core.dart';
 
 import '../controllers/app_controller.dart';
 import '../logs/structured_log_list.dart';
 import '../models/domain_models.dart';
+import '../services/source_preview.dart';
 import '../theme/app_theme.dart';
 import '../theme/breakpoints.dart';
 import '../widgets/app_select_field.dart';
 import '../widgets/compact_selector.dart';
+import '../widgets/source_code_preview.dart';
 
 const _bucketActionBarKey = ValueKey('bucket-panel-actions');
 const _bucketListKey = ValueKey('bucket-panel-scroll');
@@ -1687,10 +1690,21 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   Widget _objectPreviewSection(BuildContext context, ObjectEntry object) {
     final preview = controller.selectedObjectPreview;
     final theme = Theme.of(context);
+    final canExpand = preview != null &&
+        !preview.loading &&
+        preview.supported &&
+        (preview.kind == ObjectPreviewKind.image ||
+            preview.kind == ObjectPreviewKind.text);
     final titleRow = Row(
       children: [
         Text('Preview', style: theme.textTheme.titleMedium),
         const Spacer(),
+        if (canExpand)
+          IconButton(
+            tooltip: 'Open preview',
+            onPressed: () => _showExpandedPreview(context, object, preview),
+            icon: const Icon(Icons.open_in_full),
+          ),
         IconButton(
           tooltip: 'Reload preview',
           onPressed: controller.refreshSelectedObjectPreview,
@@ -1749,6 +1763,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       final text = preview.text ?? '';
       final visibleText =
           text.length > 12000 ? '${text.substring(0, 12000)}\n...' : text;
+      final language = sourcePreviewLanguage(object.key, preview.contentType);
       body = Container(
         width: double.infinity,
         constraints: const BoxConstraints(maxHeight: 280),
@@ -1759,12 +1774,18 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           color: theme.colorScheme.surface,
         ),
         child: SingleChildScrollView(
-          child: SelectableText(
-            visibleText.isEmpty ? '(empty file)' : visibleText,
-            style: theme.textTheme.bodySmall?.copyWith(
-              fontFamily: 'monospace',
-            ),
-          ),
+          child: language == null
+              ? SelectableText(
+                  visibleText.isEmpty ? '(empty file)' : visibleText,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    fontFamily: 'monospace',
+                  ),
+                )
+              : SourceCodePreview(
+                  source: visibleText.isEmpty ? '(empty file)' : visibleText,
+                  language: language,
+                  textStyle: theme.textTheme.bodySmall,
+                ),
         ),
       );
     } else if (preview.kind == ObjectPreviewKind.video && preview.url != null) {
@@ -1814,6 +1835,215 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           ),
         ],
       ],
+    );
+  }
+
+  Future<void> _showExpandedPreview(
+    BuildContext context,
+    ObjectEntry object,
+    ObjectPreview preview,
+  ) async {
+    final mediaSize = MediaQuery.sizeOf(context);
+    final canRenderHtml = preview.kind == ObjectPreviewKind.text &&
+        isHtmlPreview(object.key, preview.contentType);
+    var renderHtml = false;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (dialogContext, setDialogState) {
+            final theme = Theme.of(dialogContext);
+            return Dialog(
+              insetPadding: const EdgeInsets.all(24),
+              clipBehavior: Clip.antiAlias,
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxWidth: math.min(mediaSize.width - 48, 1100),
+                  maxHeight: mediaSize.height * 0.88,
+                ),
+                child: Column(
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 14, 10, 12),
+                      child: Row(
+                        children: [
+                          Icon(
+                            preview.kind == ObjectPreviewKind.image
+                                ? Icons.image_outlined
+                                : Icons.description_outlined,
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  object.key,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.titleMedium,
+                                ),
+                                if (preview.contentType != null)
+                                  Text(
+                                    preview.contentType!,
+                                    style: theme.textTheme.bodySmall,
+                                  ),
+                              ],
+                            ),
+                          ),
+                          if (canRenderHtml) ...[
+                            OutlinedButton.icon(
+                              key: const ValueKey('html-render-toggle'),
+                              onPressed: () => setDialogState(
+                                () => renderHtml = !renderHtml,
+                              ),
+                              icon: Icon(renderHtml
+                                  ? Icons.code
+                                  : Icons.web_asset_outlined),
+                              label: Text(
+                                renderHtml ? 'View source' : 'Render page',
+                              ),
+                            ),
+                            const SizedBox(width: 4),
+                          ],
+                          IconButton(
+                            tooltip: 'Close preview',
+                            onPressed: () => Navigator.of(dialogContext).pop(),
+                            icon: const Icon(Icons.close),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const Divider(height: 1),
+                    Expanded(
+                      child: preview.kind == ObjectPreviewKind.image &&
+                              preview.url != null
+                          ? ColoredBox(
+                              color: theme.colorScheme.surfaceContainerHighest,
+                              child: InteractiveViewer(
+                                minScale: 0.5,
+                                maxScale: 5,
+                                child: Center(
+                                  child: Image.network(
+                                    preview.url!,
+                                    fit: BoxFit.contain,
+                                    loadingBuilder:
+                                        (context, child, loadingProgress) {
+                                      if (loadingProgress == null) return child;
+                                      return const CircularProgressIndicator();
+                                    },
+                                    errorBuilder:
+                                        (context, error, stackTrace) =>
+                                            const Text(
+                                      'Could not load image preview.',
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            )
+                          : AnimatedSwitcher(
+                              duration: const Duration(milliseconds: 220),
+                              switchInCurve: Curves.easeOutCubic,
+                              switchOutCurve: Curves.easeInCubic,
+                              transitionBuilder: (child, animation) {
+                                final isPage = child.key ==
+                                    const ValueKey('expanded-html-preview');
+                                final offset = isPage
+                                    ? const Offset(0.06, 0)
+                                    : const Offset(-0.06, 0);
+                                return FadeTransition(
+                                  opacity: animation,
+                                  child: SlideTransition(
+                                    position: Tween<Offset>(
+                                      begin: offset,
+                                      end: Offset.zero,
+                                    ).animate(animation),
+                                    child: child,
+                                  ),
+                                );
+                              },
+                              child: renderHtml
+                                  ? _expandedHtmlPreview(preview)
+                                  : _expandedSourcePreview(
+                                      dialogContext,
+                                      object,
+                                      preview,
+                                    ),
+                            ),
+                    ),
+                    if (preview.truncated)
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 20,
+                          vertical: 10,
+                        ),
+                        color: theme.colorScheme.surfaceContainerHigh,
+                        child: Text(
+                          'Preview is limited to the first ${preview.loadedBytes} bytes.',
+                          style: theme.textTheme.bodySmall,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _expandedSourcePreview(
+    BuildContext context,
+    ObjectEntry object,
+    ObjectPreview preview,
+  ) {
+    final theme = Theme.of(context);
+    final source =
+        (preview.text ?? '').isEmpty ? '(empty file)' : preview.text!;
+    final language = sourcePreviewLanguage(object.key, preview.contentType);
+    return Scrollbar(
+      key: const ValueKey('expanded-source-preview'),
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(20),
+        child: SizedBox(
+          width: double.infinity,
+          child: language == null
+              ? SelectableText(
+                  source,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    fontFamily: 'monospace',
+                  ),
+                )
+              : SourceCodePreview(
+                  source: source,
+                  language: language,
+                  textStyle: theme.textTheme.bodyMedium,
+                ),
+        ),
+      ),
+    );
+  }
+
+  Widget _expandedHtmlPreview(ObjectPreview preview) {
+    final previewUri = Uri.tryParse(preview.url ?? '');
+    return ColoredBox(
+      key: const ValueKey('expanded-html-preview'),
+      color: Colors.white,
+      child: Scrollbar(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: SelectionArea(
+            child: HtmlWidget(
+              preview.text ?? '',
+              key: const ValueKey('rendered-html-page'),
+              baseUrl: previewUri?.resolve('.'),
+              onTapUrl: (_) async => true,
+            ),
+          ),
+        ),
+      ),
     );
   }
 

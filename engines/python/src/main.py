@@ -27,7 +27,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 
-ENGINE_VERSION = "2.2.2"
+ENGINE_VERSION = "2.2.3"
 
 # Serialize every write to stdout so transferProgress events emitted from worker
 # threads never interleave with request/response lines.

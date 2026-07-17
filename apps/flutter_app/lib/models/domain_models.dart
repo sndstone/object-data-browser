@@ -1366,11 +1366,13 @@ class AppSettings {
   const AppSettings({
     required this.darkMode,
     required this.defaultEngineId,
+    this.defaultProfileId = '',
     required this.downloadPath,
     required this.tempPath,
     required this.transferConcurrency,
     required this.multipartThresholdMiB,
     required this.multipartChunkMiB,
+    required this.dynamicMultipartSizing,
     required this.enableAnimations,
     required this.enableDiagnostics,
     required this.enableApiLogging,
@@ -1398,11 +1400,13 @@ class AppSettings {
 
   final bool darkMode;
   final String defaultEngineId;
+  final String defaultProfileId;
   final String downloadPath;
   final String tempPath;
   final int transferConcurrency;
   final int multipartThresholdMiB;
   final int multipartChunkMiB;
+  final bool dynamicMultipartSizing;
   final bool enableAnimations;
   final bool enableDiagnostics;
   final bool enableApiLogging;
@@ -1431,11 +1435,13 @@ class AppSettings {
     return {
       'darkMode': darkMode,
       'defaultEngineId': defaultEngineId,
+      'defaultProfileId': defaultProfileId,
       'downloadPath': downloadPath,
       'tempPath': tempPath,
       'transferConcurrency': transferConcurrency,
       'multipartThresholdMiB': multipartThresholdMiB,
       'multipartChunkMiB': multipartChunkMiB,
+      'dynamicMultipartSizing': dynamicMultipartSizing,
       'enableAnimations': enableAnimations,
       'enableDiagnostics': enableDiagnostics,
       'enableApiLogging': enableApiLogging,
@@ -1467,12 +1473,14 @@ class AppSettings {
     return AppSettings(
       darkMode: json['darkMode'] as bool? ?? false,
       defaultEngineId: (json['defaultEngineId'] as String?) ?? 'python',
+      defaultProfileId: (json['defaultProfileId'] as String?) ?? '',
       downloadPath: (json['downloadPath'] as String?) ?? '',
       tempPath: (json['tempPath'] as String?) ?? '',
       transferConcurrency: (json['transferConcurrency'] as num?)?.toInt() ?? 8,
       multipartThresholdMiB:
           (json['multipartThresholdMiB'] as num?)?.toInt() ?? 32,
       multipartChunkMiB: (json['multipartChunkMiB'] as num?)?.toInt() ?? 8,
+      dynamicMultipartSizing: json['dynamicMultipartSizing'] as bool? ?? true,
       enableAnimations: json['enableAnimations'] as bool? ?? true,
       enableDiagnostics: json['enableDiagnostics'] as bool? ?? true,
       enableApiLogging: json['enableApiLogging'] as bool? ?? false,
@@ -1510,11 +1518,13 @@ class AppSettings {
   AppSettings copyWith({
     bool? darkMode,
     String? defaultEngineId,
+    String? defaultProfileId,
     String? downloadPath,
     String? tempPath,
     int? transferConcurrency,
     int? multipartThresholdMiB,
     int? multipartChunkMiB,
+    bool? dynamicMultipartSizing,
     bool? enableAnimations,
     bool? enableDiagnostics,
     bool? enableApiLogging,
@@ -1542,12 +1552,15 @@ class AppSettings {
     return AppSettings(
       darkMode: darkMode ?? this.darkMode,
       defaultEngineId: defaultEngineId ?? this.defaultEngineId,
+      defaultProfileId: defaultProfileId ?? this.defaultProfileId,
       downloadPath: downloadPath ?? this.downloadPath,
       tempPath: tempPath ?? this.tempPath,
       transferConcurrency: transferConcurrency ?? this.transferConcurrency,
       multipartThresholdMiB:
           multipartThresholdMiB ?? this.multipartThresholdMiB,
       multipartChunkMiB: multipartChunkMiB ?? this.multipartChunkMiB,
+      dynamicMultipartSizing:
+          dynamicMultipartSizing ?? this.dynamicMultipartSizing,
       enableAnimations: enableAnimations ?? this.enableAnimations,
       enableDiagnostics: enableDiagnostics ?? this.enableDiagnostics,
       enableApiLogging: enableApiLogging ?? this.enableApiLogging,

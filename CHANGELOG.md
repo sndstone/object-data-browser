@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+## 2.2.3 - 2026-07-18
+
+### Dynamic multipart sizing
+- Uploads now choose an S3-compliant part size from the largest selected file, balancing parallel throughput with bounded worker memory and the 10 000-part limit.
+- Automatic sizing is enabled by default. Disabling it restores the manual multipart chunk setting; downloads continue to use the manual range size.
+
+### macOS credentials and expanded previews
+- macOS credentials persist in Keychain-backed secure storage, and metadata-only imports no longer erase existing credentials.
+- Profile credentials now use one versioned Keychain bundle, reducing post-update authorization to one prompt. Data Protection per-field items migrate with one bulk read, and unchanged settings no longer rewrite credentials.
+- Fixed ad-hoc macOS packaging that sandboxed the app without provisioned Keychain access. Ad-hoc artifacts now restore legacy Keychain access, probe both historical Keychain modes during migration, and stop automatic listing with a direct error when hydration fails.
+- macOS startup now recovers the newest profile metadata across sandboxed and unsandboxed Application Support locations, preventing an update from pairing valid Keychain items with an older empty profile list.
+- Text and image previews can open in a larger dialog; text is selectable and scrollable, while images support pan and zoom.
+- Recognized source files now use selectable syntax highlighting. Expanded HTML previews default to source and can switch to a static page render without executing scripts.
+- Added a Developer ID release lane with an embedded provisioning profile, stable team-scoped Data Protection Keychain identity, hardened signing, DMG signing, and notarization. GitHub releases now fail closed when the required Apple signing secrets are missing instead of publishing an update-unsafe ad-hoc build.
+- Signed releases migrate credentials from the legacy Keychain into the stable Data Protection Keychain bundle. Ad-hoc builds retain the reverse migration fallback for local development only.
+- Upgraded secure storage to fix macOS `errSecParam` (`-50`) when updating an existing Keychain credential bundle; Android now explicitly targets API 23 or newer as required by the upgraded secure-storage implementation.
+- Stopped issuing the legacy macOS Keychain bulk-read query that also returns `errSecParam` (`-50`) during startup migration. Older ad-hoc profiles now enter a safe one-time recovery state and can be consolidated by re-entering credentials and saving once.
+- Credential-bearing profile imports now act as an explicit Keychain recovery operation, while metadata-only imports preserve existing secrets and generated exports remain credential-free.
+- Added a separately persisted default endpoint selector beside the default engine setting; runtime endpoint switches no longer determine the next startup endpoint when a default is configured.
+
 ## 2.2.2 - 2026-07-07
 
 ### Fixed: release version metadata

@@ -36,7 +36,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-const ENGINE_VERSION: &str = "2.2.2";
+const ENGINE_VERSION: &str = "2.2.3";
 
 const SUPPORTED_METHODS: &[&str] = &[
     "health",

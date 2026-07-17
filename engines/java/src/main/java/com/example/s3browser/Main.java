@@ -120,7 +120,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class Main {
-    private static final String ENGINE_VERSION = "2.2.2";
+    private static final String ENGINE_VERSION = "2.2.3";
     private static final int REQUEST_POOL_SIZE = 8;
     private static final int DELETE_BATCH_LIMIT = 1000;
     private static final Object STDOUT_LOCK = new Object();

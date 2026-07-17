@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../models/domain_models.dart';
@@ -11,11 +12,13 @@ class StoredAppState {
     required this.settings,
     required this.profiles,
     required this.selectedProfileId,
+    this.credentialStoreError,
   });
 
   final AppSettings settings;
   final List<EndpointProfile> profiles;
   final String? selectedProfileId;
+  final String? credentialStoreError;
 }
 
 abstract class AppStateRepository {
@@ -25,6 +28,7 @@ abstract class AppStateRepository {
     required AppSettings settings,
     required List<EndpointProfile> profiles,
     required String? selectedProfileId,
+    bool allowCredentialStoreRecovery = false,
   });
 
   Future<File> exportProfiles({
@@ -36,6 +40,10 @@ abstract class AppStateRepository {
 }
 
 class LocalAppStateRepository implements AppStateRepository {
+  static const _profileSecretBundleKey = 'profiles.credentials.v2';
+  static const _macBundleId = 'com.example.s3BrowserCrossplat';
+  static const _stateFileName = 'object-data-browser-state.json';
+
   LocalAppStateRepository({
     ProfileSecretStore? secretStore,
     Future<Directory> Function()? applicationSupportDirectoryProvider,
@@ -46,10 +54,13 @@ class LocalAppStateRepository implements AppStateRepository {
 
   final ProfileSecretStore _secretStore;
   final Future<Directory> Function() _applicationSupportDirectoryProvider;
+  String? _persistedSecretBundleJson;
+  bool _secureStoreLoadFailed = false;
+  String? _credentialStoreError;
 
   @override
   Future<StoredAppState?> loadState() async {
-    final file = await _stateFile();
+    final file = await _stateFileForLoad();
     if (!await file.exists()) {
       return null;
     }
@@ -60,14 +71,18 @@ class LocalAppStateRepository implements AppStateRepository {
     final profilesJson = (decoded['profiles'] as List<Object?>? ?? const [])
         .map((item) => Map<String, Object?>.from(item as Map))
         .toList();
+    final secretsByProfile = await _loadProfileSecretBundle(
+      hasStoredProfiles: profilesJson.isNotEmpty,
+    );
     final profiles = <EndpointProfile>[];
     for (final metadata in profilesJson) {
-      profiles.add(await _hydrateProfile(metadata));
+      profiles.add(_hydrateProfile(metadata, secretsByProfile));
     }
     return StoredAppState(
       settings: AppSettings.fromJson(settingsJson),
       profiles: profiles,
       selectedProfileId: decoded['selectedProfileId'] as String?,
+      credentialStoreError: _credentialStoreError,
     );
   }
 
@@ -76,21 +91,17 @@ class LocalAppStateRepository implements AppStateRepository {
     required AppSettings settings,
     required List<EndpointProfile> profiles,
     required String? selectedProfileId,
+    bool allowCredentialStoreRecovery = false,
   }) async {
     final file = await _stateFile();
-    final previousIds = await _storedProfileIds(file);
-    final nextIds = profiles.map((profile) => profile.id).toSet();
-
-    for (final profile in profiles) {
-      final persistedToSecureStore = await _writeProfileSecrets(profile);
-      if (!persistedToSecureStore) {
-        throw StateError(
-          'Secure credential storage is unavailable. Profile secrets were not saved to local plaintext state.',
-        );
-      }
-    }
-    for (final removedId in previousIds.difference(nextIds)) {
-      await _deleteProfileSecrets(removedId);
+    final persistedToSecureStore = await _writeProfileSecretBundle(
+      profiles,
+      allowRecovery: allowCredentialStoreRecovery,
+    );
+    if (!persistedToSecureStore) {
+      throw StateError(
+        'Secure credential storage is unavailable. Profile secrets were not saved to local plaintext state.',
+      );
     }
 
     await file.parent.create(recursive: true);
@@ -141,45 +152,51 @@ class LocalAppStateRepository implements AppStateRepository {
   Future<File> _stateFile() async {
     final supportDir = await _applicationSupportDirectoryProvider();
     return File(
-      '${supportDir.path}${Platform.pathSeparator}object-data-browser-state.json',
+      '${supportDir.path}${Platform.pathSeparator}$_stateFileName',
     );
   }
 
-  Future<Set<String>> _storedProfileIds(File file) async {
-    if (!await file.exists()) {
-      return <String>{};
+  Future<File> _stateFileForLoad() async {
+    final primary = await _stateFile();
+    final alternate = _alternateMacStateFile(primary);
+    if (alternate == null || !await alternate.exists()) return primary;
+    if (!await primary.exists()) return alternate;
+    final primaryModified = await primary.lastModified();
+    final alternateModified = await alternate.lastModified();
+    return alternateModified.isAfter(primaryModified) ? alternate : primary;
+  }
+
+  File? _alternateMacStateFile(File primary) {
+    if (!Platform.isMacOS) return null;
+    const containersMarker = '/Library/Containers/';
+    const supportMarker = '/Library/Application Support/';
+    final path = primary.path;
+    if (path.contains(containersMarker)) {
+      final home = path.substring(0, path.indexOf(containersMarker));
+      return File(
+        '$home/Library/Application Support/$_macBundleId/$_stateFileName',
+      );
     }
-    final decoded =
-        jsonDecode(await file.readAsString()) as Map<String, Object?>;
-    final profilesJson = decoded['profiles'] as List<Object?>? ?? const [];
-    return profilesJson
-        .map((item) => Map<String, Object?>.from(item as Map))
-        .map((item) => (item['id'] as String?) ?? '')
-        .where((id) => id.isNotEmpty)
-        .toSet();
+    if (path.contains(supportMarker)) {
+      final home = path.substring(0, path.indexOf(supportMarker));
+      return File(
+        '$home/Library/Containers/$_macBundleId/Data/Library/Application Support/$_macBundleId/$_stateFileName',
+      );
+    }
+    return null;
   }
 
-  Future<EndpointProfile> _hydrateProfile(Map<String, Object?> metadata) async {
+  EndpointProfile _hydrateProfile(
+    Map<String, Object?> metadata,
+    Map<String, Map<String, String?>> secretsByProfile,
+  ) {
     final id = (metadata['id'] as String?) ?? '';
-    final accessKey = await _readSecret(
-          profileId: id,
-          field: 'accessKey',
-        ) ??
-        '';
-    final secretKey = await _readSecret(
-          profileId: id,
-          field: 'secretKey',
-        ) ??
-        '';
-    final sessionToken = await _readSecret(
-      profileId: id,
-      field: 'sessionToken',
-    );
+    final secrets = secretsByProfile[id] ?? const <String, String?>{};
     return EndpointProfile.fromJson({
       ...metadata,
-      'accessKey': accessKey,
-      'secretKey': secretKey,
-      'sessionToken': sessionToken,
+      'accessKey': secrets['accessKey'] ?? '',
+      'secretKey': secrets['secretKey'] ?? '',
+      'sessionToken': secrets['sessionToken'],
     });
   }
 
@@ -195,38 +212,197 @@ class LocalAppStateRepository implements AppStateRepository {
     return json;
   }
 
-  Future<bool> _writeProfileSecrets(EndpointProfile profile) async {
+  Future<Map<String, Map<String, String?>>> _loadProfileSecretBundle({
+    required bool hasStoredProfiles,
+  }) async {
+    String? bundleJson;
+    Object? primaryReadError;
     try {
-      await _secretStore.saveSecret(
-        _secretKey(profile.id, 'accessKey'),
-        profile.accessKey,
-      );
-      await _secretStore.saveSecret(
-        _secretKey(profile.id, 'secretKey'),
-        profile.secretKey,
-      );
-      if ((profile.sessionToken ?? '').isEmpty) {
-        await _secretStore.deleteSecret(_secretKey(profile.id, 'sessionToken'));
-      } else {
-        await _secretStore.saveSecret(
-          _secretKey(profile.id, 'sessionToken'),
-          profile.sessionToken ?? '',
-        );
+      bundleJson = await _secretStore.readSecret(_profileSecretBundleKey);
+    } catch (error) {
+      primaryReadError = error;
+    }
+
+    if (bundleJson != null && bundleJson.isNotEmpty) {
+      try {
+        final decoded = _decodeProfileSecretBundle(bundleJson);
+        _persistedSecretBundleJson = _encodeProfileSecretBundle(decoded);
+        return decoded;
+      } catch (error) {
+        _recordSecureStoreFailure(error);
+        return const {};
       }
+    }
+
+    // Check the non-primary Keychain implementation before scanning old
+    // per-field entries. Signed releases migrate legacy items into Data
+    // Protection; ad-hoc development builds support the reverse transition.
+    try {
+      final fallbackBundle =
+          await _secretStore.readFallbackMacSecret(_profileSecretBundleKey);
+      if (fallbackBundle != null && fallbackBundle.isNotEmpty) {
+        final decoded = _decodeProfileSecretBundle(fallbackBundle);
+        await _persistMigratedBundle(decoded);
+        if (primaryReadError != null) {
+          _recordSecureStoreFailure(primaryReadError);
+        }
+        return decoded;
+      }
+    } catch (_) {
+      // The alternate Keychain is a best-effort migration source.
+    }
+
+    Map<String, Map<String, String?>> migrated = const {};
+    if (primaryReadError == null && _secretStore.supportsPrimaryBulkRead) {
+      try {
+        // One SecItemCopyMatching call replaces three reads per profile and
+        // gives macOS one authorization boundary during migration.
+        migrated = _legacyProfileSecrets(await _secretStore.readAllSecrets());
+      } catch (error) {
+        primaryReadError = error;
+      }
+    }
+    if (migrated.isEmpty && _secretStore.supportsFallbackBulkRead) {
+      try {
+        migrated = _legacyProfileSecrets(
+          await _secretStore.readAllFallbackMacSecrets(),
+        );
+      } catch (_) {
+        // The alternate Keychain is a best-effort migration source.
+      }
+    }
+
+    if (primaryReadError != null) {
+      _recordSecureStoreFailure(primaryReadError);
+    }
+    if (migrated.isNotEmpty) {
+      await _persistMigratedBundle(migrated);
+    } else {
+      _persistedSecretBundleJson = _encodeProfileSecretBundle(const {});
+      if (primaryReadError == null && hasStoredProfiles) {
+        _recordCredentialMigrationRequired();
+      }
+    }
+    return migrated;
+  }
+
+  Future<void> _persistMigratedBundle(
+    Map<String, Map<String, String?>> migrated,
+  ) async {
+    if (_secureStoreLoadFailed) return;
+    final migratedJson = _encodeProfileSecretBundle(migrated);
+    try {
+      await _secretStore.saveSecret(_profileSecretBundleKey, migratedJson);
+      _persistedSecretBundleJson = migratedJson;
+    } catch (error) {
+      _recordSecureStoreFailure(error);
+    }
+  }
+
+  void _recordSecureStoreFailure(Object error) {
+    _secureStoreLoadFailed = true;
+    final detail = _secureStoreErrorDetail(error);
+    _credentialStoreError =
+        'macOS Keychain access failed${detail.isEmpty ? '' : ' ($detail)'}. '
+        'Credentials were not loaded. Open Settings, re-enter them, and save to repair secure storage.';
+  }
+
+  void _recordCredentialMigrationRequired() {
+    _secureStoreLoadFailed = true;
+    _credentialStoreError =
+        'Existing profile credentials could not be migrated safely from the legacy macOS Keychain. '
+        'Open Settings, re-enter each profile\'s access and secret keys, and press Save once.';
+  }
+
+  String _secureStoreErrorDetail(Object error) {
+    if (error is PlatformException) {
+      final message = error.message?.replaceAll(RegExp(r'\s+'), ' ').trim();
+      return message == null || message.isEmpty
+          ? error.code
+          : '${error.code}: $message';
+    }
+    return error.runtimeType.toString();
+  }
+
+  Future<bool> _writeProfileSecretBundle(
+    List<EndpointProfile> profiles, {
+    required bool allowRecovery,
+  }) async {
+    if (_secureStoreLoadFailed && !allowRecovery) return false;
+    final secretsByProfile = <String, Map<String, String?>>{
+      for (final profile in profiles)
+        profile.id: <String, String?>{
+          'accessKey': profile.accessKey,
+          'secretKey': profile.secretKey,
+          'sessionToken': (profile.sessionToken ?? '').isEmpty
+              ? null
+              : profile.sessionToken,
+        },
+    };
+    final bundleJson = _encodeProfileSecretBundle(secretsByProfile);
+    if (!_secureStoreLoadFailed && _persistedSecretBundleJson == bundleJson) {
+      return true;
+    }
+    try {
+      await _secretStore.saveSecret(_profileSecretBundleKey, bundleJson);
+      _persistedSecretBundleJson = bundleJson;
+      _secureStoreLoadFailed = false;
+      _credentialStoreError = null;
       return true;
     } catch (_) {
       return false;
     }
   }
 
-  Future<void> _deleteProfileSecrets(String profileId) async {
-    try {
-      await _secretStore.deleteSecret(_secretKey(profileId, 'accessKey'));
-      await _secretStore.deleteSecret(_secretKey(profileId, 'secretKey'));
-      await _secretStore.deleteSecret(_secretKey(profileId, 'sessionToken'));
-    } catch (_) {
-      // Deleting a removed profile should not block saving the remaining state.
+  String _encodeProfileSecretBundle(
+    Map<String, Map<String, String?>> secretsByProfile,
+  ) {
+    final sortedIds = secretsByProfile.keys.toList()..sort();
+    return jsonEncode(<String, Object?>{
+      'version': 2,
+      'profiles': <String, Object?>{
+        for (final id in sortedIds) id: secretsByProfile[id],
+      },
+    });
+  }
+
+  Map<String, Map<String, String?>> _decodeProfileSecretBundle(String value) {
+    final decoded = jsonDecode(value) as Map<String, Object?>;
+    final profiles =
+        Map<String, Object?>.from(decoded['profiles'] as Map? ?? const {});
+    return <String, Map<String, String?>>{
+      for (final entry in profiles.entries)
+        entry.key:
+            _credentialFields(Map<String, Object?>.from(entry.value as Map)),
+    };
+  }
+
+  Map<String, Map<String, String?>> _legacyProfileSecrets(
+    Map<String, String> items,
+  ) {
+    final result = <String, Map<String, String?>>{};
+    final pattern =
+        RegExp(r'^profile\.(.+)\.(accessKey|secretKey|sessionToken)$');
+    for (final entry in items.entries) {
+      final match = pattern.firstMatch(entry.key);
+      if (match == null) continue;
+      final profileId = match.group(1)!;
+      final field = match.group(2)!;
+      result.putIfAbsent(profileId, () => <String, String?>{})[field] =
+          entry.value;
     }
+    return <String, Map<String, String?>>{
+      for (final entry in result.entries)
+        entry.key: _credentialFields(entry.value),
+    };
+  }
+
+  Map<String, String?> _credentialFields(Map<dynamic, dynamic> value) {
+    return <String, String?>{
+      'accessKey': value['accessKey'] as String? ?? '',
+      'secretKey': value['secretKey'] as String? ?? '',
+      'sessionToken': value['sessionToken'] as String?,
+    };
   }
 
   Map<String, Object?> _profileMetadataToJson(
@@ -248,20 +424,5 @@ class LocalAppStateRepository implements AppStateRepository {
       'maxAttempts': profile.maxAttempts,
       'maxRequestsPerSecond': profile.maxRequestsPerSecond,
     };
-  }
-
-  Future<String?> _readSecret({
-    required String profileId,
-    required String field,
-  }) async {
-    try {
-      return await _secretStore.readSecret(_secretKey(profileId, field));
-    } catch (_) {
-      return null;
-    }
-  }
-
-  String _secretKey(String profileId, String field) {
-    return 'profile.$profileId.$field';
   }
 }

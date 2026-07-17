@@ -8,6 +8,8 @@ import 'package:flutter/foundation.dart';
 import '../models/domain_models.dart';
 import '../services/app_state_repository.dart';
 import '../services/engine_service.dart';
+import '../services/multipart_sizing.dart';
+import '../services/source_preview.dart';
 
 const List<String> kAwsRegions = <String>[
   'us-east-1',
@@ -174,9 +176,11 @@ class AppController extends ChangeNotifier {
     required AppSettings initialSettings,
     required List<EndpointProfile> initialProfiles,
     String? initialSelectedProfileId,
+    String? initialCredentialStoreError,
     AppStateRepository? appStateRepository,
   })  : _engineService = engineService,
         _initialSelectedProfileId = initialSelectedProfileId,
+        _credentialStoreError = initialCredentialStoreError,
         _appStateRepository = appStateRepository,
         settings = initialSettings,
         profiles = initialProfiles.map(normalizeEndpointProfile).toList() {
@@ -242,12 +246,14 @@ class AppController extends ChangeNotifier {
       (engineService as TransferJobSinkRegistrant)
           .setTransferSink(_handleTransferJobUpdate);
     }
+    bannerMessage = _credentialStoreError;
     _syncDiagnosticsOptions();
   }
 
   final EngineService _engineService;
   final String? _initialSelectedProfileId;
   final AppStateRepository? _appStateRepository;
+  String? _credentialStoreError;
   int _taskSequence = 0;
   int _guardErrorSequence = 0;
   final Map<String, String> _busyTaskIds = <String, String>{};
@@ -379,7 +385,15 @@ class AppController extends ChangeNotifier {
           source: 'engine',
         );
       }
-      if (selectedProfile != null) {
+      if (_credentialStoreError != null) {
+        bannerMessage = _credentialStoreError;
+        _addEvent(
+          level: 'ERROR',
+          category: 'Persistence',
+          message: _credentialStoreError!,
+          source: 'keychain',
+        );
+      } else if (selectedProfile != null) {
         await refreshBuckets();
         await refreshCapabilities();
       } else {
@@ -1145,6 +1159,7 @@ class AppController extends ChangeNotifier {
     }
     await _runBusy('upload', 'Starting upload...', () async {
       await _guard('Transfers', () async {
+        final uploadChunkMiB = await _uploadChunkSizeMiB(filePaths);
         final job = await _engineService.startUpload(
           engineId: activeEngineId,
           profile: profile,
@@ -1153,7 +1168,7 @@ class AppController extends ChangeNotifier {
           filePaths: filePaths,
           objectKeyByPath: objectKeyByPath,
           multipartThresholdMiB: settings.multipartThresholdMiB,
-          multipartChunkMiB: settings.multipartChunkMiB,
+          multipartChunkMiB: uploadChunkMiB,
         );
         _pendingUploadRelists[job.id] = _PendingObjectRelist(
           profileId: profile.id,
@@ -1170,12 +1185,26 @@ class AppController extends ChangeNotifier {
           level: 'INFO',
           category: 'Transfers',
           message:
-              'Started upload job ${job.id} for ${filePaths.length} file(s) into ${bucket.name}.',
+              'Started upload job ${job.id} for ${filePaths.length} file(s) into ${bucket.name} with ${settings.dynamicMultipartSizing ? 'dynamic' : 'manual'} $uploadChunkMiB MiB parts.',
           includeSelectionContext: true,
           source: 'task-tray',
         );
       });
     }, trackTask: false);
+  }
+
+  Future<int> _uploadChunkSizeMiB(List<String> filePaths) async {
+    if (!settings.dynamicMultipartSizing) {
+      return MultipartSizing.compliantManualPartSizeMiB(
+        settings.multipartChunkMiB,
+      );
+    }
+    var largestFileBytes = 0;
+    for (final path in filePaths) {
+      final size = await File(path).length();
+      largestFileBytes = math.max(largestFileBytes, size);
+    }
+    return MultipartSizing.recommendedPartSizeMiB(largestFileBytes);
   }
 
   Future<void> startSampleDownload() async {
@@ -1892,7 +1921,6 @@ class AppController extends ChangeNotifier {
         secretKey: profile.secretKey,
       );
     }
-    bannerMessage = 'Saved endpoint profile ${profile.name}.';
     _addEvent(
       level: 'INFO',
       category: 'Profiles',
@@ -1900,7 +1928,13 @@ class AppController extends ChangeNotifier {
       profileId: profile.id,
       source: 'profiles',
     );
-    await _persistState();
+    final persisted = await _persistState(
+      allowCredentialStoreRecovery: true,
+    );
+    if (persisted) _credentialStoreError = null;
+    bannerMessage = persisted
+        ? 'Saved endpoint profile ${profile.name}.'
+        : 'Profile is available for this session, but its credentials could not be saved securely.';
     notifyListeners();
   }
 
@@ -1923,6 +1957,11 @@ class AppController extends ChangeNotifier {
         await refreshBuckets();
       }
     }
+    if (settings.defaultProfileId == profileId) {
+      settings = settings.copyWith(
+        defaultProfileId: profiles.isEmpty ? '' : profiles.first.id,
+      );
+    }
     bannerMessage = 'Deleted endpoint profile.';
     _addEvent(
       level: 'INFO',
@@ -1944,6 +1983,19 @@ class AppController extends ChangeNotifier {
       source: 'engine',
     );
     await setEngine(engineId);
+  }
+
+  Future<void> setDefaultProfile(String profileId) async {
+    final profile = profiles.firstWhere((item) => item.id == profileId);
+    settings = settings.copyWith(defaultProfileId: profile.id);
+    _addEvent(
+      level: 'INFO',
+      category: 'Profiles',
+      message: 'Updated default endpoint to ${profile.name}.',
+      profileId: profile.id,
+      source: 'profiles',
+    );
+    await setSelectedProfileById(profile.id);
   }
 
   Future<void> addSampleProfile() async {
@@ -2137,9 +2189,33 @@ class AppController extends ChangeNotifier {
     if (repository == null) {
       return;
     }
-    final importedProfiles = (await repository.importProfiles(path))
-        .map(normalizeEndpointProfile)
-        .toList();
+    final existingById = <String, EndpointProfile>{
+      for (final profile in profiles) profile.id: profile,
+    };
+    final importedFromFile = await repository.importProfiles(path);
+    final importedCredentialCount = importedFromFile
+        .where(
+          (profile) =>
+              profile.accessKey.isNotEmpty ||
+              profile.secretKey.isNotEmpty ||
+              (profile.sessionToken ?? '').isNotEmpty,
+        )
+        .length;
+    final containsImportedCredentials = importedCredentialCount > 0;
+    final importedProfiles =
+        importedFromFile.map(normalizeEndpointProfile).map((profile) {
+      final existing = existingById[profile.id];
+      if (existing == null) return profile;
+      return profile.copyWith(
+        accessKey:
+            profile.accessKey.isEmpty ? existing.accessKey : profile.accessKey,
+        secretKey:
+            profile.secretKey.isEmpty ? existing.secretKey : profile.secretKey,
+        sessionToken: (profile.sessionToken ?? '').isEmpty
+            ? existing.sessionToken
+            : profile.sessionToken,
+      );
+    }).toList();
     final mergedById = <String, EndpointProfile>{
       for (final profile in profiles) profile.id: profile,
       for (final profile in importedProfiles) profile.id: profile,
@@ -2157,20 +2233,36 @@ class AppController extends ChangeNotifier {
     selectedProfile = nextSelectedId == null
         ? null
         : profiles.firstWhere((profile) => profile.id == nextSelectedId);
-    await _persistState();
-    bannerMessage = 'Imported ${importedProfiles.length} profiles.';
+    final persisted = await _persistState(
+      allowCredentialStoreRecovery: containsImportedCredentials,
+    );
+    if (persisted && containsImportedCredentials) {
+      _credentialStoreError = null;
+    }
+    final String importBannerMessage;
+    if (persisted) {
+      importBannerMessage = containsImportedCredentials
+          ? 'Imported ${importedProfiles.length} profiles and securely stored credentials for $importedCredentialCount ${importedCredentialCount == 1 ? 'profile' : 'profiles'}.'
+          : 'Imported ${importedProfiles.length} profile definitions. The file contained no credentials.';
+    } else if (!containsImportedCredentials && _credentialStoreError != null) {
+      importBannerMessage =
+          'Imported ${importedProfiles.length} profile definitions for this session, but the file contained no credentials. Import a credential-bearing file or re-enter the keys and save.';
+    } else {
+      importBannerMessage =
+          'Imported ${importedProfiles.length} profiles for this session, but credentials could not be saved securely.';
+    }
     _addEvent(
       level: 'INFO',
       category: 'Profiles',
       message: 'Imported ${importedProfiles.length} profiles from $path.',
       source: 'profiles',
     );
-    if (selectedProfile != null) {
+    if (selectedProfile != null && _credentialStoreError == null) {
       await refreshCapabilities();
       await refreshBuckets();
-    } else {
-      notifyListeners();
     }
+    bannerMessage = importBannerMessage;
+    notifyListeners();
   }
 
   void showBannerMessage(
@@ -2698,7 +2790,8 @@ class AppController extends ChangeNotifier {
         normalizedType == 'application/json' ||
         normalizedType == 'application/xml' ||
         normalizedType == 'application/x-yaml' ||
-        key.endsWith('.jsonl')) {
+        key.endsWith('.jsonl') ||
+        isCodePreview(key, contentType)) {
       return ObjectPreviewKind.text;
     }
     return ObjectPreviewKind.unsupported;
@@ -3433,6 +3526,11 @@ class AppController extends ChangeNotifier {
     if (profiles.isEmpty) {
       return null;
     }
+    if (settings.defaultProfileId.isNotEmpty) {
+      for (final profile in profiles) {
+        if (profile.id == settings.defaultProfileId) return profile;
+      }
+    }
     if (_initialSelectedProfileId == null) {
       return profiles.first;
     }
@@ -3455,17 +3553,21 @@ class AppController extends ChangeNotifier {
     }
   }
 
-  Future<void> _persistState() async {
+  Future<bool> _persistState({
+    bool allowCredentialStoreRecovery = false,
+  }) async {
     final repository = _appStateRepository;
     if (repository == null) {
-      return;
+      return false;
     }
     try {
       await repository.saveState(
         settings: settings,
         profiles: profiles,
         selectedProfileId: selectedProfile?.id,
+        allowCredentialStoreRecovery: allowCredentialStoreRecovery,
       );
+      return true;
     } catch (error) {
       _addEvent(
         level: 'ERROR',
@@ -3473,6 +3575,7 @@ class AppController extends ChangeNotifier {
         message: 'Failed to persist application state: $error',
         source: 'persistence',
       );
+      return false;
     }
   }
 
@@ -3749,6 +3852,18 @@ class AppController extends ChangeNotifier {
     }
     if (key.endsWith('.xml')) {
       return 'application/xml';
+    }
+    if (key.endsWith('.css')) {
+      return 'text/css';
+    }
+    if (key.endsWith('.js') || key.endsWith('.mjs') || key.endsWith('.jsx')) {
+      return 'text/javascript';
+    }
+    if (key.endsWith('.ts') || key.endsWith('.tsx')) {
+      return 'text/typescript';
+    }
+    if (sourcePreviewLanguage(key, null) != null) {
+      return 'text/plain';
     }
     if (key.endsWith('.png')) {
       return 'image/png';
