@@ -120,7 +120,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class Main {
-    private static final String ENGINE_VERSION = "2.2.3";
+    private static final String ENGINE_VERSION = "2.2.4";
     private static final int REQUEST_POOL_SIZE = 8;
     private static final int DELETE_BATCH_LIMIT = 1000;
     private static final Object STDOUT_LOCK = new Object();
@@ -1928,10 +1928,14 @@ public final class Main {
         }
         JsonNode config = params.path("config");
         String runId = "bench-" + UUID.randomUUID().toString().substring(0, 8);
+        Map<String, Object> benchmarkConfig = benchmarkConfigWithRunDir(
+            MAPPER.convertValue(config, new TypeReference<Map<String, Object>>() {}),
+            runId
+        );
         Map<String, Object> state = orderedMap(
             "id", runId,
             "profile", MAPPER.convertValue(params.path("profile"), new TypeReference<Map<String, Object>>() {}),
-            "config", MAPPER.convertValue(config, new TypeReference<Map<String, Object>>() {}),
+            "config", benchmarkConfig,
             "status", "running",
             "processedCount", 0,
             "startedAt", nowIso(),
@@ -2565,6 +2569,31 @@ public final class Main {
         merged.put("maxAttempts", asInt(config.get("maxAttempts")));
         merged.put("maxConcurrentRequests", asInt(config.get("maxPoolConnections")));
         return parseProfile(MAPPER.valueToTree(merged));
+    }
+
+    /**
+     * Redirects output artifacts into a per-run folder named after the run id so
+     * repeated Start presses never overwrite an earlier run's results.
+     */
+    private static Map<String, Object> benchmarkConfigWithRunDir(Map<String, Object> config, String runId) {
+        Map<String, Object> updated = new LinkedHashMap<>(config);
+        Map<String, String> defaults = Map.of(
+            "csvOutputPath", "benchmark-results.csv",
+            "jsonOutputPath", "benchmark-results.json",
+            "logFilePath", "benchmark.log"
+        );
+        for (Map.Entry<String, String> entry : defaults.entrySet()) {
+            String raw = String.valueOf(updated.getOrDefault(entry.getKey(), "")).trim();
+            if (raw.isBlank() || "null".equals(raw)) {
+                raw = entry.getValue();
+            }
+            Path path = Path.of(raw);
+            Path parent = path.getParent() == null ? Path.of("") : path.getParent();
+            if (parent.getFileName() == null || !runId.equals(parent.getFileName().toString())) {
+                updated.put(entry.getKey(), parent.resolve(runId).resolve(path.getFileName()).toString());
+            }
+        }
+        return updated;
     }
 
     private static String benchmarkBasePrefix(Map<String, Object> config, String runId) {

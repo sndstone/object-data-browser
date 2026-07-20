@@ -27,7 +27,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 
-ENGINE_VERSION = "2.2.3"
+ENGINE_VERSION = "2.2.4"
 
 # Serialize every write to stdout so transferProgress events emitted from worker
 # threads never interleave with request/response lines.
@@ -3442,6 +3442,22 @@ def _benchmark_size_list(config: dict[str, Any]) -> list[int]:
     return sizes or [4096]
 
 
+def _benchmark_config_with_run_dir(config: dict[str, Any], run_id: str) -> dict[str, Any]:
+    """Redirect output artifacts into a per-run folder named after the run id so
+    repeated Start presses never overwrite an earlier run's results."""
+    updated = dict(config)
+    for key, default_name in (
+        ("csvOutputPath", "benchmark-results.csv"),
+        ("jsonOutputPath", "benchmark-results.json"),
+        ("logFilePath", "benchmark.log"),
+    ):
+        raw = str(updated.get(key) or "").strip() or default_name
+        path = Path(raw)
+        if path.parent.name != run_id:
+            updated[key] = str(path.parent / run_id / path.name)
+    return updated
+
+
 def _benchmark_base_prefix(config: dict[str, Any], run_id: str) -> str:
     prefix = str(config.get("prefix", "")).strip()
     if prefix and not prefix.endswith("/"):
@@ -4053,6 +4069,7 @@ def _start_benchmark(params: dict[str, Any]) -> dict[str, Any]:
     if not profile_payload:
         raise SidecarError("invalid_config", "Profile configuration is required for benchmark runs.")
     run_id = f"bench-{uuid.uuid4().hex[:8]}"
+    config = _benchmark_config_with_run_dir(config, run_id)
     state = {
         "id": run_id,
         "profile": profile_payload,

@@ -28,7 +28,7 @@ import (
 	"github.com/aws/smithy-go"
 )
 
-const engineVersion = "2.2.3"
+const engineVersion = "2.2.4"
 
 var supportedMethods = []string{
 	"health", "getCapabilities", "testProfile", "listBuckets",
@@ -2189,6 +2189,32 @@ func benchmarkSizeList(config map[string]interface{}) []int {
 	return sizes
 }
 
+// benchmarkConfigWithRunDir redirects output artifacts into a per-run folder
+// named after the run id so repeated Start presses never overwrite an earlier
+// run's results.
+func benchmarkConfigWithRunDir(config map[string]interface{}, runID string) map[string]interface{} {
+	updated := map[string]interface{}{}
+	for key, value := range config {
+		updated[key] = value
+	}
+	defaults := map[string]string{
+		"csvOutputPath":  "benchmark-results.csv",
+		"jsonOutputPath": "benchmark-results.json",
+		"logFilePath":    "benchmark.log",
+	}
+	for key, defaultName := range defaults {
+		raw := strings.TrimSpace(asString(updated[key]))
+		if raw == "" {
+			raw = defaultName
+		}
+		dir := filepath.Dir(raw)
+		if filepath.Base(dir) != runID {
+			updated[key] = filepath.Join(dir, runID, filepath.Base(raw))
+		}
+	}
+	return updated
+}
+
 func benchmarkBasePrefix(config map[string]interface{}, runID string) string {
 	prefix := strings.TrimSpace(asString(config["prefix"]))
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
@@ -2617,6 +2643,7 @@ func startBenchmark(params map[string]interface{}) (map[string]interface{}, erro
 		return nil, &sidecarError{Code: "invalid_config", Message: "Profile configuration is required for benchmark runs."}
 	}
 	runID := fmt.Sprintf("bench-%d", time.Now().UnixNano())
+	config = benchmarkConfigWithRunDir(config, runID)
 	state := map[string]interface{}{
 		"id":                     runID,
 		"profile":                profilePayload,

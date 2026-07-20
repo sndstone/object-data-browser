@@ -1084,12 +1084,33 @@ class MainActivity : FlutterActivity() {
         )
     }
 
+    // Redirects output artifacts into a per-run folder named after the run id so
+    // repeated Start presses never overwrite an earlier run's results.
+    private fun benchmarkConfigWithRunDir(config: Map<String, Any?>, runId: String): Map<String, Any?> {
+        val updated = config.toMutableMap()
+        val defaults = mapOf(
+            "csvOutputPath" to "benchmark-results.csv",
+            "jsonOutputPath" to "benchmark-results.json",
+            "logFilePath" to "benchmark.log",
+        )
+        for ((key, defaultName) in defaults) {
+            val raw = updated[key]?.toString()?.trim().takeUnless { it.isNullOrEmpty() } ?: defaultName
+            val file = java.io.File(raw)
+            val parent = file.parentFile ?: java.io.File("")
+            if (parent.name != runId) {
+                updated[key] = java.io.File(java.io.File(parent, runId), file.name).path
+            }
+        }
+        return updated
+    }
+
     private fun startBenchmark(params: Map<String, Any?>): Map<String, Any?> {
         val profile = parseProfile(params["profile"])
-        val config = stringAnyMap(params["config"])
+        val runId = "bench-${System.currentTimeMillis()}"
+        val config = benchmarkConfigWithRunDir(stringAnyMap(params["config"]), runId)
         val benchmarkConfig = parseBenchmarkConfig(config)
         val run = BenchmarkRunState(
-            id = "bench-${System.currentTimeMillis()}",
+            id = runId,
             config = config,
             profile = profile,
             benchmarkConfig = benchmarkConfig,
