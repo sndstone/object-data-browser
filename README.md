@@ -29,7 +29,7 @@ This repository now includes:
 - Unified responsive breakpoints (phone < 700 px, tablet < 1 000 px, compact desktop < 1 360 px, desktop >= 1 360 px) that apply equally to resized desktop windows
 - Persistent sidecar engine processes (one long-lived process per engine instead of one per request)
 - The shared domain models and engine interface expected by all backends
-- Fully implemented Python, Go, Rust, and Java engines behind a shared contract, with parallel multipart transfers and native inspector tools (see `CHANGELOG.md` 2.1.0-2.2.3)
+- Fully implemented Python, Go, Rust, and Java engines behind a shared contract, with parallel multipart transfers and native inspector tools (see `CHANGELOG.md` 2.1.0-2.2.4)
 - Dynamic S3 upload part sizing that keeps parallel uploads within the 5 MiB–5 GiB part range and 10 000-part limit, with a manual override in Settings
 - Update-stable, Developer ID-backed macOS credential persistence with a migration path from older Keychain items, plus expandable previews with selectable syntax highlighting, image pan/zoom, and static HTML page rendering
 - Build/bootstrap scripts that stage dependencies into `.tmp` under the repo root

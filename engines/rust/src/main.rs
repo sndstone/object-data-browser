@@ -36,7 +36,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-const ENGINE_VERSION: &str = "2.2.3";
+const ENGINE_VERSION: &str = "2.2.4";
 
 const SUPPORTED_METHODS: &[&str] = &[
     "health",
@@ -2084,7 +2084,10 @@ async fn run_delete_all(params: Value) -> SidecarResult {
     }
     let batch_size = config["batchSize"].as_u64().unwrap_or(1000).clamp(1, 1000) as usize;
     let max_workers = config["maxWorkers"].as_u64().unwrap_or(4).clamp(1, 16) as usize;
-    let list_max_keys = config["listMaxKeys"].as_i64().unwrap_or(1000).clamp(1, 1000) as i32;
+    let list_max_keys = config["listMaxKeys"]
+        .as_i64()
+        .unwrap_or(1000)
+        .clamp(1, 1000) as i32;
     let deletion_delay_ms = config["deletionDelayMs"].as_u64().unwrap_or(0);
     let client = build_client(&profile).await?;
 
@@ -2246,8 +2249,7 @@ async fn run_delete_all(params: Value) -> SidecarResult {
                             .fetch_add(output.deleted().len() as u64, AtomicOrdering::Relaxed);
                         let errors = output.errors();
                         if !errors.is_empty() {
-                            failure_count
-                                .fetch_add(errors.len() as u64, AtomicOrdering::Relaxed);
+                            failure_count.fetch_add(errors.len() as u64, AtomicOrdering::Relaxed);
                             if let Some(first) = errors.first() {
                                 *last_error.lock().unwrap() = Some(
                                     first
@@ -2327,15 +2329,18 @@ async fn start_benchmark(params: Value) -> SidecarResult {
         ));
     }
     let run_id = format!("bench-{}", short_uuid());
-    let config_map = params
-        .get("config")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    let config_map = benchmark_config_with_run_dir(
+        &params
+            .get("config")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default(),
+        &run_id,
+    );
     let state = json!({
         "id": run_id,
         "profile": params["profile"],
-        "config": params["config"],
+        "config": Value::Object(config_map.clone()),
         "status": "running",
         "processedCount": 0,
         "startedAt": now_iso(),
@@ -3241,6 +3246,35 @@ fn persist_benchmark_outputs(state: &Value) -> Result<(), SidecarError> {
     fs::write(log_path, log_lines)
         .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
     Ok(())
+}
+
+/// Redirects output artifacts into a per-run folder named after the run id so
+/// repeated Start presses never overwrite an earlier run's results.
+fn benchmark_config_with_run_dir(config: &Map<String, Value>, run_id: &str) -> Map<String, Value> {
+    let mut updated = config.clone();
+    for (key, default_name) in [
+        ("csvOutputPath", "benchmark-results.csv"),
+        ("jsonOutputPath", "benchmark-results.json"),
+        ("logFilePath", "benchmark.log"),
+    ] {
+        let raw = updated
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default_name);
+        let path = Path::new(raw);
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        if parent.file_name().and_then(|name| name.to_str()) != Some(run_id) {
+            let file_name = path.file_name().unwrap_or_default();
+            let nested = parent.join(run_id).join(file_name);
+            updated.insert(
+                key.to_string(),
+                Value::String(nested.to_string_lossy().to_string()),
+            );
+        }
+    }
+    updated
 }
 
 fn benchmark_base_prefix(config: &Map<String, Value>, run_id: &str) -> Value {

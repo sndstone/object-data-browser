@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 2.2.4 - 2026-07-20
+
+### Benchmark workspace refresh
+- Reworked the active-run dashboard with clearer run identity, status, progress, live throughput, latency, data-rate cards, output controls, and a terminal-style live log.
+- Refined benchmark history and result presentation with denser summaries, clearer metric cards, and improved chart axes, smoothing, fills, markers, and stacked-series rendering.
+
+### Per-run benchmark outputs
+- Benchmark CSV, JSON, and log artifacts now write to a folder named after the run ID so repeated runs no longer overwrite earlier results.
+- Applied the per-run output layout consistently across the Python, Go, Rust, Java, Android, and mock benchmark implementations.
+
 ## 2.2.3 - 2026-07-18
 
 ### Dynamic multipart sizing

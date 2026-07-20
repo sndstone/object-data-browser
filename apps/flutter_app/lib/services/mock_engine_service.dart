@@ -18,7 +18,7 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
       id: 'python',
       label: 'Python Engine',
       language: 'Python',
-      version: '2.2.3',
+      version: '2.2.4',
       available: true,
       desktopSupported: true,
       androidSupported: false,
@@ -27,7 +27,7 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
       id: 'go',
       label: 'Go Engine',
       language: 'Go',
-      version: '2.2.3',
+      version: '2.2.4',
       available: true,
       desktopSupported: true,
       androidSupported: true,
@@ -36,7 +36,7 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
       id: 'rust',
       label: 'Rust Engine',
       language: 'Rust',
-      version: '2.2.3',
+      version: '2.2.4',
       available: true,
       desktopSupported: true,
       androidSupported: true,
@@ -45,7 +45,7 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
       id: 'java',
       label: 'Java Engine',
       language: 'Java',
-      version: '2.2.3',
+      version: '2.2.4',
       available: true,
       desktopSupported: true,
       androidSupported: false,
@@ -1002,9 +1002,10 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     required BenchmarkConfig config,
     required EndpointProfile profile,
   }) async {
+    final runId = 'bench-${DateTime.now().millisecondsSinceEpoch}';
     final run = BenchmarkRun(
-      id: 'bench-${DateTime.now().millisecondsSinceEpoch}',
-      config: config,
+      id: runId,
+      config: _configWithRunOutputDir(config, runId),
       status: 'running',
       processedCount: 0,
       startedAt: DateTime.now(),
@@ -1016,6 +1017,31 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     _runs[run.id] = run;
     unawaited(_tickRun(run.id));
     return run;
+  }
+
+  /// Mirrors the engine-side behavior: output artifacts land in a per-run
+  /// folder named after the run id so repeated runs never overwrite results.
+  BenchmarkConfig _configWithRunOutputDir(
+      BenchmarkConfig config, String runId) {
+    String nest(String rawPath, String defaultName) {
+      final raw = rawPath.trim().isEmpty ? defaultName : rawPath.trim();
+      final separator = raw.contains('\\') ? '\\' : '/';
+      final splitIndex = raw.lastIndexOf(RegExp(r'[/\\]'));
+      final parent = splitIndex < 0 ? '' : raw.substring(0, splitIndex);
+      final name = splitIndex < 0 ? raw : raw.substring(splitIndex + 1);
+      if (parent.endsWith(runId)) {
+        return raw;
+      }
+      return parent.isEmpty
+          ? '$runId$separator$name'
+          : '$parent$separator$runId$separator$name';
+    }
+
+    return config.copyWith(
+      csvOutputPath: nest(config.csvOutputPath, 'benchmark-results.csv'),
+      jsonOutputPath: nest(config.jsonOutputPath, 'benchmark-results.json'),
+      logFilePath: nest(config.logFilePath, 'benchmark.log'),
+    );
   }
 
   Future<void> _tickRun(String runId) async {

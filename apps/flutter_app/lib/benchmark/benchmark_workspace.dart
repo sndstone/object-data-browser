@@ -311,9 +311,8 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
       child: ListView(
         padding: EdgeInsets.all(panelPadding),
         children: [
-          Text('Benchmark control',
-              style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 6),
+          _sectionHeader(context, Icons.tune, 'Benchmark control'),
+          const SizedBox(height: 10),
           Builder(builder: (context) {
             final starting = controller.isBusy('benchmark-start');
             final activeRun = controller.benchmarkRun;
@@ -741,34 +740,55 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
 
   Widget _runPanel(BuildContext context, BenchmarkRun? run) {
     final operations = controller.benchmarkOperationsForRun(run);
-    final outputPaths = run == null
-        ? const <MapEntry<String, String>>[]
-        : <MapEntry<String, String>>[
-            MapEntry('CSV', run.config.csvOutputPath),
-            MapEntry('JSON', run.config.jsonOutputPath),
-            MapEntry('Log', run.config.logFilePath),
-          ];
     final isDesktopCompact =
         AppTheme.isDesktopPlatform(Theme.of(context).platform);
+    final theme = Theme.of(context);
     return Card(
       clipBehavior: Clip.antiAlias,
       child: LayoutBuilder(
         builder: (context, constraints) {
           final logHeight =
-              (constraints.maxHeight * 0.32).clamp(160.0, 240.0).toDouble();
+              (constraints.maxHeight * 0.30).clamp(140.0, 220.0).toDouble();
           return Padding(
             padding: EdgeInsets.all(isDesktopCompact ? 12.0 : 16.0),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('Active run',
-                    style: Theme.of(context).textTheme.titleMedium),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _sectionHeader(
+                        context,
+                        Icons.monitor_heart_outlined,
+                        'Active run',
+                      ),
+                    ),
+                    if (run != null) _statusChip(context, run.status),
+                  ],
+                ),
                 const SizedBox(height: 12),
                 if (run == null)
-                  const Expanded(
-                    child: Align(
-                      alignment: Alignment.topLeft,
-                      child: Text('No benchmark is running.'),
+                  Expanded(
+                    child: Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.speed_outlined,
+                            size: 40,
+                            color: theme.colorScheme.onSurfaceVariant
+                                .withValues(alpha: 0.6),
+                          ),
+                          const SizedBox(height: 12),
+                          const Text('No benchmark is running.'),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Configure a workload and press Start benchmark.',
+                            style: theme.textTheme.bodySmall,
+                            textAlign: TextAlign.center,
+                          ),
+                        ],
+                      ),
                     ),
                   )
                 else if (run.status == 'starting')
@@ -785,12 +805,12 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                           const SizedBox(height: 14),
                           Text(
                             'Starting benchmark…',
-                            style: Theme.of(context).textTheme.titleMedium,
+                            style: theme.textTheme.titleMedium,
                           ),
                           const SizedBox(height: 6),
                           Text(
                             'Contacting ${controller.activeEngineId} engine',
-                            style: Theme.of(context).textTheme.bodySmall,
+                            style: theme.textTheme.bodySmall,
                           ),
                         ],
                       ),
@@ -806,42 +826,28 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                _stat(context, 'Run ID', run.id),
-                                _stat(context, 'Status', run.status),
-                                _stat(
-                                  context,
-                                  'Bucket',
-                                  run.config.bucketName.isEmpty
-                                      ? 'Not set'
-                                      : run.config.bucketName,
+                                _runIdentityCard(context, run),
+                                const SizedBox(height: 12),
+                                ClipRRect(
+                                  borderRadius: BorderRadius.circular(999),
+                                  child: LinearProgressIndicator(
+                                    value: controller.benchmarkProgress,
+                                    minHeight: 8,
+                                  ),
                                 ),
-                                _stat(context, 'Processed',
-                                    '${run.processedCount} operations'),
-                                _stat(
-                                  context,
-                                  'Latency',
-                                  '${run.averageLatencyMs.toStringAsFixed(1)} ms average',
-                                ),
-                                _statWithTooltip(
-                                  context,
-                                  'Current ops/s',
-                                  '${run.throughputOpsPerSecond.toStringAsFixed(0)} ops/s',
-                                  tooltip:
-                                      'Measured from completed operations over active elapsed time. This is the benchmark’s truth source for live throughput.',
-                                ),
-                                _statWithTooltip(
-                                  context,
-                                  'Current data rate',
-                                  '${controller.estimatedMibsForRun(run).toStringAsFixed(2)} MiB/s',
-                                  tooltip:
-                                      'Current ops/s × average configured object size. Approximate because the workload mix can vary by size.',
+                                const SizedBox(height: 6),
+                                Text(
+                                  run.config.testMode == 'operation-count'
+                                      ? '${(controller.benchmarkProgress * 100).toStringAsFixed(0)}% of ${run.config.operationCount} operations'
+                                      : '${_activeBenchmarkSeconds(run).toStringAsFixed(0)}s of ${run.config.durationSeconds}s',
+                                  style: theme.textTheme.labelMedium,
                                 ),
                                 const SizedBox(height: 12),
+                                _runStatGrid(context, run),
+                                const SizedBox(height: 14),
                                 Text('Current activity',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .titleMedium),
-                                const SizedBox(height: 8),
+                                    style: theme.textTheme.titleMedium),
+                                const SizedBox(height: 6),
                                 Text(controller.benchmarkActivityForRun(run)),
                                 const SizedBox(height: 8),
                                 Wrap(
@@ -850,29 +856,43 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                                   children: operations.entries
                                       .map(
                                         (entry) => Chip(
+                                          visualDensity: VisualDensity.compact,
                                           label: Text(
                                               '${entry.key} ${entry.value}'),
                                         ),
                                       )
                                       .toList(),
                                 ),
-                                const SizedBox(height: 12),
-                                LinearProgressIndicator(
-                                    value: controller.benchmarkProgress),
-                                const SizedBox(height: 8),
-                                Text(
-                                  run.config.testMode == 'operation-count'
-                                      ? '${(controller.benchmarkProgress * 100).toStringAsFixed(0)}% of ${run.config.operationCount} operations'
-                                      : '${_activeBenchmarkSeconds(run).toStringAsFixed(0)}s of ${run.config.durationSeconds}s',
+                                const SizedBox(height: 14),
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: Text('Output files',
+                                          style: theme.textTheme.titleMedium),
+                                    ),
+                                    Tooltip(
+                                      message: 'Open this run’s results folder',
+                                      child: IconButton(
+                                        onPressed: () => controller.openPath(
+                                          _parentDirectory(
+                                              run.config.csvOutputPath),
+                                        ),
+                                        icon: const Icon(
+                                            Icons.folder_open_outlined),
+                                      ),
+                                    ),
+                                  ],
                                 ),
-                                const SizedBox(height: 12),
-                                Text('Output files',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .titleMedium),
+                                const SizedBox(height: 4),
+                                Text(
+                                  'Each run writes into its own folder named after the run ID.',
+                                  style: theme.textTheme.bodySmall,
+                                ),
                                 const SizedBox(height: 8),
-                                ...outputPaths.map((entry) => _outputFileTile(
-                                    context, entry.key, entry.value)),
+                                ..._outputFileEntries(run).map(
+                                  (entry) => _outputFileTile(
+                                      context, entry.key, entry.value),
+                                ),
                                 const SizedBox(height: 12),
                                 Wrap(
                                   spacing: 8,
@@ -904,36 +924,11 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                           ),
                         ),
                         const SizedBox(height: 12),
-                        Text('Live log',
-                            style: Theme.of(context).textTheme.titleMedium),
+                        Text('Live log', style: theme.textTheme.titleMedium),
                         const SizedBox(height: 8),
                         SizedBox(
                           height: logHeight,
-                          child: Container(
-                            width: double.infinity,
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(16),
-                              color: const Color(0x11000000),
-                            ),
-                            child: run.liveLog.isEmpty
-                                ? const Center(
-                                    child: Text(
-                                      'Waiting for benchmark log output...',
-                                    ),
-                                  )
-                                : ListView(
-                                    children: run.liveLog
-                                        .map(
-                                          (entry) => Padding(
-                                            padding: const EdgeInsets.only(
-                                                bottom: 6),
-                                            child: Text(entry),
-                                          ),
-                                        )
-                                        .toList(),
-                                  ),
-                          ),
+                          child: _liveLogView(context, run),
                         ),
                       ],
                     ),
@@ -943,6 +938,252 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
           );
         },
       ),
+    );
+  }
+
+  /// Compact identity strip for the active run: ID, bucket, and engine.
+  Widget _runIdentityCard(BuildContext context, BenchmarkRun run) {
+    final theme = Theme.of(context);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12),
+        color: theme.colorScheme.surfaceContainerHighest,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.tag,
+                size: 15,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  run.id,
+                  style: theme.textTheme.labelLarge,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '${run.config.bucketName.isEmpty ? 'No bucket set' : run.config.bucketName} · ${run.config.engineId.isEmpty ? controller.activeEngineId : run.config.engineId} engine',
+            style: theme.textTheme.bodySmall,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Two-column grid of live counters for the active run.
+  Widget _runStatGrid(BuildContext context, BenchmarkRun run) {
+    final tiles = <Widget>[
+      _runStatTile(
+        context,
+        icon: Icons.stacked_line_chart,
+        label: 'Processed',
+        value: '${run.processedCount}',
+        caption: 'operations',
+      ),
+      _runStatTile(
+        context,
+        icon: Icons.timer_outlined,
+        label: 'Latency',
+        value: run.averageLatencyMs.toStringAsFixed(1),
+        caption: 'ms average',
+      ),
+      _runStatTile(
+        context,
+        icon: Icons.speed_outlined,
+        label: 'Throughput',
+        value: run.throughputOpsPerSecond.toStringAsFixed(0),
+        caption: 'ops/s',
+        tooltip:
+            'Measured from completed operations over active elapsed time. This is the benchmark’s truth source for live throughput.',
+      ),
+      _runStatTile(
+        context,
+        icon: Icons.sync_alt,
+        label: 'Data rate',
+        value: controller.estimatedMibsForRun(run).toStringAsFixed(2),
+        caption: 'MiB/s',
+        tooltip:
+            'Current ops/s × average configured object size. Approximate because the workload mix can vary by size.',
+      ),
+    ];
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final columns = constraints.maxWidth >= 320 ? 2 : 1;
+        final tileWidth =
+            (constraints.maxWidth - ((columns - 1) * 8)) / columns;
+        return Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: tiles
+              .map((tile) => SizedBox(width: tileWidth, child: tile))
+              .toList(),
+        );
+      },
+    );
+  }
+
+  Widget _runStatTile(
+    BuildContext context, {
+    required IconData icon,
+    required String label,
+    required String value,
+    required String caption,
+    String? tooltip,
+  }) {
+    final theme = Theme.of(context);
+    final tile = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: theme.colorScheme.outlineVariant.withValues(alpha: 0.8),
+        ),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 30,
+            height: 30,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(9),
+              color: theme.colorScheme.primaryContainer.withValues(alpha: 0.55),
+            ),
+            child: Icon(
+              icon,
+              size: 16,
+              color: theme.colorScheme.primary,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label, style: theme.textTheme.labelMedium),
+                const SizedBox(height: 1),
+                Text.rich(
+                  TextSpan(
+                    text: value,
+                    style: theme.textTheme.titleMedium,
+                    children: [
+                      TextSpan(
+                        text: ' $caption',
+                        style: theme.textTheme.labelMedium,
+                      ),
+                    ],
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+          if (tooltip != null)
+            Tooltip(
+              message: tooltip,
+              preferBelow: false,
+              constraints: const BoxConstraints(maxWidth: 280),
+              child: Icon(
+                Icons.info_outline,
+                size: 14,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+        ],
+      ),
+    );
+    return tile;
+  }
+
+  /// Terminal-styled live log that sticks to the newest entries.
+  Widget _liveLogView(BuildContext context, BenchmarkRun run) {
+    const background = Color(0xFF0A1410);
+    const foreground = Color(0xFFC9DACF);
+    final logStyle = Theme.of(context).textTheme.bodySmall?.copyWith(
+          color: foreground,
+          fontFamily: 'Menlo',
+          fontFamilyFallback: const <String>[
+            'Consolas',
+            'Roboto Mono',
+            'monospace',
+          ],
+          fontWeight: FontWeight.w500,
+          fontSize: 12,
+          height: 1.5,
+        );
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12),
+        color: background,
+      ),
+      child: run.liveLog.isEmpty
+          ? Center(
+              child: Text(
+                'Waiting for benchmark log output...',
+                style: logStyle?.copyWith(
+                  color: foreground.withValues(alpha: 0.6),
+                ),
+              ),
+            )
+          : ListView(
+              reverse: true,
+              children: run.liveLog.reversed
+                  .map(
+                    (entry) => Padding(
+                      padding: const EdgeInsets.only(bottom: 4),
+                      child: Text(entry, style: logStyle),
+                    ),
+                  )
+                  .toList(),
+            ),
+    );
+  }
+
+  /// Parent directory of [path] using whichever separator the path uses.
+  String _parentDirectory(String path) {
+    final splitIndex = path.lastIndexOf(RegExp(r'[/\\]'));
+    if (splitIndex <= 0) {
+      return path;
+    }
+    return path.substring(0, splitIndex);
+  }
+
+  Widget _sectionHeader(BuildContext context, IconData icon, String title) {
+    final theme = Theme.of(context);
+    return Row(
+      children: [
+        Container(
+          width: 28,
+          height: 28,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            color: theme.colorScheme.primaryContainer.withValues(alpha: 0.55),
+          ),
+          child: Icon(icon, size: 16, color: theme.colorScheme.primary),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            title,
+            style: theme.textTheme.titleMedium,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
     );
   }
 
@@ -958,12 +1199,27 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Benchmark history',
-                style: Theme.of(context).textTheme.titleMedium),
+            _sectionHeader(context, Icons.history, 'Benchmark history'),
             const SizedBox(height: 8),
             Expanded(
               child: history.isEmpty
-                  ? const Text('No benchmark runs recorded yet.')
+                  ? Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.hourglass_empty,
+                            size: 32,
+                            color: Theme.of(context)
+                                .colorScheme
+                                .onSurfaceVariant
+                                .withValues(alpha: 0.6),
+                          ),
+                          const SizedBox(height: 10),
+                          const Text('No benchmark runs recorded yet.'),
+                        ],
+                      ),
+                    )
                   : ListView.separated(
                       itemCount: history.length,
                       separatorBuilder: (_, __) => const Divider(height: 1),
@@ -1059,29 +1315,35 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('Results preview',
-                          style: Theme.of(context).textTheme.titleMedium),
+                      _sectionHeader(
+                          context, Icons.query_stats, 'Results preview'),
                       const SizedBox(height: 8),
                       if (run != null) ...[
-                        Text('Viewing ${run.id}'),
+                        Text(
+                          'Viewing ${run.id}',
+                          style: Theme.of(context).textTheme.bodySmall,
+                          overflow: TextOverflow.ellipsis,
+                        ),
                         const SizedBox(height: 4),
                         if (run.resultSummary == null)
-                          const Text(
+                          Text(
                             'Live estimate while the benchmark is still running.',
+                            style: Theme.of(context).textTheme.bodySmall,
                           ),
                       ],
                     ],
                   ),
                 ),
-                OutlinedButton.icon(
+                FilledButton.tonalIcon(
                   onPressed:
                       summary == null ? null : () => _openResultsWorkspace(run),
-                  icon: const Icon(Icons.open_in_full),
+                  icon: const Icon(Icons.open_in_full, size: 16),
                   label: const Text('Open detailed view'),
                 ),
               ],
@@ -1236,34 +1498,78 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
       spacing: 12,
       runSpacing: 12,
       children: [
-        _metricCard(context, 'Operations', '$totalOps total'),
         _metricCard(
-            context, 'Latency', '${avgLatency.toStringAsFixed(1)} ms avg'),
-        _metricCard(context, 'Peak throughput',
-            '${peakThroughput.toStringAsFixed(0)} ops/s'),
+          context,
+          'Operations',
+          '$totalOps total',
+          icon: Icons.stacked_line_chart,
+        ),
+        _metricCard(
+          context,
+          'Latency',
+          '${avgLatency.toStringAsFixed(1)} ms avg',
+          icon: Icons.timer_outlined,
+        ),
+        _metricCard(
+          context,
+          'Peak throughput',
+          '${peakThroughput.toStringAsFixed(0)} ops/s',
+          icon: Icons.speed_outlined,
+        ),
         _metricCard(
           context,
           'Operation types',
           '${_availableOperations(summary).length} tracked',
+          icon: Icons.category_outlined,
         ),
       ],
     );
   }
 
-  Widget _metricCard(BuildContext context, String title, String value) {
+  Widget _metricCard(
+    BuildContext context,
+    String title,
+    String value, {
+    IconData icon = Icons.insights_outlined,
+  }) {
+    final theme = Theme.of(context);
     return Container(
-      width: 180,
-      padding: const EdgeInsets.all(12),
+      width: 196,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(16),
-        color: Theme.of(context).colorScheme.surface,
+        borderRadius: BorderRadius.circular(12),
+        color: theme.colorScheme.surface,
+        border: Border.all(
+          color: theme.colorScheme.outlineVariant.withValues(alpha: 0.8),
+        ),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
         children: [
-          Text(title, style: Theme.of(context).textTheme.labelLarge),
-          const SizedBox(height: 4),
-          Text(value, style: Theme.of(context).textTheme.titleMedium),
+          Container(
+            width: 30,
+            height: 30,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(9),
+              color: theme.colorScheme.primaryContainer.withValues(alpha: 0.55),
+            ),
+            child: Icon(icon, size: 16, color: theme.colorScheme.primary),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, style: theme.textTheme.labelMedium),
+                const SizedBox(height: 1),
+                Text(
+                  value,
+                  style: theme.textTheme.titleMedium,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
         ],
       ),
     );
@@ -1325,6 +1631,24 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                         padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
                         child: Row(
                           children: [
+                            Container(
+                              width: 36,
+                              height: 36,
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(10),
+                                color: Theme.of(dialogContext)
+                                    .colorScheme
+                                    .primaryContainer
+                                    .withValues(alpha: 0.55),
+                              ),
+                              child: Icon(
+                                Icons.query_stats,
+                                size: 20,
+                                color:
+                                    Theme.of(dialogContext).colorScheme.primary,
+                              ),
+                            ),
+                            const SizedBox(width: 12),
                             Expanded(
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1335,18 +1659,22 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                                         .textTheme
                                         .titleLarge,
                                   ),
-                                  const SizedBox(height: 6),
+                                  const SizedBox(height: 4),
                                   Text(
                                     liveRun == null
                                         ? 'No run selected'
                                         : 'Viewing ${liveRun.id}',
                                     style: Theme.of(dialogContext)
                                         .textTheme
-                                        .bodyMedium,
+                                        .bodySmall,
+                                    overflow: TextOverflow.ellipsis,
                                   ),
                                 ],
                               ),
                             ),
+                            if (liveRun != null)
+                              _statusChip(dialogContext, liveRun.status),
+                            const SizedBox(width: 8),
                             IconButton(
                               tooltip: 'Close',
                               onPressed: () =>
@@ -1555,7 +1883,26 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     return ListView(
       padding: const EdgeInsets.all(20),
       children: [
-        Text('Output files', style: Theme.of(context).textTheme.titleMedium),
+        Row(
+          children: [
+            Expanded(
+              child: Text('Output files',
+                  style: Theme.of(context).textTheme.titleMedium),
+            ),
+            OutlinedButton.icon(
+              onPressed: () => controller.openPath(
+                _parentDirectory(run.config.csvOutputPath),
+              ),
+              icon: const Icon(Icons.folder_open_outlined, size: 16),
+              label: const Text('Open results folder'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'Each run writes its artifacts into a folder named after the run ID.',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
         const SizedBox(height: 8),
         ..._outputFileEntries(run)
             .map((entry) => _outputFileTile(context, entry.key, entry.value)),
@@ -1618,7 +1965,22 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
           spacing: 12,
           runSpacing: 12,
           children: cards
-              .map((entry) => _metricCard(context, entry.key, entry.value))
+              .map(
+                (entry) => _metricCard(
+                  context,
+                  entry.key,
+                  entry.value,
+                  icon: switch (entry.key) {
+                    'Sample windows' => Icons.grid_view_outlined,
+                    'Average bandwidth' => Icons.swap_vert,
+                    'Peak bandwidth' => Icons.trending_up,
+                    'Retries' => Icons.refresh,
+                    'Checksum validated' => Icons.verified_outlined,
+                    'Object sizes' => Icons.straighten_outlined,
+                    _ => Icons.insights_outlined,
+                  },
+                ),
+              )
               .toList(),
         ),
       ],
@@ -2207,12 +2569,15 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     if (stats.isEmpty) {
       return const Center(child: Text('No checksum statistics available.'));
     }
+    final scheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
     final colors = <Color>[
-      Theme.of(context).colorScheme.primary,
-      Theme.of(context).colorScheme.secondary,
-      Theme.of(context).colorScheme.tertiary,
-      Theme.of(context).colorScheme.error,
+      scheme.primary,
+      scheme.secondary,
+      scheme.tertiary,
+      scheme.error,
     ];
+    final total = stats.fold<int>(0, (current, entry) => current + entry.value);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -2221,56 +2586,102 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 4),
         Text(
-          'Pie view of checksum validation results.',
+          'Share of checksum validation results across the run.',
           style: Theme.of(context).textTheme.bodySmall,
         ),
         const SizedBox(height: 16),
         Wrap(
-          spacing: 24,
+          spacing: 28,
           runSpacing: 24,
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             SizedBox(
-              width: math.min(constraints.maxWidth * 0.45, 260),
-              height: 260,
-              child: CustomPaint(
-                painter: _PieChartPainter(
-                  sections: List<_PieSection>.generate(
-                    stats.length,
-                    (index) => _PieSection(
-                      value: stats[index].value.toDouble(),
-                      color: colors[index % colors.length],
+              width: math.min(constraints.maxWidth * 0.45, 240),
+              height: 240,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  CustomPaint(
+                    painter: _PieChartPainter(
+                      sections: List<_PieSection>.generate(
+                        stats.length,
+                        (index) => _PieSection(
+                          value: stats[index].value.toDouble(),
+                          color: colors[index % colors.length],
+                        ),
+                      ),
                     ),
                   ),
-                ),
+                  Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          '$total',
+                          style: textTheme.headlineSmall,
+                        ),
+                        Text(
+                          'checks',
+                          style: textTheme.labelMedium,
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
               ),
             ),
             ConstrainedBox(
-              constraints: const BoxConstraints(minWidth: 220, maxWidth: 360),
+              constraints: const BoxConstraints(minWidth: 240, maxWidth: 380),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: List<Widget>.generate(
                   stats.length,
-                  (index) => Padding(
-                    padding: const EdgeInsets.only(bottom: 10),
-                    child: Row(
-                      children: [
-                        Container(
-                          width: 14,
-                          height: 14,
-                          decoration: BoxDecoration(
-                            color: colors[index % colors.length],
-                            shape: BoxShape.circle,
-                          ),
+                  (index) {
+                    final share =
+                        total == 0 ? 0.0 : stats[index].value / total * 100;
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
                         ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Text(stats[index].key.replaceAll('_', ' ')),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(10),
+                          color: colors[index % colors.length]
+                              .withValues(alpha: 0.08),
                         ),
-                        Text('${stats[index].value}'),
-                      ],
-                    ),
-                  ),
+                        child: Row(
+                          children: [
+                            Container(
+                              width: 12,
+                              height: 12,
+                              decoration: BoxDecoration(
+                                color: colors[index % colors.length],
+                                shape: BoxShape.circle,
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                stats[index].key.replaceAll('_', ' '),
+                                style: textTheme.bodyMedium,
+                              ),
+                            ),
+                            Text(
+                              '${stats[index].value}',
+                              style: textTheme.labelLarge,
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              '${share.toStringAsFixed(1)}%',
+                              style: textTheme.labelMedium,
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
                 ),
               ),
             ),
@@ -2302,24 +2713,43 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
         Text(subtitle, style: Theme.of(context).textTheme.bodySmall),
         const SizedBox(height: 12),
         Wrap(
-          spacing: 10,
-          runSpacing: 10,
+          spacing: 8,
+          runSpacing: 8,
           children: series
               .map(
-                (entry) => Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
-                      width: 12,
-                      height: 12,
-                      decoration: BoxDecoration(
-                        color: entry.color,
-                        borderRadius: BorderRadius.circular(999),
-                      ),
+                (entry) => Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(999),
+                    color: entry.color.withValues(alpha: 0.10),
+                    border: Border.all(
+                      color: entry.color.withValues(alpha: 0.35),
                     ),
-                    const SizedBox(width: 6),
-                    Text(entry.id),
-                  ],
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 9,
+                        height: 9,
+                        decoration: BoxDecoration(
+                          color: entry.color,
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        entry.id,
+                        style: Theme.of(context)
+                            .textTheme
+                            .labelMedium
+                            ?.copyWith(
+                              color: Theme.of(context).colorScheme.onSurface,
+                            ),
+                      ),
+                    ],
+                  ),
                 ),
               )
               .toList(),
@@ -2354,6 +2784,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                       gridColor: Theme.of(context).colorScheme.outlineVariant,
                       area: style == _BenchmarkLineStyle.area,
                       suffix: suffix,
+                      smooth: controller.settings.benchmarkChartSmoothing,
                     ),
                     child: const SizedBox.expand(),
                   ),
@@ -2426,30 +2857,69 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     double maxValue, {
     required String suffix,
   }) {
-    final height =
-        maxValue == 0 ? 48.0 : ((value / maxValue) * 220).clamp(48, 220);
+    const trackHeight = 190.0;
+    final barHeight = maxValue <= 0
+        ? 3.0
+        : ((value / maxValue) * trackHeight).clamp(3.0, trackHeight);
+    final scheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
     return Column(
       mainAxisAlignment: MainAxisAlignment.end,
       children: [
-        Text('${value.toStringAsFixed(1)}$suffix'),
-        const SizedBox(height: 8),
-        AnimatedContainer(
-          duration: const Duration(milliseconds: 250),
-          height: height.toDouble(),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(28),
-            gradient: LinearGradient(
-              begin: Alignment.bottomCenter,
-              end: Alignment.topCenter,
-              colors: [
-                Theme.of(context).colorScheme.primary,
-                Theme.of(context).colorScheme.tertiary,
-              ],
+        Text(
+          '${value.toStringAsFixed(1)}$suffix',
+          style: textTheme.labelMedium?.copyWith(color: scheme.onSurface),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        const SizedBox(height: 6),
+        SizedBox(
+          height: trackHeight,
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 64),
+              child: Stack(
+                alignment: Alignment.bottomCenter,
+                children: [
+                  Container(
+                    width: double.infinity,
+                    decoration: BoxDecoration(
+                      borderRadius:
+                          const BorderRadius.vertical(top: Radius.circular(8)),
+                      color: scheme.onSurface.withValues(alpha: 0.045),
+                    ),
+                  ),
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 250),
+                    curve: Curves.easeOutCubic,
+                    height: barHeight,
+                    width: double.infinity,
+                    decoration: BoxDecoration(
+                      borderRadius:
+                          const BorderRadius.vertical(top: Radius.circular(8)),
+                      gradient: LinearGradient(
+                        begin: Alignment.bottomCenter,
+                        end: Alignment.topCenter,
+                        colors: [
+                          scheme.primary,
+                          scheme.primary.withValues(alpha: 0.72),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
-        const SizedBox(height: 12),
-        Text(label, textAlign: TextAlign.center),
+        const SizedBox(height: 8),
+        Text(
+          label,
+          textAlign: TextAlign.center,
+          style: textTheme.labelMedium,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
       ],
     );
   }
@@ -2790,67 +3260,6 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
         .inSeconds
         .toDouble()
         .clamp(0, run.config.durationSeconds.toDouble());
-  }
-
-  Widget _stat(BuildContext context, String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: RichText(
-        text: TextSpan(
-          style: DefaultTextStyle.of(context).style.copyWith(height: 1.35),
-          children: [
-            TextSpan(
-              text: '$label: ',
-              style: const TextStyle(fontWeight: FontWeight.w700),
-            ),
-            TextSpan(text: value),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// Like [_stat] but shows a small info icon with a tooltip explaining the
-  /// measurement methodology.
-  Widget _statWithTooltip(
-    BuildContext context,
-    String label,
-    String value, {
-    required String tooltip,
-  }) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: [
-          Expanded(
-            child: RichText(
-              text: TextSpan(
-                style:
-                    DefaultTextStyle.of(context).style.copyWith(height: 1.35),
-                children: [
-                  TextSpan(
-                    text: '$label: ',
-                    style: const TextStyle(fontWeight: FontWeight.w700),
-                  ),
-                  TextSpan(text: value),
-                ],
-              ),
-            ),
-          ),
-          Tooltip(
-            message: tooltip,
-            preferBelow: false,
-            constraints: const BoxConstraints(maxWidth: 280),
-            child: Icon(
-              Icons.info_outline,
-              size: 14,
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
-            ),
-          ),
-        ],
-      ),
-    );
   }
 
   /// Card shown when the workload type is 'custom', with sliders for
@@ -3680,20 +4089,30 @@ class _PieChartPainter extends CustomPainter {
     if (total <= 0) {
       return;
     }
-    final stroke = size.shortestSide * 0.18;
+    final stroke = size.shortestSide * 0.15;
     final rect = Rect.fromCircle(
       center: Offset(size.width / 2, size.height / 2),
       radius: (size.shortestSide - stroke) / 2,
     );
+    // A small angular gap between segments keeps adjacent colors readable;
+    // with a single segment there is nothing to separate.
+    final gap = sections.length > 1 ? 0.035 : 0.0;
     var startAngle = -math.pi / 2;
     for (final section in sections) {
       final sweep = (section.value / total) * math.pi * 2;
+      final visibleSweep = math.max(sweep - gap, 0.02);
       final paint = Paint()
         ..style = PaintingStyle.stroke
-        ..strokeCap = StrokeCap.round
+        ..strokeCap = StrokeCap.butt
         ..strokeWidth = stroke
         ..color = section.color;
-      canvas.drawArc(rect, startAngle, sweep, false, paint);
+      canvas.drawArc(
+        rect,
+        startAngle + (gap / 2),
+        visibleSweep,
+        false,
+        paint,
+      );
       startAngle += sweep;
     }
   }
@@ -3711,6 +4130,7 @@ class _LineChartPainter extends CustomPainter {
     required this.gridColor,
     required this.area,
     required this.suffix,
+    this.smooth = true,
   });
 
   final List<_ChartSeries> series;
@@ -3718,15 +4138,21 @@ class _LineChartPainter extends CustomPainter {
   final Color gridColor;
   final bool area;
   final String suffix;
+  final bool smooth;
+
+  static const double _leftPadding = 64.0;
+  static const double _rightPadding = 14.0;
+  static const double _topPadding = 26.0;
+  static const double _bottomPadding = 34.0;
+
+  /// Points above this count stop rendering per-point markers so dense series
+  /// read as clean lines instead of dot clouds.
+  static const int _markerPointLimit = 48;
 
   @override
   void paint(Canvas canvas, Size size) {
-    const leftPadding = 78.0;
-    const rightPadding = 12.0;
-    const topPadding = 24.0;
-    const bottomPadding = 32.0;
-    final chartWidth = size.width - leftPadding - rightPadding;
-    final chartHeight = size.height - topPadding - bottomPadding;
+    final chartWidth = size.width - _leftPadding - _rightPadding;
+    final chartHeight = size.height - _topPadding - _bottomPadding;
     if (chartWidth <= 0 || chartHeight <= 0) {
       return;
     }
@@ -3743,62 +4169,63 @@ class _LineChartPainter extends CustomPainter {
     final minX = hasExplicitX ? _seriesMinX() : 0.0;
     final maxX =
         hasExplicitX ? _seriesMaxX() : math.max(maxPoints - 1, 1).toDouble();
-    final maxValue = _resolvedMaxValue(
-      hasExplicitX: hasExplicitX,
-      maxPoints: maxPoints,
+    final maxValue = _niceCeil(
+      _resolvedMaxValue(
+        hasExplicitX: hasExplicitX,
+        maxPoints: maxPoints,
+      ),
     );
 
     final gridPaint = Paint()
-      ..color = gridColor
+      ..color = gridColor.withValues(alpha: 0.55)
       ..strokeWidth = 1;
-    final minorGridPaint = Paint()
-      ..color = gridColor.withValues(alpha: 0.35)
+    final verticalGridPaint = Paint()
+      ..color = gridColor.withValues(alpha: 0.28)
       ..strokeWidth = 1;
     final axisPaint = Paint()
-      ..color = textColor.withValues(alpha: 0.5)
-      ..strokeWidth = 1.2;
+      ..color = textColor.withValues(alpha: 0.35)
+      ..strokeWidth = 1;
     final textStyle = TextStyle(
-      color: textColor.withValues(alpha: 0.8),
+      color: textColor.withValues(alpha: 0.72),
       fontSize: 11,
+      fontWeight: FontWeight.w600,
     );
     final unitPainter = TextPainter(
       text: TextSpan(
-        text: suffix,
-        style: textStyle.copyWith(
-          fontSize: 10,
-          fontWeight: FontWeight.w600,
-        ),
+        text: suffix.trim(),
+        style: textStyle.copyWith(fontSize: 10),
       ),
       textDirection: TextDirection.ltr,
-    )..layout(maxWidth: leftPadding - 8);
+    )..layout(maxWidth: _leftPadding + 40);
     unitPainter.paint(canvas, const Offset(4, 2));
 
     for (var row = 0; row <= 4; row += 1) {
-      final y = topPadding + (chartHeight * row / 4);
-      canvas.drawLine(
-        Offset(leftPadding, y),
-        Offset(size.width - rightPadding, y),
-        gridPaint,
-      );
+      final y = _topPadding + (chartHeight * row / 4);
+      if (row < 4) {
+        canvas.drawLine(
+          Offset(_leftPadding, y),
+          Offset(size.width - _rightPadding, y),
+          gridPaint,
+        );
+      }
       final value = maxValue * (1 - (row / 4));
       final painter = TextPainter(
         text: TextSpan(
-          text: _formatAxisValue(value, suffix),
+          text: _formatAxisValue(value),
           style: textStyle,
         ),
         textDirection: TextDirection.ltr,
-      )..layout(maxWidth: leftPadding - 8);
-      painter.paint(canvas, Offset(4, y - painter.height / 2));
+        textAlign: TextAlign.right,
+      )..layout(maxWidth: _leftPadding - 10);
+      painter.paint(
+        canvas,
+        Offset(_leftPadding - 8 - painter.width, y - painter.height / 2),
+      );
     }
 
     canvas.drawLine(
-      const Offset(leftPadding, topPadding),
-      Offset(leftPadding, size.height - bottomPadding),
-      axisPaint,
-    );
-    canvas.drawLine(
-      Offset(leftPadding, size.height - bottomPadding),
-      Offset(size.width - rightPadding, size.height - bottomPadding),
+      Offset(_leftPadding, size.height - _bottomPadding),
+      Offset(size.width - _rightPadding, size.height - _bottomPadding),
       axisPaint,
     );
 
@@ -3808,35 +4235,6 @@ class _LineChartPainter extends CustomPainter {
         maxX: maxX,
         chartWidth: chartWidth,
       );
-      final minorStep = tickStep >= 0.5 ? tickStep / 2 : 0.0;
-      if (minorStep > 0) {
-        for (final tick in _timeTicks(
-          minX: minX,
-          maxX: maxX,
-          step: minorStep,
-        )) {
-          final alignedToMajor =
-              ((tick / tickStep) - (tick / tickStep).round()).abs() < 0.001;
-          if (alignedToMajor) {
-            continue;
-          }
-          final dx = _chartDx(
-            chartWidth: chartWidth,
-            leftPadding: leftPadding,
-            index: 0,
-            count: 1,
-            x: tick,
-            hasExplicitX: true,
-            minX: minX,
-            maxX: maxX,
-          );
-          canvas.drawLine(
-            Offset(dx, topPadding),
-            Offset(dx, size.height - bottomPadding),
-            minorGridPaint,
-          );
-        }
-      }
       for (final tick in _timeTicks(
         minX: minX,
         maxX: maxX,
@@ -3844,7 +4242,7 @@ class _LineChartPainter extends CustomPainter {
       )) {
         final dx = _chartDx(
           chartWidth: chartWidth,
-          leftPadding: leftPadding,
+          leftPadding: _leftPadding,
           index: 0,
           count: 1,
           x: tick,
@@ -3853,9 +4251,14 @@ class _LineChartPainter extends CustomPainter {
           maxX: maxX,
         );
         canvas.drawLine(
-          Offset(dx, topPadding),
-          Offset(dx, size.height - bottomPadding),
-          gridPaint,
+          Offset(dx, _topPadding),
+          Offset(dx, size.height - _bottomPadding),
+          verticalGridPaint,
+        );
+        canvas.drawLine(
+          Offset(dx, size.height - _bottomPadding),
+          Offset(dx, size.height - _bottomPadding + 4),
+          axisPaint,
         );
         final labelPainter = TextPainter(
           text: TextSpan(
@@ -3868,7 +4271,7 @@ class _LineChartPainter extends CustomPainter {
           canvas,
           Offset(
             dx - (labelPainter.width / 2),
-            size.height - bottomPadding + 8,
+            size.height - _bottomPadding + 8,
           ),
         );
       }
@@ -3887,13 +4290,18 @@ class _LineChartPainter extends CustomPainter {
         }
         final dx = _chartDx(
           chartWidth: chartWidth,
-          leftPadding: leftPadding,
+          leftPadding: _leftPadding,
           index: index,
           count: labelPoints.length,
           x: labelPoints[index].x,
           hasExplicitX: hasExplicitX,
           minX: minX,
           maxX: maxX,
+        );
+        canvas.drawLine(
+          Offset(dx, size.height - _bottomPadding),
+          Offset(dx, size.height - _bottomPadding + 4),
+          axisPaint,
         );
         final labelPainter = TextPainter(
           text: TextSpan(text: labelPoints[index].label, style: textStyle),
@@ -3903,7 +4311,7 @@ class _LineChartPainter extends CustomPainter {
           canvas,
           Offset(
             dx - (labelPainter.width / 2),
-            size.height - bottomPadding + 8,
+            size.height - _bottomPadding + 8,
           ),
         );
       }
@@ -3914,25 +4322,25 @@ class _LineChartPainter extends CustomPainter {
         canvas,
         chartWidth: chartWidth,
         chartHeight: chartHeight,
-        leftPadding: leftPadding,
-        topPadding: topPadding,
-        bottomPadding: bottomPadding,
+        leftPadding: _leftPadding,
+        topPadding: _topPadding,
+        bottomPadding: _bottomPadding,
         maxValue: maxValue,
       );
       return;
     }
 
+    final baseline = _topPadding + chartHeight;
     for (final entry in series) {
       if (entry.points.isEmpty) {
         continue;
       }
-      final path = Path();
       final offsets = <Offset>[];
       for (var index = 0; index < entry.points.length; index += 1) {
         final point = entry.points[index];
         final dx = _chartDx(
           chartWidth: chartWidth,
-          leftPadding: leftPadding,
+          leftPadding: _leftPadding,
           index: index,
           count: entry.points.length,
           x: point.x,
@@ -3940,45 +4348,115 @@ class _LineChartPainter extends CustomPainter {
           minX: minX,
           maxX: maxX,
         );
-        final dy =
-            topPadding + chartHeight - ((point.value / maxValue) * chartHeight);
+        final dy = baseline - ((point.value / maxValue) * chartHeight);
         offsets.add(Offset(dx, dy));
-        if (index == 0) {
-          path.moveTo(dx, dy);
-        } else {
-          path.lineTo(dx, dy);
+      }
+
+      final linePath = _seriesPath(offsets);
+      final fillAlpha = area ? 0.20 : 0.08;
+      final fillPath = Path.from(linePath)
+        ..lineTo(offsets.last.dx, baseline)
+        ..lineTo(offsets.first.dx, baseline)
+        ..close();
+      canvas.drawPath(
+        fillPath,
+        Paint()
+          ..style = PaintingStyle.fill
+          ..shader = ui.Gradient.linear(
+            const Offset(0, _topPadding),
+            Offset(0, baseline),
+            <Color>[
+              entry.color.withValues(alpha: fillAlpha),
+              entry.color.withValues(alpha: 0.0),
+            ],
+          ),
+      );
+      canvas.drawPath(
+        linePath,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.2
+          ..strokeCap = StrokeCap.round
+          ..strokeJoin = StrokeJoin.round
+          ..color = entry.color,
+      );
+      if (offsets.length <= _markerPointLimit) {
+        for (final offset in offsets) {
+          canvas.drawCircle(
+            offset,
+            2.6,
+            Paint()..color = entry.color,
+          );
         }
+      } else {
         canvas.drawCircle(
-          Offset(dx, dy),
-          3.5,
+          offsets.last,
+          3.2,
           Paint()..color = entry.color,
         );
       }
-      if (area && offsets.isNotEmpty) {
-        final fillPath = Path()
-          ..moveTo(offsets.first.dx, topPadding + chartHeight)
-          ..lineTo(offsets.first.dx, offsets.first.dy);
-        for (var index = 1; index < offsets.length; index += 1) {
-          fillPath.lineTo(offsets[index].dx, offsets[index].dy);
-        }
-        fillPath
-          ..lineTo(offsets.last.dx, topPadding + chartHeight)
-          ..close();
-        canvas.drawPath(
-          fillPath,
-          Paint()
-            ..style = PaintingStyle.fill
-            ..color = entry.color.withValues(alpha: 0.12),
-        );
+    }
+  }
+
+  /// Builds the series polyline, optionally smoothed with Catmull-Rom style
+  /// cubic segments. Control-point y values are clamped to the chart band so
+  /// the curve never dips below the baseline.
+  Path _seriesPath(List<Offset> points) {
+    final path = Path()..moveTo(points.first.dx, points.first.dy);
+    if (!smooth || points.length < 3) {
+      for (var index = 1; index < points.length; index += 1) {
+        path.lineTo(points[index].dx, points[index].dy);
       }
-      canvas.drawPath(
-        path,
-        Paint()
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 2.4
-          ..color = entry.color,
+      return path;
+    }
+    final minY = points.fold<double>(
+      double.infinity,
+      (current, point) => point.dy < current ? point.dy : current,
+    );
+    final maxY = points.fold<double>(
+      double.negativeInfinity,
+      (current, point) => point.dy > current ? point.dy : current,
+    );
+    for (var index = 0; index < points.length - 1; index += 1) {
+      final previous = index == 0 ? points[0] : points[index - 1];
+      final current = points[index];
+      final next = points[index + 1];
+      final afterNext = index + 2 < points.length ? points[index + 2] : next;
+      final control1 = Offset(
+        current.dx + (next.dx - previous.dx) / 6,
+        (current.dy + (next.dy - previous.dy) / 6).clamp(minY, maxY),
+      );
+      final control2 = Offset(
+        next.dx - (afterNext.dx - current.dx) / 6,
+        (next.dy - (afterNext.dy - current.dy) / 6).clamp(minY, maxY),
+      );
+      path.cubicTo(
+        control1.dx,
+        control1.dy,
+        control2.dx,
+        control2.dy,
+        next.dx,
+        next.dy,
       );
     }
+    return path;
+  }
+
+  /// Rounds up to a value whose quarters land on clean axis labels.
+  double _niceCeil(double value) {
+    if (value <= 0 || !value.isFinite) {
+      return 1;
+    }
+    final exponent = (math.log(value) / math.ln10).floor();
+    final magnitude = math.pow(10.0, exponent).toDouble();
+    final normalized = value / magnitude;
+    const niceSteps = <double>[1, 2, 4, 5, 10];
+    for (final step in niceSteps) {
+      if (normalized <= step + 0.0001) {
+        return step * magnitude;
+      }
+    }
+    return 10 * magnitude;
   }
 
   bool _hasExplicitX() {
@@ -4201,41 +4679,43 @@ class _LineChartPainter extends CustomPainter {
         cumulative[index] = topValue;
       }
 
-      final fillPath = Path()
-        ..moveTo(topPoints.first.dx, bottomPoints.first.dy);
-      fillPath.lineTo(topPoints.first.dx, topPoints.first.dy);
-      for (var index = 1; index < topPoints.length; index += 1) {
-        fillPath.lineTo(topPoints[index].dx, topPoints[index].dy);
-      }
+      final linePath = _seriesPath(topPoints);
+      final fillPath = Path.from(linePath);
       for (var index = bottomPoints.length - 1; index >= 0; index -= 1) {
         fillPath.lineTo(bottomPoints[index].dx, bottomPoints[index].dy);
       }
       fillPath.close();
 
-      final linePath = Path()..moveTo(topPoints.first.dx, topPoints.first.dy);
-      for (var index = 1; index < topPoints.length; index += 1) {
-        linePath.lineTo(topPoints[index].dx, topPoints[index].dy);
-      }
-
       canvas.drawPath(
         fillPath,
         Paint()
           ..style = PaintingStyle.fill
-          ..color = entry.color.withValues(alpha: 0.18),
+          ..shader = ui.Gradient.linear(
+            Offset(0, topPadding),
+            Offset(0, topPadding + chartHeight),
+            <Color>[
+              entry.color.withValues(alpha: 0.26),
+              entry.color.withValues(alpha: 0.10),
+            ],
+          ),
       );
       canvas.drawPath(
         linePath,
         Paint()
           ..style = PaintingStyle.stroke
-          ..strokeWidth = 2.4
+          ..strokeWidth = 2.0
+          ..strokeCap = StrokeCap.round
+          ..strokeJoin = StrokeJoin.round
           ..color = entry.color,
       );
-      for (final point in topPoints) {
-        canvas.drawCircle(
-          point,
-          3.5,
-          Paint()..color = entry.color,
-        );
+      if (topPoints.length <= _markerPointLimit) {
+        for (final point in topPoints) {
+          canvas.drawCircle(
+            point,
+            2.4,
+            Paint()..color = entry.color,
+          );
+        }
       }
     }
   }
@@ -4246,21 +4726,24 @@ class _LineChartPainter extends CustomPainter {
         oldDelegate.textColor != textColor ||
         oldDelegate.gridColor != gridColor ||
         oldDelegate.area != area ||
-        oldDelegate.suffix != suffix;
+        oldDelegate.suffix != suffix ||
+        oldDelegate.smooth != smooth;
   }
 
-  String _formatAxisValue(double value, String suffix) {
-    final normalizedSuffix = suffix.trim();
+  String _formatAxisValue(double value) {
     if (value >= 1000000000) {
-      return '${(value / 1000000000).toStringAsFixed(1)}G $normalizedSuffix';
+      return '${(value / 1000000000).toStringAsFixed(1)}G';
     }
     if (value >= 1000000) {
-      return '${(value / 1000000).toStringAsFixed(1)}M $normalizedSuffix';
+      return '${(value / 1000000).toStringAsFixed(1)}M';
     }
     if (value >= 1000) {
-      return '${(value / 1000).toStringAsFixed(1)}k $normalizedSuffix';
+      return '${(value / 1000).toStringAsFixed(1)}k';
+    }
+    if (value == value.roundToDouble()) {
+      return value.toStringAsFixed(0);
     }
     final decimals = value >= 100 ? 0 : (value >= 10 ? 1 : 2);
-    return '${value.toStringAsFixed(decimals)} $normalizedSuffix';
+    return value.toStringAsFixed(decimals);
   }
 }
