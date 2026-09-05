@@ -10,6 +10,14 @@
 - Generalized Android-only mobile UI and engine metadata branches so iOS uses the mobile layouts without desktop drag/drop or unsupported directory picking.
 - Benchmark and bucket-encryption mutations are explicitly capability-gated in the first iOS release.
 
+## 2.2.6
+
+- Implemented the GUI improvement plan: consistent destructive confirmations, severity-aware banners, one debounced object search, desktop shortcuts and copy actions.
+- Grouped inspector navigation, validated JSON/tag and settings editors, protected secret reveal, and retained profile drafts across settings sections.
+- Added job status/rate/ETA and retry/cleanup controls, searchable Event Log filters, actionable empty states and accessible navigation.
+- Improved phone scrolling and connection selection, dark-mode surfaces, object/version rows and live breadcrumbs; bundled Inter/Sora for offline typography.
+- Added GUI regression/layout tests and a local render-review harness. See [the implementation ledger](docs/2.2.6-gui-implementation.md), including the G22 version-download engine follow-up.
+
 ## 2.2.5
 
 ### Testing feedback revision (build 2)

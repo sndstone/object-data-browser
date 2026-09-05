@@ -1,3 +1,4 @@
+import '../utils/format.dart';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -219,7 +220,7 @@ class _ApiTraceCard extends StatelessWidget {
     final theme = Theme.of(context);
     final entry = group.displayEntry;
     final summaryParts = <String>[
-      _formatDateTime(entry.timestamp),
+      formatDateTime(entry.timestamp),
       if ((entry.engineId ?? '').isNotEmpty) entry.engineId!,
       if ((entry.responseStatus ?? '').isNotEmpty)
         'Status ${entry.responseStatus}',
@@ -374,7 +375,7 @@ class _EventEntryCard extends StatelessWidget {
                   '[${entry.level}] ${entry.category}',
                   style: theme.textTheme.titleSmall,
                 ),
-                Chip(label: Text(_formatDateTime(entry.timestamp))),
+                Chip(label: Text(formatDateTime(entry.timestamp))),
               ],
             ),
             if (contextParts.isNotEmpty) ...[
@@ -413,7 +414,7 @@ class _ParsedApiEntryCard extends StatelessWidget {
       if ((entry.objectKey ?? '').isNotEmpty) 'Object ${entry.objectKey}',
     ];
     final summaryParts = <String>[
-      _formatDateTime(entry.timestamp),
+      formatDateTime(entry.timestamp),
       if (parsed.status != null && parsed.status!.isNotEmpty)
         'Status ${parsed.status}',
       if (parsed.method != null && parsed.method!.isNotEmpty) parsed.method!,
@@ -594,13 +595,4 @@ Object? _decodeTraceValue(String raw) {
     }
   }
   return trimmed;
-}
-
-String _formatDateTime(DateTime value) {
-  final twoDigitMonth = value.month.toString().padLeft(2, '0');
-  final twoDigitDay = value.day.toString().padLeft(2, '0');
-  final twoDigitHour = value.hour.toString().padLeft(2, '0');
-  final twoDigitMinute = value.minute.toString().padLeft(2, '0');
-  final twoDigitSecond = value.second.toString().padLeft(2, '0');
-  return '${value.year}-$twoDigitMonth-$twoDigitDay $twoDigitHour:$twoDigitMinute:$twoDigitSecond';
 }

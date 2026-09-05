@@ -1,3 +1,5 @@
+import '../widgets/navigation_item.dart';
+import 'app_shortcuts.dart';
 import 'dart:async';
 
 import 'dart:ui' show AppExitResponse;
@@ -168,117 +170,124 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
                 },
               );
 
-              return Scaffold(
-                bottomNavigationBar: AnimatedSwitcher(
-                  duration: AppMotion.duration(context,
-                      enabled: controller.settings.enableAnimations,
-                      milliseconds: 220),
-                  child: phone
-                      ? KeyedSubtree(
-                          key: const ValueKey('phone-navigation'),
-                          child: _buildBottomNav(controller, navTabs),
-                        )
-                      : const SizedBox.shrink(
-                          key: ValueKey('no-phone-navigation'),
-                        ),
-                ),
-                body: ColoredBox(
-                  color: controller.settings.darkMode
-                      ? AppTheme.darkRail
-                      : Theme.of(context).colorScheme.inverseSurface,
-                  child: SafeArea(
-                    child: Stack(
-                      children: [
-                        Row(
-                          children: [
-                            AnimatedContainer(
-                              key: const ValueKey('workspace-navigation-rail'),
-                              duration: AppMotion.duration(context,
-                                  enabled: controller.settings.enableAnimations,
-                                  milliseconds: 220),
-                              curve: Curves.easeOutCubic,
-                              width: compact ? 0 : (compactRail ? 72 : 126),
-                              child: ClipRect(
-                                child: compact
-                                    ? const SizedBox.shrink()
-                                    : _buildRail(
-                                        context,
-                                        controller,
-                                        navTabs,
-                                        collapsed: compactRail,
-                                      ),
-                              ),
+              return AppShortcuts(
+                  controller: controller,
+                  child: Scaffold(
+                    bottomNavigationBar: AnimatedSwitcher(
+                      duration: AppMotion.duration(context,
+                          enabled: controller.settings.enableAnimations,
+                          milliseconds: 220),
+                      child: phone
+                          ? KeyedSubtree(
+                              key: const ValueKey('phone-navigation'),
+                              child: _buildBottomNav(controller, navTabs),
+                            )
+                          : const SizedBox.shrink(
+                              key: ValueKey('no-phone-navigation'),
                             ),
-                            Expanded(
-                              child: Container(
-                                decoration: BoxDecoration(
-                                  color:
-                                      Theme.of(context).scaffoldBackgroundColor,
-                                  borderRadius: !compact
-                                      ? const BorderRadius.horizontal(
-                                          left: Radius.circular(8),
-                                        )
-                                      : BorderRadius.zero,
+                    ),
+                    body: ColoredBox(
+                      color: controller.settings.darkMode
+                          ? AppTheme.darkRail
+                          : Theme.of(context).colorScheme.inverseSurface,
+                      child: SafeArea(
+                        child: Stack(
+                          children: [
+                            Row(
+                              children: [
+                                AnimatedContainer(
+                                  key: const ValueKey(
+                                      'workspace-navigation-rail'),
+                                  duration: AppMotion.duration(context,
+                                      enabled:
+                                          controller.settings.enableAnimations,
+                                      milliseconds: 220),
+                                  curve: Curves.easeOutCubic,
+                                  width: compact ? 0 : (compactRail ? 72 : 126),
+                                  child: ClipRect(
+                                    child: compact
+                                        ? const SizedBox.shrink()
+                                        : _buildRail(
+                                            context,
+                                            controller,
+                                            navTabs,
+                                            collapsed: compactRail,
+                                          ),
+                                  ),
                                 ),
-                                child: Column(
-                                  children: [
-                                    _AppHeader(
-                                      controller: controller,
-                                      compact: compact || compactRail,
-                                      phone: phone,
+                                Expanded(
+                                  child: Container(
+                                    decoration: BoxDecoration(
+                                      color: Theme.of(context)
+                                          .scaffoldBackgroundColor,
+                                      borderRadius: !compact
+                                          ? const BorderRadius.horizontal(
+                                              left: Radius.circular(8),
+                                            )
+                                          : BorderRadius.zero,
                                     ),
-                                    AnimatedSize(
-                                      duration: AppMotion.duration(context,
-                                          enabled: controller
-                                              .settings.enableAnimations,
-                                          milliseconds: 220),
-                                      curve: Curves.easeOutCubic,
-                                      child: AnimatedSwitcher(
-                                        duration: AppMotion.duration(context,
-                                            enabled: controller
-                                                .settings.enableAnimations,
-                                            milliseconds: 220),
-                                        switchInCurve: Curves.easeOutCubic,
-                                        switchOutCurve: Curves.easeInCubic,
-                                        transitionBuilder: (child, animation) =>
-                                            FadeTransition(
-                                                opacity: animation,
-                                                child: child),
-                                        child: tablet
-                                            ? KeyedSubtree(
-                                                key: const ValueKey(
-                                                  'tablet-navigation',
-                                                ),
-                                                child: _buildTopTabs(
-                                                  controller,
-                                                  navTabs,
-                                                ),
-                                              )
-                                            : const SizedBox.shrink(
-                                                key: ValueKey(
-                                                  'no-tablet-navigation',
-                                                ),
-                                              ),
-                                      ),
+                                    child: Column(
+                                      children: [
+                                        _AppHeader(
+                                          controller: controller,
+                                          compact: compact || compactRail,
+                                          phone: phone,
+                                        ),
+                                        MotionSize(
+                                          duration: AppMotion.duration(context,
+                                              enabled: controller
+                                                  .settings.enableAnimations,
+                                              milliseconds: 220),
+                                          curve: Curves.easeOutCubic,
+                                          child: AnimatedSwitcher(
+                                            duration: AppMotion.duration(
+                                                context,
+                                                enabled: controller
+                                                    .settings.enableAnimations,
+                                                milliseconds: 220),
+                                            switchInCurve: Curves.easeOutCubic,
+                                            switchOutCurve: Curves.easeInCubic,
+                                            transitionBuilder: (child,
+                                                    animation) =>
+                                                FadeTransition(
+                                                    opacity: animation,
+                                                    child: child),
+                                            child: tablet
+                                                ? KeyedSubtree(
+                                                    key: const ValueKey(
+                                                      'tablet-navigation',
+                                                    ),
+                                                    child: _buildTopTabs(
+                                                      controller,
+                                                      navTabs,
+                                                    ),
+                                                  )
+                                                : const SizedBox.shrink(
+                                                    key: ValueKey(
+                                                      'no-tablet-navigation',
+                                                    ),
+                                                  ),
+                                          ),
+                                        ),
+                                        Expanded(child: body),
+                                      ],
                                     ),
-                                    Expanded(child: body),
-                                  ],
+                                  ),
                                 ),
-                              ),
+                              ],
+                            ),
+                            Positioned(
+                              top: phone ? null : 76,
+                              bottom: phone ? 12 : null,
+                              right: 12,
+                              left: phone ? 12 : null,
+                              child: _BannerOverlay(controller: controller),
                             ),
                           ],
                         ),
-                        Positioned(
-                          top: phone ? 8 : 76,
-                          right: 12,
-                          left: phone ? 12 : null,
-                          child: _BannerOverlay(controller: controller),
-                        ),
-                      ],
+                      ),
                     ),
-                  ),
-                ),
-              );
+                  ));
             },
           ),
         ),
@@ -296,16 +305,14 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
     return Container(
       padding:
           EdgeInsets.fromLTRB(collapsed ? 8 : 10, 18, collapsed ? 8 : 10, 12),
-      color: controller.settings.darkMode
-          ? AppTheme.darkRail
-          : theme.colorScheme.inverseSurface,
+      color: theme.extension<AppRailTheme>()!.background,
       child: Column(
         children: [
           Container(
             width: 44,
             height: 44,
             decoration: BoxDecoration(
-              color: AppTheme.lightAccent,
+              color: theme.extension<AppRailTheme>()!.logoBackground,
               borderRadius: BorderRadius.circular(10),
               boxShadow: [
                 BoxShadow(
@@ -315,15 +322,17 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
                 ),
               ],
             ),
-            child: const Icon(
+            child: Icon(
               Icons.inventory_2_rounded,
-              color: Color(0xFF9FE870),
+              color: theme.extension<AppRailTheme>()!.foreground,
               size: 28,
             ),
           ),
           const SizedBox(height: 42),
           ...navTabs.map(
             (tab) => _RailDestination(
+              index: navTabs.indexOf(tab),
+              count: navTabs.length,
               selected: controller.activeTab == tab,
               icon: _tabIcon(tab, selected: false),
               selectedIcon: _tabIcon(tab, selected: true),
@@ -416,8 +425,11 @@ class _RailDestination extends StatelessWidget {
     required this.label,
     required this.onTap,
     required this.collapsed,
+    required this.index,
+    required this.count,
   });
 
+  final int index, count;
   final bool selected;
   final IconData icon;
   final IconData selectedIcon;
@@ -427,50 +439,58 @@ class _RailDestination extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final textColor = selected ? Colors.white : const Color(0xFFD4DED7);
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: Tooltip(
-        message: collapsed ? label : '',
-        child: Material(
-            color: selected ? const Color(0xFF075D31) : Colors.transparent,
-            borderRadius: BorderRadius.circular(8),
-            child: InkWell(
-              borderRadius: BorderRadius.circular(8),
-              onTap: onTap,
-              child: SizedBox(
-                height: 48,
-                child: Row(
-                  mainAxisAlignment: collapsed
-                      ? MainAxisAlignment.center
-                      : MainAxisAlignment.start,
-                  children: [
-                    SizedBox(width: collapsed ? 0 : 12),
-                    Icon(
-                      selected ? selectedIcon : icon,
-                      color: textColor,
-                      size: 20,
+    final rail = Theme.of(context).extension<AppRailTheme>()!;
+    final textColor = rail.foreground;
+    return NavigationItem(
+        label: '$label, tab ${index + 1} of $count',
+        selected: selected,
+        onActivate: onTap,
+        child: Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Tooltip(
+            message: label,
+            child: Material(
+                color: selected ? rail.selectedBackground : Colors.transparent,
+                borderRadius: BorderRadius.circular(8),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: onTap,
+                  child: SizedBox(
+                    height: 48,
+                    child: Row(
+                      mainAxisAlignment: collapsed
+                          ? MainAxisAlignment.center
+                          : MainAxisAlignment.start,
+                      children: [
+                        SizedBox(width: collapsed ? 0 : 12),
+                        Icon(
+                          selected ? selectedIcon : icon,
+                          color: textColor,
+                          size: 20,
+                        ),
+                        if (!collapsed) ...[
+                          const SizedBox(width: 10),
+                          Expanded(
+                              child: Text(
+                            label,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context)
+                                .textTheme
+                                .labelLarge
+                                ?.copyWith(
+                                  color: textColor,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                          )),
+                        ],
+                      ],
                     ),
-                    if (!collapsed) ...[
-                      const SizedBox(width: 10),
-                      Expanded(
-                          child: Text(
-                        label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                              color: textColor,
-                              fontSize: 12,
-                              fontWeight: FontWeight.w800,
-                            ),
-                      )),
-                    ],
-                  ],
-                ),
-              ),
-            )),
-      ),
-    );
+                  ),
+                )),
+          ),
+        ));
   }
 }
 
@@ -530,7 +550,8 @@ class _AppHeader extends StatelessWidget {
                 children: [
                   SizedBox(
                     width: desktopCompact ? 260 : 300,
-                    child: _DesktopHeaderMark(compact: desktopCompact),
+                    child: _DesktopHeaderMark(
+                        compact: desktopCompact, controller: controller),
                   ),
                   SizedBox(width: desktopCompact ? 12 : 16),
                   if (controller.activeTab == WorkspaceTab.browser)
@@ -563,7 +584,8 @@ class _AppHeader extends StatelessWidget {
 }
 
 class _DesktopHeaderMark extends StatelessWidget {
-  const _DesktopHeaderMark({required this.compact});
+  const _DesktopHeaderMark({required this.compact, required this.controller});
+  final AppController controller;
 
   final bool compact;
 
@@ -603,14 +625,33 @@ class _DesktopHeaderMark extends StatelessWidget {
                   style: theme.textTheme.titleLarge,
                 ),
                 const SizedBox(height: 3),
-                Text(
-                  'Buckets  >  Objects  >  Inspect',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.labelLarge?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
+                if (controller.activeTab == WorkspaceTab.browser)
+                  SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(children: [
+                        Text(
+                            controller.selectedProfile?.name ?? 'No connection',
+                            style: theme.textTheme.bodySmall),
+                        if (controller.selectedBucket != null)
+                          TextButton(
+                              onPressed: () =>
+                                  controller.refreshObjects(prefix: ''),
+                              child: Text(
+                                  ' › ${controller.selectedBucket!.name}')),
+                        ..._prefixButtons(),
+                      ]))
+                else
+                  Text(
+                      controller.activeTab == WorkspaceTab.tasks
+                          ? 'Jobs · ${controller.tasksForView(BrowserTaskView.running).length} running, ${controller.tasksForView(BrowserTaskView.failed).length} failed'
+                          : controller.activeTab == WorkspaceTab.settings
+                              ? 'Settings · ${controller.settingsSectionName}'
+                              : controller.activeTab == WorkspaceTab.eventLog
+                                  ? 'Event Log · ${controller.eventLog.length} events'
+                                  : 'Benchmark',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall),
               ],
             ),
           ),
@@ -618,69 +659,32 @@ class _DesktopHeaderMark extends StatelessWidget {
       ),
     );
   }
+
+  List<Widget> _prefixButtons() {
+    final parts =
+        controller.currentPrefix.split('/').where((p) => p.isNotEmpty).toList();
+    return [
+      for (var i = 0; i < parts.length; i++)
+        if (parts.length <= 4 || i == 0 || i >= parts.length - 2)
+          TextButton(
+              onPressed: () => controller.refreshObjects(
+                  prefix: '${parts.take(i + 1).join('/')}/'),
+              child: Text(' › ${parts[i]}'))
+        else if (i == 1)
+          const Text(' › …')
+    ];
+  }
 }
 
 class _HeaderSearchField extends StatelessWidget {
   const _HeaderSearchField({required this.controller});
-
   final AppController controller;
-
   @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final hasOpenBucket = controller.selectedBucket != null;
-    final initialValue = controller.objectFilterMode == BrowserFilterMode.text
-        ? controller.objectFilterValue
-        : '';
-    return SizedBox(
-      height: 46,
-      child: TextFormField(
-        key: ValueKey(
-          'header-object-search-${controller.selectedBucket?.name ?? 'none'}',
-        ),
-        initialValue: initialValue,
-        enabled: hasOpenBucket,
-        decoration: InputDecoration(
-          hintText: hasOpenBucket
-              ? 'Search loaded objects...'
-              : 'Open a bucket to search objects...',
-          prefixIcon: const Icon(Icons.search, size: 20),
-          suffixIcon: Padding(
-            padding: const EdgeInsets.only(right: 8),
-            child: Container(
-              width: 32,
-              height: 26,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: theme.colorScheme.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Text(
-                'Ctrl K',
-                style: theme.textTheme.labelSmall?.copyWith(
-                  color: theme.colorScheme.onSurface,
-                  fontSize: 11,
-                ),
-              ),
-            ),
-          ),
-          suffixIconConstraints: const BoxConstraints(
-            minWidth: 42,
-            minHeight: 32,
-          ),
-          contentPadding: const EdgeInsets.fromLTRB(12, 12, 12, 10),
-        ),
-        onChanged: hasOpenBucket
-            ? (value) {
-                if (controller.objectFilterMode != BrowserFilterMode.text) {
-                  controller.setObjectFilterMode(BrowserFilterMode.text);
-                }
-                unawaited(controller.applyObjectFilter(value));
-              }
-            : null,
-      ),
-    );
-  }
+  Widget build(BuildContext context) => OutlinedButton.icon(
+      onPressed: controller.requestObjectSearchFocus,
+      icon: const Icon(Icons.search),
+      label: Text(
+          'Search  ${Theme.of(context).platform == TargetPlatform.macOS ? '⌘K' : 'Ctrl K'}'));
 }
 
 class _HeaderThemeToggle extends StatelessWidget {
@@ -745,21 +749,48 @@ class _HeaderControlStrip extends StatelessWidget {
                   0,
                 ),
       child: phone
-          ? Column(
-              children: [
-                _labeledPhoneField(
-                  context,
-                  label: 'Endpoint profile',
-                  child: _profileDropdown(context, profiles, phone: true),
-                ),
-                const SizedBox(height: 8),
-                _labeledPhoneField(
-                  context,
-                  label: 'Backend engine',
-                  child: _engineDropdown(context, engines, phone: true),
-                ),
-              ],
-            )
+          ? SizedBox(
+              width: double.infinity,
+              child: TextButton.icon(
+                  icon: const Icon(Icons.cloud_outlined),
+                  label: Text(
+                      '${controller.selectedProfile?.name ?? 'Choose connection'} · ${controller.activeEngineId}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis),
+                  onPressed: () => showModalBottomSheet<void>(
+                      context: context,
+                      isScrollControlled: true,
+                      builder: (context) => SafeArea(
+                          child: AnimatedBuilder(
+                              animation: controller,
+                              builder: (context, _) => Padding(
+                                  padding: EdgeInsets.fromLTRB(
+                                      20,
+                                      20,
+                                      20,
+                                      20 +
+                                          MediaQuery.viewInsetsOf(context)
+                                              .bottom),
+                                  child: Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        _labeledPhoneField(context,
+                                            label: 'Endpoint profile',
+                                            child: _profileDropdown(
+                                                context, controller.profiles,
+                                                phone: true)),
+                                        const SizedBox(height: 16),
+                                        _labeledPhoneField(context,
+                                            label: 'Backend engine',
+                                            child: _engineDropdown(
+                                                context, controller.engines,
+                                                phone: true)),
+                                        const SizedBox(height: 12),
+                                        TextButton(
+                                            onPressed: () =>
+                                                Navigator.pop(context),
+                                            child: const Text('Done')),
+                                      ])))))))
           : Align(
               alignment: desktopPinned ? Alignment.topRight : Alignment.topLeft,
               child: desktopPinned
@@ -939,239 +970,123 @@ class _BannerOverlay extends StatefulWidget {
 }
 
 class _BannerOverlayState extends State<_BannerOverlay> {
-  Timer? _dismissTimer;
-  String? _lastMessage;
-  bool _lastBusy = false;
-
+  Timer? _timer;
+  Object? _lastState;
   @override
   void initState() {
     super.initState();
-    widget.controller.addListener(_handleChange);
-    _lastMessage = widget.controller.bannerMessage;
-    _lastBusy = widget.controller.hasBusyActions;
-    _scheduleDismiss();
+    widget.controller.addListener(_changed);
+    _changed();
   }
 
   @override
   void dispose() {
-    _dismissTimer?.cancel();
-    widget.controller.removeListener(_handleChange);
+    _timer?.cancel();
+    widget.controller.removeListener(_changed);
     super.dispose();
   }
 
-  void _handleChange() {
-    final next = widget.controller.bannerMessage;
-    final busy = widget.controller.hasBusyActions;
-    if (next != _lastMessage || busy != _lastBusy) {
-      _lastMessage = next;
-      _lastBusy = busy;
-      _scheduleDismiss();
-    }
-  }
-
-  void _scheduleDismiss() {
-    _dismissTimer?.cancel();
-    final message = widget.controller.bannerMessage;
-    if (message == null || message.isEmpty) {
-      return;
-    }
-    if (widget.controller.hasBusyActions) {
-      return;
-    }
-    if (widget.controller.bannerTask?.isRunningLike ?? false) {
-      return;
-    }
-    _dismissTimer = Timer(_dismissDelayFor(message), () {
-      if (!mounted) return;
-      if (widget.controller.bannerMessage == message &&
-          !widget.controller.hasBusyActions) {
-        widget.controller.clearBanner();
-      }
-    });
-  }
-
-  Duration _dismissDelayFor(String message) {
-    final normalized = message.toLowerCase();
-    if (normalized.contains('listed ') ||
-        normalized.contains('list returned') ||
-        normalized.contains('listing completed') ||
-        normalized.contains('completed listing')) {
-      return const Duration(seconds: 2);
-    }
-    if (normalized.contains('listing ')) {
-      return const Duration(seconds: 5);
-    }
-    return const Duration(milliseconds: 3500);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final message = widget.controller.bannerMessage;
-    final busy = widget.controller.hasBusyActions;
-    final visible = message != null && message.isNotEmpty;
-    final canOpenTask = widget.controller.bannerTaskId != null;
-    final bannerTask = widget.controller.bannerTask;
-    return IgnorePointer(
-      ignoring: !visible,
-      child: AnimatedSwitcher(
-        duration: AppMotion.duration(context,
-            enabled: widget.controller.settings.enableAnimations,
-            milliseconds: 180),
-        transitionBuilder: (child, animation) {
-          return FadeTransition(
-            opacity: animation,
-            child: SlideTransition(
-              position: Tween<Offset>(
-                begin: const Offset(0, -0.25),
-                end: Offset.zero,
-              ).animate(animation),
-              child: child,
-            ),
-          );
-        },
-        child: !visible
-            ? const SizedBox.shrink(key: ValueKey('banner-empty'))
-            : Align(
-                key: ValueKey('banner-${bannerTask?.id ?? 'message'}'),
-                alignment: Alignment.topRight,
-                child: Material(
-                  color: Colors.transparent,
-                  child: Container(
-                    constraints: const BoxConstraints(maxWidth: 420),
-                    padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
-                    decoration: BoxDecoration(
-                      color: theme.colorScheme.inverseSurface,
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(
-                        color: theme.colorScheme.outlineVariant
-                            .withValues(alpha: 0.4),
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.18),
-                          blurRadius: 12,
-                          offset: const Offset(0, 4),
-                        ),
-                      ],
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Flexible(
-                          child: InkWell(
-                            borderRadius: BorderRadius.circular(8),
-                            onTap: canOpenTask
-                                ? widget.controller.openBannerTask
-                                : null,
-                            child: Padding(
-                              padding: const EdgeInsets.fromLTRB(0, 2, 6, 2),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  _BannerStatusIndicator(
-                                    busy: busy,
-                                    canOpenTask: canOpenTask,
-                                    task: bannerTask,
-                                  ),
-                                  const SizedBox(width: 10),
-                                  Flexible(
-                                    child: Text(
-                                      message,
-                                      style:
-                                          theme.textTheme.bodyMedium?.copyWith(
-                                        color:
-                                            theme.colorScheme.onInverseSurface,
-                                      ),
-                                      overflow: TextOverflow.ellipsis,
-                                      maxLines: 2,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        InkWell(
-                          borderRadius: BorderRadius.circular(8),
-                          onTap: () => widget.controller.clearBanner(),
-                          child: Padding(
-                            padding: const EdgeInsets.all(4),
-                            child: Icon(
-                              Icons.close,
-                              size: 14,
-                              color: theme.colorScheme.onInverseSurface
-                                  .withValues(alpha: 0.8),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-      ),
+  void _changed() {
+    final c = widget.controller;
+    final state = (
+      c.bannerMessage,
+      c.bannerSeverity,
+      c.hasBusyActions,
+      c.bannerTask?.status
     );
+    if (state == _lastState) return;
+    _lastState = state;
+    _timer?.cancel();
+    if (c.bannerMessage == null ||
+        c.hasBusyActions ||
+        (c.bannerTask?.isRunningLike ?? false)) {
+      return;
+    }
+    final duration = switch (c.bannerSeverity) {
+      BannerSeverity.error => null,
+      BannerSeverity.warning => const Duration(seconds: 8),
+      BannerSeverity.success => const Duration(seconds: 2),
+      BannerSeverity.info => const Duration(milliseconds: 3500),
+    };
+    if (duration != null) {
+      _timer = Timer(duration, () {
+        if (mounted) c.clearBanner();
+      });
+    }
   }
-}
-
-class _BannerStatusIndicator extends StatelessWidget {
-  const _BannerStatusIndicator({
-    required this.busy,
-    required this.canOpenTask,
-    required this.task,
-  });
-
-  final bool busy;
-  final bool canOpenTask;
-  final BrowserTaskRecord? task;
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final progressTask = task?.kind == BrowserTaskKind.transfer ? task : null;
-    if (progressTask != null) {
-      final progress = progressTask.progress.clamp(0, 1).toDouble();
-      final percent = (progress * 100).round();
-      return Container(
-        width: 44,
-        height: 24,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: theme.colorScheme.onInverseSurface.withValues(alpha: 0.12),
-          borderRadius: BorderRadius.circular(999),
-          border: Border.all(
-            color: theme.colorScheme.onInverseSurface.withValues(alpha: 0.18),
-          ),
-        ),
-        child: Text(
-          '$percent%',
-          style: theme.textTheme.labelSmall?.copyWith(
-            color: theme.colorScheme.onInverseSurface,
-            fontSize: 11,
-            fontWeight: FontWeight.w800,
-          ),
-        ),
-      );
-    }
-
-    return SizedBox(
-      width: 16,
-      height: 16,
-      child: busy
-          ? CircularProgressIndicator(
-              strokeWidth: 2,
-              valueColor: AlwaysStoppedAnimation<Color>(
-                theme.colorScheme.onInverseSurface,
-              ),
-            )
-          : Icon(
-              canOpenTask
-                  ? Icons.task_alt_outlined
-                  : Icons.check_circle_outline,
-              size: 16,
-              color: theme.colorScheme.onInverseSurface,
+    final c = widget.controller;
+    final colors = Theme.of(context).colorScheme;
+    final background = switch (c.bannerSeverity) {
+      BannerSeverity.error => colors.errorContainer,
+      BannerSeverity.warning => colors.tertiaryContainer,
+      BannerSeverity.success => colors.primaryContainer,
+      BannerSeverity.info => colors.inverseSurface,
+    };
+    final foreground = switch (c.bannerSeverity) {
+      BannerSeverity.error => colors.onErrorContainer,
+      BannerSeverity.warning => colors.onTertiaryContainer,
+      BannerSeverity.success => colors.onPrimaryContainer,
+      BannerSeverity.info => colors.onInverseSurface,
+    };
+    return AnimatedSwitcher(
+      duration: AppMotion.duration(context,
+          enabled: c.settings.enableAnimations, milliseconds: 180),
+      child: c.bannerMessage == null
+          ? const SizedBox.shrink(key: ValueKey('banner-empty'))
+          : Align(
+              key: ValueKey('banner-${c.bannerTaskId ?? 'message'}'),
+              alignment: Alignment.topRight,
+              child: Semantics(
+                  liveRegion: true,
+                  child: Material(
+                    color: background,
+                    borderRadius: BorderRadius.circular(10),
+                    child: Container(
+                        constraints: const BoxConstraints(maxWidth: 480),
+                        padding: const EdgeInsets.all(8),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(
+                              switch (c.bannerSeverity) {
+                                BannerSeverity.error => Icons.error_outline,
+                                BannerSeverity.warning => Icons.warning_amber,
+                                BannerSeverity.success =>
+                                  Icons.check_circle_outline,
+                                BannerSeverity.info => Icons.info_outline
+                              },
+                              color: foreground),
+                          if (c.bannerTask?.kind == BrowserTaskKind.transfer)
+                            Text(
+                                '${(c.bannerTask!.progress.clamp(0, 1) * 100).round()}%',
+                                style: TextStyle(color: foreground)),
+                          const SizedBox(width: 8),
+                          Flexible(
+                              child: InkWell(
+                                  onTap: c.bannerTaskId != null
+                                      ? c.openBannerTask
+                                      : null,
+                                  child: Text(c.bannerMessage!,
+                                      style: TextStyle(color: foreground)))),
+                          if (c.bannerSeverity == BannerSeverity.error)
+                            TextButton(
+                                onPressed: c.openErrorDetails,
+                                style: TextButton.styleFrom(
+                                    foregroundColor: foreground),
+                                child: const Text('Details'))
+                          else if (c.bannerTaskId != null)
+                            TextButton(
+                                onPressed: c.openBannerTask,
+                                style: TextButton.styleFrom(
+                                    foregroundColor: foreground),
+                                child: const Text('Details')),
+                          IconButton(
+                              tooltip: 'Dismiss message',
+                              onPressed: c.clearBanner,
+                              icon: Icon(Icons.close, color: foreground)),
+                        ])),
+                  )),
             ),
     );
   }

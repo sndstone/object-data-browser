@@ -1,3 +1,4 @@
+import 'navigation_item.dart';
 import 'package:flutter/material.dart';
 
 class CompactSelectorOption<T> {
@@ -85,46 +86,53 @@ class CompactSelector<T> extends StatelessWidget {
         ? const EdgeInsets.symmetric(horizontal: 9, vertical: 6)
         : const EdgeInsets.symmetric(horizontal: 12, vertical: 7);
 
-    return Tooltip(
-      message: option.label,
-      waitDuration: const Duration(milliseconds: 550),
-      child: Material(
-        color: background,
-        borderRadius: BorderRadius.circular(6),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(6),
-          onTap: () => onChanged(option.value),
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 160),
-            curve: Curves.easeOutCubic,
-            constraints: BoxConstraints(minHeight: dense ? 30 : 34),
-            padding: padding,
-            child: Row(
-              mainAxisSize: expand ? MainAxisSize.max : MainAxisSize.min,
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                if (option.icon != null) ...[
-                  Icon(option.icon, size: dense ? 10 : 11, color: foreground),
-                  SizedBox(width: dense ? 4 : 5),
-                ],
-                Flexible(
-                  child: Text(
-                    option.label,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    textAlign: TextAlign.center,
-                    style: theme.textTheme.labelLarge?.copyWith(
-                      color: foreground,
-                      fontWeight:
-                          isSelected ? FontWeight.w800 : FontWeight.w700,
+    return NavigationItem(
+        label:
+            '${option.label}, tab ${options.indexOf(option) + 1} of ${options.length}',
+        selected: isSelected,
+        onActivate: () => onChanged(option.value),
+        child: Tooltip(
+          message: option.label,
+          waitDuration: const Duration(milliseconds: 550),
+          child: Material(
+            color: background,
+            borderRadius: BorderRadius.circular(6),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(6),
+              onTap: () => onChanged(option.value),
+              child: Container(
+                constraints: BoxConstraints(minHeight: dense ? 30 : 34),
+                padding: padding,
+                child: Row(
+                  mainAxisSize: expand ? MainAxisSize.max : MainAxisSize.min,
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    if (option.icon != null &&
+                        !(expand &&
+                            MediaQuery.textScalerOf(context).scale(14) >
+                                18)) ...[
+                      Icon(option.icon,
+                          size: dense ? 10 : 11, color: foreground),
+                      SizedBox(width: dense ? 4 : 5),
+                    ],
+                    Flexible(
+                      child: Text(
+                        option.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.labelLarge?.copyWith(
+                          color: foreground,
+                          fontWeight:
+                              isSelected ? FontWeight.w800 : FontWeight.w700,
+                        ),
+                      ),
                     ),
-                  ),
+                  ],
                 ),
-              ],
+              ),
             ),
           ),
-        ),
-      ),
-    );
+        ));
   }
 }

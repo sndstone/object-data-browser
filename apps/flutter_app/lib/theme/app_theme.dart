@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 class AppTheme {
   static const Color lightCanvas = Color(0xFFF7F8F5);
@@ -165,87 +164,106 @@ class AppTheme {
           ? MaterialTapTargetSize.shrinkWrap
           : MaterialTapTargetSize.padded,
     );
-    final textTheme =
-        GoogleFonts.spaceGroteskTextTheme(base.textTheme).copyWith(
-      displayLarge: GoogleFonts.sora(
-        fontWeight: FontWeight.w700,
-        letterSpacing: 0,
-        fontSize: 58,
-        height: 0.98,
-        color: scheme.onSurface,
-      ),
-      displayMedium: GoogleFonts.sora(
-        fontWeight: FontWeight.w700,
-        letterSpacing: 0,
-        fontSize: 44,
-        height: 1.0,
-        color: scheme.onSurface,
-      ),
-      headlineMedium: GoogleFonts.sora(
-        fontWeight: FontWeight.w700,
-        letterSpacing: 0,
-        color: scheme.onSurface,
-      ),
-      headlineSmall: GoogleFonts.sora(
-        fontWeight: FontWeight.w700,
-        letterSpacing: 0,
-        color: scheme.onSurface,
-      ),
-      titleLarge: GoogleFonts.spaceGrotesk(
-        fontWeight: FontWeight.w700,
-        letterSpacing: 0,
-        fontSize: desktopCompact ? 18.0 : 20.0,
-        color: scheme.onSurface,
-      ),
-      titleMedium: GoogleFonts.inter(
-        fontWeight: FontWeight.w700,
-        letterSpacing: 0,
-        fontSize: desktopCompact ? 14.0 : 15.0,
-        height: 1.25,
-        color: scheme.onSurface,
-      ),
-      bodyLarge: GoogleFonts.inter(
-        fontWeight: FontWeight.w500,
-        color: scheme.onSurface,
-        fontSize: desktopCompact ? 15.0 : 16.0,
-        height: 1.4,
-      ),
-      bodyMedium: GoogleFonts.inter(
-        fontWeight: FontWeight.w500,
-        color: scheme.onSurface,
-        fontSize: desktopCompact ? 14.0 : 15.0,
-        height: 1.4,
-      ),
-      bodySmall: GoogleFonts.inter(
-        fontWeight: FontWeight.w600,
-        color: scheme.onSurfaceVariant,
-        fontSize: desktopCompact ? 13.0 : 13.75,
-        height: 1.35,
-      ),
-      labelLarge: GoogleFonts.inter(
-        fontWeight: FontWeight.w700,
-        letterSpacing: 0,
-        fontSize: desktopCompact ? 13.25 : 14.0,
-        height: 1.2,
-        color: scheme.onSurface,
-      ),
-      labelMedium: GoogleFonts.inter(
-        fontWeight: FontWeight.w700,
-        letterSpacing: 0,
-        fontSize: desktopCompact ? 12.5 : 13.25,
-        height: 1.2,
-        color: scheme.onSurfaceVariant,
-      ),
-      labelSmall: GoogleFonts.inter(
-        fontWeight: FontWeight.w700,
-        letterSpacing: 0,
-        fontSize: desktopCompact ? 11.75 : 12.5,
-        height: 1.2,
-        color: scheme.onSurfaceVariant,
-      ),
-    );
+    final textTheme = base.textTheme.apply(fontFamily: 'Inter').copyWith(
+          displayLarge: TextStyle(
+            fontFamily: 'Sora',
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0,
+            fontSize: 58,
+            height: 0.98,
+            color: scheme.onSurface,
+          ),
+          displayMedium: TextStyle(
+            fontFamily: 'Sora',
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0,
+            fontSize: 44,
+            height: 1.0,
+            color: scheme.onSurface,
+          ),
+          headlineMedium: TextStyle(
+            fontFamily: 'Sora',
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0,
+            color: scheme.onSurface,
+          ),
+          headlineSmall: TextStyle(
+            fontFamily: 'Sora',
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0,
+            color: scheme.onSurface,
+          ),
+          titleLarge: TextStyle(
+            fontFamily: 'Sora',
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0,
+            fontSize: desktopCompact ? 18.0 : 20.0,
+            color: scheme.onSurface,
+          ),
+          titleMedium: TextStyle(
+            fontFamily: 'Inter',
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0,
+            fontSize: desktopCompact ? 14.0 : 15.0,
+            height: 1.25,
+            color: scheme.onSurface,
+          ),
+          bodyLarge: TextStyle(
+            fontFamily: 'Inter',
+            fontWeight: FontWeight.w500,
+            color: scheme.onSurface,
+            fontSize: desktopCompact ? 15.0 : 16.0,
+            height: 1.4,
+          ),
+          bodyMedium: TextStyle(
+            fontFamily: 'Inter',
+            fontWeight: FontWeight.w500,
+            color: scheme.onSurface,
+            fontSize: desktopCompact ? 14.0 : 15.0,
+            height: 1.4,
+          ),
+          bodySmall: TextStyle(
+            fontFamily: 'Inter',
+            fontWeight: FontWeight.w600,
+            color: scheme.onSurfaceVariant,
+            fontSize: desktopCompact ? 13.0 : 13.75,
+            height: 1.35,
+          ),
+          labelLarge: TextStyle(
+            fontFamily: 'Inter',
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0,
+            fontSize: desktopCompact ? 13.25 : 14.0,
+            height: 1.2,
+            color: scheme.onSurface,
+          ),
+          labelMedium: TextStyle(
+            fontFamily: 'Inter',
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0,
+            fontSize: desktopCompact ? 12.5 : 13.25,
+            height: 1.2,
+            color: scheme.onSurfaceVariant,
+          ),
+          labelSmall: TextStyle(
+            fontFamily: 'Inter',
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0,
+            fontSize: desktopCompact ? 11.75 : 12.5,
+            height: 1.2,
+            color: scheme.onSurfaceVariant,
+          ),
+        );
 
     return base.copyWith(
+      extensions: [
+        AppStatusTheme(scheme.brightness == Brightness.dark
+            ? const Color(0xFFAEC6F1)
+            : const Color(0xFF2B4F7A)),
+        scheme.brightness == Brightness.dark
+            ? AppRailTheme.dark
+            : AppRailTheme.light
+      ],
       textTheme: textTheme,
       scaffoldBackgroundColor: scaffoldBackground,
       canvasColor: scaffoldBackground,
@@ -454,4 +472,56 @@ class AppTheme {
     final offset = desktopCompact && compactRows ? -2.0 : 0.0;
     return VisualDensity(horizontal: offset, vertical: offset);
   }
+}
+
+@immutable
+class AppRailTheme extends ThemeExtension<AppRailTheme> {
+  const AppRailTheme(
+      {required this.background,
+      required this.selectedBackground,
+      required this.foreground,
+      required this.logoBackground});
+  final Color background, selectedBackground, foreground, logoBackground;
+  static const light = AppRailTheme(
+      background: AppTheme.lightRail,
+      selectedBackground: Color(0xFF075D31),
+      foreground: Color(0xFFD4DED7),
+      logoBackground: AppTheme.lightAccent);
+  static const dark = AppRailTheme(
+      background: AppTheme.darkRail,
+      selectedBackground: AppTheme.darkRailElevated,
+      foreground: AppTheme.darkText,
+      logoBackground: AppTheme.darkAccentSoft);
+  @override
+  AppRailTheme copyWith(
+          {Color? background,
+          Color? selectedBackground,
+          Color? foreground,
+          Color? logoBackground}) =>
+      AppRailTheme(
+          background: background ?? this.background,
+          selectedBackground: selectedBackground ?? this.selectedBackground,
+          foreground: foreground ?? this.foreground,
+          logoBackground: logoBackground ?? this.logoBackground);
+  @override
+  AppRailTheme lerp(covariant AppRailTheme? other, double t) => other == null
+      ? this
+      : AppRailTheme(
+          background: Color.lerp(background, other.background, t)!,
+          selectedBackground:
+              Color.lerp(selectedBackground, other.selectedBackground, t)!,
+          foreground: Color.lerp(foreground, other.foreground, t)!,
+          logoBackground: Color.lerp(logoBackground, other.logoBackground, t)!);
+}
+
+@immutable
+class AppStatusTheme extends ThemeExtension<AppStatusTheme> {
+  const AppStatusTheme(this.running);
+  final Color running;
+  @override
+  AppStatusTheme copyWith({Color? running}) =>
+      AppStatusTheme(running ?? this.running);
+  @override
+  AppStatusTheme lerp(covariant AppStatusTheme? other, double t) =>
+      AppStatusTheme(Color.lerp(running, other?.running ?? running, t)!);
 }

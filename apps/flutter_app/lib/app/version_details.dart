@@ -1,5 +1,5 @@
-const String kApplicationVersion = '2.2.5';
-const String kApplicationBuild = '2.2.5+1';
+const String kApplicationVersion = '2.2.6';
+const String kApplicationBuild = '2.2.6+1';
 
 const Map<String, String> kFlutterDependencyVersions = <String, String>{
   'flutter': 'sdk',

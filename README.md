@@ -107,3 +107,9 @@ See [implementation and validation details](docs/2.2.5-implementation.md) and
 the [visual improvement plan](docs/improvement-plan.html). Public Apple releases
 still require the documented signing, provisioning, notarization, and physical
 device Keychain/local-network checks.
+
+### 2.2.6 GUI improvements
+
+The GUI plan implementation and verification notes are recorded in
+[the 2.2.6 ledger](docs/2.2.6-gui-implementation.md). The application is 2.2.6+1;
+the unchanged bundled engine implementations remain 2.2.5.

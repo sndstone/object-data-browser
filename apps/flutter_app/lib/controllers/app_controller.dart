@@ -253,6 +253,7 @@ class AppController extends ChangeNotifier {
           .setTransferSink(_handleTransferJobUpdate);
     }
     bannerMessage = _credentialStoreError;
+    bannerSeverity = BannerSeverity.error;
     _syncDiagnosticsOptions();
   }
 
@@ -345,7 +346,52 @@ class AppController extends ChangeNotifier {
   bool showAllObjects = false;
   bool listAllKeys = false;
   bool loading = false;
-  String? bannerMessage;
+  String? _bannerMessage;
+  String? get bannerMessage => _bannerMessage;
+  set bannerMessage(String? value) {
+    _bannerMessage = value;
+    bannerSeverity = BannerSeverity.info;
+  }
+
+  BannerSeverity bannerSeverity = BannerSeverity.info;
+  String? pendingEventLogFilter;
+  String settingsSectionName = 'Connections';
+  void openConnectionSettings() {
+    settingsSectionName = 'Connections';
+    selectTab(WorkspaceTab.settings);
+  }
+
+  void setSettingsSection(String section) {
+    settingsSectionName = section;
+    notifyListeners();
+  }
+
+  final objectSearchFocus = ValueNotifier<int>(0);
+  final inspectorToggleRequest = ValueNotifier<int>(0);
+  final deleteSelectionRequest = ValueNotifier<int>(0);
+  bool pendingInspectorToggle = false;
+  void requestInspectorToggle() {
+    pendingInspectorToggle = true;
+    selectTab(WorkspaceTab.browser);
+    inspectorToggleRequest.value++;
+  }
+
+  void requestDeleteSelection() {
+    if (activeTab == WorkspaceTab.browser) deleteSelectionRequest.value++;
+  }
+
+  bool pendingObjectSearchFocus = false;
+  void requestObjectSearchFocus() {
+    pendingObjectSearchFocus = true;
+    selectTab(WorkspaceTab.browser);
+    objectSearchFocus.value++;
+  }
+
+  void openErrorDetails() {
+    pendingEventLogFilter = 'ERROR';
+    selectTab(WorkspaceTab.eventLog);
+  }
+
   String? bannerTaskId;
   VersionBrowserOptions versionBrowserOptions = const VersionBrowserOptions();
   late TestDataToolConfig testDataConfig;
@@ -430,6 +476,7 @@ class AppController extends ChangeNotifier {
       }
       if (_credentialStoreError != null) {
         bannerMessage = _credentialStoreError;
+        bannerSeverity = BannerSeverity.error;
         _addEvent(
           level: 'ERROR',
           category: 'Persistence',
@@ -449,6 +496,7 @@ class AppController extends ChangeNotifier {
       }
     } catch (error) {
       bannerMessage = 'Initialization failed: $error';
+      bannerSeverity = BannerSeverity.error;
       _addEvent(
         level: 'ERROR',
         category: 'App',
@@ -481,7 +529,17 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
+  final Map<InspectorGroup, BrowserInspectorTab> inspectorGroupTabs = {};
+  void clearSelectedObject() {
+    selectedObject = null;
+    selectedObjectDetails = null;
+    selectedObjectPreview = null;
+    objectSelection.clear();
+    setInspectorTab(BrowserInspectorTab.bucketInfo);
+  }
+
   void setInspectorTab(BrowserInspectorTab tab) {
+    inspectorGroupTabs[tab.group] = tab;
     inspectorTab = tab;
     notifyListeners();
   }
@@ -1023,7 +1081,7 @@ class AppController extends ChangeNotifier {
     await refreshObjects(prefix: currentPrefix);
   }
 
-  Future<void> applyObjectFilter(String value) async {
+  Future<void> applyObjectFilter(String value, {bool log = true}) async {
     if (objectFilterMode == BrowserFilterMode.regex) {
       try {
         RegExp(value);
@@ -1045,14 +1103,16 @@ class AppController extends ChangeNotifier {
     objectSelection.clear();
     objectFilterValue = value;
     objectPage = 1;
-    _addEvent(
-      level: 'INFO',
-      category: 'Objects',
-      message:
-          'Updated object filter to "$value" in ${objectFilterMode.name} mode.',
-      includeSelectionContext: true,
-      source: 'object-browser',
-    );
+    if (log) {
+      _addEvent(
+        level: 'INFO',
+        category: 'Objects',
+        message:
+            'Updated object filter to "$value" in ${objectFilterMode.name} mode.',
+        includeSelectionContext: true,
+        source: 'object-browser',
+      );
+    }
     if (objectFilterMode == BrowserFilterMode.prefix) {
       await refreshObjects(prefix: value);
       return;
@@ -1279,11 +1339,13 @@ class AppController extends ChangeNotifier {
           return;
         }
         final uploadChunkMiB = await _uploadChunkSizeMiB(filePaths);
+        final requestEngine = activeEngineId;
+        final requestPrefix = currentPrefix;
         final job = await _engineService.startUpload(
-          engineId: activeEngineId,
+          engineId: requestEngine,
           profile: profile,
           bucketName: bucket.name,
-          prefix: currentPrefix,
+          prefix: requestPrefix,
           filePaths: filePaths,
           objectKeyByPath: objectKeyByPath,
           multipartThresholdMiB: settings.multipartThresholdMiB,
@@ -1292,14 +1354,21 @@ class AppController extends ChangeNotifier {
         _pendingUploadRelists[job.id] = _PendingObjectRelist(
           profileId: profile.id,
           bucketName: bucket.name,
-          prefix: currentPrefix,
+          prefix: requestPrefix,
           listAll: listAllKeys,
         );
+        _registerUploadRetry(job.id, profile.id, bucket.name, requestEngine,
+            requestPrefix, filePaths, objectKeyByPath);
         transferJobs = [job, ...transferJobs];
         _trackTransferJob(job);
         _maybeRelistAfterUpload(job);
         bannerTaskId = job.id;
         bannerMessage = _transferBannerMessage(job);
+        bannerSeverity = job.status == 'failed'
+            ? BannerSeverity.error
+            : job.status == 'completed'
+                ? BannerSeverity.success
+                : BannerSeverity.info;
         _addEvent(
           level: 'INFO',
           category: 'Transfers',
@@ -1310,6 +1379,30 @@ class AppController extends ChangeNotifier {
         );
       });
     }, trackTask: false);
+  }
+
+  void _registerUploadRetry(
+      String id,
+      String profileId,
+      String bucket,
+      String engine,
+      String prefix,
+      List<String> paths,
+      Map<String, String> keys) {
+    final files = List<String>.of(paths);
+    final mapping = Map<String, String>.of(keys);
+    _retryTransfers[id] = () async {
+      if (selectedProfile?.id != profileId ||
+          selectedBucket?.name != bucket ||
+          activeEngineId != engine ||
+          currentPrefix != prefix) {
+        showBannerMessage(
+            'Open the original upload connection, engine, bucket and prefix before retrying.',
+            severity: BannerSeverity.warning);
+        return;
+      }
+      await startSampleUpload(files, objectKeyByPath: mapping);
+    };
   }
 
   Future<int> _uploadChunkSizeMiB(List<String> filePaths) async {
@@ -1333,6 +1426,7 @@ class AppController extends ChangeNotifier {
     final id = 'upload-batch-${DateTime.now().microsecondsSinceEpoch}';
     final engineId = activeEngineId;
     final prefix = currentPrefix;
+    _registerUploadRetry(id, profile.id, bucket, engineId, prefix, paths, keys);
     final batch = UploadBatch(
         id: id,
         engine: _engineService,
@@ -1420,19 +1514,55 @@ class AppController extends ChangeNotifier {
     }
     await _runBusy('download', 'Starting download...', () async {
       await _guard('Transfers', () async {
+        final retryEngine = activeEngineId;
+        final retryDestination = settings.downloadPath;
+        final retryThreshold = settings.multipartThresholdMiB;
+        final retryChunk = settings.multipartChunkMiB;
+        final retryKeys = List<String>.of(keys);
         final job = await _engineService.startDownload(
-          engineId: activeEngineId,
+          engineId: retryEngine,
           profile: profile,
           bucketName: bucket.name,
-          keys: keys,
-          destinationPath: settings.downloadPath,
-          multipartThresholdMiB: settings.multipartThresholdMiB,
-          multipartChunkMiB: settings.multipartChunkMiB,
+          keys: retryKeys,
+          destinationPath: retryDestination,
+          multipartThresholdMiB: retryThreshold,
+          multipartChunkMiB: retryChunk,
         );
+        Future<void> replay() async {
+          if (activeEngineId != retryEngine ||
+              selectedProfile?.id != profile.id ||
+              selectedBucket?.name != bucket.name) {
+            showBannerMessage(
+                'Select the original connection, engine and bucket before retrying.',
+                severity: BannerSeverity.warning);
+            return;
+          }
+          await _guard('Transfers', () async {
+            final next = await _engineService.startDownload(
+                engineId: retryEngine,
+                profile: selectedProfile!,
+                bucketName: bucket.name,
+                keys: retryKeys,
+                destinationPath: retryDestination,
+                multipartThresholdMiB: retryThreshold,
+                multipartChunkMiB: retryChunk);
+            _retryTransfers[next.id] = replay;
+            transferJobs = [next, ...transferJobs];
+            bannerTaskId = next.id;
+            _trackTransferJob(next);
+          });
+        }
+
+        _retryTransfers[job.id] = replay;
         transferJobs = [job, ...transferJobs];
         _trackTransferJob(job);
         bannerTaskId = job.id;
         bannerMessage = _transferBannerMessage(job);
+        bannerSeverity = job.status == 'failed'
+            ? BannerSeverity.error
+            : job.status == 'completed'
+                ? BannerSeverity.success
+                : BannerSeverity.info;
         final destinationLabel =
             AppPlatform.isMobile ? 'Downloads' : settings.downloadPath;
         _addEvent(
@@ -1725,7 +1855,7 @@ class AppController extends ChangeNotifier {
 
   Future<void> runDeleteAllTool() async {
     final profile = selectedProfile;
-    if (profile == null) {
+    if (profile == null || deleteAllState.running) {
       return;
     }
     final taskId = _nextTaskId('delete-all');
@@ -1914,6 +2044,7 @@ class AppController extends ChangeNotifier {
       if (!_benchmarkPollErrorReported) {
         _benchmarkPollErrorReported = true;
         bannerMessage = 'Benchmark status polling failed: $error';
+        bannerSeverity = BannerSeverity.error;
         _addEvent(
           level: 'ERROR',
           category: 'Benchmark',
@@ -2160,6 +2291,8 @@ class AppController extends ChangeNotifier {
         ? 'Saved endpoint profile ${profile.name}.'
         : _credentialStoreError ??
             'Profile is available for this session, but its credentials could not be saved securely.';
+    bannerSeverity =
+        persisted ? BannerSeverity.success : BannerSeverity.warning;
     notifyListeners();
   }
 
@@ -2494,11 +2627,17 @@ class AppController extends ChangeNotifier {
     String message, {
     String category = 'App',
     String source = 'app',
+    BannerSeverity severity = BannerSeverity.info,
   }) {
     bannerMessage = message;
+    bannerSeverity = severity;
     bannerTaskId = null;
     _addEvent(
-      level: 'INFO',
+      level: severity == BannerSeverity.error
+          ? 'ERROR'
+          : severity == BannerSeverity.warning
+              ? 'WARN'
+              : 'INFO',
       category: category,
       message: message,
       source: source,
@@ -2724,6 +2863,49 @@ class AppController extends ChangeNotifier {
     _bucketScopedEventsInputProfileId = profileId;
     _bucketScopedEventsInputBucketName = bucketName;
     return results;
+  }
+
+  final Map<String, Future<void> Function()> _retryTransfers = {};
+  bool canRetryTask(BrowserTaskRecord task) =>
+      task.isFailedLike &&
+      _retryTransfers.containsKey(task.id) &&
+      task.profileId == selectedProfile?.id &&
+      task.bucketName == selectedBucket?.name;
+  Future<void> retryTask(BrowserTaskRecord task) async {
+    if (!canRetryTask(task) || isBusy('retry-${task.id}')) return;
+    await _runBusy('retry-${task.id}', 'Retrying ${task.label}...', () async {
+      final before = browserTasks.map((t) => t.id).toSet();
+      await _retryTransfers[task.id]!();
+      final next = browserTasks
+          .where((t) =>
+              t.kind == BrowserTaskKind.transfer && !before.contains(t.id))
+          .firstOrNull;
+      if (next != null) {
+        _upsertTask(task.copyWith(
+            outputLines: [...task.outputLines, 'Retried as ${next.id}']));
+      }
+    }, trackTask: false);
+  }
+
+  void clearFinishedTasks() {
+    final removed = browserTasks
+        .where((t) => [
+              'completed',
+              'failed',
+              'cancelled',
+              'canceled',
+              'error',
+              'stopped'
+            ].contains(t.status))
+        .map((t) => t.id)
+        .toSet();
+    browserTasks = browserTasks.where((t) => !removed.contains(t.id)).toList();
+    transferJobs = transferJobs.where((t) => !removed.contains(t.id)).toList();
+    for (final id in removed) {
+      _retryTransfers.remove(id);
+    }
+    if (removed.contains(selectedTaskId)) selectedTaskId = null;
+    notifyListeners();
   }
 
   List<BrowserTaskRecord> tasksForView(BrowserTaskView view) {
@@ -3112,7 +3294,8 @@ class AppController extends ChangeNotifier {
       await operation();
     } on EngineException catch (error) {
       _guardErrorSequence += 1;
-      bannerMessage = '${error.code.name}: ${error.message}';
+      bannerMessage = '${error.code.displayLabel}: ${error.message}';
+      bannerSeverity = BannerSeverity.error;
       _addEvent(
         level: 'ERROR',
         category: category,
@@ -3124,6 +3307,7 @@ class AppController extends ChangeNotifier {
     } catch (error) {
       _guardErrorSequence += 1;
       bannerMessage = error.toString();
+      bannerSeverity = BannerSeverity.error;
       _addEvent(
         level: 'ERROR',
         category: category,
@@ -3217,6 +3401,14 @@ class AppController extends ChangeNotifier {
       }
       _busyActions.remove(actionKey);
       _busyTaskIds.remove(actionKey);
+      if (!failed &&
+          bannerSeverity == BannerSeverity.info &&
+          !(bannerTask?.isRunningLike ?? false)) {
+        if (bannerMessage == busyMessage) {
+          bannerMessage = 'Operation completed.';
+        }
+        bannerSeverity = BannerSeverity.success;
+      }
       // Any pending coalesced progress notification is superseded by the
       // notify below; cancelling keeps tests free of stray timers.
       if (_busyActions.isEmpty) {
@@ -3250,6 +3442,9 @@ class AppController extends ChangeNotifier {
 
   @override
   void dispose() {
+    objectSearchFocus.dispose();
+    inspectorToggleRequest.dispose();
+    deleteSelectionRequest.dispose();
     _objectQuery.dispose();
     _busyLineNotifyTimer?.cancel();
     shutdownEngines();
@@ -3822,6 +4017,17 @@ class AppController extends ChangeNotifier {
 
   void _trackTransferJob(TransferJob job) {
     final currentTask = _taskById(job.id);
+    final now = DateTime.now();
+    var rate = currentTask?.bytesPerSecond ?? 0.0;
+    final previousTime = currentTask?.sampledAt;
+    if (previousTime != null && currentTask?.bytesTransferred != null) {
+      final seconds = now.difference(previousTime).inMicroseconds / 1000000;
+      final bytes = job.bytesTransferred - currentTask!.bytesTransferred!;
+      if (seconds > 0 && bytes >= 0) {
+        final sample = bytes / seconds;
+        rate = rate == 0 ? sample : rate + (2 / 11) * (sample - rate);
+      }
+    }
     _upsertTask(
       BrowserTaskRecord(
         id: job.id,
@@ -3834,6 +4040,8 @@ class AppController extends ChangeNotifier {
                 ? null
                 : DateTime.now(),
         progress: job.progress,
+        bytesPerSecond: rate,
+        sampledAt: now,
         profileId: _pendingUploadRelists[job.id]?.profileId ??
             currentTask?.profileId ??
             selectedProfile?.id,
@@ -3857,6 +4065,11 @@ class AppController extends ChangeNotifier {
     );
     if (bannerTaskId == job.id) {
       bannerMessage = _transferBannerMessage(job);
+      bannerSeverity = job.status == 'failed'
+          ? BannerSeverity.error
+          : job.status == 'completed'
+              ? BannerSeverity.success
+              : BannerSeverity.info;
     }
     notifyListeners();
   }

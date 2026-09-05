@@ -3,6 +3,14 @@ name: Release Matrix
 on:
   workflow_dispatch:
     inputs:
+      build_desktop:
+        description: Build Windows and Linux packages
+        type: boolean
+        default: true
+      build_android:
+        description: Include Android builds without iOS
+        type: boolean
+        default: false
       build_macos:
         description: Build signed/notarized macOS (requires Apple secrets)
         type: boolean
@@ -23,6 +31,7 @@ jobs:
     uses: ./.github/workflows/verification.yml
 
   windows:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_desktop == true }}
     needs: verify
     strategy:
       fail-fast: false
@@ -50,6 +59,7 @@ jobs:
           if-no-files-found: error
 
   linux:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_desktop == true }}
     needs: verify
     strategy:
       fail-fast: false
@@ -161,7 +171,7 @@ jobs:
             dist/macos/*.dmg
 
   android:
-    if: ${{ inputs.build_mobile == true }}
+    if: ${{ inputs.build_android == true || inputs.build_mobile == true }}
     needs: verify
     runs-on: ubuntu-24.04
     steps:

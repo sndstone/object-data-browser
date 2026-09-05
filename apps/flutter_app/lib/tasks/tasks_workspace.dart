@@ -1,3 +1,6 @@
+import '../theme/app_theme.dart';
+import '../widgets/empty_state.dart';
+import '../utils/format.dart';
 import 'package:flutter/material.dart';
 
 import '../controllers/app_controller.dart';
@@ -34,7 +37,15 @@ class TasksWorkspace extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('Jobs', style: theme.textTheme.headlineSmall),
+                Wrap(
+                    spacing: 12,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      Text('Jobs', style: theme.textTheme.headlineSmall),
+                      OutlinedButton(
+                          onPressed: controller.clearFinishedTasks,
+                          child: const Text('Clear finished'))
+                    ]),
                 const SizedBox(height: 8),
                 Text(
                   'Track running work, review failures, and open completed jobs.',
@@ -47,21 +58,24 @@ class TasksWorkspace extends StatelessWidget {
           CompactSelector<BrowserTaskView>(
             selected: view,
             onChanged: controller.setTaskView,
-            options: const [
+            options: [
               CompactSelectorOption(
                 value: BrowserTaskView.running,
                 icon: Icons.play_circle_outline,
-                label: 'Running',
+                label:
+                    'Running · ${controller.tasksForView(BrowserTaskView.running).length}',
               ),
               CompactSelectorOption(
                 value: BrowserTaskView.failed,
                 icon: Icons.error_outline,
-                label: 'Failed',
+                label:
+                    'Failed · ${controller.tasksForView(BrowserTaskView.failed).length}',
               ),
               CompactSelectorOption(
                 value: BrowserTaskView.all,
                 icon: Icons.view_list_outlined,
-                label: 'All',
+                label:
+                    'All · ${controller.tasksForView(BrowserTaskView.all).length}',
               ),
             ],
           ),
@@ -91,21 +105,24 @@ class _TaskList extends StatelessWidget {
   Widget build(BuildContext context) {
     final tasks = controller.tasksForView(view);
     if (tasks.isEmpty) {
-      return Center(
-        child: Text(
-          switch (view) {
+      return EmptyState(
+          icon: Icons.task_alt,
+          title: switch (view) {
             BrowserTaskView.running => 'No running tasks.',
             BrowserTaskView.failed => 'No failed tasks.',
-            BrowserTaskView.all => 'No task history yet.',
+            BrowserTaskView.all => 'No task history yet.'
           },
-        ),
-      );
+          message: 'Upload or download objects from the browser.',
+          action: TextButton(
+              onPressed: () => controller.selectTab(WorkspaceTab.browser),
+              child: const Text('Open browser')));
     }
 
     return ListView.separated(
       itemCount: tasks.length,
       separatorBuilder: (_, __) => const SizedBox(height: 12),
       itemBuilder: (context, index) => _TaskCard(
+        key: ValueKey(tasks[index].id),
         controller: controller,
         task: tasks[index],
       ),
@@ -113,8 +130,9 @@ class _TaskList extends StatelessWidget {
   }
 }
 
-class _TaskCard extends StatelessWidget {
+class _TaskCard extends StatefulWidget {
   const _TaskCard({
+    super.key,
     required this.controller,
     required this.task,
   });
@@ -123,32 +141,56 @@ class _TaskCard extends StatelessWidget {
   final BrowserTaskRecord task;
 
   @override
+  State<_TaskCard> createState() => _TaskCardState();
+}
+
+class _TaskCardState extends State<_TaskCard> {
+  final ExpansibleController _expansion = ExpansibleController();
+  AppController get controller => widget.controller;
+  BrowserTaskRecord get task => widget.task;
+  @override
+  void didUpdateWidget(covariant _TaskCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (task.id == controller.selectedTaskId) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !_expansion.isExpanded) _expansion.expand();
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _expansion.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final details = <String>[
       if (task.profileId != null) 'Profile: ${task.profileId}',
       if (task.bucketName != null) 'Bucket: ${task.bucketName}',
-      'Started: ${_formatDateTime(task.startedAt)}',
+      'Started: ${formatDateTime(task.startedAt)}',
       if (task.completedAt != null)
-        'Completed: ${_formatDateTime(task.completedAt!)}',
+        'Completed: ${formatDateTime(task.completedAt!)}',
       if (task.strategyLabel != null) 'Strategy: ${task.strategyLabel}',
       if (task.currentItemLabel != null)
         'Current item: ${task.currentItemLabel}',
     ];
     final metricLines = <String>[
       if (task.bytesTransferred != null && task.totalBytes != null)
-        'Bytes: ${_formatBytes(task.bytesTransferred!)}/${_formatBytes(task.totalBytes!)}',
+        'Bytes: ${formatBytes(task.bytesTransferred!)}/${formatBytes(task.totalBytes!)}',
       if (task.itemCount != null)
         'Items: ${(task.itemsCompleted ?? 0)}/${task.itemCount}',
       if (task.partsTotal != null)
         'Parts: ${(task.partsCompleted ?? 0)}/${task.partsTotal}'
-            '${task.partSizeBytes == null ? '' : ' - ${_formatBytes(task.partSizeBytes!)} per part'}',
+            '${task.partSizeBytes == null ? '' : ' - ${formatBytes(task.partSizeBytes!)} per part'}',
     ];
 
     return Card(
       margin: EdgeInsets.zero,
       child: ExpansionTile(
-        key:
-            ValueKey('task-${task.id}-${task.id == controller.selectedTaskId}'),
+        key: PageStorageKey(task.id),
+        controller: _expansion,
         initiallyExpanded: task.id == controller.selectedTaskId,
         onExpansionChanged: (expanded) {
           if (expanded) {
@@ -169,11 +211,12 @@ class _TaskCard extends StatelessWidget {
               spacing: 8,
               runSpacing: 8,
               children: [
-                Chip(label: Text(task.status)),
+                TaskStatusPill(status: task.status),
               ],
             ),
             const SizedBox(height: 8),
             LinearProgressIndicator(
+              color: TaskStatusPill.color(context, task.status),
               value: task.isRunningLike &&
                       task.status != 'paused' &&
                       task.progress == 0 &&
@@ -182,6 +225,19 @@ class _TaskCard extends StatelessWidget {
                   : task.progress.clamp(0.0, 1.0),
             ),
             const SizedBox(height: 8),
+            Text(
+                '${task.elapsed.inMinutes}m ${task.elapsed.inSeconds % 60}s elapsed${task.bytesPerSecond >= 1024 ? ' · ${formatBytes(task.bytesPerSecond.round())}/s' : ''}${task.eta != null ? ' · ~${task.eta!.inMinutes + 1} min left' : ''}',
+                style: Theme.of(context).textTheme.bodySmall),
+            if (controller.canRetryTask(task))
+              TextButton(
+                  onPressed: controller.isBusy('retry-${task.id}')
+                      ? null
+                      : () => controller.retryTask(task),
+                  child: const Text('Retry')),
+            if (task.isFailedLike)
+              TextButton(
+                  onPressed: controller.openErrorDetails,
+                  child: const Text('Open Event Log')),
             if (task.isFailedLike)
               Text(
                   task.outputLines.isEmpty
@@ -216,7 +272,8 @@ class _TaskCard extends StatelessWidget {
                 color: Theme.of(context).colorScheme.surfaceContainerHighest,
                 borderRadius: BorderRadius.circular(12),
               ),
-              child: SelectableText(task.outputLines.join('\n')),
+              child: SelectableText(task.outputLines.join('\n'),
+                  key: PageStorageKey('output-${task.id}')),
             ),
           if (task.outputLines.isNotEmpty) const SizedBox(height: 12),
           Wrap(
@@ -288,25 +345,38 @@ class _TaskCard extends StatelessWidget {
       ),
     );
   }
+}
 
-  String _formatBytes(int value) {
-    if (value >= 1024 * 1024 * 1024) {
-      return '${(value / (1024 * 1024 * 1024)).toStringAsFixed(1)} GiB';
-    }
-    if (value >= 1024 * 1024) {
-      return '${(value / (1024 * 1024)).toStringAsFixed(1)} MiB';
-    }
-    if (value >= 1024) {
-      return '${(value / 1024).toStringAsFixed(1)} KiB';
-    }
-    return '$value B';
+class TaskStatusPill extends StatelessWidget {
+  const TaskStatusPill({super.key, required this.status});
+  final String status;
+  static Color color(BuildContext context, String status) {
+    final c = Theme.of(context).colorScheme;
+    return switch (status) {
+      'failed' || 'cancelled' => c.error,
+      'paused' => c.tertiary,
+      'running' ||
+      'queued' ||
+      'active' =>
+        Theme.of(context).extension<AppStatusTheme>()?.running ?? c.secondary,
+      _ => c.onSurfaceVariant
+    };
   }
 
-  String _formatDateTime(DateTime value) {
-    final twoDigitMonth = value.month.toString().padLeft(2, '0');
-    final twoDigitDay = value.day.toString().padLeft(2, '0');
-    final twoDigitHour = value.hour.toString().padLeft(2, '0');
-    final twoDigitMinute = value.minute.toString().padLeft(2, '0');
-    return '${value.year}-$twoDigitMonth-$twoDigitDay $twoDigitHour:$twoDigitMinute';
-  }
+  @override
+  Widget build(BuildContext context) => Chip(
+      avatar: Icon(
+          switch (status) {
+            'failed' || 'cancelled' => Icons.error_outline,
+            'paused' => Icons.pause_circle_outline,
+            'completed' => Icons.check_circle_outline,
+            _ => Icons.play_circle_outline
+          },
+          size: 16,
+          color: color(context, status)),
+      label: Text(status.isEmpty
+          ? 'Unknown'
+          : '${status[0].toUpperCase()}${status.substring(1)}'),
+      labelStyle: TextStyle(color: color(context, status)),
+      backgroundColor: color(context, status).withValues(alpha: .12));
 }

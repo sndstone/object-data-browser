@@ -106,3 +106,29 @@ class PreferenceTextScaler extends TextScaler {
   @override
   double get textScaleFactor => scale(14) / 14;
 }
+
+/// AnimatedSize with a direct layout path when motion is disabled. A zero
+/// duration animation can notify its render object during performLayout.
+class MotionSize extends StatelessWidget {
+  const MotionSize(
+      {super.key,
+      required this.duration,
+      required this.child,
+      this.alignment = Alignment.center,
+      this.curve = Curves.linear,
+      this.clipBehavior = Clip.hardEdge});
+  final Duration duration;
+  final Widget child;
+  final AlignmentGeometry alignment;
+  final Curve curve;
+  final Clip clipBehavior;
+  @override
+  Widget build(BuildContext context) => duration == Duration.zero
+      ? child
+      : AnimatedSize(
+          duration: duration,
+          alignment: alignment,
+          curve: curve,
+          clipBehavior: clipBehavior,
+          child: child);
+}

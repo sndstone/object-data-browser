@@ -1,3 +1,5 @@
+import 'package:google_fonts/google_fonts.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
@@ -6,6 +8,13 @@ import 'services/app_bootstrap.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  GoogleFonts.config.allowRuntimeFetching = false;
+  LicenseRegistry.addLicense(() async* {
+    for (final family in ['Inter', 'Sora']) {
+      yield LicenseEntryWithLineBreaks([family],
+          await rootBundle.loadString('assets/fonts/$family-OFL.txt'));
+    }
+  });
 
   // Show a visible error screen in release builds instead of a blank white
   // window, which happens when Flutter's default release-mode ErrorWidget

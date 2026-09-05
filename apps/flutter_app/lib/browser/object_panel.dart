@@ -1,9 +1,11 @@
+import '../widgets/empty_state.dart';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
 import '../theme/app_motion.dart';
-import '../widgets/app_select_field.dart';
+import '../widgets/compact_selector.dart';
 import 'object_table.dart';
 
 class ObjectPanel extends StatefulWidget {
@@ -25,6 +27,65 @@ class ObjectPanel extends StatefulWidget {
 
 class _ObjectPanelState extends State<ObjectPanel> {
   bool _viewExpanded = false;
+  late final TextEditingController _search =
+      TextEditingController(text: controller.objectFilterValue);
+  final FocusNode _searchFocus = FocusNode();
+  Timer? _debounce;
+  late String _externalValue;
+  late Object _searchContext;
+  Object get _contextSignature => (
+        controller.selectedProfile?.id,
+        controller.selectedBucket?.name,
+        controller.currentPrefix,
+        controller.objectFilterMode
+      );
+  @override
+  void initState() {
+    super.initState();
+    _externalValue = controller.objectFilterValue;
+    _searchContext = _contextSignature;
+    controller.objectSearchFocus.addListener(_focusSearch);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && controller.pendingObjectSearchFocus) _focusSearch();
+    });
+  }
+
+  void _focusSearch() {
+    controller.pendingObjectSearchFocus = false;
+    _searchFocus.requestFocus();
+  }
+
+  @override
+  void didUpdateWidget(covariant ObjectPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (_searchContext != _contextSignature) {
+      _searchContext = _contextSignature;
+      _debounce?.cancel();
+      _externalValue = controller.objectFilterValue;
+      _search.text = _externalValue;
+    } else if (_externalValue != controller.objectFilterValue) {
+      _externalValue = controller.objectFilterValue;
+      if (_search.text != _externalValue) {
+        _debounce?.cancel();
+        _search.text = _externalValue;
+      }
+    }
+  }
+
+  void _apply(String value) {
+    _debounce?.cancel();
+    controller.applyObjectFilter(value);
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    controller.objectSearchFocus.removeListener(_focusSearch);
+    _search.dispose();
+    _searchFocus.dispose();
+    super.dispose();
+  }
+
   AppController get controller => widget.controller;
   VoidCallback get onUpload => widget.onUpload;
   VoidCallback get onDelete => widget.onDelete;
@@ -58,6 +119,12 @@ class _ObjectPanelState extends State<ObjectPanel> {
     final busy = c.isBusy('refresh-objects');
     return CallbackShortcuts(
         bindings: {
+          const SingleActivator(LogicalKeyboardKey.delete): () {
+            if (FocusManager.instance.primaryFocus?.context?.widget
+                is! EditableText) {
+              onDelete();
+            }
+          },
           const SingleActivator(LogicalKeyboardKey.escape):
               c.clearObjectSelection,
         },
@@ -91,9 +158,18 @@ class _ObjectPanelState extends State<ObjectPanel> {
                       LayoutBuilder(builder: (context, constraints) {
                         final narrow = constraints.maxWidth < 450;
                         final search = TextFormField(
-                            key: ValueKey(
-                                'object-filter-${c.objectFilterMode.name}-${c.objectFilterValue}'),
-                            initialValue: c.objectFilterValue,
+                            key: const ValueKey('object-search'),
+                            controller: _search,
+                            focusNode: _searchFocus,
+                            onChanged: (value) {
+                              _debounce?.cancel();
+                              if (c.objectFilterMode !=
+                                  BrowserFilterMode.prefix) {
+                                _debounce = Timer(
+                                    const Duration(milliseconds: 250),
+                                    () => _apply(value));
+                              }
+                            },
                             enabled: hasBucket,
                             decoration: InputDecoration(
                                 labelText: c.objectFilterMode ==
@@ -106,34 +182,38 @@ class _ObjectPanelState extends State<ObjectPanel> {
                                     : null,
                                 errorText: c.objectFilterError,
                                 prefixIcon: const Icon(Icons.search)),
-                            onFieldSubmitted: c.applyObjectFilter);
-                        final mode = SizedBox(
-                            width: narrow ? 108 : 140,
-                            child: AppSelectField<BrowserFilterMode>(
-                                value: c.objectFilterMode,
-                                decoration:
-                                    const InputDecoration(labelText: 'Filter'),
-                                items: const [
-                                  AppSelectItem(
-                                      value: BrowserFilterMode.prefix,
-                                      label: 'Prefix'),
-                                  AppSelectItem(
-                                      value: BrowserFilterMode.text,
-                                      label: 'Text'),
-                                  AppSelectItem(
-                                      value: BrowserFilterMode.regex,
-                                      label: 'Regex')
-                                ],
-                                onChanged: hasBucket
-                                    ? (v) {
-                                        if (v != null) c.setObjectFilterMode(v);
-                                      }
-                                    : null));
-                        return Row(children: [
-                          mode,
-                          const SizedBox(width: 8),
-                          Expanded(child: search)
-                        ]);
+                            onFieldSubmitted: _apply);
+                        final mode = CompactSelector<BrowserFilterMode>(
+                            selected: c.objectFilterMode,
+                            dense: true,
+                            options: const [
+                              CompactSelectorOption(
+                                  value: BrowserFilterMode.prefix,
+                                  label: 'Prefix'),
+                              CompactSelectorOption(
+                                  value: BrowserFilterMode.text, label: 'Text'),
+                              CompactSelectorOption(
+                                  value: BrowserFilterMode.regex,
+                                  label: 'Regex')
+                            ],
+                            onChanged: (v) {
+                              if (!hasBucket) return;
+                              _debounce?.cancel();
+                              c.setObjectFilterMode(v);
+                            });
+                        return narrow
+                            ? Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                    mode,
+                                    const SizedBox(height: 8),
+                                    search
+                                  ])
+                            : Row(children: [
+                                mode,
+                                const SizedBox(width: 8),
+                                Expanded(child: search)
+                              ]);
                       }),
                       const SizedBox(height: 10),
                       Wrap(
@@ -169,7 +249,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
                                     : Icons.refresh)),
                           ]),
                       ClipRect(
-                          child: AnimatedSize(
+                          child: MotionSize(
                         alignment: Alignment.topCenter,
                         duration: AppMotion.duration(context,
                             enabled: c.settings.enableAnimations),
@@ -228,7 +308,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
                                 ),
                               ),
                       )),
-                      AnimatedSize(
+                      MotionSize(
                           duration: AppMotion.duration(context,
                               enabled: c.settings.enableAnimations),
                           curve: Curves.easeOutCubic,
@@ -272,12 +352,38 @@ class _ObjectPanelState extends State<ObjectPanel> {
                         const LinearProgressIndicator(minHeight: 2),
                       Expanded(
                           child: objects.isEmpty
-                              ? Center(
-                                  child: Text(!hasBucket
-                                      ? 'Select a bucket to load objects.'
-                                      : c.objects.isEmpty
-                                          ? 'No objects in this bucket and prefix.'
-                                          : 'No matches in loaded objects. Change your filter or load more keys.'))
+                              ? EmptyState(
+                                  icon: Icons.folder_open_outlined,
+                                  title: c.selectedProfile == null
+                                      ? 'No connection configured'
+                                      : !hasBucket
+                                          ? 'No bucket open'
+                                          : c.objects.isEmpty
+                                              ? 'No objects in this prefix'
+                                              : 'No matching objects',
+                                  message: c.selectedProfile == null
+                                      ? 'Create an endpoint profile to connect to your storage.'
+                                      : !hasBucket
+                                          ? 'Pick a bucket or refresh the list for this endpoint.'
+                                          : c.objects.isEmpty
+                                              ? 'Upload files to get started.'
+                                              : 'Change the filter or load more keys.',
+                                  action: TextButton(
+                                      onPressed: c.selectedProfile == null
+                                          ? () =>
+                                              c.selectTab(WorkspaceTab.settings)
+                                          : !hasBucket
+                                              ? c.refreshBuckets
+                                              : c.objects.isEmpty
+                                                  ? onUpload
+                                                  : () => _apply(''),
+                                      child: Text(c.selectedProfile == null
+                                          ? 'Create profile'
+                                          : !hasBucket
+                                              ? 'Refresh buckets'
+                                              : c.objects.isEmpty
+                                                  ? 'Upload files'
+                                                  : 'Clear filter')))
                               : ObjectTable(
                                   objects: objects,
                                   selectedKey: c.selectedObject?.key,

@@ -274,6 +274,8 @@ void main() {
     await tester.pumpAndSettle();
     expect(controller.objectSortDescending, true);
     expect(find.text('Bucket config'), findsOneWidget);
+    await tester.tap(find.text('Diagnostics'));
+    await tester.pumpAndSettle();
     expect(find.text('Events & Debug'), findsOneWidget);
     expect(find.byTooltip('Advanced inspector tools'), findsNothing);
     await tester.tap(find.widgetWithText(OutlinedButton, 'View tools'));
@@ -953,7 +955,7 @@ void main() {
     );
   });
 
-  testWidgets('listing banner clears after five seconds', (
+  testWidgets('info banner clears after three and a half seconds', (
     WidgetTester tester,
   ) async {
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -966,7 +968,7 @@ void main() {
     await tester.pump();
     expect(find.text('Listing objects for bucket-0...'), findsOneWidget);
 
-    await tester.pump(const Duration(milliseconds: 4999));
+    await tester.pump(const Duration(milliseconds: 3499));
     expect(find.text('Listing objects for bucket-0...'), findsOneWidget);
 
     await tester.pump(const Duration(milliseconds: 2));
@@ -981,7 +983,8 @@ void main() {
     await tester.binding.setSurfaceSize(const Size(1440, 1024));
 
     final controller = await _buildController();
-    controller.showBannerMessage('Listed first 1000 objects in bucket-0.');
+    controller.showBannerMessage('Listed first 1000 objects in bucket-0.',
+        severity: BannerSeverity.success);
 
     await tester.pumpWidget(S3BrowserApp(controller: controller));
     await tester.pump();
@@ -1267,16 +1270,19 @@ void main() {
     await tester.pumpWidget(S3BrowserApp(controller: controller));
     await tester.pumpAndSettle();
 
-    expect(find.text('Search loaded objects...'), findsOneWidget);
+    expect(find.byKey(const ValueKey('object-search')), findsOneWidget);
+    controller.setObjectFilterMode(BrowserFilterMode.text);
+    await tester.pump();
     expect(
       controller.visibleObjects.map((object) => object.name),
       containsAll(['photo-001.jpg', 'report-2026-03.csv']),
     );
 
     await tester.enterText(
-      find.byKey(const ValueKey('header-object-search-benchmark-scratch')),
+      find.byKey(const ValueKey('object-search')),
       'photo',
     );
+    await tester.pump(const Duration(milliseconds: 251));
     await tester.pumpAndSettle();
 
     expect(controller.objectFilterMode, BrowserFilterMode.text);
@@ -1289,7 +1295,7 @@ void main() {
     controller.emitChange();
     await tester.pumpAndSettle();
 
-    expect(find.text('Search loaded objects...'), findsNothing);
+    expect(find.byKey(const ValueKey('object-search')), findsNothing);
   });
 
   testWidgets('header theme toggle switches dark and light modes', (

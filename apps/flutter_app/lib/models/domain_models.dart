@@ -1,3 +1,20 @@
+enum BannerSeverity { info, success, warning, error }
+
+extension ErrorCodeLabel on ErrorCode {
+  String get displayLabel => switch (this) {
+        ErrorCode.authFailed => 'Authentication failed',
+        ErrorCode.tlsError => 'Secure connection failed',
+        ErrorCode.timeout => 'Request timed out',
+        ErrorCode.throttled => 'Too many requests',
+        ErrorCode.unsupportedFeature => 'Feature unavailable',
+        ErrorCode.invalidConfig => 'Invalid configuration',
+        ErrorCode.objectConflict => 'Object conflict',
+        ErrorCode.partialBatchFailure => 'Some operations failed',
+        ErrorCode.engineUnavailable => 'Engine unavailable',
+        ErrorCode.unknown => 'Operation failed',
+      };
+}
+
 enum WorkspaceTab {
   browser,
   benchmark,
@@ -202,6 +219,47 @@ class EndpointProfile {
   final int maxConcurrentRequests;
   final int maxAttempts;
   final int maxRequestsPerSecond;
+
+  @override
+  bool operator ==(Object other) =>
+      other is EndpointProfile &&
+      id == other.id &&
+      name == other.name &&
+      endpointUrl == other.endpointUrl &&
+      region == other.region &&
+      accessKey == other.accessKey &&
+      secretKey == other.secretKey &&
+      pathStyle == other.pathStyle &&
+      verifyTls == other.verifyTls &&
+      endpointType == other.endpointType &&
+      sessionToken == other.sessionToken &&
+      signerOverride == other.signerOverride &&
+      notes == other.notes &&
+      connectTimeoutSeconds == other.connectTimeoutSeconds &&
+      readTimeoutSeconds == other.readTimeoutSeconds &&
+      maxConcurrentRequests == other.maxConcurrentRequests &&
+      maxAttempts == other.maxAttempts &&
+      maxRequestsPerSecond == other.maxRequestsPerSecond;
+  @override
+  int get hashCode => Object.hashAll([
+        id,
+        name,
+        endpointUrl,
+        region,
+        accessKey,
+        secretKey,
+        pathStyle,
+        verifyTls,
+        endpointType,
+        sessionToken,
+        signerOverride,
+        notes,
+        connectTimeoutSeconds,
+        readTimeoutSeconds,
+        maxConcurrentRequests,
+        maxAttempts,
+        maxRequestsPerSecond
+      ]);
 
   Map<String, Object?> toJson() {
     return {
@@ -1270,8 +1328,24 @@ class BrowserTaskRecord {
     this.canCancel = false,
     this.workspaceTab,
     this.actionKey,
+    this.bytesPerSecond = 0,
+    this.sampledAt,
   });
 
+  final double bytesPerSecond;
+  final DateTime? sampledAt;
+  Duration get elapsed =>
+      (completedAt ?? sampledAt ?? DateTime.now()).difference(startedAt);
+  Duration? get eta => isRunningLike &&
+          status != 'paused' &&
+          bytesPerSecond >= 1024 &&
+          totalBytes != null &&
+          bytesTransferred != null
+      ? Duration(
+          seconds: ((totalBytes! - bytesTransferred!).clamp(0, totalBytes!) /
+                  bytesPerSecond)
+              .ceil())
+      : null;
   final String id;
   final BrowserTaskKind kind;
   final String label;
@@ -1317,6 +1391,8 @@ class BrowserTaskRecord {
     bool? canCancel,
     WorkspaceTab? workspaceTab,
     String? actionKey,
+    double? bytesPerSecond,
+    DateTime? sampledAt,
   }) {
     return BrowserTaskRecord(
       id: id,
@@ -1344,6 +1420,8 @@ class BrowserTaskRecord {
       canCancel: canCancel ?? this.canCancel,
       workspaceTab: workspaceTab ?? this.workspaceTab,
       actionKey: actionKey ?? this.actionKey,
+      bytesPerSecond: bytesPerSecond ?? this.bytesPerSecond,
+      sampledAt: sampledAt ?? this.sampledAt,
     );
   }
 
@@ -1623,4 +1701,18 @@ class EngineException implements Exception {
 
   @override
   String toString() => 'EngineException($code, $message)';
+}
+
+enum InspectorGroup { object, bucket, diagnostics }
+
+extension InspectorTabGroup on BrowserInspectorTab {
+  InspectorGroup get group => switch (this) {
+        BrowserInspectorTab.bucketInfo ||
+        BrowserInspectorTab.bucketAdmin =>
+          InspectorGroup.bucket,
+        BrowserInspectorTab.tools ||
+        BrowserInspectorTab.eventsAndDebug =>
+          InspectorGroup.diagnostics,
+        _ => InspectorGroup.object,
+      };
 }

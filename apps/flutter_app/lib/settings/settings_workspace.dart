@@ -1,3 +1,6 @@
+import 'dart:async';
+import '../widgets/setting_fields.dart';
+import '../widgets/danger_button.dart';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -26,7 +29,16 @@ class SettingsWorkspace extends StatefulWidget {
 
 class _SettingsWorkspaceState extends State<SettingsWorkspace> {
   AppController get controller => widget.controller;
-  String _sectionName = 'Connections';
+  String get _sectionName => controller.settingsSectionName;
+  final Map<String, EndpointProfile> _profileDrafts = {};
+  static const _sectionDescriptions = {
+    'Connections':
+        'Endpoint profiles and credentials. Exports never include secrets.',
+    'General': 'Startup preferences and application behavior.',
+    'Transfers': 'Upload sizing, concurrency and retry behavior.',
+    'Appearance': 'Theme, text size and row density.',
+    'Diagnostics': 'Choose which engine activity is recorded.',
+  };
   static const _sections = [
     'Connections',
     'General',
@@ -50,611 +62,712 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
       engines: controller.engines,
     );
 
-    final content = ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        _sectionIntro(
-          context,
-          title: 'Settings',
-          description:
-              'Tune the storage shell, connection behavior, and transfer defaults without losing the desktop workflow.',
-        ),
-        const SizedBox(height: 16),
-        _section(
-          context,
-          title: 'General',
-          children: [
-            SwitchListTile(
-              value: settings.enableAnimations,
-              onChanged: (value) => controller.updateSettings(
-                settings.copyWith(enableAnimations: value),
-              ),
-              title: const Text('Enable animations'),
-            ),
-            AppSelectField<String>(
-              value: settings.defaultEngineId,
-              decoration: const InputDecoration(labelText: 'Default engine'),
-              items: controller.engines
-                  .map(
-                    (engine) => AppSelectItem(
-                      value: engine.id,
-                      label: engine.label,
+    return LayoutBuilder(builder: (context, constraints) {
+      final wide = constraints.maxWidth >= 900;
+      final sections = <_SettingsSection>[
+        _SettingsSection(
+            'General',
+            Icons.settings_outlined,
+            _sectionDescriptions['General'] ?? 'Configure General preferences.',
+            () => _section(
+                  context,
+                  title: 'General',
+                  children: () => [
+                    SwitchListTile(
+                      value: settings.enableAnimations,
+                      onChanged: (value) => controller.updateSettings(
+                        settings.copyWith(enableAnimations: value),
+                      ),
+                      title: const Text('Enable animations'),
                     ),
-                  )
-                  .toList(),
-              onChanged: controller.engines.isEmpty
-                  ? null
-                  : (value) async {
-                      if (value != null) {
-                        await controller.setDefaultEngine(value);
-                      }
-                    },
-            ),
-            const SizedBox(height: 12),
-            AppSelectField<String>(
-              value: controller.profiles.any(
-                (profile) => profile.id == settings.defaultProfileId,
-              )
-                  ? settings.defaultProfileId
-                  : null,
-              decoration: const InputDecoration(labelText: 'Default endpoint'),
-              items: controller.profiles
-                  .map(
-                    (profile) => AppSelectItem(
-                      value: profile.id,
-                      label: profile.name,
+                    AppSelectField<String>(
+                      value: settings.defaultEngineId,
+                      decoration:
+                          const InputDecoration(labelText: 'Default engine'),
+                      items: controller.engines
+                          .map(
+                            (engine) => AppSelectItem(
+                              value: engine.id,
+                              label: engine.label,
+                            ),
+                          )
+                          .toList(),
+                      onChanged: controller.engines.isEmpty
+                          ? null
+                          : (value) async {
+                              if (value != null) {
+                                await controller.setDefaultEngine(value);
+                              }
+                            },
                     ),
-                  )
-                  .toList(),
-              onChanged: controller.profiles.isEmpty
-                  ? null
-                  : (value) async {
-                      if (value != null) {
-                        await controller.setDefaultProfile(value);
-                      }
-                    },
-            ),
-          ],
-        ),
-        _section(
-          context,
-          title: 'Connections',
-          children: [
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                FilledButton.icon(
-                  onPressed: controller.profiles.isEmpty
-                      ? null
-                      : () async {
-                          final defaultPath =
-                              '${controller.settings.downloadPath}${Platform.pathSeparator}s3-browser-profiles.json';
-                          final exportPath = isMobile
-                              ? defaultPath
-                              : (await FilePicker.platform.saveFile(
-                                    dialogTitle: 'Export profiles',
-                                    fileName: defaultPath
-                                        .split(Platform.pathSeparator)
-                                        .last,
-                                  ) ??
-                                  defaultPath);
-                          await controller.exportProfilesToPath(exportPath);
-                          if (Platform.isIOS && context.mounted) {
-                            final box =
-                                context.findRenderObject() as RenderBox?;
-                            await SharePlus.instance.share(
-                              ShareParams(
-                                files: [XFile(exportPath)],
-                                subject: 'Object Data Browser profiles',
-                                sharePositionOrigin: box == null
-                                    ? null
-                                    : box.localToGlobal(Offset.zero) & box.size,
+                    const SizedBox(height: 12),
+                    AppSelectField<String>(
+                      value: controller.profiles.any(
+                        (profile) => profile.id == settings.defaultProfileId,
+                      )
+                          ? settings.defaultProfileId
+                          : null,
+                      decoration:
+                          const InputDecoration(labelText: 'Default endpoint'),
+                      items: controller.profiles
+                          .map(
+                            (profile) => AppSelectItem(
+                              value: profile.id,
+                              label: profile.name,
+                            ),
+                          )
+                          .toList(),
+                      onChanged: controller.profiles.isEmpty
+                          ? null
+                          : (value) async {
+                              if (value != null) {
+                                await controller.setDefaultProfile(value);
+                              }
+                            },
+                    ),
+                  ],
+                )),
+        _SettingsSection(
+            'Connections',
+            Icons.cable,
+            _sectionDescriptions['Connections'] ??
+                'Configure Connections preferences.',
+            () => _section(
+                  context,
+                  title: 'Connections',
+                  children: () => [
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: controller.profiles.isEmpty
+                              ? null
+                              : () async {
+                                  final defaultPath =
+                                      '${controller.settings.downloadPath}${Platform.pathSeparator}s3-browser-profiles.json';
+                                  final exportPath = isMobile
+                                      ? defaultPath
+                                      : (await FilePicker.platform.saveFile(
+                                            dialogTitle: 'Export profiles',
+                                            fileName: defaultPath
+                                                .split(Platform.pathSeparator)
+                                                .last,
+                                          ) ??
+                                          defaultPath);
+                                  await controller
+                                      .exportProfilesToPath(exportPath);
+                                  if (Platform.isIOS && context.mounted) {
+                                    final box = context.findRenderObject()
+                                        as RenderBox?;
+                                    await SharePlus.instance.share(
+                                      ShareParams(
+                                        files: [XFile(exportPath)],
+                                        subject: 'Object Data Browser profiles',
+                                        sharePositionOrigin: box == null
+                                            ? null
+                                            : box.localToGlobal(Offset.zero) &
+                                                box.size,
+                                      ),
+                                    );
+                                  }
+                                },
+                          icon: const Icon(Icons.upload_file_outlined),
+                          label: const Text('Export profiles'),
+                        ),
+                        OutlinedButton.icon(
+                          onPressed: () async {
+                            final picked = await FilePicker.platform.pickFiles(
+                              type: profileImportPickerType(
+                                isMobile: AppPlatform.isMobile,
                               ),
+                              allowedExtensions: profileImportAllowedExtensions(
+                                isMobile: AppPlatform.isMobile,
+                              ),
+                              dialogTitle: 'Import profiles',
                             );
-                          }
+                            final file = picked?.files.single;
+                            final path = file?.path;
+                            if (path == null) {
+                              return;
+                            }
+                            if (file != null &&
+                                !isJsonProfileImportSelection(file)) {
+                              controller.showBannerMessage(
+                                'Select a JSON profile export file.',
+                                category: 'Profiles',
+                                source: 'profiles',
+                              );
+                              return;
+                            }
+                            await controller.importProfilesFromPath(path);
+                          },
+                          icon: const Icon(Icons.download_outlined),
+                          label: const Text('Import profiles'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'App-generated profile exports contain endpoint settings only, never credentials. When an imported JSON file contains access and secret keys, they are moved into secure storage.',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                    const SizedBox(height: 12),
+                    if (controller.profiles.isEmpty)
+                      const ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: Text('No endpoint profiles configured'),
+                        subtitle: Text(
+                          'Create a profile, enter endpoint URL and credentials, save it, then test it by listing buckets.',
+                        ),
+                      )
+                    else
+                      ...controller.profiles.map(
+                        (profile) => Padding(
+                          padding: const EdgeInsets.only(bottom: 12),
+                          child: _ProfileEditorCard(
+                            key: ValueKey(profile.id),
+                            controller: controller,
+                            profile: profile,
+                            initialDraft: _profileDrafts[profile.id],
+                            onDraftChanged: (draft) {
+                              if (draft == null) {
+                                _profileDrafts.remove(profile.id);
+                              } else {
+                                _profileDrafts[profile.id] = draft;
+                              }
+                            },
+                          ),
+                        ),
+                      ),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: OutlinedButton.icon(
+                        onPressed: () async {
+                          await controller.addSampleProfile();
                         },
-                  icon: const Icon(Icons.upload_file_outlined),
-                  label: const Text('Export profiles'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: () async {
-                    final picked = await FilePicker.platform.pickFiles(
-                      type: profileImportPickerType(
-                        isMobile: AppPlatform.isMobile,
+                        icon: const Icon(Icons.add),
+                        label: const Text('Create profile'),
                       ),
-                      allowedExtensions: profileImportAllowedExtensions(
-                        isMobile: AppPlatform.isMobile,
+                    ),
+                  ],
+                )),
+        _SettingsSection(
+            'Transfers',
+            Icons.swap_vert,
+            _sectionDescriptions['Transfers'] ??
+                'Configure Transfers preferences.',
+            () => _section(
+                  context,
+                  title: 'Transfers',
+                  children: () => [
+                    _numberField(
+                      label: 'Concurrent transfers',
+                      min: 1,
+                      max: 256,
+                      initialValue: settings.transferConcurrency,
+                      onSubmitted: (value) => controller.updateSettings(
+                        settings.copyWith(transferConcurrency: value),
                       ),
-                      dialogTitle: 'Import profiles',
-                    );
-                    final file = picked?.files.single;
-                    final path = file?.path;
-                    if (path == null) {
-                      return;
-                    }
-                    if (file != null && !isJsonProfileImportSelection(file)) {
-                      controller.showBannerMessage(
-                        'Select a JSON profile export file.',
-                        category: 'Profiles',
-                        source: 'profiles',
-                      );
-                      return;
-                    }
-                    await controller.importProfilesFromPath(path);
-                  },
-                  icon: const Icon(Icons.download_outlined),
-                  label: const Text('Import profiles'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text(
-              'App-generated profile exports contain endpoint settings only, never credentials. When an imported JSON file contains access and secret keys, they are moved into secure storage.',
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
-            const SizedBox(height: 12),
-            if (controller.profiles.isEmpty)
-              const ListTile(
-                contentPadding: EdgeInsets.zero,
-                title: Text('No endpoint profiles configured'),
-                subtitle: Text(
-                  'Create a profile, enter endpoint URL and credentials, save it, then test it by listing buckets.',
-                ),
-              )
-            else
-              ...controller.profiles.map(
-                (profile) => Padding(
-                  padding: const EdgeInsets.only(bottom: 12),
-                  child: _ProfileEditorCard(
-                    key: ValueKey(profile.id),
-                    controller: controller,
-                    profile: profile,
-                  ),
-                ),
-              ),
-            Align(
-              alignment: Alignment.centerLeft,
-              child: OutlinedButton.icon(
-                onPressed: () async {
-                  await controller.addSampleProfile();
-                },
-                icon: const Icon(Icons.add),
-                label: const Text('Create profile'),
-              ),
-            ),
-          ],
-        ),
-        _section(
-          context,
-          title: 'Transfers',
-          children: [
-            _numberField(
-              label: 'Concurrent transfers',
-              initialValue: settings.transferConcurrency,
-              onSubmitted: (value) => controller.updateSettings(
-                settings.copyWith(transferConcurrency: value),
-              ),
-            ),
-            const SizedBox(height: 12),
-            _numberField(
-              label: 'Multipart threshold (MiB)',
-              initialValue: settings.multipartThresholdMiB,
-              onSubmitted: (value) => controller.updateSettings(
-                settings.copyWith(multipartThresholdMiB: value),
-              ),
-            ),
-            const SizedBox(height: 12),
-            SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              value: settings.dynamicMultipartSizing,
-              onChanged: (value) => controller.updateSettings(
-                settings.copyWith(dynamicMultipartSizing: value),
-              ),
-              title: const Text('Automatically size upload parts'),
-              subtitle: const Text(
-                'Choose an S3-compliant part size independently for each file. Files share one upload job, while each file has its own multipart schedule. Disable this to use manual part sizes.',
-              ),
-            ),
-            const SizedBox(height: 4),
-            _numberField(
-              label: settings.dynamicMultipartSizing
-                  ? 'Manual chunk size (MiB, downloads and fallback)'
-                  : 'Manual multipart chunk size (MiB)',
-              initialValue: settings.multipartChunkMiB,
-              onSubmitted: (value) => controller.updateSettings(
-                settings.copyWith(multipartChunkMiB: value),
-              ),
-            ),
-            SwitchListTile(
-              value: settings.relistObjectsAfterMutation,
-              onChanged: (value) => controller.updateSettings(
-                settings.copyWith(relistObjectsAfterMutation: value),
-              ),
-              title: const Text('Refresh object list after uploads'),
-              subtitle: const Text(
-                'Relist the current object view after prefix creation or a completed upload.',
-              ),
-            ),
-          ],
-        ),
-        _section(
-          context,
-          title: 'Downloads & Temp Storage',
-          children: [
-            _textField(
-              label: 'Default download path',
-              initialValue: settings.downloadPath,
-              onSubmitted: (value) => controller
-                  .updateSettings(settings.copyWith(downloadPath: value)),
-            ),
-            const SizedBox(height: 12),
-            _textField(
-              label: 'Temp path override',
-              initialValue: settings.tempPath,
-              onSubmitted: (value) =>
-                  controller.updateSettings(settings.copyWith(tempPath: value)),
-            ),
-          ],
-        ),
-        _section(
-          context,
-          title: 'Appearance',
-          children: [
-            SwitchListTile(
-              value: settings.darkMode,
-              onChanged: (value) =>
-                  controller.updateSettings(settings.copyWith(darkMode: value)),
-              title: const Text('Dark mode'),
-            ),
-            const ListTile(
-              contentPadding: EdgeInsets.zero,
-              title: Text('Unified adaptive shell'),
-              subtitle: Text(
-                'Desktop uses a rail; mobile uses segmented navigation. The browser, benchmark, and settings screens keep the same structure across platforms.',
-              ),
-            ),
-            AppSelectField<BrowserInspectorLayout>(
-              value: settings.browserInspectorLayout,
-              decoration: const InputDecoration(
-                labelText: 'Browser inspector placement',
-              ),
-              items: const [
-                AppSelectItem(
-                  value: BrowserInspectorLayout.bottom,
-                  label: 'Below object panel',
-                ),
-                AppSelectItem(
-                  value: BrowserInspectorLayout.right,
-                  label: 'Right of object panel',
-                ),
-              ],
-              onChanged: (value) {
-                if (value == null) {
-                  return;
-                }
-                controller.updateSettings(
-                  settings.copyWith(browserInspectorLayout: value),
-                );
-              },
-            ),
-            const SizedBox(height: 16),
-            ListTile(
-              contentPadding: EdgeInsets.zero,
-              title: Text(
-                'Inspector panel size: ${settings.browserInspectorSize}px',
-              ),
-              subtitle: const Text(
-                'Applies to the inspector height in stacked mode and width in right-side mode.',
-              ),
-            ),
-            Slider(
-              min: 240,
-              max: 560,
-              divisions: 16,
-              value: settings.browserInspectorSize.toDouble().clamp(240, 560),
-              label: '${settings.browserInspectorSize}px',
-              onChanged: (value) {
-                controller.updateSettings(
-                  settings.copyWith(browserInspectorSize: value.round()),
-                );
-              },
-            ),
-            const SizedBox(height: 8),
-            ListTile(
-              contentPadding: EdgeInsets.zero,
-              title: Text('UI scale: ${settings.uiScalePercent}%'),
-              subtitle: const Text(
-                'Text size is independent of row density. Default: 100%. OS accessibility enlargement is always respected.',
-              ),
-            ),
-            Slider(
-              min: 60,
-              max: 150,
-              divisions: 18,
-              value: settings.uiScalePercent.toDouble().clamp(60, 150),
-              label: '${settings.uiScalePercent}%',
-              onChanged: (value) {
-                controller.updateSettings(
-                  settings.copyWith(uiScalePercent: value.round()),
-                );
-              },
-            ),
-            const SizedBox(height: 8),
-            ListTile(
-              contentPadding: EdgeInsets.zero,
-              title: Text(
-                'Log text scale: ${settings.logTextScalePercent}%',
-              ),
-              subtitle: const Text(
-                'Applies only to Event Log and Events & Debug so trace text stays readable at smaller UI scales.',
-              ),
-            ),
-            Slider(
-              min: 80,
-              max: 130,
-              divisions: 10,
-              value: settings.logTextScalePercent.toDouble().clamp(80, 130),
-              label: '${settings.logTextScalePercent}%',
-              onChanged: (value) {
-                controller.updateSettings(
-                  settings.copyWith(logTextScalePercent: value.round()),
-                );
-              },
-            ),
-          ],
-        ),
-        _section(
-          context,
-          title: 'Safety & Recovery',
-          children: [
-            _numberField(
-              label: 'Safe retries',
-              initialValue: settings.safeRetries,
-              onSubmitted: (value) => controller
-                  .updateSettings(settings.copyWith(safeRetries: value)),
-            ),
-            const SizedBox(height: 12),
-            _numberField(
-              label: 'Retry base delay (ms)',
-              initialValue: settings.retryBaseDelayMs,
-              onSubmitted: (value) => controller.updateSettings(
-                settings.copyWith(retryBaseDelayMs: value),
-              ),
-            ),
-            const SizedBox(height: 12),
-            _numberField(
-              label: 'Retry max delay (ms)',
-              initialValue: settings.retryMaxDelayMs,
-              onSubmitted: (value) => controller.updateSettings(
-                settings.copyWith(retryMaxDelayMs: value),
-              ),
-            ),
-            const SizedBox(height: 12),
-            _numberField(
-              label: 'Request delay (ms)',
-              initialValue: settings.requestDelayMs,
-              onSubmitted: (value) => controller.updateSettings(
-                settings.copyWith(requestDelayMs: value),
-              ),
-            ),
-            const SizedBox(height: 12),
-            phone
-                ? Column(
-                    children: [
+                    ),
+                    const SizedBox(height: 12),
+                    _numberField(
+                      label: 'Multipart threshold (MiB)',
+                      initialValue: settings.multipartThresholdMiB,
+                      onSubmitted: (value) => controller.updateSettings(
+                        settings.copyWith(multipartThresholdMiB: value),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      value: settings.dynamicMultipartSizing,
+                      onChanged: (value) => controller.updateSettings(
+                        settings.copyWith(dynamicMultipartSizing: value),
+                      ),
+                      title: const Text('Automatically size upload parts'),
+                      subtitle: const Text(
+                        'Choose an S3-compliant part size independently for each file. Files share one upload job, while each file has its own multipart schedule. Disable this to use manual part sizes.',
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    _numberField(
+                      label: settings.dynamicMultipartSizing
+                          ? 'Manual chunk size (MiB, downloads and fallback)'
+                          : 'Manual multipart chunk size (MiB)',
+                      min: 5,
+                      max: 5120,
+                      initialValue: settings.multipartChunkMiB,
+                      onSubmitted: (value) => controller.updateSettings(
+                        settings.copyWith(multipartChunkMiB: value),
+                      ),
+                    ),
+                    SwitchListTile(
+                      value: settings.relistObjectsAfterMutation,
+                      onChanged: (value) => controller.updateSettings(
+                        settings.copyWith(relistObjectsAfterMutation: value),
+                      ),
+                      title: const Text('Refresh object list after uploads'),
+                      subtitle: const Text(
+                        'Relist the current object view after prefix creation or a completed upload.',
+                      ),
+                    ),
+                  ],
+                )),
+        _SettingsSection(
+            'Downloads & Temp Storage',
+            Icons.download_outlined,
+            _sectionDescriptions['Downloads & Temp Storage'] ??
+                'Configure Downloads & Temp Storage preferences.',
+            () => _section(
+                  context,
+                  title: 'Downloads & Temp Storage',
+                  children: () => [
+                    _textField(
+                      label: 'Default download path',
+                      initialValue: settings.downloadPath,
+                      onSubmitted: (value) => controller.updateSettings(
+                          settings.copyWith(downloadPath: value)),
+                    ),
+                    const SizedBox(height: 12),
+                    _textField(
+                      label: 'Temp path override',
+                      initialValue: settings.tempPath,
+                      onSubmitted: (value) => controller
+                          .updateSettings(settings.copyWith(tempPath: value)),
+                    ),
+                  ],
+                )),
+        _SettingsSection(
+            'Appearance',
+            Icons.palette_outlined,
+            _sectionDescriptions['Appearance'] ??
+                'Configure Appearance preferences.',
+            () => _section(
+                  context,
+                  title: 'Appearance',
+                  children: () => [
+                    SwitchListTile.adaptive(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Compact desktop rows'),
+                      subtitle: const Text(
+                          'Keep text readable while reducing row padding. Touch targets remain comfortable.'),
+                      value: controller.settings.compactRows,
+                      onChanged: (value) => controller.updateSettings(
+                          controller.settings.copyWith(compactRows: value)),
+                    ),
+                    SwitchListTile(
+                      value: settings.darkMode,
+                      onChanged: (value) => controller
+                          .updateSettings(settings.copyWith(darkMode: value)),
+                      title: const Text('Dark mode'),
+                    ),
+                    const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 8),
+                        child: Text(
+                            'Desktop uses a rail; mobile uses segmented navigation. The browser, benchmark, and settings screens keep the same structure across platforms.')),
+                    AppSelectField<BrowserInspectorLayout>(
+                      value: settings.browserInspectorLayout,
+                      decoration: const InputDecoration(
+                        labelText: 'Browser inspector placement',
+                      ),
+                      items: const [
+                        AppSelectItem(
+                          value: BrowserInspectorLayout.bottom,
+                          label: 'Below object panel',
+                        ),
+                        AppSelectItem(
+                          value: BrowserInspectorLayout.right,
+                          label: 'Right of object panel',
+                        ),
+                      ],
+                      onChanged: (value) {
+                        if (value == null) {
+                          return;
+                        }
+                        controller.updateSettings(
+                          settings.copyWith(browserInspectorLayout: value),
+                        );
+                      },
+                    ),
+                    const SizedBox(height: 16),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: Text(
+                        'Inspector panel size: ${settings.browserInspectorSize}px',
+                      ),
+                      subtitle: const Text(
+                        'Applies to the inspector height in stacked mode and width in right-side mode.',
+                      ),
+                    ),
+                    Slider(
+                      min: 240,
+                      max: 560,
+                      divisions: 16,
+                      value: settings.browserInspectorSize
+                          .toDouble()
+                          .clamp(240, 560),
+                      label: '${settings.browserInspectorSize}px',
+                      onChanged: (value) {
+                        controller.updateSettings(
+                          settings.copyWith(
+                              browserInspectorSize: value.round()),
+                        );
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: Text('UI scale: ${settings.uiScalePercent}%'),
+                      subtitle: const Text(
+                        'Text size is independent of row density. Default: 100%. OS accessibility enlargement is always respected.',
+                      ),
+                    ),
+                    Slider(
+                      min: 60,
+                      max: 150,
+                      divisions: 18,
+                      value: settings.uiScalePercent.toDouble().clamp(60, 150),
+                      label: '${settings.uiScalePercent}%',
+                      onChanged: (value) {
+                        controller.updateSettings(
+                          settings.copyWith(uiScalePercent: value.round()),
+                        );
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: Text(
+                        'Log text scale: ${settings.logTextScalePercent}%',
+                      ),
+                      subtitle: const Text(
+                        'Applies only to Event Log and Events & Debug so trace text stays readable at smaller UI scales.',
+                      ),
+                    ),
+                    Slider(
+                      min: 80,
+                      max: 130,
+                      divisions: 10,
+                      value: settings.logTextScalePercent
+                          .toDouble()
+                          .clamp(80, 130),
+                      label: '${settings.logTextScalePercent}%',
+                      onChanged: (value) {
+                        controller.updateSettings(
+                          settings.copyWith(logTextScalePercent: value.round()),
+                        );
+                      },
+                    ),
+                  ],
+                )),
+        _SettingsSection(
+            'Safety & Recovery',
+            Icons.health_and_safety_outlined,
+            _sectionDescriptions['Safety & Recovery'] ??
+                'Configure Safety & Recovery preferences.',
+            () => _section(
+                  context,
+                  title: 'Safety & Recovery',
+                  children: () => [
+                    _numberField(
+                      label: 'Safe retries',
+                      min: 0,
+                      max: 100,
+                      initialValue: settings.safeRetries,
+                      onSubmitted: (value) => controller.updateSettings(
+                          settings.copyWith(safeRetries: value)),
+                    ),
+                    const SizedBox(height: 12),
+                    _numberField(
+                      label: 'Retry base delay (ms)',
+                      min: 0,
+                      max: 2147483647,
+                      initialValue: settings.retryBaseDelayMs,
+                      onSubmitted: (value) => controller.updateSettings(
+                        settings.copyWith(retryBaseDelayMs: value),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    _numberField(
+                      label: 'Retry max delay (ms)',
+                      min: 0,
+                      max: 2147483647,
+                      initialValue: settings.retryMaxDelayMs,
+                      onSubmitted: (value) => controller.updateSettings(
+                        settings.copyWith(retryMaxDelayMs: value),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    _numberField(
+                      label: 'Request delay (ms)',
+                      min: 0,
+                      max: 2147483647,
+                      initialValue: settings.requestDelayMs,
+                      onSubmitted: (value) => controller.updateSettings(
+                        settings.copyWith(requestDelayMs: value),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    phone
+                        ? Column(
+                            children: [
+                              _numberField(
+                                label: 'Connect timeout (s)',
+                                initialValue: settings.connectTimeoutSeconds,
+                                onSubmitted: (value) =>
+                                    controller.updateSettings(
+                                  settings.copyWith(
+                                      connectTimeoutSeconds: value),
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+                              _numberField(
+                                label: 'Read timeout (s)',
+                                initialValue: settings.readTimeoutSeconds,
+                                onSubmitted: (value) =>
+                                    controller.updateSettings(
+                                  settings.copyWith(readTimeoutSeconds: value),
+                                ),
+                              ),
+                            ],
+                          )
+                        : Row(
+                            children: [
+                              Expanded(
+                                child: _numberField(
+                                  label: 'Connect timeout (s)',
+                                  initialValue: settings.connectTimeoutSeconds,
+                                  onSubmitted: (value) =>
+                                      controller.updateSettings(
+                                    settings.copyWith(
+                                        connectTimeoutSeconds: value),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: _numberField(
+                                  label: 'Read timeout (s)',
+                                  initialValue: settings.readTimeoutSeconds,
+                                  onSubmitted: (value) =>
+                                      controller.updateSettings(
+                                    settings.copyWith(
+                                        readTimeoutSeconds: value),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                    const SizedBox(height: 12),
+                    _numberField(
+                      label: 'Max pool connections',
+                      initialValue: settings.maxPoolConnections,
+                      onSubmitted: (value) => controller.updateSettings(
+                        settings.copyWith(maxPoolConnections: value),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    _numberField(
+                      label: 'Max requests per second (0 = unlimited)',
+                      min: 0,
+                      max: 2147483647,
+                      initialValue: settings.maxRequestsPerSecond,
+                      onSubmitted: (value) => controller.updateSettings(
+                        settings.copyWith(maxRequestsPerSecond: value),
+                      ),
+                    ),
+                    SwitchListTile(
+                      value: settings.enableCrashRecovery,
+                      onChanged: (value) => controller.updateSettings(
+                        settings.copyWith(enableCrashRecovery: value),
+                      ),
+                      title: const Text(
+                          'Crash isolation and engine restart recovery'),
+                    ),
+                  ],
+                )),
+        if (!isMobile)
+          _SettingsSection(
+              'Benchmark',
+              Icons.speed,
+              _sectionDescriptions['Benchmark'] ??
+                  'Configure Benchmark preferences.',
+              () => _section(
+                    context,
+                    title: 'Benchmark',
+                    children: () => [
+                      SwitchListTile(
+                        value: settings.benchmarkChartSmoothing,
+                        onChanged: (value) => controller.updateSettings(
+                          settings.copyWith(benchmarkChartSmoothing: value),
+                        ),
+                        title: const Text('Smooth result charts'),
+                      ),
+                      SwitchListTile(
+                        value: settings.benchmarkDebugMode,
+                        onChanged: (value) => controller.updateSettings(
+                          settings.copyWith(benchmarkDebugMode: value),
+                        ),
+                        title: const Text('Benchmark debug mode'),
+                      ),
+                      const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 8),
+                          child: Text(
+                              'Benchmark mode always uses the currently selected endpoint profile and backend engine from the app header.')),
                       _numberField(
-                        label: 'Connect timeout (s)',
-                        initialValue: settings.connectTimeoutSeconds,
+                        label: 'Benchmark data cache (MB)',
+                        min: 0,
+                        max: 2147483647,
+                        initialValue: settings.benchmarkDataCacheMb,
                         onSubmitted: (value) => controller.updateSettings(
-                          settings.copyWith(connectTimeoutSeconds: value),
+                          settings.copyWith(benchmarkDataCacheMb: value),
                         ),
                       ),
                       const SizedBox(height: 12),
-                      _numberField(
-                        label: 'Read timeout (s)',
-                        initialValue: settings.readTimeoutSeconds,
+                      _textField(
+                        label: 'Benchmark log path',
+                        initialValue: settings.benchmarkLogPath,
                         onSubmitted: (value) => controller.updateSettings(
-                          settings.copyWith(readTimeoutSeconds: value),
+                          settings.copyWith(benchmarkLogPath: value),
                         ),
                       ),
                     ],
-                  )
-                : Row(
-                    children: [
-                      Expanded(
-                        child: _numberField(
-                          label: 'Connect timeout (s)',
-                          initialValue: settings.connectTimeoutSeconds,
-                          onSubmitted: (value) => controller.updateSettings(
-                            settings.copyWith(connectTimeoutSeconds: value),
-                          ),
-                        ),
+                  )),
+        _SettingsSection(
+            'Diagnostics',
+            Icons.bug_report_outlined,
+            _sectionDescriptions['Diagnostics'] ??
+                'Configure Diagnostics preferences.',
+            () => _section(
+                  context,
+                  title: 'Diagnostics',
+                  children: () => [
+                    SwitchListTile(
+                      value: settings.enableDiagnostics,
+                      onChanged: (value) => controller.updateSettings(
+                        settings.copyWith(enableDiagnostics: value),
                       ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: _numberField(
-                          label: 'Read timeout (s)',
-                          initialValue: settings.readTimeoutSeconds,
-                          onSubmitted: (value) => controller.updateSettings(
-                            settings.copyWith(readTimeoutSeconds: value),
-                          ),
+                      title: const Text('Diagnostics workspace'),
+                    ),
+                    SwitchListTile(
+                      value: settings.enableApiLogging,
+                      onChanged: (value) => controller.updateSettings(
+                        settings.copyWith(enableApiLogging: value),
+                      ),
+                      title: const Text('API logging'),
+                    ),
+                    SwitchListTile(
+                      value: settings.enableDebugLogging,
+                      onChanged: (value) => controller.updateSettings(
+                        settings.copyWith(enableDebugLogging: value),
+                      ),
+                      title: const Text('Debug logging in Event Log'),
+                    ),
+                    const ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: Text('Diagnostic logging'),
+                      subtitle: Text(
+                        'API logging records redacted request and response envelopes. Debug logging adds broader trace details in Event Log.',
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    _numberField(
+                      label: 'Default presign expiration (minutes)',
+                      min: 1,
+                      max: 10080,
+                      initialValue: settings.defaultPresignMinutes,
+                      onSubmitted: (value) => controller.updateSettings(
+                        settings.copyWith(defaultPresignMinutes: value),
+                      ),
+                    ),
+                  ],
+                )),
+        _SettingsSection(
+            'Version Details',
+            Icons.info_outline,
+            _sectionDescriptions['Version Details'] ??
+                'Configure Version Details preferences.',
+            () => _section(
+                  context,
+                  title: 'Version Details',
+                  children: () => [
+                    TextButton.icon(
+                        onPressed: () => showLicensePage(
+                            context: context,
+                            applicationName: 'Object Data Browser',
+                            applicationVersion: kApplicationVersion),
+                        icon: const Icon(Icons.description_outlined),
+                        label: const Text('Open source and font licenses')),
+                    const ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: Text('Application version'),
+                      subtitle:
+                          Text('$kApplicationVersion ($kApplicationBuild)'),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      isMobile
+                          ? 'Mobile app dependencies'
+                          : 'Flutter dependencies',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    ...dependencyVersions.entries.map(
+                      (entry) => ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        title: Text(entry.key),
+                        trailing: Text(entry.value),
+                      ),
+                    ),
+                    if (bundledComponentVersions.isNotEmpty) ...[
+                      const Divider(height: 24),
+                      Text(
+                        isMobile ? 'Mobile engines' : 'Bundled engines',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      const SizedBox(height: 8),
+                      ...bundledComponentVersions.entries.map(
+                        (entry) => ListTile(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          title: Text(entry.key),
+                          trailing: Text(entry.value),
                         ),
                       ),
                     ],
-                  ),
-            const SizedBox(height: 12),
-            _numberField(
-              label: 'Max pool connections',
-              initialValue: settings.maxPoolConnections,
-              onSubmitted: (value) => controller.updateSettings(
-                settings.copyWith(maxPoolConnections: value),
-              ),
-            ),
-            const SizedBox(height: 12),
-            _numberField(
-              label: 'Max requests per second (0 = unlimited)',
-              initialValue: settings.maxRequestsPerSecond,
-              onSubmitted: (value) => controller.updateSettings(
-                settings.copyWith(maxRequestsPerSecond: value),
-              ),
-            ),
-            SwitchListTile(
-              value: settings.enableCrashRecovery,
-              onChanged: (value) => controller.updateSettings(
-                settings.copyWith(enableCrashRecovery: value),
-              ),
-              title: const Text('Crash isolation and engine restart recovery'),
-            ),
-          ],
-        ),
-        _section(
-          context,
-          title: 'Benchmark',
-          children: [
-            SwitchListTile(
-              value: settings.benchmarkChartSmoothing,
-              onChanged: (value) => controller.updateSettings(
-                settings.copyWith(benchmarkChartSmoothing: value),
-              ),
-              title: const Text('Smooth result charts'),
-            ),
-            SwitchListTile(
-              value: settings.benchmarkDebugMode,
-              onChanged: (value) => controller.updateSettings(
-                settings.copyWith(benchmarkDebugMode: value),
-              ),
-              title: const Text('Benchmark debug mode'),
-            ),
-            const ListTile(
-              contentPadding: EdgeInsets.zero,
-              title: Text('Engine and endpoint selection'),
-              subtitle: Text(
-                'Benchmark mode always uses the currently selected endpoint profile and backend engine from the app header.',
-              ),
-            ),
-            _numberField(
-              label: 'Benchmark data cache (MB)',
-              initialValue: settings.benchmarkDataCacheMb,
-              onSubmitted: (value) => controller.updateSettings(
-                settings.copyWith(benchmarkDataCacheMb: value),
-              ),
-            ),
-            const SizedBox(height: 12),
-            _textField(
-              label: 'Benchmark log path',
-              initialValue: settings.benchmarkLogPath,
-              onSubmitted: (value) => controller.updateSettings(
-                settings.copyWith(benchmarkLogPath: value),
-              ),
-            ),
-          ],
-        ),
-        _section(
-          context,
-          title: 'Diagnostics',
-          children: [
-            SwitchListTile(
-              value: settings.enableDiagnostics,
-              onChanged: (value) => controller.updateSettings(
-                settings.copyWith(enableDiagnostics: value),
-              ),
-              title: const Text('Diagnostics workspace'),
-            ),
-            SwitchListTile(
-              value: settings.enableApiLogging,
-              onChanged: (value) => controller.updateSettings(
-                settings.copyWith(enableApiLogging: value),
-              ),
-              title: const Text('API logging'),
-            ),
-            SwitchListTile(
-              value: settings.enableDebugLogging,
-              onChanged: (value) => controller.updateSettings(
-                settings.copyWith(enableDebugLogging: value),
-              ),
-              title: const Text('Debug logging in Event Log'),
-            ),
-            const ListTile(
-              contentPadding: EdgeInsets.zero,
-              title: Text('Diagnostic logging'),
-              subtitle: Text(
-                'API logging records redacted request and response envelopes. Debug logging adds broader trace details in Event Log.',
-              ),
-            ),
-            const SizedBox(height: 12),
-            _numberField(
-              label: 'Default presign expiration (minutes)',
-              initialValue: settings.defaultPresignMinutes,
-              onSubmitted: (value) => controller.updateSettings(
-                settings.copyWith(defaultPresignMinutes: value),
-              ),
-            ),
-          ],
-        ),
-        _section(
-          context,
-          title: 'Version Details',
-          children: [
-            const ListTile(
-              contentPadding: EdgeInsets.zero,
-              title: Text('Application version'),
-              subtitle: Text('$kApplicationVersion ($kApplicationBuild)'),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              isMobile ? 'Mobile app dependencies' : 'Flutter dependencies',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            const SizedBox(height: 8),
-            ...dependencyVersions.entries.map(
-              (entry) => ListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                title: Text(entry.key),
-                trailing: Text(entry.value),
-              ),
-            ),
-            if (bundledComponentVersions.isNotEmpty) ...[
-              const Divider(height: 24),
-              Text(
-                isMobile ? 'Mobile engines' : 'Bundled engines',
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
-              const SizedBox(height: 8),
-              ...bundledComponentVersions.entries.map(
-                (entry) => ListTile(
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                  title: Text(entry.key),
-                  trailing: Text(entry.value),
-                ),
-              ),
-            ],
-          ],
-        ),
-      ],
-    );
-    return LayoutBuilder(builder: (context, constraints) {
-      if (constraints.maxWidth < 900) return content;
+                  ],
+                )),
+      ];
+      final active = sections.firstWhere((s) => s.title == _sectionName,
+          orElse: () => sections.first);
+      final content = ListView(padding: const EdgeInsets.all(16), children: [
+        _sectionIntro(context,
+            title: active.title, description: active.description, wide: wide),
+        const SizedBox(height: 16),
+        active.builder(),
+      ]);
+      if (!wide) return content;
       return Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         SizedBox(
             width: 190,
             child: ListView(padding: const EdgeInsets.all(12), children: [
-              for (final section in _sections
-                  .where((s) => s != 'Benchmark' || !AppPlatform.isMobile))
+              for (final section in sections)
                 Padding(
                     padding: const EdgeInsets.only(bottom: 4),
                     child: Material(
                         color: Colors.transparent,
                         child: ListTile(
-                            selected: _sectionName == section,
+                            selected: _sectionName == section.title,
                             shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(8)),
                             selectedTileColor:
                                 Theme.of(context).colorScheme.primaryContainer,
-                            title: Text(section),
+                            leading: Icon(section.icon, size: 18),
+                            title: Text(section.title),
                             onTap: () =>
-                                setState(() => _sectionName = section)))),
+                                controller.setSettingsSection(section.title)))),
             ])),
         const VerticalDivider(width: 1),
         Expanded(child: content),
@@ -665,12 +778,13 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
   Widget _section(
     BuildContext context, {
     required String title,
-    required List<Widget> children,
+    required List<Widget> Function() children,
   }) {
     final theme = Theme.of(context);
     final phone = MediaQuery.sizeOf(context).width < 700;
+    if (title != _sectionName) return const SizedBox.shrink();
     return Offstage(
-        offstage: title != _sectionName,
+        offstage: false,
         child: TickerMode(
             enabled: title == _sectionName,
             child: Padding(
@@ -689,18 +803,8 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(title, style: theme.textTheme.titleLarge),
-                      if (title == 'Appearance')
-                        SwitchListTile.adaptive(
-                          contentPadding: EdgeInsets.zero,
-                          title: const Text('Compact desktop rows'),
-                          subtitle: const Text(
-                              'Keep text readable while reducing row padding. Touch targets remain comfortable.'),
-                          value: controller.settings.compactRows,
-                          onChanged: (value) => controller.updateSettings(
-                              controller.settings.copyWith(compactRows: value)),
-                        ),
                       const SizedBox(height: 8),
-                      ...children,
+                      ...children(),
                     ],
                   ),
                 ),
@@ -712,6 +816,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
     BuildContext context, {
     required String title,
     required String description,
+    required bool wide,
   }) {
     final theme = Theme.of(context);
     return Container(
@@ -728,7 +833,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
           const SizedBox(height: 10),
           Text(description, style: theme.textTheme.bodyLarge),
           const SizedBox(height: 16),
-          if (MediaQuery.sizeOf(context).width < 1100)
+          if (!wide)
             AppSelectField<String>(
                 value: _sectionName,
                 decoration:
@@ -738,7 +843,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                     .map((s) => AppSelectItem(value: s, label: s))
                     .toList(),
                 onChanged: (value) {
-                  if (value != null) setState(() => _sectionName = value);
+                  if (value != null) controller.setSettingsSection(value);
                 }),
         ],
       ),
@@ -750,29 +855,26 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
     required String initialValue,
     required ValueChanged<String> onSubmitted,
   }) {
-    return TextFormField(
-      initialValue: initialValue,
-      decoration: InputDecoration(labelText: label),
-      onFieldSubmitted: onSubmitted,
-    );
+    return SettingTextField(
+        key: ValueKey(label),
+        label: label,
+        value: initialValue,
+        onCommit: onSubmitted);
   }
 
-  Widget _numberField({
-    required String label,
-    required int initialValue,
-    required ValueChanged<int> onSubmitted,
-  }) {
-    return TextFormField(
-      initialValue: '$initialValue',
-      keyboardType: TextInputType.number,
-      decoration: InputDecoration(labelText: label),
-      onFieldSubmitted: (value) {
-        final parsed = int.tryParse(value);
-        if (parsed != null) {
-          onSubmitted(parsed);
-        }
-      },
-    );
+  Widget _numberField(
+      {required String label,
+      required int initialValue,
+      required ValueChanged<int> onSubmitted,
+      int min = 1,
+      int max = 2147483647}) {
+    return SettingNumberField(
+        key: ValueKey(label),
+        label: label,
+        value: initialValue,
+        min: min,
+        max: max,
+        onCommit: onSubmitted);
   }
 }
 
@@ -781,10 +883,14 @@ class _ProfileEditorCard extends StatefulWidget {
     super.key,
     required this.controller,
     required this.profile,
+    this.initialDraft,
+    required this.onDraftChanged,
   });
 
   final AppController controller;
   final EndpointProfile profile;
+  final EndpointProfile? initialDraft;
+  final ValueChanged<EndpointProfile?> onDraftChanged;
 
   @override
   State<_ProfileEditorCard> createState() => _ProfileEditorCardState();
@@ -805,6 +911,26 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   late bool _useHttps;
   late bool _verifyTls;
   late bool _expanded;
+  bool _revealSecret = false, _revealToken = false;
+  Timer? _revealTimer;
+  void _reveal(bool token) {
+    setState(() {
+      if (token) {
+        _revealToken = !_revealToken;
+      } else {
+        _revealSecret = !_revealSecret;
+      }
+    });
+    _revealTimer?.cancel();
+    _revealTimer = Timer(const Duration(seconds: 30), () {
+      if (mounted) {
+        setState(() {
+          _revealSecret = false;
+          _revealToken = false;
+        });
+      }
+    });
+  }
 
   @override
   void initState() {
@@ -832,6 +958,9 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   void didUpdateWidget(covariant _ProfileEditorCard oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.profile != widget.profile) {
+      widget.onDraftChanged(null);
+      _revealSecret = false;
+      _revealToken = false;
       _syncText(_nameController, widget.profile.name);
       _syncText(_endpointController, widget.profile.endpointUrl);
       _syncText(_regionController, widget.profile.region);
@@ -856,30 +985,28 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   }
 
   void _syncFromProfile() {
-    _nameController = TextEditingController(text: widget.profile.name);
-    _endpointController =
-        TextEditingController(text: widget.profile.endpointUrl);
-    _regionController = TextEditingController(text: widget.profile.region);
-    _accessKeyController =
-        TextEditingController(text: widget.profile.accessKey);
-    _secretKeyController =
-        TextEditingController(text: widget.profile.secretKey);
+    final profile = widget.initialDraft ?? widget.profile;
+    _nameController = TextEditingController(text: profile.name);
+    _endpointController = TextEditingController(text: profile.endpointUrl);
+    _regionController = TextEditingController(text: profile.region);
+    _accessKeyController = TextEditingController(text: profile.accessKey);
+    _secretKeyController = TextEditingController(text: profile.secretKey);
     _sessionTokenController =
-        TextEditingController(text: widget.profile.sessionToken ?? '');
+        TextEditingController(text: profile.sessionToken ?? '');
     _connectTimeoutController = TextEditingController(
-      text: '${widget.profile.connectTimeoutSeconds}',
+      text: '${profile.connectTimeoutSeconds}',
     );
     _readTimeoutController = TextEditingController(
-      text: '${widget.profile.readTimeoutSeconds}',
+      text: '${profile.readTimeoutSeconds}',
     );
-    _notesController = TextEditingController(text: widget.profile.notes ?? '');
-    _endpointType = widget.profile.endpointType;
-    _pathStyle = widget.profile.pathStyle;
+    _notesController = TextEditingController(text: profile.notes ?? '');
+    _endpointType = profile.endpointType;
+    _pathStyle = profile.pathStyle;
     _useHttps = endpointUsesHttps(
-      widget.profile.endpointUrl,
-      fallback: widget.profile.verifyTls,
+      profile.endpointUrl,
+      fallback: profile.verifyTls,
     );
-    _verifyTls = widget.profile.verifyTls;
+    _verifyTls = profile.verifyTls;
     _endpointController.addListener(_handleEndpointInputChanged);
     _accessKeyController.addListener(_handleAccessKeyChanged);
   }
@@ -995,8 +1122,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
             ),
         },
         region: _regionController.text.trim(),
-        accessKey: _accessKeyController.text,
-        secretKey: _secretKeyController.text,
+        accessKey: _accessKeyController.text.trim(),
+        secretKey: _secretKeyController.text.trim(),
         sessionToken: (_endpointType == EndpointProfileType.azureBlob ||
                 _sessionTokenController.text.trim().isEmpty)
             ? null
@@ -1012,6 +1139,10 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
             int.tryParse(_connectTimeoutController.text.trim()) ?? 5,
         readTimeoutSeconds:
             int.tryParse(_readTimeoutController.text.trim()) ?? 60,
+        signerOverride: widget.profile.signerOverride,
+        maxConcurrentRequests: widget.profile.maxConcurrentRequests,
+        maxAttempts: widget.profile.maxAttempts,
+        maxRequestsPerSecond: widget.profile.maxRequestsPerSecond,
         notes: _notesController.text.trim(),
       ),
     );
@@ -1028,6 +1159,9 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
 
   @override
   void dispose() {
+    final draft = _buildProfile();
+    widget.onDraftChanged(draft == widget.profile ? null : draft);
+    _revealTimer?.cancel();
     _endpointController.removeListener(_handleEndpointInputChanged);
     _accessKeyController.removeListener(_handleAccessKeyChanged);
     _nameController.dispose();
@@ -1044,6 +1178,17 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
 
   @override
   Widget build(BuildContext context) {
+    String? timeoutError(String value) {
+      final n = int.tryParse(value.trim());
+      return n == null || n < 1 || n > 2147483647
+          ? 'Enter a positive timeout in seconds.'
+          : null;
+    }
+
+    final connectError = timeoutError(_connectTimeoutController.text);
+    final readError = timeoutError(_readTimeoutController.text);
+    final valid = connectError == null && readError == null;
+    final isDirty = _buildProfile() != widget.profile;
     final isSelected =
         widget.controller.selectedProfile?.id == widget.profile.id;
     final isTesting =
@@ -1056,7 +1201,13 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         child: ExpansionTile(
           initiallyExpanded: _expanded,
-          onExpansionChanged: (value) => setState(() => _expanded = value),
+          onExpansionChanged: (value) => setState(() {
+            _expanded = value;
+            if (!value) {
+              _revealSecret = false;
+              _revealToken = false;
+            }
+          }),
           title: Text(
             widget.profile.name.isEmpty
                 ? 'Unnamed profile'
@@ -1077,8 +1228,10 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
               children: [
                 if (isSelected) const Chip(label: Text('Active')),
                 Chip(
-                    label: Text(_buildProfile().toJson().toString() !=
-                            widget.profile.toJson().toString()
+                    backgroundColor: isDirty
+                        ? Theme.of(context).colorScheme.tertiaryContainer
+                        : null,
+                    label: Text(isDirty
                         ? 'Unsaved edits'
                         : widget.controller.profilePersistenceStatus)),
                 if (widget.controller.settings.defaultProfileId ==
@@ -1217,9 +1370,20 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                       const SizedBox(height: 8),
                       TextField(
                         controller: _secretKeyController,
-                        obscureText: true,
+                        obscureText: !_revealSecret,
+                        style: _revealSecret
+                            ? const TextStyle(fontFamily: 'monospace')
+                            : null,
                         decoration: InputDecoration(
                           labelText: _endpointType.secretKeyLabel,
+                          suffixIcon: IconButton(
+                              tooltip: _revealSecret
+                                  ? 'Hide secret'
+                                  : 'Reveal secret',
+                              onPressed: () => _reveal(false),
+                              icon: Icon(_revealSecret
+                                  ? Icons.visibility_off
+                                  : Icons.visibility)),
                         ),
                       ),
                     ],
@@ -1238,9 +1402,20 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                       Expanded(
                         child: TextField(
                           controller: _secretKeyController,
-                          obscureText: true,
+                          obscureText: !_revealSecret,
+                          style: _revealSecret
+                              ? const TextStyle(fontFamily: 'monospace')
+                              : null,
                           decoration: InputDecoration(
                             labelText: _endpointType.secretKeyLabel,
+                            suffixIcon: IconButton(
+                                tooltip: _revealSecret
+                                    ? 'Hide secret'
+                                    : 'Reveal secret',
+                                onPressed: () => _reveal(false),
+                                icon: Icon(_revealSecret
+                                    ? Icons.visibility_off
+                                    : Icons.visibility)),
                           ),
                         ),
                       ),
@@ -1250,7 +1425,17 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
             if (_endpointType != EndpointProfileType.azureBlob)
               TextField(
                 controller: _sessionTokenController,
-                decoration: const InputDecoration(
+                obscureText: !_revealToken,
+                style: _revealToken
+                    ? const TextStyle(fontFamily: 'monospace')
+                    : null,
+                decoration: InputDecoration(
+                  suffixIcon: IconButton(
+                      tooltip: _revealToken ? 'Hide token' : 'Reveal token',
+                      onPressed: () => _reveal(true),
+                      icon: Icon(_revealToken
+                          ? Icons.visibility_off
+                          : Icons.visibility)),
                   labelText: 'Session token (optional)',
                 ),
               ),
@@ -1291,7 +1476,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         TextField(
                           controller: _connectTimeoutController,
                           keyboardType: TextInputType.number,
-                          decoration: const InputDecoration(
+                          decoration: InputDecoration(
+                            errorText: connectError,
                             labelText: 'Connect timeout (s)',
                           ),
                         ),
@@ -1299,7 +1485,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         TextField(
                           controller: _readTimeoutController,
                           keyboardType: TextInputType.number,
-                          decoration: const InputDecoration(
+                          decoration: InputDecoration(
+                            errorText: readError,
                             labelText: 'Read timeout (s)',
                           ),
                         ),
@@ -1311,7 +1498,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                           child: TextField(
                             controller: _connectTimeoutController,
                             keyboardType: TextInputType.number,
-                            decoration: const InputDecoration(
+                            decoration: InputDecoration(
+                              errorText: connectError,
                               labelText: 'Connect timeout (s)',
                             ),
                           ),
@@ -1321,7 +1509,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                           child: TextField(
                             controller: _readTimeoutController,
                             keyboardType: TextInputType.number,
-                            decoration: const InputDecoration(
+                            decoration: InputDecoration(
+                              errorText: readError,
                               labelText: 'Read timeout (s)',
                             ),
                           ),
@@ -1341,15 +1530,20 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
               runSpacing: 8,
               children: [
                 FilledButton.icon(
-                  onPressed: () async {
-                    final profile = _buildProfile();
-                    await widget.controller.saveProfile(profile);
-                  },
+                  onPressed: !valid ||
+                          !isDirty &&
+                              widget.controller.profilePersistenceStatus ==
+                                  'Saved securely'
+                      ? null
+                      : () async {
+                          final profile = _buildProfile();
+                          await widget.controller.saveProfile(profile);
+                        },
                   icon: const Icon(Icons.save_outlined),
                   label: const Text('Save'),
                 ),
                 OutlinedButton.icon(
-                  onPressed: isTesting
+                  onPressed: !valid || isTesting
                       ? null
                       : () async {
                           final profile = _buildProfile();
@@ -1360,7 +1554,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                   label: Text(isTesting ? 'Testing...' : 'Test'),
                 ),
                 OutlinedButton.icon(
-                  onPressed: isSelecting
+                  onPressed: !valid || isSelecting
                       ? null
                       : () async {
                           final profile = _buildProfile();
@@ -1371,12 +1565,34 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                   icon: const Icon(Icons.check_circle_outline),
                   label: Text(isSelecting ? 'Loading...' : 'Use profile'),
                 ),
-                OutlinedButton.icon(
+                TextButton.icon(
+                  style: TextButton.styleFrom(
+                      foregroundColor: Theme.of(context).colorScheme.error),
                   onPressed: () async {
-                    await widget.controller.deleteProfile(widget.profile.id);
+                    final profile = widget.profile;
+                    final confirmed = await showDialog<bool>(
+                        context: context,
+                        builder: (context) => AlertDialog(
+                                title:
+                                    Text('Delete profile "${profile.name}"?'),
+                                content: Text(
+                                    'This removes the endpoint profile and its saved credentials.${isSelected ? '\nThe app will switch to the next available profile.' : ''}'),
+                                actions: [
+                                  TextButton(
+                                      onPressed: () =>
+                                          Navigator.pop(context, false),
+                                      child: const Text('Cancel')),
+                                  DangerButton(
+                                      onPressed: () =>
+                                          Navigator.pop(context, true),
+                                      child: const Text('Delete profile'))
+                                ]));
+                    if (confirmed == true) {
+                      await widget.controller.deleteProfile(profile.id);
+                    }
                   },
                   icon: const Icon(Icons.delete_outline),
-                  label: const Text('Delete'),
+                  label: const Text('Delete…'),
                 ),
               ],
             ),
@@ -1385,4 +1601,11 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
       ),
     );
   }
+}
+
+class _SettingsSection {
+  const _SettingsSection(this.title, this.icon, this.description, this.builder);
+  final String title, description;
+  final IconData icon;
+  final Widget Function() builder;
 }

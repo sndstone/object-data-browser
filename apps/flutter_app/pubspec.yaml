@@ -2,7 +2,7 @@ name: s3_browser_crossplat
 description: Cross-platform object data browser with pluggable backend engines.
 publish_to: "none"
 # GitHub Releases are published from this version value.
-version: 2.2.5+2
+version: 2.2.6+1
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
@@ -27,3 +27,13 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/fonts/Inter-OFL.txt
+    - assets/fonts/Sora-OFL.txt
+  fonts:
+    - family: Inter
+      fonts:
+        - asset: assets/fonts/Inter.ttf
+    - family: Sora
+      fonts:
+        - asset: assets/fonts/Sora.ttf

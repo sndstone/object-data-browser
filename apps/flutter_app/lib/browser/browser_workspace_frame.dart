@@ -49,6 +49,7 @@ class _BrowserWorkspaceFrameState extends State<BrowserWorkspaceFrame> {
       c.objectSortField,
       c.objectSortDescending,
       c.inspectorTab,
+      Object.hashAll(c.inspectorGroupTabs.entries.map((e) => (e.key, e.value))),
       c.adminState,
       c.versions,
       c.versionCursor,

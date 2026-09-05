@@ -1,0 +1,1142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Object Data Browser — GUI improvement plan (2.2.5 review)</title>
+<style>
+:root{--ink:#141b18;--muted:#5e6a66;--green:#004d19;--green-soft:#eaf3e4;--line:#dde3dd;--paper:#f7f8f5;--panel:#fff;--panel-muted:#f3f5f0;--orange:#a45225;--orange-soft:#f8ecdf;--red:#b3261e;--red-soft:#f9dedc;--blue:#2b4f7a;--blue-soft:#e4ecf6;--rail:#002117}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:84px}
+body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+a{color:var(--green)}
+button,input,select{font:inherit}
+button{cursor:pointer;border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);padding:7px 13px}
+button:hover{background:var(--green-soft)}
+button[aria-pressed=true]{background:var(--green);color:#fff;border-color:var(--green)}
+code{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:#eef2ec;padding:1px 5px;border-radius:4px;overflow-wrap:anywhere}
+header.top{position:sticky;top:0;z-index:20;background:#f7f8f5f2;border-bottom:1px solid var(--line);backdrop-filter:blur(10px)}
+.topbar{max-width:1320px;margin:auto;display:flex;align-items:center;justify-content:space-between;gap:20px;padding:13px 28px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:14px}
+.logo{width:28px;height:28px;background:var(--green);border-radius:7px;color:#9fe870;display:grid;place-items:center;font-size:13px;font-weight:800}
+.topbar nav{display:flex;gap:20px}
+.topbar nav a{text-decoration:none;font-size:13px;color:var(--muted)}
+main{max-width:1240px;margin:auto;padding:44px 28px 80px}
+.eyebrow{text-transform:uppercase;letter-spacing:2px;font-size:11px;font-weight:750;color:var(--green)}
+h1{font-size:clamp(34px,5vw,58px);line-height:1.06;letter-spacing:-1.8px;font-weight:700;margin:16px 0 18px;max-width:900px}
+h2{font-size:28px;line-height:1.2;letter-spacing:-.8px;font-weight:700;margin:8px 0 14px}
+h3{font-size:19px;line-height:1.3;margin:6px 0 10px;letter-spacing:-.2px}
+p{margin:0 0 12px}
+.lead{font-size:18px;color:var(--muted);max-width:780px}
+.meta-row{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0 30px}
+.pill{font-size:11px;padding:3px 9px;border-radius:5px;display:inline-block;background:var(--green-soft);color:var(--green);font-weight:700;white-space:nowrap}
+.pill.p0{background:var(--red-soft);color:var(--red)}
+.pill.p1{background:var(--orange-soft);color:var(--orange)}
+.pill.p2{background:var(--blue-soft);color:var(--blue)}
+.pill.neutral{background:#e8ece7;color:var(--muted)}
+.grid2{display:grid;grid-template-columns:1.4fr 1fr;gap:22px}
+.callout{background:var(--rail);color:#fff;padding:26px 28px;border-radius:12px}
+.callout h3{color:#fff;font-size:22px}
+.callout p{color:#cfe0d4}
+.callout ul{padding-left:18px;margin:0;color:#dbe8de}
+.callout li{margin-bottom:6px}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.stat{border:1px solid var(--line);border-radius:10px;background:#fff;padding:16px 18px}
+.stat b{display:block;font-size:28px;line-height:1.2;font-weight:700}
+.stat span{font-size:12px;color:var(--muted)}
+section{margin-top:58px}
+.section-head{display:flex;gap:24px;justify-content:space-between;align-items:end;margin-bottom:20px}
+.section-head p{color:var(--muted);max-width:720px;margin:0}
+.keep{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:20px}
+.keep div{border-top:2px solid #c9d8cb;padding:12px 2px;font-size:13px}
+.keep b{display:block;margin-bottom:4px}
+.filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);padding-bottom:16px;margin-bottom:18px}
+.filters input{padding:8px 12px;border:1px solid var(--line);border-radius:7px;background:#fff;min-width:220px;flex:1}
+.filters select{padding:8px;border:1px solid var(--line);border-radius:7px;background:#fff}
+.filters .count{font-size:12px;color:var(--muted);margin-left:auto}
+.legend{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:22px}
+.legend div{font-size:12px;background:#fff;border:1px solid var(--line);border-radius:8px;padding:10px 12px;color:var(--muted)}
+.legend b{display:block;color:var(--ink);font-size:12px;margin-bottom:2px}
+.item{background:#fff;border:1px solid var(--line);border-radius:12px;padding:24px 26px;margin-bottom:18px}
+.item-head{display:flex;flex-direction:column;gap:6px;margin-bottom:16px}
+.tags{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.tags .id{font:700 12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+.observed{font-size:13.5px;color:var(--muted);max-width:900px}
+.observed b{color:var(--ink)}
+.compare{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:8px 0 18px}
+figure{margin:0;min-width:0}
+figcaption{display:flex;justify-content:space-between;font-size:11px;text-transform:uppercase;letter-spacing:1.1px;font-weight:700;color:var(--muted);margin-bottom:8px}
+figcaption.after{color:var(--green)}
+.under{font-size:12px;color:var(--muted);margin-top:8px}
+.detail{display:grid;grid-template-columns:130px 1fr;gap:8px 16px;margin:0;font-size:13.5px}
+.detail dt{font-weight:700;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.8px;padding-top:2px}
+.detail dd{margin:0}
+.detail dd ul{margin:0;padding-left:18px}
+.detail dd li{margin-bottom:3px}
+/* ---------- mockup primitives ---------- */
+.mock{border:1px solid #d4ddd5;border-radius:9px;background:#fff;padding:12px;font-size:11px;line-height:1.45;color:#2f3d37;min-height:150px;position:relative;overflow:hidden;box-shadow:0 6px 20px #192c2508}
+.mock.dark{background:#111c18;color:#eaf1ec;border-color:#2b3a34}
+.mock.dark .fld,.mock.dark .b.out,.mock.dark .b.txt{background:#18251f;color:#eaf1ec;border-color:#2b3a34}
+.mock .bar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.mock .bar.right{justify-content:flex-end}
+.mock .title{font-weight:700;font-size:13px;margin-bottom:6px}
+.mock .sub{font-size:10px;color:#6b796e}
+.mock.dark .sub{color:#abb8b1}
+.b{display:inline-flex;align-items:center;gap:4px;border:1px solid #d6ded7;padding:5px 9px;border-radius:6px;white-space:nowrap;background:#fff;color:#2f3d37;font-size:10.5px;font-weight:600}
+.b.pri{background:var(--green);border-color:var(--green);color:#fff}
+.b.dng{background:var(--red);border-color:var(--red);color:#fff}
+.b.dng.out{background:#fff;color:var(--red);border-color:#e3a49f}
+.b.txt{border-color:transparent;background:transparent;color:#2f3d37}
+.b.txt.red{color:var(--red)}
+.b.dis{opacity:.45}
+.b.icon{padding:5px 6px}
+.chip{display:inline-block;font-size:10px;padding:2px 8px;border-radius:999px;background:#e8ece7;color:#3a4a42;font-weight:600}
+.chip.ok{background:var(--green-soft);color:var(--green)}
+.chip.err{background:var(--red-soft);color:var(--red)}
+.chip.warn{background:var(--orange-soft);color:var(--orange)}
+.chip.run{background:#e4ecf6;color:var(--blue)}
+.chip.on{background:var(--green);color:#fff}
+.fld{border:1px solid #c9d3cb;padding:6px 8px;border-radius:6px;background:#fff;display:inline-flex;align-items:center;gap:6px;color:#455c4c;min-width:0;max-width:100%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.fld.wide{width:100%}
+.fld.err{border-color:var(--red)}
+.fld .lbl{font-size:9px;color:#6b796e;margin-right:2px}
+.fld .kbd{margin-left:auto}
+.kbd{font:10px ui-monospace,SFMono-Regular,Menlo,monospace;background:#eef2ec;border:1px solid #d6ded7;border-radius:4px;padding:1px 5px;color:#2f3d37}
+.errtext{font-size:10px;color:var(--red);margin:3px 0 6px}
+.oktext{font-size:10px;color:var(--green);margin:3px 0 6px}
+.rows{border-top:1px solid #ebefea}
+.r{display:grid;grid-template-columns:30px minmax(0,1fr) 104px 62px 22px;gap:6px;align-items:center;padding:6px 4px;border-bottom:1px solid #ebefea}
+.r.hd{font-size:9.5px;color:#6b796e;text-transform:uppercase;letter-spacing:.6px}
+.r.sel{background:var(--green-soft)}
+.r span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.r .num{text-align:right;font-variant-numeric:tabular-nums}
+.cb{width:12px;height:12px;border:1.5px solid #8a978e;border-radius:3px;display:inline-block;vertical-align:middle}
+.cb.on{background:var(--green);border-color:var(--green)}
+.ic{display:inline-block;width:14px;height:14px;border-radius:3px;background:#c9d8cb;vertical-align:middle;margin-right:4px;font-size:8px;text-align:center;line-height:14px;color:#1f3a2a;font-weight:800}
+.ic.img{background:#f2d6b3}.ic.txt{background:#d6e4f5}.ic.zip{background:#e6d9f2}.ic.code{background:#d8efd5}.ic.dir{background:#e8ece7}
+.dlg{border:1px solid #d4ddd5;border-radius:9px;background:#fff;padding:12px;box-shadow:0 10px 30px #0f1f1a1f;max-width:330px;margin:8px auto 0}
+.dlg .title{font-size:12.5px}
+.dlg .actions{display:flex;justify-content:flex-end;gap:6px;margin-top:10px}
+.banner{display:inline-flex;align-items:center;gap:8px;background:var(--rail);color:#f3f6f2;border-radius:9px;padding:7px 10px;font-size:10.5px;margin-top:6px;max-width:100%}
+.banner.err{background:#5a1a16;color:#ffe4e1;border:1px solid #b3261e}
+.banner.ok{background:#0f3d24;color:#e6f5e8}
+.banner .x{margin-left:6px;opacity:.7}
+.tabs{display:flex;gap:4px;flex-wrap:wrap;margin:6px 0}
+.t{border:1px solid #d6ded7;border-radius:6px;padding:3px 8px;font-size:10px;font-weight:600;color:#3a4a42;background:#fff}
+.t.on{background:var(--green-soft);border-color:#b9cbbc;color:var(--green)}
+.t.dim{opacity:.55}
+.seg{display:inline-flex;border:1px solid #d6ded7;border-radius:7px;padding:2px;gap:2px;background:#fff}
+.seg .t{border:none;background:transparent}
+.seg .t.on{background:var(--green-soft)}
+.crumb{font-size:10.5px;color:#455c4c}
+.crumb b{color:var(--ink)}
+.progress{height:4px;border-radius:3px;background:#e7eee1;margin:6px 0;overflow:hidden}
+.progress i{display:block;height:100%;background:var(--green);border-radius:3px}
+.progress.err i{background:var(--red)}
+.card{border:1px solid #e3e9e3;border-radius:8px;padding:9px 10px;margin-bottom:8px;background:#fff}
+.mock.dark .card{background:#18251f;border-color:#2b3a34}
+.json{font:9.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;border-radius:8px;padding:8px;white-space:pre;overflow:hidden}
+.json.faint{background:#1a1a1a11;color:#a4b0aa}
+.json.good{background:#18251f;color:#c9dccf}
+.json .k{color:#9fe870}.json .s{color:#f2d6b3}
+.phone{width:210px;margin:0 auto;border:1px solid #c8d5c8;border-radius:16px;padding:10px;background:#fff;min-height:270px}
+.phone .b{padding:4px 7px}.phone .r{padding:5px 2px}
+.rail{position:absolute;left:0;top:0;bottom:0;width:38px;background:var(--rail);color:#c5d6c9;font-size:8px;text-align:center;padding-top:10px;line-height:2.8}
+.rail .on{background:#075d31;color:#fff;border-radius:4px;margin:0 3px}
+.with-rail{padding-left:50px}
+.hint{font-size:10px;color:#6b796e;font-style:italic}
+.list li{margin-bottom:5px}
+.roadmap{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+.phase{border-top:3px solid #abc2ad;padding:16px 2px}
+.phase b{font-size:12px;color:var(--green)}
+.phase h3{font-size:17px}
+.phase p{font-size:13px;color:var(--muted)}
+.phase .gate{font-size:12px;color:var(--ink);border-top:1px solid var(--line);padding-top:10px}
+.evidence{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+.box{background:#fff;border:1px solid var(--line);border-radius:10px;padding:22px}
+.box p,.box li{font-size:13px}
+.box ul{padding-left:18px}
+footer{padding:28px 0 0;font-size:12px;color:var(--muted);border-top:1px solid var(--line);margin-top:50px}
+.empty{padding:30px;color:var(--muted);text-align:center}
+[hidden]{display:none!important}
+@media(max-width:960px){.grid2,.evidence{grid-template-columns:1fr}.legend{grid-template-columns:1fr 1fr}.roadmap{grid-template-columns:1fr 1fr}.keep{grid-template-columns:1fr}.compare{grid-template-columns:1fr}.detail{grid-template-columns:1fr}.detail dt{padding-top:6px}}
+@media(max-width:640px){main{padding:28px 16px 50px}.topbar{padding:12px 16px}.topbar nav{display:none}.roadmap,.legend{grid-template-columns:1fr}.item{padding:18px}.section-head{display:block}}
+@media print{header.top{position:static}.topbar nav,.topbar button,.filters,.legend{display:none!important}body{background:#fff;font-size:11px}main{max-width:none;padding:14px}.item,.box,.phase,figure{break-inside:avoid}.compare{grid-template-columns:1fr 1fr}.mock{box-shadow:none}}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="topbar">
+    <div class="brand"><span class="logo">O</span>Object Data Browser / GUI review 2.2.5</div>
+    <nav>
+      <a href="#summary">Summary</a>
+      <a href="#improvements">Improvements</a>
+      <a href="#sequence">Sequence</a>
+      <a href="#evidence">Evidence</a>
+    </nav>
+    <button type="button" onclick="window.print()">Print / save PDF</button>
+  </div>
+</header>
+
+<main>
+<section id="summary" style="margin-top:0">
+  <div class="eyebrow">GUI review · 5 September 2026 · main @ fe45c59 (2.2.5 build 2)</div>
+  <h1>Twenty-two GUI improvements, each shown before and after.</h1>
+  <p class="lead">A source-level review of the Flutter interface after the 2.2.5 improvement pass. The browser, inspector, settings, jobs, event log, shell, theme and shared widgets were read in full. Every item below states the current behavior, the proposed edit, what it does, how it functions, the files involved, and how to verify it.</p>
+  <div class="meta-row">
+    <span class="pill p0">4 × P0 safety</span>
+    <span class="pill p1">13 × P1 usability</span>
+    <span class="pill p2">5 × P2 polish</span>
+    <span class="pill neutral">Mockups are HTML reconstructions, not screenshots</span>
+    <span class="pill neutral">No repository changes made by this review</span>
+  </div>
+
+  <div class="grid2">
+    <div class="callout">
+      <h3>Recommended direction</h3>
+      <p>The 2.2.5 pass fixed the big structural problems. What remains is a set of small trust gaps and rough edges that a user meets every day.</p>
+      <ul>
+        <li><b>Close the destructive-action gaps first.</b> Two delete paths and profile deletion still run without confirmation, and the banner cannot tell an error from a success.</li>
+        <li><b>Then remove duplication.</b> Two search boxes, two settings navigators, three copies of byte/date formatting, a keyboard hint with no shortcut behind it.</li>
+        <li><b>Then finish the details.</b> Type icons, real dates, copy buttons, dark-mode colors, semantics, empty states, bundled fonts.</li>
+      </ul>
+    </div>
+    <div class="stats">
+      <div class="stat"><b>22</b><span>improvement items with before/after</span></div>
+      <div class="stat"><b>3</b><span>unconfirmed destructive paths found (G01, G04)</span></div>
+      <div class="stat"><b>0</b><span>uses of Clipboard in lib/ today (G08)</span></div>
+      <div class="stat"><b>9</b><span>Dart files carry most of the work</span></div>
+    </div>
+  </div>
+
+  <h3 style="margin-top:34px">What already works and should be preserved</h3>
+  <div class="keep">
+    <div><b>Direction-aware motion</b>Workspace, mobile section and inspector transitions in <code>DirectionalSwitcher</code> respect reduced motion and the app preference. Keep as is.</div>
+    <div><b>Lazy object table</b><code>ObjectTable</code> uses fixed-extent rows, real checkboxes, shift-range selection and header sorting. Build on it; do not replace it.</div>
+    <div><b>Frame caching</b><code>BrowserWorkspaceFrame</code> rebuilds the browser only when displayed data changes. New state added by this plan must be added to its signature.</div>
+    <div><b>Accessible select field</b><code>AppSelectField</code> has keyboard navigation, flip-up placement and a native fallback on touch. Reuse it everywhere a dropdown appears.</div>
+    <div><b>Text scaling model</b><code>PreferenceTextScaler</code> never cancels OS enlargement, and row density is separate from text size. Any new dense layout must respect both.</div>
+    <div><b>Bounded previews</b>Text and image previews stay bounded, HTML renders statically, source is highlighted and selectable. Untouched by this plan.</div>
+  </div>
+</section>
+
+<section id="improvements">
+  <div class="section-head">
+    <div>
+      <div class="eyebrow">01 / Improvement inventory</div>
+      <h2>Before and after, item by item.</h2>
+      <p>P0 = safety and trust, do first. P1 = daily-use friction. P2 = polish. Effort S ≈ half a day, M ≈ one to two days, L ≈ three to five days, including tests. Line references point at the reviewed working tree.</p>
+    </div>
+  </div>
+
+  <div class="legend">
+    <div><b>Observed</b>What the source does today, with the widget or method involved.</div>
+    <div><b>Before / After</b>Illustrative mockups built from the code. Data is fictional.</div>
+    <div><b>The edit</b>The concrete change to make.</div>
+    <div><b>What it does / How it functions</b>User-visible result and the mechanism behind it.</div>
+    <div><b>Files / Verify</b>Where the work lands and the test that proves it.</div>
+  </div>
+
+  <div class="filters">
+    <input id="q" type="search" placeholder="Find an improvement (title, file, keyword)" aria-label="Find an improvement">
+    <select id="area" aria-label="Area">
+      <option value="">All areas</option>
+      <option>Browser</option><option>Inspector</option><option>Shell</option><option>Settings</option><option>Jobs</option><option>Event Log</option><option>Theme</option><option>Mobile</option>
+    </select>
+    <select id="prio" aria-label="Priority">
+      <option value="">All priorities</option>
+      <option>P0</option><option>P1</option><option>P2</option>
+    </select>
+    <span class="count" id="count"></span>
+  </div>
+
+  <!-- ============================ P0 ============================ -->
+
+  <article class="item" id="G01" data-area="Inspector" data-priority="P0">
+    <div class="item-head">
+      <div class="tags"><span class="id">G01</span><span class="pill p0">P0</span><span class="pill">Inspector</span><span class="pill neutral">Effort S</span></div>
+      <h3>Confirm before deleting from the Versions tab and the Delete-all tool</h3>
+      <p class="observed"><b>Observed:</b> In <code>browser_workspace.dart</code>, the Versions tab button “Delete selected” calls <code>controller.deleteSelectedObject</code> directly, and the Tools tab button “Run delete all” calls <code>controller.runDeleteAllTool</code> directly. Neither shows a dialog. Delete-all removes every object in the bucket typed into the field. The object panel’s own Delete button does confirm (via <code>_confirmDeleteObjects</code>), so behavior is inconsistent between surfaces.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span><span>Versions and Tools tabs</span></figcaption>
+        <div class="mock">
+          <div class="title">Versions</div>
+          <div class="bar"><span class="b pri">Show all versions</span><span class="b">Refresh versions</span><span class="b">Download selected</span><span class="b">Delete selected</span></div>
+          <div class="hint">Click → objects deleted immediately.</div>
+          <div class="title" style="margin-top:12px">Tools › Delete all</div>
+          <div class="bar"><span class="fld"><span class="lbl">Bucket</span>media-archive</span><span class="fld"><span class="lbl">Batch</span>1000</span></div>
+          <div class="bar"><span class="b pri">Run delete all</span></div>
+          <div class="hint">Click → every object in “media-archive” is deleted.</div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span><span>Same buttons, confirmed</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="b pri">Show all versions</span><span class="b">Refresh versions</span><span class="b">Download selected</span><span class="b dng out">Delete selected</span></div>
+          <div class="dlg">
+            <div class="title">Delete every object in “media-archive”?</div>
+            <div class="sub">Runs the delete-all tool with batch 1000 on engine Python. This cannot be undone. Type the bucket name to confirm.</div>
+            <div class="bar" style="margin-top:8px"><span class="fld wide">media-arch<span style="opacity:.4">|</span></span></div>
+            <div class="actions"><span class="b txt">Cancel</span><span class="b dng dis">Delete all objects</span></div>
+          </div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Route the Versions “Delete selected” through the existing <code>_confirmDeleteObjects(context)</code>. Add <code>_confirmDeleteAll(context)</code> for the tool: a dialog that names the bucket, engine and batch size and requires the bucket name to be typed before the destructive button enables. Disable “Run delete all” while <code>deleteAllState.running</code>.</dd>
+      <dt>What it does</dt><dd>Makes every delete path in the app pass through one confirmation with the same wording, and makes the highest-impact action (whole-bucket deletion) require deliberate input.</dd>
+      <dt>How it functions</dt><dd>The dialog snapshots <code>selectedProfile?.id</code> and <code>selectedBucket?.name</code> the way <code>_confirmDeleteObjects</code> already does, so a profile switch during the dialog cancels the action. Typed-name matching compares trimmed strings and re-evaluates on each keystroke via <code>StatefulBuilder</code>.</dd>
+      <dt>Files</dt><dd><code>apps/flutter_app/lib/browser/browser_workspace.dart</code> (<code>_versionsView</code>, <code>_toolsView</code>, new <code>_confirmDeleteAll</code>)</dd>
+      <dt>Verify</dt><dd>Widget tests: tapping “Delete selected” in Versions shows the dialog and the mock engine receives no delete until confirmed; “Delete all objects” stays disabled until the typed name matches.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G02" data-area="Browser" data-priority="P0">
+    <div class="item-head">
+      <div class="tags"><span class="id">G02</span><span class="pill p0">P0</span><span class="pill">Browser</span><span class="pill neutral">Effort S</span></div>
+      <h3>Destructive actions look destructive</h3>
+      <p class="observed"><b>Observed:</b> <code>_confirmDeleteObjects</code> and <code>_confirmDeleteBucket</code> render the confirming button as a default <code>FilledButton</code>, which is the same green as Create, Save and Upload. In the bucket context menu, “Delete bucket” and “Force delete bucket” look like every other item (the object menu already tints its delete icon red). In the bucket panel a “Delete selected” text button sits beside the “New bucket” primary.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span></figcaption>
+        <div class="mock">
+          <div class="dlg" style="margin-top:0">
+            <div class="title">Delete 3 object(s)?</div>
+            <div class="sub">Bucket: media-archive<br>2026/report-a.pdf<br>2026/report-b.pdf<br>2026/report-c.pdf</div>
+            <div class="actions"><span class="b txt">Cancel</span><span class="b pri">Delete</span></div>
+          </div>
+          <div class="hint" style="margin-top:8px">Same green as “Create” and “Save”.</div>
+          <div class="bar" style="margin-top:8px"><span class="b pri">+ New bucket</span><span class="b txt">🗑 Delete selected</span></div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div class="dlg" style="margin-top:0">
+            <div class="title">Delete 3 objects?</div>
+            <div class="sub">Bucket <b>media-archive</b> · 2026/report-a.pdf, report-b.pdf, report-c.pdf<br>Versioned bucket: this creates delete markers.</div>
+            <div class="actions"><span class="b txt">Cancel</span><span class="b dng">Delete 3 objects</span></div>
+          </div>
+          <div class="hint" style="margin-top:8px">Error-colored confirm; count in the label.</div>
+          <div class="bar" style="margin-top:8px"><span class="b pri">+ New bucket</span><span class="b icon">↻</span><span class="sub">Delete lives in the bucket’s ⋯ menu, tinted red and separated.</span></div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Add a small <code>DangerButton</code> (FilledButton with <code>colorScheme.error</code>/<code>onError</code>) and use it for every confirming delete. Tint destructive <code>PopupMenuItem</code>s with <code>ListTile(iconColor: error, textColor: error)</code> and keep them after a divider. Remove the bucket panel’s inline “Delete selected” button; the ⋯ menu and right-click already offer it.</dd>
+      <dt>What it does</dt><dd>Users can tell a destructive confirm from a constructive one at a glance, and the primary bucket action bar holds only the primary action.</dd>
+      <dt>How it functions</dt><dd>Purely presentational. The dialog title includes the count and the button label repeats the verb and count so the final click is unambiguous.</dd>
+      <dt>Files</dt><dd><code>lib/browser/browser_workspace.dart</code>, new <code>lib/widgets/danger_button.dart</code></dd>
+      <dt>Verify</dt><dd>Golden or semantics test that delete confirm buttons use the error color; existing context-menu tests keep passing.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G03" data-area="Shell" data-priority="P0">
+    <div class="item-head">
+      <div class="tags"><span class="id">G03</span><span class="pill p0">P0</span><span class="pill">Shell</span><span class="pill neutral">Effort M</span></div>
+      <h3>A banner that knows an error from a success</h3>
+      <p class="observed"><b>Observed:</b> <code>AppController._guard</code> writes failures into the same <code>bannerMessage</code> string used for “Listed 120 objects”. <code>_BannerOverlay</code> renders every message on <code>inverseSurface</code> and auto-dismisses after 3.5 s unless something is busy, so an error such as <code>networkError: connection refused</code> disappears before it can be read. Dismiss timing is chosen by matching substrings like <code>'listed '</code>. Error text is prefixed with the raw enum name.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span></figcaption>
+        <div class="mock">
+          <div class="banner">✓ Listed 120 objects in media-archive <span class="x">✕</span></div><br>
+          <div class="banner">✓ networkError: Connection refused (127.0.0.1:9000) <span class="x">✕</span></div>
+          <div class="hint" style="margin-top:8px">Same look, same check icon, both gone in 3.5 s.</div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div class="banner ok">✓ Listed 120 objects in media-archive <span class="x">✕</span></div><br>
+          <div class="banner err">⚠ Could not reach the endpoint · connection refused (127.0.0.1:9000) &nbsp;<span class="b txt" style="color:#ffd7d3;padding:0 4px">Details</span> <span class="x">✕</span></div>
+          <div class="hint" style="margin-top:8px">Success fades in 2 s. Error stays until closed; Details opens Event Log filtered to errors.</div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Add <code>BannerSeverity { info, success, warning, error }</code> and a <code>bannerSeverity</code> field on the controller. <code>_guard</code> sets <code>error</code>; listing/transfer completion sets <code>success</code>; <code>showBannerMessage</code> gains a <code>severity</code> parameter. Replace <code>_dismissDelayFor(String)</code> with a severity/kind switch: error = never, warning = 8 s, success = 2 s, info = 3.5 s. Map <code>ErrorCode</code> to human phrases.</dd>
+      <dt>What it does</dt><dd>Errors persist and are visually distinct; successes get out of the way faster; the raw enum names disappear.</dd>
+      <dt>How it functions</dt><dd>The overlay picks container colors from <code>colorScheme.errorContainer</code>/<code>primaryContainer</code> by severity, wraps the message in <code>Semantics(liveRegion: true)</code> so assistive tech announces it, and the Details action sets a pending Event Log filter (pairs with G14) before <code>selectTab(eventLog)</code>.</dd>
+      <dt>Files</dt><dd><code>lib/controllers/app_controller.dart</code> (<code>_guard</code>, <code>showBannerMessage</code>), <code>lib/app/s3_browser_app.dart</code> (<code>_BannerOverlay</code>, <code>_BannerStatusIndicator</code>), <code>lib/models/domain_models.dart</code></dd>
+      <dt>Verify</dt><dd>Keep the existing banner timing tests; add: an error banner is still present after 10 s of pumped time; success dismisses at 2 s; Details navigates with the filter applied.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G04" data-area="Settings" data-priority="P0">
+    <div class="item-head">
+      <div class="tags"><span class="id">G04</span><span class="pill p0">P0</span><span class="pill">Settings</span><span class="pill neutral">Effort S</span></div>
+      <h3>Confirm profile deletion</h3>
+      <p class="observed"><b>Observed:</b> In <code>_ProfileEditorCard</code> the Delete button calls <code>controller.deleteProfile(id)</code> immediately. The profile and, on the next persisted save, its credentials in the consolidated Keychain bundle are gone. Delete sits in the same <code>Wrap</code> as Save, Test and Use profile with identical outlined styling.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span></figcaption>
+        <div class="mock">
+          <div class="title">MinIO lab <span class="chip ok">Active</span> <span class="chip">Saved</span></div>
+          <div class="sub">https://minio.lab.local:9000</div>
+          <div class="bar" style="margin-top:10px"><span class="b pri">💾 Save</span><span class="b">Test</span><span class="b">Use profile</span><span class="b">🗑 Delete</span></div>
+          <div class="hint">One click deletes the profile and its stored secrets.</div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="b pri">💾 Save</span><span class="b">Test</span><span class="b">Use profile</span><span style="flex:1"></span><span class="b txt red">Delete…</span></div>
+          <div class="dlg">
+            <div class="title">Delete profile “MinIO lab”?</div>
+            <div class="sub">Its saved access key and secret are removed from secure storage. Export profiles first if you want a metadata backup.</div>
+            <div class="actions"><span class="b txt">Cancel</span><span class="b dng">Delete profile</span></div>
+          </div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Wrap the call in a confirmation dialog that names the profile and states the credential consequence; move Delete to the trailing edge as a red text button with an ellipsis.</dd>
+      <dt>What it does</dt><dd>Prevents losing a working endpoint configuration and its secrets with one mis-click.</dd>
+      <dt>How it functions</dt><dd><code>showDialog&lt;bool&gt;</code> then <code>deleteProfile</code> only on <code>true</code>. If the profile is the active one, the dialog adds a line saying the app will switch to the next profile.</dd>
+      <dt>Files</dt><dd><code>lib/settings/settings_workspace.dart</code></dd>
+      <dt>Verify</dt><dd>Widget test: Delete opens a dialog; Cancel leaves <code>controller.profiles</code> unchanged; confirm removes it.</dd>
+    </dl>
+  </article>
+
+  <!-- ============================ P1 · Browser ============================ -->
+
+  <article class="item" id="G05" data-area="Browser" data-priority="P1">
+    <div class="item-head">
+      <div class="tags"><span class="id">G05</span><span class="pill p1">P1</span><span class="pill">Browser</span><span class="pill neutral">Effort M</span></div>
+      <h3>One object search, not two</h3>
+      <p class="observed"><b>Observed:</b> At desktop width the header shows <code>_HeaderSearchField</code> (text mode only, applies on every keystroke, silently switches the filter mode to Text) while the object panel shows its own search with a mode select and Enter-to-apply. Both write <code>objectFilterValue</code>. The header field is keyed by bucket only, so it does not reflect a value applied from the panel. <code>applyObjectFilter</code> adds an Event Log entry per call, so header typing logs one event per keystroke. The panel field is keyed by the filter value, so it is rebuilt and loses focus after each submit.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span><span>≥ 1360 px</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="fld" style="min-width:170px">🔍 Search loaded objects… <span class="kbd">Ctrl K</span></span><span class="fld"><span class="lbl">Endpoint</span>MinIO lab ▾</span><span class="fld"><span class="lbl">Engine</span>Python ▾</span></div>
+          <div class="card">
+            <div class="title">media-archive</div>
+            <div class="bar"><span class="fld"><span class="lbl">Filter</span>Text ▾</span><span class="fld" style="flex:1">🔍 Search loaded objects</span></div>
+            <div class="hint">Two fields, one state. Header typing logs an event per key.</div>
+          </div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="b">🔍 Search objects <span class="kbd">⌘K</span></span><span style="flex:1"></span><span class="fld"><span class="lbl">Endpoint</span>MinIO lab ▾</span><span class="fld"><span class="lbl">Engine</span>Python ▾</span></div>
+          <div class="card">
+            <div class="title">media-archive</div>
+            <div class="fld wide">🔍 report <span class="seg" style="margin-left:auto"><span class="t">Prefix</span><span class="t on">Text</span><span class="t">Regex</span></span></div>
+            <div class="oktext">12 matches in 480 loaded · applies 250 ms after you stop typing</div>
+          </div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Remove <code>_HeaderSearchField</code>; the header shows a slim button with the platform shortcut glyph that focuses the panel field. The panel field owns a <code>TextEditingController</code> and <code>FocusNode</code> in state, embeds the mode as a segmented control, debounces Text/Regex by 250 ms and applies Prefix on Enter. <code>applyObjectFilter</code> gains a <code>log</code> flag so only settled queries are recorded.</dd>
+      <dt>What it does</dt><dd>One place to search, no mode surprises, no Event Log spam, no lost focus, and a live match count.</dd>
+      <dt>How it functions</dt><dd>A <code>Timer</code> in <code>_ObjectPanelState</code> restarts on each change; focus is requested through a controller notifier (<code>requestObjectSearchFocus()</code>) that the panel listens to. When the controller’s filter value changes externally (breadcrumb navigation), the panel syncs the text without triggering another apply.</dd>
+      <dt>Files</dt><dd><code>lib/app/s3_browser_app.dart</code>, <code>lib/browser/object_panel.dart</code>, <code>lib/controllers/app_controller.dart</code></dd>
+      <dt>Verify</dt><dd>Widget test: typing three characters produces one filter event after the debounce; pressing ⌘K focuses the field; submitting keeps focus.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G06" data-area="Shell" data-priority="P1">
+    <div class="item-head">
+      <div class="tags"><span class="id">G06</span><span class="pill p1">P1</span><span class="pill">Shell</span><span class="pill neutral">Effort M</span></div>
+      <h3>Keyboard shortcuts that actually exist</h3>
+      <p class="observed"><b>Observed:</b> The header search shows a “Ctrl K” badge, but no <code>Shortcuts</code> or key binding for K exists anywhere in <code>lib/</code>. The only bindings are per-row Space/Enter/Shift+F10 in <code>ObjectTable</code> and Escape in <code>ObjectPanel</code>. On macOS the badge should read ⌘K.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="fld" style="min-width:200px">🔍 Search loaded objects… <span class="kbd">Ctrl K</span></span></div>
+          <div class="hint">Pressing Ctrl K does nothing. Delete key does nothing. No shortcut list.</div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span><span>Shortcut sheet (?)</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="kbd">⌘K</span> Focus search &nbsp; <span class="kbd">⌘R</span> Refresh objects &nbsp; <span class="kbd">⌘I</span> Toggle inspector</div>
+          <div class="bar"><span class="kbd">⌘1…5</span> Workspaces &nbsp; <span class="kbd">⌫</span> Delete selection (confirms) &nbsp; <span class="kbd">Esc</span> Clear selection</div>
+          <div class="bar"><span class="kbd">Space</span> Check row &nbsp; <span class="kbd">↵</span> Open / inspect &nbsp; <span class="kbd">⇧F10</span> Row menu &nbsp; <span class="kbd">?</span> This sheet</div>
+          <div class="hint">Glyphs follow the platform: ⌘ on macOS/iOS, Ctrl elsewhere.</div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Add an <code>AppShortcuts</code> widget above the <code>Scaffold</code> using <code>Shortcuts</code> + <code>Actions</code> with <code>SingleActivator(meta:/control:)</code> chosen by platform. Intents: FocusSearch, RefreshObjects, ToggleInspector, SelectWorkspace(n), DeleteSelection, ShowShortcuts. A <code>ShortcutLabel</code> helper renders the badge text.</dd>
+      <dt>What it does</dt><dd>Desktop users can drive the browser without the mouse, and the UI stops advertising a shortcut it does not have.</dd>
+      <dt>How it functions</dt><dd>DeleteSelection routes to the same <code>_confirmDeleteObjects</code> as the button (G01/G02), so no shortcut bypasses confirmation. Text fields keep their own keys because <code>Shortcuts</code> only fires for unhandled events.</dd>
+      <dt>Files</dt><dd><code>lib/app/s3_browser_app.dart</code>, new <code>lib/app/app_shortcuts.dart</code>, <code>lib/browser/object_panel.dart</code></dd>
+      <dt>Verify</dt><dd>Widget tests sending <code>LogicalKeyboardKey.keyK</code> with the platform modifier focus the search; Delete with a selection opens the confirm dialog.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G07" data-area="Browser" data-priority="P1">
+    <div class="item-head">
+      <div class="tags"><span class="id">G07</span><span class="pill p1">P1</span><span class="pill">Browser</span><span class="pill neutral">Effort M</span></div>
+      <h3>Object rows: type icon, real dates, calmer row actions</h3>
+      <p class="observed"><b>Observed:</b> <code>ObjectTable</code> receives <code>contentTypeFor</code> but never reads it; files have no leading icon while folders do. The Modified column renders <code>month/day HH:mm</code> with no year and an unpadded month, so “3/7 09:12” could be 2024 or 2026. The ⋯ actions button is drawn on every row. Size is left-aligned in a proportional font. <code>_formatBytes</code>/<code>_formatDateTime</code> are duplicated in <code>object_table.dart</code>, <code>tasks_workspace.dart</code>, <code>browser_workspace.dart</code> and <code>structured_log_list.dart</code>.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span></figcaption>
+        <div class="mock">
+          <div class="rows">
+            <div class="r hd"><span></span><span>Name ↕</span><span>Modified ↕</span><span>Size ↕</span><span></span></div>
+            <div class="r"><span><span class="ic dir">▸</span></span><span>2026/</span><span></span><span>—</span><span>⋯</span></div>
+            <div class="r"><span><span class="cb"></span></span><span>quarterly-report.pdf</span><span>3/7 09:12</span><span>1.2 MiB</span><span>⋯</span></div>
+            <div class="r sel"><span><span class="cb on"></span></span><span>hero-banner.png</span><span>12/24 18:40</span><span>848.3 KiB</span><span>⋯</span></div>
+            <div class="r"><span><span class="cb"></span></span><span>build.tar.gz</span><span>1/2 00:05</span><span>3.9 GiB</span><span>⋯</span></div>
+          </div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div class="rows">
+            <div class="r hd"><span></span><span>Name ↕</span><span>Modified ↕</span><span style="text-align:right">Size ↕</span><span></span></div>
+            <div class="r"><span><span class="ic dir">▸</span></span><span>2026/</span><span class="sub">12 items</span><span class="num">—</span><span></span></div>
+            <div class="r"><span><span class="ic txt">P</span></span><span>quarterly-report.pdf</span><span>2026-03-07 09:12</span><span class="num">1.2 MiB</span><span></span></div>
+            <div class="r sel"><span><span class="cb on"></span></span><span><span class="ic img">I</span>hero-banner.png</span><span>2025-12-24 18:40</span><span class="num">848.3 KiB</span><span>⋯</span></div>
+            <div class="r"><span><span class="ic zip">Z</span></span><span>build.tar.gz</span><span>2026-01-02 00:05</span><span class="num">3.9 GiB</span><span></span></div>
+          </div>
+          <div class="hint">Checkbox replaces the icon on hover, focus, selection or touch. ⋯ only on the hovered/selected row on desktop.</div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Use <code>contentTypeFor</code> (and the key extension) to pick a leading icon: image, text/document, archive, video, code, other. Format dates as <code>yyyy-MM-dd HH:mm</code> with a tooltip holding the full timestamp and a relative phrase. Right-align Size with <code>FontFeature.tabularFigures()</code>. Show the ⋯ button on hover/focus/selected on desktop, always on touch. Extract <code>lib/utils/format.dart</code> (<code>formatBytes</code>, <code>formatDateTime</code>, <code>formatRelative</code>) and delete the four copies.</dd>
+      <dt>What it does</dt><dd>Rows are scannable by type, dates are unambiguous, sizes line up, and the list is visually quieter.</dd>
+      <dt>How it functions</dt><dd>A lightweight <code>_HoverRow</code> wraps each row in <code>MouseRegion</code> and swaps icon/checkbox with an <code>AnimatedSwitcher</code> of 120 ms (respecting <code>AppMotion.duration</code>). Fixed <code>itemExtent</code> is unchanged so scrolling performance is unaffected.</dd>
+      <dt>Files</dt><dd><code>lib/browser/object_table.dart</code>, new <code>lib/utils/format.dart</code>, dedupe in <code>tasks_workspace.dart</code>, <code>browser_workspace.dart</code>, <code>structured_log_list.dart</code></dd>
+      <dt>Verify</dt><dd>Unit tests for the formatter; widget test asserting the year appears and that a PNG row renders the image icon.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G08" data-area="Inspector" data-priority="P1">
+    <div class="item-head">
+      <div class="tags"><span class="id">G08</span><span class="pill p1">P1</span><span class="pill">Inspector</span><span class="pill neutral">Effort S</span></div>
+      <h3>Copy where you would expect it</h3>
+      <p class="observed"><b>Observed:</b> <code>grep Clipboard lib/</code> returns nothing. Object key, ETag and headers, the presigned URL, the curl helper, bucket names and version IDs are shown as <code>SelectableText</code> or plain text; the only way to copy is to drag-select inside a narrow panel. The object context menu has no copy entries.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span><span>Share link tab</span></figcaption>
+        <div class="mock">
+          <div class="title">Share link</div>
+          <div class="bar"><span class="fld"><span class="lbl">Expiration (min)</span>60</span></div>
+          <div class="bar"><span class="b pri">🔗 Generate presigned URL</span></div>
+          <div class="sub">Expires: 60 minutes</div>
+          <div style="font-size:10px;overflow-wrap:anywhere;color:#455c4c">https://minio.lab.local:9000/media-archive/2026/quarterly-report.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&amp;X-Amz-Credential=…&amp;X-Amz-Signature=…</div>
+          <div class="hint">Select-all by hand, then copy.</div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div class="title">Share link</div>
+          <div class="bar"><span class="fld"><span class="lbl">Expiration (min)</span>60</span><span class="b pri">🔗 Generate</span></div>
+          <div class="card"><div class="bar" style="margin:0"><span class="sub">Presigned URL · expires 10:12</span><span style="flex:1"></span><span class="b icon">⧉ Copy</span></div><div style="font-size:10px;overflow-wrap:anywhere;color:#455c4c">https://minio.lab.local:9000/media-archive/2026/quarterly-report.pdf?X-Amz-…</div></div>
+          <div class="card"><div class="bar" style="margin:0"><span class="sub">curl</span><span style="flex:1"></span><span class="b icon">⧉ Copy</span></div><div class="json faint" style="padding:4px 6px">curl -o quarterly-report.pdf "https://…"</div></div>
+          <div class="banner ok">✓ Copied presigned URL</div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Add <code>CopyableValue</code> (label, value, optional monospace) with a trailing copy <code>IconButton</code>; use it for Key, ETag, presigned URL, curl helper, bucket name and version IDs. Add context menu items “Copy key”, “Copy s3:// URI” and “Copy presigned URL” (generates, then copies).</dd>
+      <dt>What it does</dt><dd>One click copies the exact string, with a success banner confirming what was copied.</dd>
+      <dt>How it functions</dt><dd><code>Clipboard.setData(ClipboardData(text:))</code>, then <code>showBannerMessage(severity: success)</code> (G03). On touch platforms <code>HapticFeedback.selectionClick()</code> accompanies the copy.</dd>
+      <dt>Files</dt><dd>new <code>lib/widgets/copyable_value.dart</code>; <code>lib/browser/browser_workspace.dart</code> (<code>_objectDetailsView</code>, <code>_presignView</code>, <code>_versionsView</code>, <code>_showObjectContextMenu</code>)</dd>
+      <dt>Verify</dt><dd>Widget test with a mock <code>SystemChannels.platform</code> handler asserting the clipboard payload equals the object key.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G09" data-area="Inspector" data-priority="P1">
+    <div class="item-head">
+      <div class="tags"><span class="id">G09</span><span class="pill p1">P1</span><span class="pill">Inspector</span><span class="pill neutral">Effort M</span></div>
+      <h3>Inspector: grouped tabs, a breadcrumb, and a way out</h3>
+      <p class="observed"><b>Observed:</b> With an object selected, <code>_inspectorPanel</code> wraps up to seven chips (Object, Preview, Versions, Bucket config, Tools, Events &amp; Debug, Share link) into a 280–560 px panel, producing two or three rows of tabs. The header shows only the object name. The inspector has no close control; hiding it requires the ⓘ button in the object panel. Returning to bucket context requires clearing the selection elsewhere. Bucket config also contains an instructional “Action surface” row rendered as data.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span><span>Right-docked, 300 px</span></figcaption>
+        <div class="mock" style="max-width:300px">
+          <div class="title">quarterly-report.pdf</div>
+          <div class="tabs"><span class="t on">▤ Object</span><span class="t">◫ Preview</span><span class="t">↺ Versions</span><span class="t">⚙ Bucket config</span><span class="t">🛠 Tools</span><span class="t">🐞 Events &amp; Debug</span><span class="t">🔗 Share link</span></div>
+          <div class="sub">Key: 2026/quarterly-report.pdf<br>Storage class: STANDARD<br>Last modified: 2026-03-07 09:12</div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock" style="max-width:300px">
+          <div class="bar" style="margin-bottom:4px"><span class="crumb">media-archive › 2026 › <b>quarterly-report.pdf</b></span><span style="flex:1"></span><span class="b icon" title="Back to bucket">⟵</span><span class="b icon" title="Hide inspector">✕</span></div>
+          <div class="seg"><span class="t on">Object</span><span class="t">Bucket</span><span class="t">Diagnostics</span></div>
+          <div class="tabs"><span class="t on">Details</span><span class="t">Preview</span><span class="t">Versions</span><span class="t">Share</span></div>
+          <div class="sub">Key: 2026/quarterly-report.pdf ⧉<br>Storage class: STANDARD<br>Last modified: 2026-03-07 09:12</div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Group <code>BrowserInspectorTab</code> values into three groups via an extension: Object (Details, Preview, Versions, Share), Bucket (Info, Config), Diagnostics (Tools, Events &amp; Debug). Render a group segment plus a dense sub-tab row for the active group only. Header becomes a breadcrumb with “Back to bucket” (clears <code>selectedObject</code>) and “Hide inspector” (sets <code>browserInspectorVisible=false</code>). Remove the “Action surface” pseudo-stat.</dd>
+      <dt>What it does</dt><dd>Never more than four chips per row, the current context is always visible, and the panel can be closed from where the user is looking.</dd>
+      <dt>How it functions</dt><dd>The controller remembers the last sub-tab per group; Azure profiles still hide Versions and Share through the existing availability filter. <code>DirectionalSwitcher</code> positions use the flattened tab index so motion direction stays correct.</dd>
+      <dt>Files</dt><dd><code>lib/browser/browser_workspace.dart</code> (<code>_inspectorPanel</code>), <code>lib/models/domain_models.dart</code>, <code>lib/controllers/app_controller.dart</code> (<code>clearSelectedObject</code>)</dd>
+      <dt>Verify</dt><dd>Extend the “inspector actions remain visible” test: at 280 px width no more than one row of sub-tabs; Back clears the object and shows Bucket › Info.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G10" data-area="Settings" data-priority="P1">
+    <div class="item-head">
+      <div class="tags"><span class="id">G10</span><span class="pill p1">P1</span><span class="pill">Settings</span><span class="pill neutral">Effort M</span></div>
+      <h3>Settings fields commit on blur and validate</h3>
+      <p class="observed"><b>Observed:</b> <code>_numberField</code> and <code>_textField</code> in <code>settings_workspace.dart</code> (and their copies in <code>browser_workspace.dart</code> for Tools and Share link) are <code>TextFormField(initialValue, onFieldSubmitted)</code>. Only Enter commits; clicking elsewhere discards the edit with no indication. A non-integer is silently ignored. There are no ranges, so 0 concurrent transfers or a negative timeout is accepted. Nothing shows that a value was saved.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="fld wide"><span class="lbl">Concurrent transfers</span>12<span style="opacity:.4">|</span></span></div>
+          <div class="bar"><span class="fld wide"><span class="lbl">Multipart threshold (MiB)</span>64</span></div>
+          <div class="hint">User types 12, clicks the next field → value silently stays 4. Typing “-5” and pressing Enter is accepted.</div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="fld wide"><span class="lbl">Concurrent transfers</span>12<span style="margin-left:auto;color:var(--green)">✓ Saved</span></span></div>
+          <div class="bar"><span class="fld wide err"><span class="lbl">Connect timeout (s)</span>0</span></div>
+          <div class="errtext">Enter a value between 1 and 600 seconds. Previous value 5 is kept.</div>
+          <div class="hint">Commits on Enter or when focus leaves. Esc restores the saved value.</div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Create <code>SettingNumberField</code> and <code>SettingTextField</code> in <code>lib/widgets/setting_fields.dart</code> with <code>min</code>, <code>max</code>, <code>unit</code>, <code>helper</code>. They own a controller and focus node, commit on submit and on focus loss, show inline error text, keep the last valid value, and flash a “Saved” suffix for 1.2 s. Replace all call sites, including Tools and Share link.</dd>
+      <dt>What it does</dt><dd>Edits are never silently lost, invalid values never reach the engines, and the user sees confirmation.</dd>
+      <dt>How it functions</dt><dd><code>FocusNode.addListener</code> triggers commit when <code>hasFocus</code> turns false. Validation is a pure function returning a message or null; <code>updateSettings</code> is called only when the parsed value differs and is valid. The suffix uses <code>AnimatedSwitcher</code> under <code>AppMotion.duration</code>.</dd>
+      <dt>Files</dt><dd>new <code>lib/widgets/setting_fields.dart</code>; <code>lib/settings/settings_workspace.dart</code>; <code>lib/browser/browser_workspace.dart</code> (<code>_toolsView</code>, <code>_presignView</code>)</dd>
+      <dt>Verify</dt><dd>Widget tests: type then move focus → settings updated; out-of-range → error text and unchanged settings; Esc reverts.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G11" data-area="Settings" data-priority="P1">
+    <div class="item-head">
+      <div class="tags"><span class="id">G11</span><span class="pill p1">P1</span><span class="pill">Settings</span><span class="pill neutral">Effort M</span></div>
+      <h3>Settings navigation: one breakpoint, data-driven sections</h3>
+      <p class="observed"><b>Observed:</b> The side list appears when the workspace <code>constraints.maxWidth ≥ 900</code>, but the intro card’s section dropdown appears when the window <code>MediaQuery</code> width <code>&lt; 1100</code>. Because the rail takes 72–126 px, both navigators are visible in windows roughly 1030–1100 px wide. “Compact desktop rows” is injected by a <code>title == 'Appearance'</code> check inside <code>_section</code>. Two static <code>ListTile</code>s (“Unified adaptive shell”, “Engine and endpoint selection”) carry no control. All nine sections are built every frame and hidden with <code>Offstage</code>.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span><span>Window ≈ 1060 px</span></figcaption>
+        <div class="mock with-rail">
+          <div class="rail">▣<br>▤<br>◔<br>≡<br><span class="on">⚙</span></div>
+          <div style="display:grid;grid-template-columns:70px 1fr;gap:8px">
+            <div class="sub" style="line-height:1.9"><span class="chip on">Connections</span><br>General<br>Transfers<br>Downloads<br>Appearance<br>Safety<br>…</div>
+            <div>
+              <div class="card"><div class="title">Settings</div><div class="sub">Tune the storage shell, connection behavior…</div><div class="bar" style="margin-top:6px"><span class="fld wide"><span class="lbl">Settings section</span>Connections ▾</span></div></div>
+              <div class="hint">Side list and dropdown both shown.</div>
+            </div>
+          </div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock with-rail">
+          <div class="rail">▣<br>▤<br>◔<br>≡<br><span class="on">⚙</span></div>
+          <div style="display:grid;grid-template-columns:78px 1fr;gap:8px">
+            <div class="sub" style="line-height:1.9"><span class="chip on">🔌 Connections</span><br>⚙ General<br>⇅ Transfers<br>⤓ Downloads<br>◐ Appearance<br>⛑ Safety<br>…</div>
+            <div>
+              <div class="card"><div class="title">Connections</div><div class="sub">Endpoint profiles and credentials. Exports never include secrets.</div></div>
+              <div class="hint">One navigator per width; only the active section is built.</div>
+            </div>
+          </div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Describe sections as a list of <code>_SettingsSection(id, title, icon, description, builder)</code>. One <code>LayoutBuilder</code> decides: ≥ 900 px side list, otherwise a dropdown in the header. Build only <code>_sections[active].builder(context)</code>. Move “Compact desktop rows” into Appearance’s children. Turn the two static tiles into helper text under the related control.</dd>
+      <dt>What it does</dt><dd>No duplicated navigation, less work per frame, and a settings screen that reads as sections with purposes rather than a long form.</dd>
+      <dt>How it functions</dt><dd>Section state stays in the workspace; the per-section description replaces the generic intro paragraph. Profile editor cards keep their <code>ValueKey(profile.id)</code> so drafts survive rebuilds as they do today.</dd>
+      <dt>Files</dt><dd><code>lib/settings/settings_workspace.dart</code></dd>
+      <dt>Verify</dt><dd>Widget test at 1060 px window width asserts exactly one navigator; existing “settings usable at enlarged text on phone” test keeps passing.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G12" data-area="Settings" data-priority="P1">
+    <div class="item-head">
+      <div class="tags"><span class="id">G12</span><span class="pill p1">P1</span><span class="pill">Settings</span><span class="pill neutral">Effort S</span></div>
+      <h3>Secrets: a reveal toggle and an honest dirty state</h3>
+      <p class="observed"><b>Observed:</b> The secret key field is <code>obscureText: true</code> with no way to reveal it, so a typo cannot be checked before Save/Test. The session token is plain text. The “Unsaved edits” chip is computed on every rebuild by <code>_buildProfile().toJson().toString() != widget.profile.toJson().toString()</code>, and every text controller calls <code>setState</code> on each keystroke, so the whole card serializes twice per key press.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="fld" style="flex:1"><span class="lbl">Access key</span>AKIAEXAMPLE7Q</span><span class="fld" style="flex:1"><span class="lbl">Secret key</span>••••••••••••••••</span></div>
+          <div class="bar"><span class="fld wide"><span class="lbl">Session token (optional)</span>FwoGZXIvYXdzEBYaD…</span></div>
+          <div class="bar"><span class="chip">Unsaved edits</span></div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="fld" style="flex:1"><span class="lbl">Access key</span>AKIAEXAMPLE7Q</span><span class="fld" style="flex:1"><span class="lbl">Secret key</span><span style="font-family:ui-monospace,monospace">wJalrXUtnFEMI/K7…</span><span class="kbd">👁</span></span></div>
+          <div class="bar"><span class="fld wide"><span class="lbl">Session token (optional)</span>••••••••••••••••<span class="kbd">👁</span></span></div>
+          <div class="bar"><span class="chip warn">Unsaved edits</span><span class="sub">Re-hides after 30 s or when the card collapses.</span></div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Add an eye <code>IconButton</code> suffix to the secret and token fields with a timed auto-hide; render revealed secrets in monospace; trim pasted whitespace. Implement <code>EndpointProfile.==</code>/<code>hashCode</code> (or an <code>equals</code> helper) and compute <code>isDirty</code> once per build. Style the dirty chip in the warning palette and disable Save when clean.</dd>
+      <dt>What it does</dt><dd>Users can check a secret before testing, tokens are no longer shown by default, and the card stops doing JSON round-trips on every keystroke.</dd>
+      <dt>How it functions</dt><dd>Reveal state is local to the card; a <code>Timer</code> re-hides. Equality ignores nothing: any field difference, including trimmed endpoint normalization, counts as dirty exactly as today.</dd>
+      <dt>Files</dt><dd><code>lib/settings/settings_workspace.dart</code>, <code>lib/models/domain_models.dart</code></dd>
+      <dt>Verify</dt><dd>Widget test: toggle reveals the text; dirty chip appears after a change and disappears after Save.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G13" data-area="Jobs" data-priority="P1">
+    <div class="item-head">
+      <div class="tags"><span class="id">G13</span><span class="pill p1">P1</span><span class="pill">Jobs</span><span class="pill neutral">Effort M</span></div>
+      <h3>Jobs: state color, rates, and cleanup</h3>
+      <p class="observed"><b>Observed:</b> <code>_TaskCard</code> renders <code>Chip(label: Text(task.status))</code> with the raw lowercase status (“running”, “paused”, “failed”). The progress bar is always the primary color, including for failed and cancelled jobs. Only <code>metricLines.first</code> is visible when collapsed; there is no elapsed time, throughput or ETA. There is no “Clear finished” or “Retry”. The <code>ExpansionTile</code> key includes <code>selectedTaskId</code>, so selecting a task recreates the tiles.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span></figcaption>
+        <div class="mock">
+          <div class="seg"><span class="t on">▶ Running</span><span class="t">⚠ Failed</span><span class="t">≣ All</span></div>
+          <div class="card"><div class="title">Upload 3 files → media-archive/2026/</div><span class="chip">running</span><div class="progress"><i style="width:62%"></i></div><div class="sub">Bytes: 1.8 GiB/2.9 GiB</div></div>
+          <div class="card"><div class="title">Download quarterly-report.pdf</div><span class="chip">failed</span><div class="progress"><i style="width:30%"></i></div><div class="sub" style="color:var(--red)">This operation failed. Expand for details before retrying.</div></div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="seg"><span class="t on">▶ Running · 1</span><span class="t">⚠ Failed · 1</span><span class="t">≣ All · 9</span></span><span style="flex:1"></span><span class="b">Clear finished</span></div>
+          <div class="card"><div class="title">Upload 3 files → media-archive/2026/</div><span class="chip run">● Running</span> <span class="sub">2 of 3 files · 04:12 elapsed · 7.4 MiB/s · ~2 min left</span><div class="progress"><i style="width:62%"></i></div></div>
+          <div class="card"><div class="title">Download quarterly-report.pdf</div><span class="chip err">✕ Failed</span> <span class="sub" style="color:var(--red)">accessDenied: GetObject not permitted</span><div class="progress err"><i style="width:30%"></i></div><div class="bar" style="margin:6px 0 0"><span class="b">Retry</span><span class="b txt">Open Event Log</span></div></div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Add a <code>TaskStatusPill</code> mapping status → icon, label and color (running/queued = blue, paused = tertiary, failed/cancelled = error, completed = neutral). Sample <code>bytesPerSecond</code> in the controller from successive progress events and expose <code>elapsed</code>, <code>rate</code>, <code>eta</code> on <code>BrowserTaskRecord</code>. Color the bar by state. Add <code>clearFinishedTasks()</code> and a “Retry” for failed transfers whose keys and destination are recorded. Key tiles by <code>PageStorageKey(task.id)</code> and expand the selected one via <code>ExpansionTileController</code>.</dd>
+      <dt>What it does</dt><dd>A glance shows what is running, what failed and why, how fast, and how long remains; the list can be tidied.</dd>
+      <dt>How it functions</dt><dd>Rate is an exponential moving average over the last ten progress samples to avoid jitter; ETA is hidden when rate is below a threshold. Retry re-issues <code>startDownload</code>/<code>startSampleUpload</code> with the stored arguments and links the new job in the card’s output lines.</dd>
+      <dt>Files</dt><dd><code>lib/tasks/tasks_workspace.dart</code>, <code>lib/controllers/app_controller.dart</code>, <code>lib/models/domain_models.dart</code></dd>
+      <dt>Verify</dt><dd>Extend the tasks widget tests: failed card shows error pill and bar; running card shows a rate after two progress events; Clear finished removes completed and failed records only.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G14" data-area="Event Log" data-priority="P1">
+    <div class="item-head">
+      <div class="tags"><span class="id">G14</span><span class="pill p1">P1</span><span class="pill">Event Log</span><span class="pill neutral">Effort M</span></div>
+      <h3>Event Log: filter, search, counts</h3>
+      <p class="observed"><b>Observed:</b> <code>EventLogWorkspace</code> offers Export and Clear plus a permanent three-line description. There is no level or category filter and no text search. With API logging enabled the list quickly holds hundreds of cards. Clear has no confirmation regardless of size.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="title" style="margin:0">Event Log</span><span style="flex:1"></span><span class="b pri">⤓ Export</span><span class="b">Clear</span></div>
+          <div class="sub">Every profile save/test, bucket refresh, object refresh, transfer action, and benchmark action is recorded here. When API logging or debug logging is enabled…</div>
+          <div class="card"><b>GET</b> <span class="chip">API</span> <span class="chip">Status 200</span> <span class="chip">41 ms</span></div>
+          <div class="card"><b>[ERROR] Objects</b> <span class="chip">2026-09-05 10:02:11</span><div class="sub">accessDenied: GetObject not permitted</div></div>
+          <div class="card"><b>PUT</b> <span class="chip">API</span> <span class="chip">Status 200</span> <span class="chip">88 ms</span></div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="title" style="margin:0">Event Log</span><span class="b icon" title="What is recorded here">ⓘ</span><span style="flex:1"></span><span class="b pri">⤓ Export</span><span class="b">Clear…</span></div>
+          <div class="bar"><span class="seg"><span class="t">All</span><span class="t on">Error</span><span class="t">Warn</span><span class="t">Info</span><span class="t">API</span><span class="t">Debug</span></span><span class="fld"><span class="lbl">Category</span>All ▾</span><span class="fld" style="flex:1">🔍 accessDenied</span></div>
+          <div class="sub">Showing 3 of 1,280 · newest first</div>
+          <div class="card"><b>[ERROR] Objects</b> <span class="chip err">Error</span> <span class="chip">10:02:11</span><div class="sub">accessDenied: GetObject not permitted · media-archive/2026/quarterly-report.pdf</div></div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Add a filter row (level segment, category select, search field) held in workspace state; pass the filtered list to <code>StructuredLogList</code>. Show “Showing X of Y · newest first”. Collapse the description into an info tooltip. Confirm Clear when more than 100 entries. Accept a <code>pendingEventLogFilter</code> from the controller so the error banner’s Details (G03) lands here with Error preselected.</dd>
+      <dt>What it does</dt><dd>Finding the one error among API traces takes one click, and the log is usable while diagnostics are on.</dd>
+      <dt>How it functions</dt><dd>Filtering happens on the already newest-first list; <code>StructuredLogList</code> keeps its identity-based cache, so the filtered list is memoized per (entries, filter) pair. Search matches message, category, bucket and object key case-insensitively.</dd>
+      <dt>Files</dt><dd><code>lib/event_log/event_log_workspace.dart</code>, <code>lib/logs/structured_log_list.dart</code>, <code>lib/controllers/app_controller.dart</code></dd>
+      <dt>Verify</dt><dd>Widget test: selecting Error hides API cards; search narrows to matching messages; count text updates.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G15" data-area="Theme" data-priority="P1">
+    <div class="item-head">
+      <div class="tags"><span class="id">G15</span><span class="pill p1">P1</span><span class="pill">Theme</span><span class="pill neutral">Effort S</span></div>
+      <h3>Dark-mode and theme consistency</h3>
+      <p class="observed"><b>Observed:</b> <code>_jsonBlock</code> in <code>browser_workspace.dart</code> uses <code>const Color(0x11000000)</code> (7 % black), which is nearly invisible on the dark panel. <code>_RailDestination</code> hard-codes <code>Color(0xFF075D31)</code> and <code>Color(0xFFD4DED7)</code>; the rail logo uses <code>AppTheme.lightAccent</code> in both modes. Feature pills in Bucket info (<code>_pill</code>) look identical whether a feature is enabled or not, differing only by icon. JSON in Bucket config is plain <code>SelectableText</code> although <code>SourceCodePreview</code> already highlights JSON.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span><span>Dark mode</span></figcaption>
+        <div class="mock dark">
+          <div class="title">Lifecycle JSON</div>
+          <div class="json faint">{
+  "Rules": [
+    { "ID": "expire-tmp", "Status": "Enabled",
+      "Expiration": { "Days": 30 } }
+  ]
+}</div>
+          <div class="bar" style="margin-top:8px"><span class="chip">✓ Versioning</span><span class="chip">⊘ Object lock</span><span class="chip">✓ Lifecycle</span></div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock dark">
+          <div class="title">Lifecycle JSON <span class="b icon" style="float:right">⧉</span></div>
+          <div class="json good">{
+  <span class="k">"Rules"</span>: [
+    { <span class="k">"ID"</span>: <span class="s">"expire-tmp"</span>, <span class="k">"Status"</span>: <span class="s">"Enabled"</span>,
+      <span class="k">"Expiration"</span>: { <span class="k">"Days"</span>: 30 } }
+  ]
+}</div>
+          <div class="bar" style="margin-top:8px"><span class="chip ok">✓ Versioning</span><span class="chip" style="background:transparent;border:1px dashed #556">⊘ Object lock</span><span class="chip ok">✓ Lifecycle</span></div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Replace the hard-coded tint with <code>colorScheme.surfaceContainerHighest</code> and render JSON through <code>SourceCodePreview(language: json)</code>. Add an <code>AppRailTheme</code> <code>ThemeExtension</code> (background, selectedBackground, foreground, logoBackground) consumed by <code>_buildRail</code> and <code>_RailDestination</code>. Make <code>_pill</code> render enabled features filled and disabled ones outlined and muted.</dd>
+      <dt>What it does</dt><dd>Configuration blocks are readable in dark mode, the rail is themeable, and feature state is visible without reading icons.</dd>
+      <dt>How it functions</dt><dd><code>Theme.of(context).extension&lt;AppRailTheme&gt;()</code> with light and dark instances defined next to the color schemes in <code>app_theme.dart</code>.</dd>
+      <dt>Files</dt><dd><code>lib/browser/browser_workspace.dart</code>, <code>lib/theme/app_theme.dart</code>, <code>lib/app/s3_browser_app.dart</code></dd>
+      <dt>Verify</dt><dd>Golden test of Bucket config in dark mode; unit check that no <code>Color(0x</code> literals remain in workspace files.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G16" data-area="Inspector" data-priority="P1">
+    <div class="item-head">
+      <div class="tags"><span class="id">G16</span><span class="pill p1">P1</span><span class="pill">Inspector</span><span class="pill neutral">Effort M</span></div>
+      <h3>Validate JSON and tags before saving bucket configuration</h3>
+      <p class="observed"><b>Observed:</b> <code>_showJsonEditorDialog</code> passes <code>controllerText.text.trim()</code> to <code>onSave</code> without parsing; a syntax error surfaces later as an engine error banner after the dialog has closed and the text is lost. <code>_showTagEditorDialog</code> parses “key=value” lines and silently drops any line without “=”.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span></figcaption>
+        <div class="mock">
+          <div class="dlg" style="margin-top:0;max-width:100%">
+            <div class="title">Policy JSON</div>
+            <div class="json faint" style="background:#f3f5f0;color:#2f3d37">{
+  "Version": "2012-10-17",
+  "Statement": [ { "Effect": "Allow" ]
+}</div>
+            <div class="actions"><span class="b txt">Cancel</span><span class="b pri">Save</span></div>
+          </div>
+          <div class="hint">Save closes the dialog; the engine rejects it 2 s later.</div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div class="dlg" style="margin-top:0;max-width:100%">
+            <div class="title">Policy JSON <span class="b icon" style="float:right">Format</span></div>
+            <div class="json good">{
+  <span class="k">"Version"</span>: <span class="s">"2012-10-17"</span>,
+  <span class="k">"Statement"</span>: [ { <span class="k">"Effect"</span>: <span class="s">"Allow"</span> <span style="background:#7a2a24;color:#fff">]</span>
+}</div>
+            <div class="errtext">Line 3, column 44: expected “}” but found “]”.</div>
+            <div class="actions"><span class="b txt">Cancel</span><span class="b pri dis">Save</span></div>
+          </div>
+          <div class="hint">Tags become key/value rows with add/remove and duplicate-key checks.</div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Move the two dialogs into <code>lib/browser/json_editor_dialog.dart</code> and <code>tag_editor_dialog.dart</code>. JSON editor: monospace field, live <code>jsonDecode</code> validation with line/column from <code>FormatException.offset</code>, Save disabled while invalid, a Format action that pretty-prints. Tag editor: a list of key/value rows with add/remove, validation for empty or duplicate keys and the 50-tag S3 limit.</dd>
+      <dt>What it does</dt><dd>Malformed configuration is caught before a network round trip, and no tag is discarded silently.</dd>
+      <dt>How it functions</dt><dd>Validation runs in the dialog’s <code>StatefulBuilder</code> on each change (debounced 150 ms for large documents). Save returns the canonical string; the existing controller save methods are unchanged.</dd>
+      <dt>Files</dt><dd><code>lib/browser/browser_workspace.dart</code>, new dialog files</dd>
+      <dt>Verify</dt><dd>Widget tests: invalid JSON disables Save and shows position; tag rows with a duplicate key show an error and cannot be saved.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G17" data-area="Mobile" data-priority="P1">
+    <div class="item-head">
+      <div class="tags"><span class="id">G17</span><span class="pill p1">P1</span><span class="pill">Mobile</span><span class="pill neutral">Effort M</span></div>
+      <h3>Phone: no nested scrolling, a compact connection header</h3>
+      <p class="observed"><b>Observed:</b> <code>_mobileBrowserShell</code> is a <code>SingleChildScrollView</code>, and on phones <code>_objectPanel</code> is wrapped in a <code>SizedBox</code> of 78 % screen height (minimum 520 px) containing its own <code>ListView</code>. The page scrolls a little, then the inner list scrolls, and the footer paging sits below the fold. <code>_HeaderControlStrip</code> on phones stacks two labeled dropdowns (about 130 px) above every workspace, including Jobs and Settings.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span><span>390 px</span></figcaption>
+        <div class="mock" style="background:#edf2e9">
+          <div class="phone">
+            <div class="sub">Endpoint profile</div><div class="fld wide" style="margin-bottom:6px">MinIO lab ▾</div>
+            <div class="sub">Backend engine</div><div class="fld wide" style="margin-bottom:8px">Python ▾</div>
+            <div class="seg" style="width:100%"><span class="t">Buckets</span><span class="t on">Objects</span><span class="t">Inspect</span></div>
+            <div class="card" style="margin-top:8px"><div class="title">media-archive</div><div class="fld wide">🔍 Search loaded objects</div><div class="rows" style="margin-top:6px"><div class="r" style="grid-template-columns:22px minmax(0,1fr) 48px"><span class="cb"></span><span>quarterly-report.pdf</span><span>1.2 MiB</span></div><div class="r" style="grid-template-columns:22px minmax(0,1fr) 48px"><span class="cb"></span><span>hero-banner.png</span><span>848 KiB</span></div></div><div class="hint">↕ page scrolls · ↕ list scrolls</div></div>
+          </div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock" style="background:#edf2e9">
+          <div class="phone">
+            <div class="bar"><span class="b" style="flex:1;justify-content:space-between">🔌 MinIO lab · Python <span>▾</span></span></div>
+            <div class="seg" style="width:100%"><span class="t">Buckets</span><span class="t on">Objects</span><span class="t">Inspect</span></div>
+            <div class="card" style="margin-top:8px;min-height:150px;display:flex;flex-direction:column"><div class="title">media-archive</div><div class="fld wide">🔍 Search</div><div class="rows" style="margin-top:6px;flex:1"><div class="r" style="grid-template-columns:22px minmax(0,1fr) 48px"><span class="ic txt">P</span><span>quarterly-report.pdf</span><span>1.2 MiB</span></div><div class="r" style="grid-template-columns:22px minmax(0,1fr) 48px"><span class="ic img">I</span><span>hero-banner.png</span><span>848 KiB</span></div></div><div class="sub">1–50 of 480 · Load more</div></div>
+            <div class="hint">Only the list scrolls; footer always visible. Connection chip opens a sheet.</div>
+          </div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>On phones render the browser as a <code>Column</code> with the section selector and an <code>Expanded</code> section; the object panel fills the remaining height and only its list scrolls. Buckets and Inspect keep page scrolling where content is static. Replace the two stacked dropdowns with one connection chip (profile · engine) that opens a bottom sheet holding both <code>AppSelectField</code>s.</dd>
+      <dt>What it does</dt><dd>Recovers roughly a third of the phone viewport for content and removes the double-scroll feel.</dd>
+      <dt>How it functions</dt><dd>The existing <code>DirectionalSwitcher</code> stays; its <code>layoutBuilder</code> stacks children with <code>Positioned.fill</code> so the incoming and outgoing panels share the viewport. The sheet reuses the controller methods already bound to the dropdowns.</dd>
+      <dt>Files</dt><dd><code>lib/browser/browser_workspace.dart</code> (<code>_mobileBrowserShell</code>, <code>_objectPanel</code>), <code>lib/app/s3_browser_app.dart</code> (<code>_HeaderControlStrip</code> phone branch)</dd>
+      <dt>Verify</dt><dd>Extend the 390 px large-text test: footer paging is visible without scrolling the page; the connection chip opens a sheet with both selectors.</dd>
+    </dl>
+  </article>
+
+  <!-- ============================ P2 ============================ -->
+
+  <article class="item" id="G18" data-area="Theme" data-priority="P2">
+    <div class="item-head">
+      <div class="tags"><span class="id">G18</span><span class="pill p2">P2</span><span class="pill">Theme</span><span class="pill neutral">Effort S</span></div>
+      <h3>Bundle the fonts and use two families</h3>
+      <p class="observed"><b>Observed:</b> <code>app_theme.dart</code> builds the text theme from <code>GoogleFonts.spaceGrotesk</code>, <code>GoogleFonts.sora</code> and <code>GoogleFonts.inter</code>. <code>pubspec.yaml</code> declares no <code>fonts:</code> and <code>main.dart</code> never sets <code>GoogleFonts.config.allowRuntimeFetching = false</code>, so a first launch, or any offline launch before the cache is warm, renders platform fallback fonts and re-lays out when downloads complete. Three families is one more than the design needs.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span><span>First offline launch</span></figcaption>
+        <div class="mock">
+          <div style="font-family:Georgia,serif;font-size:14px;font-weight:700">Object Data Browser</div>
+          <div style="font-family:Georgia,serif" class="sub">Buckets &gt; Objects &gt; Inspect</div>
+          <div class="hint" style="margin-top:8px">Fallback glyphs, then a visible re-layout when Sora, Space Grotesk and Inter arrive from the network.</div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div style="font-size:14px;font-weight:700">Object Data Browser</div>
+          <div class="sub">MinIO lab › media-archive › 2026/</div>
+          <div class="hint" style="margin-top:8px">Inter 400–700 and Sora 700 shipped as assets; identical offline and online; no runtime fetch.</div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Add the font files under <code>apps/flutter_app/assets/fonts/</code> with their OFL licenses, register them in <code>pubspec.yaml</code>, set <code>GoogleFonts.config.allowRuntimeFetching = false</code> in <code>main.dart</code>, and map <code>titleLarge</code> to Sora so Space Grotesk can be dropped.</dd>
+      <dt>What it does</dt><dd>Deterministic typography on every platform and no network dependency for the UI itself.</dd>
+      <dt>How it functions</dt><dd><code>google_fonts</code> resolves bundled assets by family and weight when present; the theme code otherwise stays the same. Add the license to the app’s About/Version Details.</dd>
+      <dt>Files</dt><dd><code>pubspec.yaml</code>, <code>lib/main.dart</code>, <code>lib/theme/app_theme.dart</code>, <code>assets/fonts/</code></dd>
+      <dt>Verify</dt><dd>Run the app with networking disabled and confirm no font fetch log lines; existing golden-free widget tests unaffected.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G19" data-area="Shell" data-priority="P2">
+    <div class="item-head">
+      <div class="tags"><span class="id">G19</span><span class="pill p2">P2</span><span class="pill">Shell</span><span class="pill neutral">Effort S</span></div>
+      <h3>The header mark shows where you are</h3>
+      <p class="observed"><b>Observed:</b> <code>_DesktopHeaderMark</code> renders the static caption “Buckets &gt; Objects &gt; Inspect” under the app name on every workspace. It occupies 260–300 px of the header and conveys nothing about state.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="ic" style="width:26px;height:26px;line-height:26px;background:var(--green-soft);color:var(--green)">▣</span><div><div class="title" style="margin:0">Object Data Browser</div><div class="sub">Buckets &nbsp;&gt;&nbsp; Objects &nbsp;&gt;&nbsp; Inspect</div></div></div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div class="bar"><span class="ic" style="width:26px;height:26px;line-height:26px;background:var(--green-soft);color:var(--green)">▣</span><div><div class="title" style="margin:0">Object Data Browser</div><div class="crumb"><u>MinIO lab</u> › <u>media-archive</u> › <u>2026</u> › <b>reports/</b></div></div></div>
+          <div class="hint">On Jobs: “Jobs · 1 running, 1 failed”. On Settings: “Settings · Connections”.</div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Replace the static caption with a live breadcrumb built from <code>selectedProfile</code>, <code>selectedBucket</code> and <code>currentPrefix</code>; tapping a segment calls <code>refreshObjects(prefix:)</code>. Other workspaces show a one-line status summary.</dd>
+      <dt>What it does</dt><dd>Turns decorative header space into orientation and a navigation shortcut.</dd>
+      <dt>How it functions</dt><dd>Segments are <code>TextButton</code>s in a <code>Wrap</code> with <code>TextOverflow.ellipsis</code> on the last segment; the middle collapses to “…” beyond four levels.</dd>
+      <dt>Files</dt><dd><code>lib/app/s3_browser_app.dart</code> (<code>_DesktopHeaderMark</code>)</dd>
+      <dt>Verify</dt><dd>Widget test: selecting a bucket updates the header text; tapping the bucket segment resets the prefix.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G20" data-area="Shell" data-priority="P2">
+    <div class="item-head">
+      <div class="tags"><span class="id">G20</span><span class="pill p2">P2</span><span class="pill">Shell</span><span class="pill neutral">Effort S</span></div>
+      <h3>Semantics for the custom navigation widgets</h3>
+      <p class="observed"><b>Observed:</b> <code>_RailDestination</code> and <code>CompactSelector._item</code> are plain <code>InkWell</code>s with no <code>Semantics(button:, selected:)</code>, so screen readers announce “MinIO lab” or “Objects” without role or state. The rail tooltip is present only when collapsed. Sort headers in <code>ObjectTable</code> already do this correctly.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span><span>VoiceOver output</span></figcaption>
+        <div class="mock">
+          <div class="json faint" style="background:#f3f5f0;color:#2f3d37">“Buckets”
+“Jobs”
+“Objects”</div>
+          <div class="hint">No role, no selected state, no position.</div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div class="json faint" style="background:#f3f5f0;color:#2f3d37">“Buckets, tab, 1 of 5, selected”
+“Jobs, tab, 2 of 5”
+“Objects, tab, 2 of 3, selected”</div>
+          <div class="hint">Visible focus ring; tooltip on every icon-only control.</div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Wrap each destination and selector item in <code>MergeSemantics</code> + <code>Semantics(button: true, selected: isSelected, label: '$label, tab ${i+1} of $n')</code>; use <code>FocusableActionDetector</code> for a visible focus ring and Enter/Space activation; always provide tooltips on icon-only rail items.</dd>
+      <dt>What it does</dt><dd>Assistive technologies and keyboard users get the same information sighted mouse users already have.</dd>
+      <dt>How it functions</dt><dd>Semantics only; no layout change. <code>CompactSelector</code> receives the index and count it already knows.</dd>
+      <dt>Files</dt><dd><code>lib/widgets/compact_selector.dart</code>, <code>lib/app/s3_browser_app.dart</code></dd>
+      <dt>Verify</dt><dd>Semantics tests using <code>tester.getSemantics</code> asserting <code>isSelected</code> and the label format.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G21" data-area="Browser" data-priority="P2">
+    <div class="item-head">
+      <div class="tags"><span class="id">G21</span><span class="pill p2">P2</span><span class="pill">Browser</span><span class="pill neutral">Effort S</span></div>
+      <h3>Empty states that lead somewhere</h3>
+      <p class="observed"><b>Observed:</b> Empty conditions are centered plain text: “Select a bucket to load objects.”, “No buckets loaded yet for this endpoint.”, “No task history yet.”, “No events recorded yet.” None offers the next action, even though the action is one call away.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span></figcaption>
+        <div class="mock" style="display:grid;place-items:center"><div class="sub">Select a bucket to load objects.</div></div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock" style="display:grid;place-items:center;text-align:center">
+          <div><div style="font-size:22px">▤</div><div class="title" style="margin:4px 0 2px">No bucket open</div><div class="sub">Pick a bucket on the left, or refresh the list for MinIO lab.</div><div class="bar" style="justify-content:center;margin-top:8px"><span class="b">↻ Refresh buckets</span></div></div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Add <code>EmptyState(icon, title, message, action)</code> and use it in the object panel (no profile → Create profile → Settings › Connections; no bucket → Refresh buckets; empty prefix → Upload files), the bucket panel, Jobs and Event Log.</dd>
+      <dt>What it does</dt><dd>A first-run or empty screen tells the user what to do next instead of only what is missing.</dd>
+      <dt>How it functions</dt><dd>Pure presentational widget; actions call existing controller methods or <code>selectTab</code>.</dd>
+      <dt>Files</dt><dd>new <code>lib/widgets/empty_state.dart</code>; <code>object_panel.dart</code>, <code>browser_workspace.dart</code>, <code>tasks_workspace.dart</code>, <code>event_log_workspace.dart</code></dd>
+      <dt>Verify</dt><dd>Widget test: with no profile the object panel shows “Create profile” and tapping it opens Settings.</dd>
+    </dl>
+  </article>
+
+  <article class="item" id="G22" data-area="Inspector" data-priority="P2">
+    <div class="item-head">
+      <div class="tags"><span class="id">G22</span><span class="pill p2">P2</span><span class="pill">Inspector</span><span class="pill neutral">Effort M · capability-gated</span></div>
+      <h3>Version rows that are readable and actionable</h3>
+      <p class="observed"><b>Observed:</b> <code>_versionsView</code> lists each version as a <code>ListTile</code> whose title is the opaque <code>versionId</code>, with the key and metadata in a three-line subtitle and a plain-text trailing “Latest / Prior / Delete marker”. There is no per-version action; the toolbar’s Download/Delete act on the selected object’s current version.</p>
+    </div>
+    <div class="compare">
+      <figure>
+        <figcaption><span>Before · current</span></figcaption>
+        <div class="mock">
+          <div class="card"><b style="font-size:10px;overflow-wrap:anywhere">3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY+MTRCxf3vjVBH40Nr8X8gdRQBpUMLUo</b><div class="sub">2026/quarterly-report.pdf<br>STANDARD - 1.2 MiB - 2026-03-07 09:12</div><div class="sub" style="text-align:right">Latest</div></div>
+          <div class="card"><b style="font-size:10px;overflow-wrap:anywhere">null</b><div class="sub">2026/quarterly-report.pdf<br>STANDARD - 1.1 MiB - 2026-02-28 16:40</div><div class="sub" style="text-align:right">Prior</div></div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption class="after"><span>After · proposed</span></figcaption>
+        <div class="mock">
+          <div class="card"><div class="bar" style="margin:0"><b>quarterly-report.pdf</b><span class="chip ok">Latest</span><span style="flex:1"></span><span class="b icon">⋯</span></div><div class="sub">1.2 MiB · 2026-03-07 09:12 · STANDARD · <span style="font-family:ui-monospace,monospace">3HL4kq…MLUo</span> ⧉</div></div>
+          <div class="card"><div class="bar" style="margin:0"><b>quarterly-report.pdf</b><span class="chip">Prior</span><span style="flex:1"></span><span class="b icon">⋯</span></div><div class="sub">1.1 MiB · 2026-02-28 16:40 · STANDARD · <span style="font-family:ui-monospace,monospace">null</span></div></div>
+          <div class="hint">⋯ → Download this version · Delete this version… (only when the engine reports version operations)</div>
+        </div>
+      </figure>
+    </div>
+    <dl class="detail">
+      <dt>The edit</dt><dd>Title = key, trailing = colored status pill, subtitle = size · date · class · shortened copyable version ID (G08). Add a row menu with per-version download and confirmed delete, shown only when <code>capabilities</code> report version-scoped operations for the active engine.</dd>
+      <dt>What it does</dt><dd>Versions read as history of a file rather than a list of tokens, and specific versions can be acted on where the engine allows it.</dd>
+      <dt>How it functions</dt><dd>The UI checks capability state before rendering the menu; if the engine contract lacks version-scoped download/delete, only the presentation changes and the action work is tracked as an engine task outside this GUI plan.</dd>
+      <dt>Files</dt><dd><code>lib/browser/browser_workspace.dart</code> (<code>_versionsView</code>); engine contract and adapters only if the capability is absent</dd>
+      <dt>Verify</dt><dd>Widget test that the menu is hidden when the mock engine reports no version operations and shown when it does.</dd>
+    </dl>
+  </article>
+
+  <div class="empty" id="none" hidden>No improvements match this filter.</div>
+</section>
+
+<section id="sequence">
+  <div class="section-head">
+    <div>
+      <div class="eyebrow">02 / Delivery sequence</div>
+      <h2>Small, verifiable steps.</h2>
+      <p>Each phase ends with <code>flutter analyze</code> and the full test suite green, plus the gate below. Phases 2–4 can overlap once phase 1 has landed.</p>
+    </div>
+  </div>
+  <div class="roadmap">
+    <div class="phase"><b>Phase 1 · about 1 week</b><h3>Safety</h3><p>G01 confirmations, G02 destructive styling, G03 banner severity, G04 profile delete.</p><div class="gate">Gate: no destructive path reaches an engine without a confirmed dialog; error banners persist until dismissed; tests added for each.</div></div>
+    <div class="phase"><b>Phase 2 · 2–3 weeks</b><h3>Browser &amp; inspector</h3><p>G05 single search, G06 shortcuts, G07 rows, G08 copy, G09 inspector, G15 theme, G16 editors.</p><div class="gate">Gate: keyboard and mouse flows pass at 700, 1000, 1360 and 1500 px in light and dark mode with 130 % text.</div></div>
+    <div class="phase"><b>Phase 3 · 1–2 weeks</b><h3>Settings, Jobs, Log</h3><p>G10 field commit, G11 settings structure, G12 secrets, G13 jobs, G14 log filters.</p><div class="gate">Gate: no setting is lost on blur; one navigator at every width; a failed job is identifiable in under two seconds in a usability check.</div></div>
+    <div class="phase"><b>Phase 4 · 1–2 weeks</b><h3>Polish</h3><p>G17 phone shell, G18 fonts, G19 header breadcrumb, G20 semantics, G21 empty states, G22 versions.</p><div class="gate">Gate: 390 px large-text regression passes; offline launch shows final typography; semantics tests pass.</div></div>
+  </div>
+</section>
+
+<section id="evidence">
+  <div class="section-head">
+    <div>
+      <div class="eyebrow">03 / Evidence &amp; boundaries</div>
+      <h2>What this review establishes.</h2>
+    </div>
+  </div>
+  <div class="evidence">
+    <div class="box">
+      <h3>Inspected</h3>
+      <ul>
+        <li>Read in full: <code>lib/app/s3_browser_app.dart</code>, <code>lib/browser/browser_workspace.dart</code>, <code>object_panel.dart</code>, <code>object_table.dart</code>, <code>browser_workspace_frame.dart</code>, <code>lib/settings/settings_workspace.dart</code>, <code>lib/tasks/tasks_workspace.dart</code>, <code>lib/event_log/event_log_workspace.dart</code>, <code>lib/logs/structured_log_list.dart</code>, <code>lib/widgets/app_select_field.dart</code>, <code>compact_selector.dart</code>, <code>lib/theme/app_theme.dart</code>, <code>breakpoints.dart</code>, <code>app_motion.dart</code>.</li>
+        <li>Sampled: <code>lib/controllers/app_controller.dart</code> (<code>_guard</code>, <code>showBannerMessage</code>, <code>applyObjectFilter</code>, <code>setSelectedObject</code>, delete and download paths, event ordering), <code>lib/benchmark/benchmark_workspace.dart</code> (layout only), <code>pubspec.yaml</code>, the existing test names, the 2.2.5 plan and implementation ledger.</li>
+        <li>Confirmed by search: no <code>Clipboard</code> usage in <code>lib/</code>; no key binding for K; <code>contentTypeFor</code> unused in <code>ObjectTable</code>; no <code>fonts:</code> section in <code>pubspec.yaml</code>.</li>
+      </ul>
+      <h3>Not done here</h3>
+      <ul>
+        <li>No app was launched and no screenshots were taken; every mockup is a reconstruction from source using fictional data.</li>
+        <li><code>flutter analyze</code> and <code>flutter test</code> were not run for this review (the Flutter SDK is not on this machine’s PATH). The 2.2.5 ledger records 119 passing tests at build 2.</li>
+        <li>Benchmark workspace internals, engine adapters and native platform code were out of scope.</li>
+        <li>Effort figures are planning ranges for one developer, including tests, not commitments.</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3>Verification checklist for the implementation</h3>
+      <ul>
+        <li>Every P0 item ships with a widget test that fails on the current tree.</li>
+        <li><code>BrowserWorkspaceFrame</code> signature updated for any new controller state the browser displays (banner severity, search focus, sub-tab memory, task rates).</li>
+        <li>Reduced-motion and “Enable animations” off still remove all new motion (hover swaps, saved-state suffix, sheet transitions).</li>
+        <li>Large-text checks at 130 % and 150 % on the object table, inspector sub-tabs and phone header chip.</li>
+        <li>Dark-mode pass over every surface touched, with no <code>Color(0x…)</code> literals left in workspace files.</li>
+        <li>Keyboard-only walkthrough: open bucket, search, check two rows, delete with confirmation, undo via Cancel, copy a key, switch workspace.</li>
+        <li>Security constraints from <code>AGENTS.md</code> unchanged: credentials never leave <code>ProfileSecretStore</code>; exports remain metadata-only; previews stay bounded and non-executing.</li>
+      </ul>
+      <h3>Relationship to the 2.2.5 plan</h3>
+      <p>All eighteen items of <code>docs/improvement-plan.html</code> are implemented. This plan does not reopen them; it starts from that tree. Where an item here touches the same widget (object rows, inspector, settings), it builds on the 2.2.5 structure rather than replacing it.</p>
+    </div>
+  </div>
+</section>
+
+<footer>Prepared for Object Data Browser · Local, self-contained HTML · No external assets or telemetry · Reviewed tree: <code>main @ fe45c59</code> · Mockups use fictional endpoint, object and job data.</footer>
+</main>
+
+<script>
+(function(){
+  var q=document.getElementById('q'),area=document.getElementById('area'),prio=document.getElementById('prio'),count=document.getElementById('count'),none=document.getElementById('none');
+  var items=Array.prototype.slice.call(document.querySelectorAll('.item'));
+  function apply(){
+    var text=(q.value||'').toLowerCase(),a=area.value,p=prio.value,shown=0;
+    items.forEach(function(el){
+      var ok=(!a||el.dataset.area===a)&&(!p||el.dataset.priority===p)&&(!text||el.textContent.toLowerCase().indexOf(text)>-1);
+      el.hidden=!ok; if(ok) shown++;
+    });
+    count.textContent=shown+' of '+items.length+' shown';
+    none.hidden=shown!==0;
+  }
+  [q,area,prio].forEach(function(el){el.addEventListener('input',apply);el.addEventListener('change',apply);});
+  apply();
+})();
+</script>
+</body>
+</html>

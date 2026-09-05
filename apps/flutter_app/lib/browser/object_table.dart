@@ -1,3 +1,4 @@
+import '../utils/format.dart';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -58,7 +59,7 @@ class ObjectTable extends StatelessWidget {
                                   'Name', BrowserObjectSortField.name))),
                       if (!narrow)
                         SizedBox(
-                            width: 140,
+                            width: 165,
                             child: _sortHeader('Modified',
                                 BrowserObjectSortField.lastModified)),
                       SizedBox(
@@ -80,94 +81,133 @@ class ObjectTable extends StatelessWidget {
                     final theme = Theme.of(context);
                     void toggle() => onToggle(
                         object, HardwareKeyboard.instance.isShiftPressed);
-                    return Semantics(
-                        selected: checked || inspected,
-                        label: object.isFolder ? 'Folder ${object.name}' : null,
-                        child: Material(
-                            color: checked || inspected
-                                ? theme.colorScheme.primaryContainer
-                                : Colors.transparent,
-                            child: Builder(builder: (rowContext) {
-                              void actions() {
-                                final box =
-                                    rowContext.findRenderObject() as RenderBox;
-                                onShowContextMenu(
-                                    object,
-                                    box.localToGlobal(
-                                        box.size.center(Offset.zero)));
-                              }
+                    return _HoverRow(
+                        builder: (active) => Semantics(
+                            selected: checked || inspected,
+                            label: object.isFolder
+                                ? 'Folder ${object.name}'
+                                : null,
+                            child: Material(
+                                color: checked || inspected
+                                    ? theme.colorScheme.primaryContainer
+                                    : Colors.transparent,
+                                child: Builder(builder: (rowContext) {
+                                  void actions() {
+                                    final box = rowContext.findRenderObject()
+                                        as RenderBox;
+                                    onShowContextMenu(
+                                        object,
+                                        box.localToGlobal(
+                                            box.size.center(Offset.zero)));
+                                  }
 
-                              return CallbackShortcuts(
-                                  bindings: {
-                                    const SingleActivator(
-                                        LogicalKeyboardKey.space): toggle,
-                                    const SingleActivator(
-                                            LogicalKeyboardKey.enter):
-                                        () => onSelect(object),
-                                    const SingleActivator(
-                                        LogicalKeyboardKey.f10,
-                                        shift: true): actions,
-                                  },
-                                  child: InkWell(
-                                      onTap: () {
-                                        if (HardwareKeyboard
-                                            .instance.isShiftPressed) {
-                                          toggle();
-                                        } else {
-                                          onSelect(object);
-                                        }
+                                  return CallbackShortcuts(
+                                      bindings: {
+                                        const SingleActivator(
+                                            LogicalKeyboardKey.space): toggle,
+                                        const SingleActivator(
+                                                LogicalKeyboardKey.enter):
+                                            () => onSelect(object),
+                                        const SingleActivator(
+                                            LogicalKeyboardKey.f10,
+                                            shift: true): actions,
                                       },
-                                      onLongPress: actions,
-                                      onSecondaryTapDown: (details) =>
-                                          onShowContextMenu(
-                                              object, details.globalPosition),
-                                      child: Padding(
-                                          padding: const EdgeInsets.symmetric(
-                                              horizontal: 8),
-                                          child: Row(children: [
-                                            SizedBox(
-                                                width: 48,
-                                                child: object.isFolder
-                                                    ? const Icon(
-                                                        Icons.folder_outlined)
-                                                    : Checkbox(
-                                                        value: checked,
-                                                        semanticLabel:
-                                                            'Select ${object.name}',
-                                                        onChanged: (_) =>
-                                                            toggle())),
-                                            Expanded(
-                                                child: Tooltip(
-                                                    message: object.key,
-                                                    child: Text(object.name,
-                                                        maxLines: 1,
-                                                        overflow: TextOverflow
-                                                            .ellipsis))),
-                                            if (!narrow)
-                                              SizedBox(
-                                                  width: 140,
-                                                  child: Text(
-                                                      '${object.modifiedAt.month}/${object.modifiedAt.day} ${object.modifiedAt.hour.toString().padLeft(2, '0')}:${object.modifiedAt.minute.toString().padLeft(2, '0')}',
-                                                      style: theme.textTheme
-                                                          .bodySmall)),
-                                            SizedBox(
-                                                width: 96,
-                                                child: Text(
-                                                    object.isFolder
-                                                        ? '—'
-                                                        : _bytes(object.size),
-                                                    style: theme
-                                                        .textTheme.bodySmall)),
-                                            SizedBox(
-                                                width: 48,
-                                                child: IconButton(
-                                                    tooltip:
-                                                        'Object actions for ${object.name}',
-                                                    icon: const Icon(
-                                                        Icons.more_horiz),
-                                                    onPressed: actions)),
-                                          ]))));
-                            })));
+                                      child: InkWell(
+                                          onTap: () {
+                                            if (HardwareKeyboard
+                                                .instance.isShiftPressed) {
+                                              toggle();
+                                            } else {
+                                              onSelect(object);
+                                            }
+                                          },
+                                          onLongPress: actions,
+                                          onSecondaryTapDown: (details) =>
+                                              onShowContextMenu(object,
+                                                  details.globalPosition),
+                                          child: Padding(
+                                              padding:
+                                                  const EdgeInsets.symmetric(
+                                                      horizontal: 8),
+                                              child: Row(children: [
+                                                SizedBox(
+                                                    width: 48,
+                                                    child: object.isFolder
+                                                        ? const Icon(Icons
+                                                            .folder_outlined)
+                                                        : Checkbox(
+                                                            value: checked,
+                                                            semanticLabel:
+                                                                'Select ${object.name}',
+                                                            onChanged: (_) =>
+                                                                toggle())),
+                                                if (!object.isFolder)
+                                                  Padding(
+                                                      padding:
+                                                          const EdgeInsets.only(
+                                                              right: 8),
+                                                      child: Icon(
+                                                          objectTypeIcon(
+                                                              object.key,
+                                                              contentTypeFor(
+                                                                  object)),
+                                                          size: 18)),
+                                                Expanded(
+                                                    child: Tooltip(
+                                                        message: object.key,
+                                                        child: Text(object.name,
+                                                            maxLines: 1,
+                                                            overflow:
+                                                                TextOverflow
+                                                                    .ellipsis))),
+                                                if (!narrow)
+                                                  SizedBox(
+                                                      width: 165,
+                                                      child: Tooltip(
+                                                          message:
+                                                              '${object.modifiedAt.toIso8601String()} · ${formatRelative(object.modifiedAt)}',
+                                                          child: Text(
+                                                              formatDateTime(object
+                                                                  .modifiedAt),
+                                                              style: theme
+                                                                  .textTheme
+                                                                  .bodySmall))),
+                                                SizedBox(
+                                                    width: 96,
+                                                    child: Text(
+                                                        object.isFolder
+                                                            ? '—'
+                                                            : formatBytes(
+                                                                object.size),
+                                                        textAlign:
+                                                            TextAlign.right,
+                                                        style: theme
+                                                            .textTheme.bodySmall
+                                                            ?.copyWith(
+                                                                fontFeatures: const [
+                                                              FontFeature
+                                                                  .tabularFigures()
+                                                            ]))),
+                                                SizedBox(
+                                                    width: 48,
+                                                    child: Opacity(
+                                                        opacity: AppPlatform
+                                                                    .isMobile ||
+                                                                active ||
+                                                                checked ||
+                                                                inspected
+                                                            ? 1
+                                                            : 0,
+                                                        child: IconButton(
+                                                            tooltip:
+                                                                'Object actions for ${object.name}',
+                                                            icon: const Icon(
+                                                                Icons
+                                                                    .more_horiz),
+                                                            onPressed:
+                                                                actions))),
+                                              ]))));
+                                }))));
                   })),
         ]);
       });
@@ -198,11 +238,57 @@ class ObjectTable extends StatelessWidget {
                 ]))));
   }
 
-  static String _bytes(int n) => n >= 1073741824
-      ? '${(n / 1073741824).toStringAsFixed(1)} GiB'
-      : n >= 1048576
-          ? '${(n / 1048576).toStringAsFixed(1)} MiB'
-          : n >= 1024
-              ? '${(n / 1024).toStringAsFixed(1)} KiB'
-              : '$n B';
+  static IconData objectTypeIcon(String key, String contentType) {
+    final ext = key.split('.').last.toLowerCase();
+    if (contentType.startsWith('image/') ||
+        ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].contains(ext)) {
+      return Icons.image_outlined;
+    }
+    if (contentType.startsWith('video/') ||
+        ['mp4', 'mov', 'webm'].contains(ext)) {
+      return Icons.movie_outlined;
+    }
+    if (['zip', 'gz', 'tar', '7z', 'rar'].contains(ext)) {
+      return Icons.archive_outlined;
+    }
+    if ([
+      'json',
+      'html',
+      'css',
+      'js',
+      'ts',
+      'py',
+      'dart',
+      'go',
+      'rs',
+      'java',
+      'yaml',
+      'xml'
+    ].contains(ext)) {
+      return Icons.code;
+    }
+    if (contentType.startsWith('text/') ||
+        ['pdf', 'doc', 'docx', 'txt', 'md'].contains(ext)) {
+      return Icons.description_outlined;
+    }
+    return Icons.insert_drive_file_outlined;
+  }
+}
+
+class _HoverRow extends StatefulWidget {
+  const _HoverRow({required this.builder});
+  final Widget Function(bool active) builder;
+  @override
+  State<_HoverRow> createState() => _HoverRowState();
+}
+
+class _HoverRowState extends State<_HoverRow> {
+  bool _hover = false, _focus = false;
+  @override
+  Widget build(BuildContext context) => MouseRegion(
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: Focus(
+          onFocusChange: (v) => setState(() => _focus = v),
+          child: widget.builder(_hover || _focus)));
 }

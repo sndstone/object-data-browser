@@ -1,3 +1,10 @@
+import '../widgets/empty_state.dart';
+import 'json_editor_dialog.dart';
+import 'tag_editor_dialog.dart';
+import '../widgets/copyable_value.dart';
+import '../utils/format.dart';
+import '../widgets/setting_fields.dart';
+import '../widgets/danger_button.dart';
 import 'dart:io';
 import 'dart:math' as math;
 
@@ -47,6 +54,47 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   double? _pendingInspectorSize;
   _MobileBrowserSection _mobileSection = _MobileBrowserSection.buckets;
   bool _dragging = false;
+  @override
+  void initState() {
+    super.initState();
+    if (controller.pendingObjectSearchFocus) {
+      _mobileSection = _MobileBrowserSection.objects;
+    }
+    controller.objectSearchFocus.addListener(_searchRequested);
+    controller.inspectorToggleRequest.addListener(_toggleInspector);
+    controller.deleteSelectionRequest.addListener(_deleteRequested);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && controller.pendingInspectorToggle) _toggleInspector();
+    });
+  }
+
+  void _deleteRequested() {
+    if (mounted) _confirmDeleteObjects(context);
+  }
+
+  void _toggleInspector() {
+    if (!mounted) return;
+    controller.pendingInspectorToggle = false;
+    if (MediaQuery.sizeOf(context).width >= 1000) {
+      controller.updateSettings(controller.settings.copyWith(
+          browserInspectorVisible:
+              !controller.settings.browserInspectorVisible));
+    } else {
+      _showInspectorDialog(context);
+    }
+  }
+
+  void _searchRequested() {
+    if (mounted) setState(() => _mobileSection = _MobileBrowserSection.objects);
+  }
+
+  @override
+  void dispose() {
+    controller.objectSearchFocus.removeListener(_searchRequested);
+    controller.inspectorToggleRequest.removeListener(_toggleInspector);
+    controller.deleteSelectionRequest.removeListener(_deleteRequested);
+    super.dispose();
+  }
 
   AppSettings get _settings => controller.settings;
 
@@ -73,7 +121,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         maxSize,
       );
     }
-    final minSize = desktopCompact ? 140.0 : 160.0;
+    final minSize =
+        math.max(220.0, MediaQuery.textScalerOf(context).scale(160));
     final maxSize = math.max(
       minSize,
       constraints.maxHeight * (desktopCompact ? 0.29 : 0.32),
@@ -285,13 +334,14 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     final duration = AppMotion.duration(context,
         enabled: controller.settings.enableAnimations, milliseconds: 260);
 
-    return SingleChildScrollView(
+    return Padding(
       padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
       child: Column(
         children: [
           SizedBox(
             width: double.infinity,
             child: CompactSelector<_MobileBrowserSection>(
+              dense: true,
               selected: effectiveSection,
               expand: true,
               options: const [
@@ -319,11 +369,13 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             ),
           ),
           const SizedBox(height: 14),
-          DirectionalSwitcher(
+          Expanded(
+              child: DirectionalSwitcher(
             position: effectiveSection.index,
             duration: duration,
             layoutBuilder: (current, previous) => Stack(
                 alignment: Alignment.topCenter,
+                fit: StackFit.expand,
                 children: [...previous, if (current != null) current]),
             child: KeyedSubtree(
               key: ValueKey(effectiveSection),
@@ -336,7 +388,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                   _inspectorPanel(context, compact: true),
               },
             ),
-          ),
+          )),
         ],
       ),
     );
@@ -519,10 +571,19 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             ),
           ),
         ],
+        const PopupMenuItem(value: 'copy-key', child: Text('Copy key')),
+        const PopupMenuItem(value: 'copy-uri', child: Text('Copy s3:// URI')),
+        if (!object.isFolder &&
+            controller.selectedProfile?.endpointType !=
+                EndpointProfileType.azureBlob)
+          const PopupMenuItem(
+              value: 'copy-url', child: Text('Copy presigned URL')),
         const PopupMenuDivider(),
         PopupMenuItem(
           value: 'delete',
           child: ListTile(
+            iconColor: Theme.of(context).colorScheme.error,
+            textColor: Theme.of(context).colorScheme.error,
             contentPadding: EdgeInsets.zero,
             leading: Icon(
               Icons.delete_outline,
@@ -537,6 +598,21 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     );
 
     switch (selected) {
+      case 'copy-key':
+        await copyValue(controller, 'Key', object.key);
+        return;
+      case 'copy-uri':
+        await copyValue(controller, 'S3 URI',
+            's3://${controller.selectedBucket?.name}/${object.key}');
+        return;
+      case 'copy-url':
+        await controller.generateSelectedPresignedUrl();
+        final bundle = controller.selectedObjectDetails?.presignedUrl;
+        if (bundle != null &&
+            controller.bannerSeverity != BannerSeverity.error) {
+          await copyValue(controller, 'Presigned URL', bundle.url);
+        }
+        return;
       case 'open-folder':
         await controller.openFolder(object);
         return;
@@ -670,6 +746,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     if (keys.isEmpty) return;
     final profileId = controller.selectedProfile?.id;
     final bucketName = controller.selectedBucket?.name;
+    final engineId = controller.activeEngineId;
     final confirmed = await showDialog<bool>(
         context: context,
         builder: (context) => AlertDialog(
@@ -680,14 +757,63 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                   TextButton(
                       onPressed: () => Navigator.pop(context, false),
                       child: const Text('Cancel')),
-                  FilledButton(
+                  DangerButton(
                       onPressed: () => Navigator.pop(context, true),
-                      child: const Text('Delete'))
+                      child: Text('Delete ${keys.length} object(s)'))
                 ]));
     if (confirmed == true &&
         controller.selectedProfile?.id == profileId &&
-        controller.selectedBucket?.name == bucketName) {
+        controller.selectedBucket?.name == bucketName &&
+        controller.activeEngineId == engineId) {
       await controller.deleteObjectKeys(keys);
+    }
+  }
+
+  Future<void> _confirmDeleteAll(BuildContext context) async {
+    final profileId = controller.selectedProfile?.id;
+    final engine = controller.activeEngineId;
+    final config = controller.deleteAllConfig;
+    final selectedBucket = controller.selectedBucket?.name;
+    final bucket = config.bucketName.trim();
+    if (profileId == null ||
+        bucket.isEmpty ||
+        controller.deleteAllState.running) {
+      return;
+    }
+    var typed = '';
+    final accepted = await showDialog<bool>(
+        context: context,
+        builder: (context) => StatefulBuilder(
+            builder: (context, update) => AlertDialog(
+                  title: const Text('Delete all objects?'),
+                  content: SingleChildScrollView(
+                      child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    Text(
+                        'Bucket: $bucket\nEngine: $engine\nBatch size: ${config.batchSize}\n\nThis deletes every object. Type the bucket name to confirm.'),
+                    TextField(
+                        autofocus: true,
+                        decoration: const InputDecoration(
+                            labelText: 'Bucket name confirmation'),
+                        onChanged: (v) => update(() => typed = v)),
+                  ])),
+                  actions: [
+                    TextButton(
+                        onPressed: () => Navigator.pop(context, false),
+                        child: const Text('Cancel')),
+                    DangerButton(
+                        onPressed: typed.trim() == bucket
+                            ? () => Navigator.pop(context, true)
+                            : null,
+                        child: const Text('Delete all objects'))
+                  ],
+                )));
+    if (accepted == true &&
+        controller.selectedProfile?.id == profileId &&
+        controller.activeEngineId == engine &&
+        controller.selectedBucket?.name == selectedBucket &&
+        identical(controller.deleteAllConfig, config) &&
+        !controller.deleteAllState.running) {
+      await controller.runDeleteAllTool();
     }
   }
 
@@ -708,12 +834,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         },
         onContextMenu: (object, position) =>
             _showObjectContextMenu(context, object, position));
-    return Breakpoints.isPhone(MediaQuery.sizeOf(context).width)
-        ? SizedBox(
-            height:
-                (MediaQuery.sizeOf(context).height * .78).clamp(520.0, 920.0),
-            child: panel)
-        : panel;
+    return panel;
   }
 
   Widget _inspectorPanel(BuildContext context, {required bool compact}) {
@@ -733,6 +854,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             BrowserInspectorTab.versions,
           ];
     contextualTabs.addAll([
+      if (!contextualTabs.contains(BrowserInspectorTab.bucketInfo))
+        BrowserInspectorTab.bucketInfo,
       if (!contextualTabs.contains(BrowserInspectorTab.bucketAdmin))
         BrowserInspectorTab.bucketAdmin,
       BrowserInspectorTab.tools,
@@ -753,7 +876,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         : availableTabs.first;
     final desktopCompact = _desktopCompact(context);
     final panelBody = DirectionalSwitcher(
-      position: availableTabs.indexOf(tab),
+      position: tab.index,
       duration: AppMotion.duration(context,
           enabled: controller.settings.enableAnimations),
       child: KeyedSubtree(
@@ -792,14 +915,57 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: Theme.of(context).textTheme.titleLarge)),
+              if (controller.selectedObject != null)
+                IconButton(
+                    tooltip: 'Back to bucket',
+                    onPressed: controller.clearSelectedObject,
+                    icon: const Icon(Icons.arrow_back)),
+              IconButton(
+                  tooltip: 'Hide inspector',
+                  onPressed: () {
+                    controller.updateSettings(controller.settings
+                        .copyWith(browserInspectorVisible: false));
+                    if (phone) {
+                      setState(
+                          () => _mobileSection = _MobileBrowserSection.objects);
+                    }
+                    if (Navigator.of(context).canPop()) {
+                      Navigator.of(context).pop();
+                    }
+                  },
+                  icon: const Icon(Icons.close)),
             ]),
             const SizedBox(height: 12),
+            CompactSelector<InspectorGroup>(
+                expand: true,
+                selected: tab.group,
+                dense: true,
+                options: [
+                  for (final group in InspectorGroup.values)
+                    if (availableTabs.any((t) => t.group == group))
+                      CompactSelectorOption(
+                          value: group,
+                          label: switch (group) {
+                            InspectorGroup.object => 'Object',
+                            InspectorGroup.bucket => 'Bucket',
+                            InspectorGroup.diagnostics => 'Diagnostics'
+                          })
+                ],
+                onChanged: (group) {
+                  final tabs =
+                      availableTabs.where((t) => t.group == group).toList();
+                  final remembered = controller.inspectorGroupTabs[group];
+                  controller.setInspectorTab(
+                      tabs.contains(remembered) ? remembered! : tabs.first);
+                }),
+            const SizedBox(height: 6),
             CompactSelector<BrowserInspectorTab>(
               selected: tab,
-              wrap: true,
+              wrap: false,
               dense: true,
               onChanged: controller.setInspectorTab,
               options: availableTabs
+                  .where((t) => t.group == tab.group)
                   .map(
                     (entry) => CompactSelectorOption(
                       value: entry,
@@ -810,16 +976,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                   .toList(),
             ),
             const SizedBox(height: 12),
-            if (phone)
-              panelBody
-            else if (compact)
-              SizedBox(
-                height: (MediaQuery.sizeOf(context).height * 0.62)
-                    .clamp(420.0, 920.0),
-                child: panelBody,
-              )
-            else
-              Expanded(child: panelBody),
+            Expanded(child: panelBody),
           ],
         ),
       ),
@@ -885,10 +1042,6 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         ]),
         const SizedBox(height: 12),
         _inlineStat('Selected bucket', admin.bucketName),
-        _inlineStat(
-          'Action surface',
-          'Right-click the bucket or use the overflow menu in the bucket list.',
-        ),
         const Divider(height: 16),
         Text('Lifecycle JSON', style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 8),
@@ -945,7 +1098,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           'Created',
           bucket.createdAt == null
               ? 'Unknown'
-              : _formatDateTime(bucket.createdAt!),
+              : formatDateTime(bucket.createdAt!),
         ),
         _inlineStat('Approx objects', '~${bucket.objectCountHint}'),
         _inlineStat(
@@ -1065,40 +1218,28 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       children: [
         _inlineStat('Key', object.key),
         _inlineStat('Storage class', object.storageClass),
-        _inlineStat('Last modified', _formatDateTime(object.modifiedAt)),
-        _inlineStat('Size', _formatBytes(object.size)),
+        _inlineStat('Last modified', formatDateTime(object.modifiedAt)),
+        _inlineStat('Size', formatBytes(object.size)),
         const Divider(height: 16),
         Text('Metadata', style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 8),
         ...details.metadata.entries.map(
-          (entry) => ListTile(
-            contentPadding: EdgeInsets.zero,
-            dense: true,
-            title: Text(entry.key),
-            trailing: Text(entry.value),
-          ),
+          (entry) => CopyableValue(
+              label: entry.key, value: entry.value, controller: controller),
         ),
         const Divider(height: 16),
         Text('Headers', style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 8),
         ...details.headers.entries.map(
-          (entry) => ListTile(
-            contentPadding: EdgeInsets.zero,
-            dense: true,
-            title: Text(entry.key),
-            trailing: Text(entry.value),
-          ),
+          (entry) => CopyableValue(
+              label: entry.key, value: entry.value, controller: controller),
         ),
         const Divider(height: 16),
         Text('Tags', style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 8),
         ...details.tags.entries.map(
-          (entry) => ListTile(
-            contentPadding: EdgeInsets.zero,
-            dense: true,
-            title: Text(entry.key),
-            trailing: Text(entry.value),
-          ),
+          (entry) => CopyableValue(
+              label: entry.key, value: entry.value, controller: controller),
         ),
       ],
     );
@@ -1485,8 +1626,9 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               label: const Text('Download selected'),
             ),
             OutlinedButton.icon(
-              onPressed:
-                  hasSelectedObject ? controller.deleteSelectedObject : null,
+              onPressed: hasSelectedObject
+                  ? () => _confirmDeleteObjects(context)
+                  : null,
               icon: const Icon(Icons.delete_outline),
               label: const Text('Delete selected'),
             ),
@@ -1584,16 +1726,28 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           (version) => ListTile(
             contentPadding: EdgeInsets.zero,
             dense: true,
-            title: Text(version.versionId),
-            subtitle: Text(
-              '${version.key}\n${version.storageClass} - ${_formatBytes(version.size)} - ${_formatDateTime(version.modifiedAt)}',
-            ),
-            isThreeLine: true,
-            trailing: Text(
-              version.deleteMarker
-                  ? 'Delete marker'
-                  : (version.latest ? 'Latest' : 'Prior'),
-            ),
+            title:
+                Text(version.key, maxLines: 1, overflow: TextOverflow.ellipsis),
+            subtitle:
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(
+                  '${formatBytes(version.size)} · ${formatDateTime(version.modifiedAt)} · ${version.storageClass}'),
+              CopyableValue(
+                  label: 'Version ID',
+                  value: version.versionId,
+                  controller: controller,
+                  monospace: true,
+                  shorten: true),
+            ]),
+            trailing: Chip(
+                label: Text(version.deleteMarker
+                    ? 'Delete marker'
+                    : version.latest
+                        ? 'Latest'
+                        : 'Prior'),
+                backgroundColor: version.latest
+                    ? Theme.of(context).colorScheme.primaryContainer
+                    : null),
           ),
         ),
       ],
@@ -1608,6 +1762,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       children: [
         _numberField(
           label: 'Expiration (minutes)',
+          min: 1,
+          max: 10080,
           initialValue: controller.settings.defaultPresignMinutes,
           onSubmitted: (value) {
             controller.updateSettings(
@@ -1628,7 +1784,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         else ...[
           _inlineStat('Expires', '${bundle.expirationMinutes} minutes'),
           const SizedBox(height: 8),
-          SelectableText(bundle.url),
+          CopyableValue(
+              label: 'Presigned URL',
+              value: bundle.url,
+              controller: controller),
           const SizedBox(height: 16),
           Text('curl helper', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 8),
@@ -1672,6 +1831,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         const SizedBox(height: 8),
         _numberField(
           label: 'Object size (bytes)',
+          min: 0,
+          max: 5368709120,
           initialValue: testData.objectSizeBytes,
           onSubmitted: (value) {
             controller.updateTestDataConfig(
@@ -1745,6 +1906,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             Expanded(
               child: _numberField(
                 label: 'Batch size',
+                min: 1,
+                max: 1000,
                 initialValue: deleteAll.batchSize,
                 onSubmitted: (value) {
                   controller.updateDeleteAllConfig(
@@ -1798,6 +1961,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             Expanded(
               child: _numberField(
                 label: 'List max keys',
+                min: 1,
+                max: 1000,
                 initialValue: deleteAll.listMaxKeys,
                 onSubmitted: (value) {
                   controller.updateDeleteAllConfig(
@@ -1809,6 +1974,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             Expanded(
               child: _numberField(
                 label: 'Delete delay (ms)',
+                min: 0,
+                max: 2147483647,
                 initialValue: deleteAll.deletionDelayMs,
                 onSubmitted: (value) {
                   controller.updateDeleteAllConfig(
@@ -1829,7 +1996,9 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           title: const Text('Immediate deletion'),
         ),
         FilledButton.icon(
-          onPressed: controller.runDeleteAllTool,
+          onPressed: controller.deleteAllState.running
+              ? null
+              : () => _confirmDeleteAll(context),
           icon: const Icon(Icons.delete_sweep_outlined),
           label: const Text('Run delete all'),
         ),
@@ -1899,7 +2068,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               contentPadding: EdgeInsets.zero,
               dense: true,
               title: Text('[${event.level}] ${event.message}'),
-              subtitle: Text(_formatDateTime(event.timestamp)),
+              subtitle: Text(formatDateTime(event.timestamp)),
             ),
           ),
         if ((details?.debugLogExcerpt ?? const <String>[]).isNotEmpty) ...[
@@ -1917,20 +2086,14 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     required Key key,
     required List<Widget> children,
   }) {
-    final phone = Breakpoints.isPhone(MediaQuery.sizeOf(context).width);
-    return ListView(
-      key: key,
-      shrinkWrap: phone,
-      primary: false,
-      physics: phone
-          ? const NeverScrollableScrollPhysics()
-          : const AlwaysScrollableScrollPhysics(),
-      children: children,
-    );
+    return ListView(key: key, primary: false, children: children);
   }
 
   Widget _inlineStat(String label, String value) {
     final theme = Theme.of(context);
+    if (['Key', 'ETag', 'Bucket', 'Bucket name'].contains(label)) {
+      return CopyableValue(label: label, value: value, controller: controller);
+    }
     return Padding(
       padding: const EdgeInsets.only(bottom: 6),
       child: RichText(
@@ -1956,6 +2119,13 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
 
   Widget _pill(String label, bool enabled) {
     return Chip(
+      backgroundColor: enabled
+          ? Theme.of(context).colorScheme.primaryContainer
+          : Colors.transparent,
+      labelStyle: TextStyle(
+          color: enabled
+              ? Theme.of(context).colorScheme.onPrimaryContainer
+              : Theme.of(context).colorScheme.onSurfaceVariant),
       avatar: Icon(
         enabled ? Icons.check_circle : Icons.block,
         size: 16,
@@ -1971,9 +2141,17 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       padding: EdgeInsets.all(desktopCompact ? 10 : 12),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(desktopCompact ? 12 : 14),
-        color: const Color(0x11000000),
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
       ),
-      child: SelectableText(value),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Align(
+            alignment: Alignment.centerRight,
+            child: IconButton(
+                tooltip: 'Copy value',
+                onPressed: () => copyValue(controller, 'Value', value),
+                icon: const Icon(Icons.copy_outlined))),
+        SourceCodePreview(source: value, language: 'json')
+      ]),
     );
   }
 
@@ -1990,50 +2168,26 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     required String initialValue,
     required ValueChanged<String> onSubmitted,
   }) {
-    return TextFormField(
-      initialValue: initialValue,
-      decoration: InputDecoration(labelText: label),
-      onFieldSubmitted: onSubmitted,
-    );
+    return SettingTextField(
+        key: ValueKey(label),
+        label: label,
+        value: initialValue,
+        onCommit: onSubmitted);
   }
 
-  Widget _numberField({
-    required String label,
-    required int initialValue,
-    required ValueChanged<int> onSubmitted,
-  }) {
-    return TextFormField(
-      initialValue: '$initialValue',
-      keyboardType: TextInputType.number,
-      decoration: InputDecoration(labelText: label),
-      onFieldSubmitted: (value) {
-        final parsed = int.tryParse(value);
-        if (parsed != null) {
-          onSubmitted(parsed);
-        }
-      },
-    );
-  }
-
-  String _formatBytes(int value) {
-    if (value >= 1024 * 1024 * 1024) {
-      return '${(value / (1024 * 1024 * 1024)).toStringAsFixed(1)} GiB';
-    }
-    if (value >= 1024 * 1024) {
-      return '${(value / (1024 * 1024)).toStringAsFixed(1)} MiB';
-    }
-    if (value >= 1024) {
-      return '${(value / 1024).toStringAsFixed(1)} KiB';
-    }
-    return '$value B';
-  }
-
-  String _formatDateTime(DateTime value) {
-    final twoDigitMonth = value.month.toString().padLeft(2, '0');
-    final twoDigitDay = value.day.toString().padLeft(2, '0');
-    final twoDigitHour = value.hour.toString().padLeft(2, '0');
-    final twoDigitMinute = value.minute.toString().padLeft(2, '0');
-    return '${value.year}-$twoDigitMonth-$twoDigitDay $twoDigitHour:$twoDigitMinute';
+  Widget _numberField(
+      {required String label,
+      required int initialValue,
+      required ValueChanged<int> onSubmitted,
+      int min = 1,
+      int max = 2147483647}) {
+    return SettingNumberField(
+        key: ValueKey(label),
+        label: label,
+        value: initialValue,
+        min: min,
+        max: max,
+        onCommit: onSubmitted);
   }
 
   Future<void> _showCreateBucketDialog(BuildContext context) async {
@@ -2118,6 +2272,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     String bucketName, {
     bool force = false,
   }) async {
+    final profileId = controller.selectedProfile?.id;
+    final engineId = controller.activeEngineId;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -2132,14 +2288,16 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             onPressed: () => Navigator.of(context).pop(false),
             child: const Text('Cancel'),
           ),
-          FilledButton(
+          DangerButton(
             onPressed: () => Navigator.of(context).pop(true),
             child: Text(force ? 'Force delete' : 'Delete'),
           ),
         ],
       ),
     );
-    if (confirmed == true) {
+    if (confirmed == true &&
+        controller.selectedProfile?.id == profileId &&
+        controller.activeEngineId == engineId) {
       await controller.deleteBucketByName(bucketName, force: force);
     }
   }
@@ -2263,94 +2421,19 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     required String initialValue,
     required Future<void> Function(String value) onSave,
   }) async {
-    final controllerText = TextEditingController(text: initialValue);
-    await showDialog<void>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text(title),
-        content: SizedBox(
-          width: 560,
-          child: TextField(
-            controller: controllerText,
-            minLines: 12,
-            maxLines: 20,
-            decoration: const InputDecoration(
-              border: OutlineInputBorder(),
-            ),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () async {
-              Navigator.of(context).pop();
-              await onSave(controllerText.text.trim());
-            },
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
-    controllerText.dispose();
+    final value = await showDialog<String>(
+        context: context,
+        builder: (_) =>
+            JsonEditorDialog(title: title, initialValue: initialValue));
+    if (value != null) await onSave(value);
   }
 
-  Future<void> _showTagEditorDialog(
-    BuildContext context, {
-    required Map<String, String> initialTags,
-  }) async {
-    final controllerText = TextEditingController(
-      text: initialTags.entries
-          .map((entry) => '${entry.key}=${entry.value}')
-          .join('\n'),
-    );
-    await showDialog<void>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Bucket tags'),
-        content: SizedBox(
-          width: 460,
-          child: TextField(
-            controller: controllerText,
-            minLines: 8,
-            maxLines: 16,
-            decoration: const InputDecoration(
-              labelText: 'One key=value pair per line',
-              border: OutlineInputBorder(),
-            ),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () async {
-              final tags = <String, String>{};
-              for (final line in controllerText.text.split('\n')) {
-                final trimmed = line.trim();
-                if (trimmed.isEmpty) {
-                  continue;
-                }
-                final separator = trimmed.indexOf('=');
-                if (separator <= 0) {
-                  continue;
-                }
-                tags[trimmed.substring(0, separator).trim()] =
-                    trimmed.substring(separator + 1).trim();
-              }
-              Navigator.of(context).pop();
-              await controller.saveBucketTags(tags);
-            },
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
-    controllerText.dispose();
+  Future<void> _showTagEditorDialog(BuildContext context,
+      {required Map<String, String> initialTags}) async {
+    final value = await showDialog<Map<String, String>>(
+        context: context,
+        builder: (_) => TagEditorDialog(initialTags: initialTags));
+    if (value != null) await controller.saveBucketTags(value);
   }
 }
 
@@ -2537,20 +2620,24 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
           ),
         ),
         const PopupMenuDivider(),
-        const PopupMenuItem(
+        PopupMenuItem(
           value: 'delete',
           child: ListTile(
+            iconColor: Theme.of(context).colorScheme.error,
+            textColor: Theme.of(context).colorScheme.error,
             contentPadding: EdgeInsets.zero,
-            leading: Icon(Icons.delete_outline),
-            title: Text('Delete bucket'),
+            leading: const Icon(Icons.delete_outline),
+            title: const Text('Delete bucket'),
           ),
         ),
-        const PopupMenuItem(
+        PopupMenuItem(
           value: 'force-delete',
           child: ListTile(
+            iconColor: Theme.of(context).colorScheme.error,
+            textColor: Theme.of(context).colorScheme.error,
             contentPadding: EdgeInsets.zero,
-            leading: Icon(Icons.delete_forever_outlined),
-            title: Text('Force delete bucket'),
+            leading: const Icon(Icons.delete_forever_outlined),
+            title: const Text('Force delete bucket'),
           ),
         ),
       ],
@@ -2627,7 +2714,6 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
     final hasProfile = profile != null;
     final isRefreshing = controller.isBusy('refresh-buckets');
     final isCreatingBucket = controller.isBusy('create-bucket');
-    final isDeletingBucket = controller.isBusy('delete-bucket');
 
     final bucketListContent = ListView(
       key: _bucketListKey,
@@ -2636,11 +2722,21 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
       primary: false,
       physics: const AlwaysScrollableScrollPhysics(),
       children: [
-        if (buckets.isEmpty && hasProfile)
-          const Padding(
-            padding: EdgeInsets.only(bottom: 12),
-            child: Text('No buckets loaded yet for this endpoint.'),
-          )
+        if (buckets.isEmpty)
+          EmptyState(
+              icon: Icons.storage_outlined,
+              title: hasProfile
+                  ? 'No buckets loaded yet for this endpoint.'
+                  : 'No connection configured',
+              message: hasProfile
+                  ? 'Refresh this connection to list its buckets.'
+                  : 'Create a profile to connect to your storage.',
+              action: TextButton(
+                  onPressed: hasProfile
+                      ? controller.refreshBuckets
+                      : controller.openConnectionSettings,
+                  child:
+                      Text(hasProfile ? 'Refresh buckets' : 'Create profile')))
         else if (visibleBuckets.isEmpty && hasProfile)
           const Padding(
             padding: EdgeInsets.only(bottom: 12),
@@ -2751,13 +2847,16 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
       child: Padding(
         padding: EdgeInsets.all(desktopCompact ? 12 : 16),
         child: Column(
-          mainAxisSize: widget.compact ? MainAxisSize.min : MainAxisSize.max,
+          mainAxisSize: MainAxisSize.max,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
               children: [
-                Text('Buckets', style: Theme.of(context).textTheme.titleLarge),
-                const Spacer(),
+                Expanded(
+                    child: Text('Buckets',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.titleLarge)),
                 if (isRefreshing)
                   OutlinedButton.icon(
                     onPressed: controller.cancelListing,
@@ -2801,18 +2900,6 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
                       : const Icon(Icons.add_circle_outline),
                   label: Text(isCreatingBucket ? 'Creating...' : 'New bucket'),
                 ),
-                if (controller.selectedBucket != null)
-                  TextButton.icon(
-                    onPressed: hasProfile && !isDeletingBucket
-                        ? () => widget.onDeleteBucket(
-                              controller.selectedBucket!.name,
-                            )
-                        : null,
-                    icon: isDeletingBucket
-                        ? widget.inlineSpinnerBuilder()
-                        : const Icon(Icons.delete_forever_outlined),
-                    label: const Text('Delete selected'),
-                  ),
               ],
             ),
             if (!hasProfile)
@@ -2823,16 +2910,9 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
                 ),
               ),
             const SizedBox(height: 12),
-            if (widget.compact)
-              SizedBox(
-                height: (MediaQuery.sizeOf(context).height * 0.34)
-                    .clamp(240.0, 360.0),
-                child: bucketListViewport,
-              )
-            else
-              Expanded(
-                child: bucketListViewport,
-              ),
+            Expanded(
+              child: bucketListViewport,
+            ),
           ],
         ),
       ),
