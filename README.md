@@ -113,3 +113,15 @@ device Keychain/local-network checks.
 The GUI plan implementation and verification notes are recorded in
 [the 2.2.6 ledger](docs/2.2.6-gui-implementation.md). The application is 2.2.6+1;
 the unchanged bundled engine implementations remain 2.2.5.
+
+The [2.2.6 release](https://github.com/sndstone/object-data-browser/releases/tag/v2.2.6)
+provides Windows x64/ARM64 MSI installers, Linux x64/ARM64 DEB and RPM packages,
+and an Android ARM64 **test** APK for sideloading on Android 7.0+ (API 24+). Android artifacts use a debug
+signing key; a different build may require reinstallation rather than an in-place
+upgrade. The test AAB is a secondary build artifact, not directly installable.
+Public macOS and iOS packages still require the Apple release configuration above.
+
+The Release Matrix workflow can select Windows/Linux with `build_desktop` and
+Android independently with `build_android`; `build_mobile` includes both Android
+and iOS. Mobile builds bootstrap tools for the host architecture and cross-compile
+the ARM64 app. Release checksums are supplied in `SHA256SUMS`.
