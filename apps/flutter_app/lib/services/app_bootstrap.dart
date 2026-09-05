@@ -9,6 +9,7 @@ import 'android_engine_service.dart';
 import 'app_state_repository.dart';
 import 'desktop_sidecar_engine_service.dart';
 import 'engine_service.dart';
+import 'ios_engine_service.dart';
 import 'mock_engine_service.dart';
 
 class AppBootstrap {
@@ -19,7 +20,7 @@ class AppBootstrap {
     AppStateRepository? appStateRepository,
     EngineService? engineService,
   }) async {
-    final downloadPath = await _resolveDownloadPath();
+    final downloadPath = await resolveDownloadPath();
     final tempDir = await getTemporaryDirectory();
     final repository = appStateRepository ?? LocalAppStateRepository();
 
@@ -53,7 +54,7 @@ class AppBootstrap {
       browserInspectorLayout: BrowserInspectorLayout.bottom,
       browserInspectorSize: 360,
       relistObjectsAfterMutation: true,
-      uiScalePercent: 70,
+      uiScalePercent: 100,
       logTextScalePercent: 80,
     );
     final storedState = await repository.loadState();
@@ -77,6 +78,8 @@ class AppBootstrap {
       resolvedEngineService = DesktopSidecarEngineService();
     } else if (Platform.isAndroid) {
       resolvedEngineService = AndroidEngineService();
+    } else if (Platform.isIOS) {
+      resolvedEngineService = IosEngineService();
     } else {
       resolvedEngineService = MockEngineService();
     }
@@ -92,11 +95,22 @@ class AppBootstrap {
     return controller;
   }
 
-  static Future<String> _resolveDownloadPath() async {
-    if (Platform.isAndroid) {
+  static Future<String> resolveDownloadPath({
+    bool? isAndroid,
+    bool? isIOS,
+    Future<String?> Function()? androidDownloadsPath,
+    Future<Directory?> Function()? downloadsDirectoryProvider,
+    Future<Directory> Function()? documentsDirectoryProvider,
+    Future<Directory> Function()? temporaryDirectoryProvider,
+    String? currentDirectoryPath,
+  }) async {
+    final android = isAndroid ?? Platform.isAndroid;
+    final ios = isIOS ?? Platform.isIOS;
+    if (android) {
       try {
-        final nativePath =
-            await _androidChannel.invokeMethod<String>('getUserDownloadsPath');
+        final nativePath = androidDownloadsPath == null
+            ? await _androidChannel.invokeMethod<String>('getUserDownloadsPath')
+            : await androidDownloadsPath();
         if (nativePath != null && nativePath.trim().isNotEmpty) {
           return nativePath;
         }
@@ -107,16 +121,24 @@ class AppBootstrap {
       }
     }
 
-    final downloadDir = await getDownloadsDirectory();
+    if (ios) {
+      final documentsDir = await (documentsDirectoryProvider ??
+          getApplicationDocumentsDirectory)();
+      return documentsDir.path;
+    }
+
+    final downloadDir =
+        await (downloadsDirectoryProvider ?? getDownloadsDirectory)();
     if (downloadDir != null) {
       return downloadDir.path;
     }
 
-    if (Platform.isAndroid) {
-      final temp = await getTemporaryDirectory();
+    if (android) {
+      final temp =
+          await (temporaryDirectoryProvider ?? getTemporaryDirectory)();
       return temp.path;
     }
 
-    return Directory.current.path;
+    return currentDirectoryPath ?? Directory.current.path;
   }
 }

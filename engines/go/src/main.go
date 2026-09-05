@@ -28,7 +28,7 @@ import (
 	"github.com/aws/smithy-go"
 )
 
-const engineVersion = "2.2.4"
+const engineVersion = "2.2.5"
 
 var supportedMethods = []string{
 	"health", "getCapabilities", "testProfile", "listBuckets",
@@ -122,6 +122,7 @@ func main() {
 
 		var req request
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
+			writeJSON(map[string]interface{}{"requestId": nil, "ok": false, "error": &sidecarError{Code: "invalid_config", Message: "Malformed JSON request."}})
 			continue
 		}
 		if req.Params == nil {
@@ -168,7 +169,7 @@ func dispatchRequest(req request) (result map[string]interface{}, err error) {
 	return handleRequest(req)
 }
 
-func writeJSON(value response) {
+func writeJSON(value interface{}) {
 	out, _ := json.Marshal(value)
 	fmt.Println(string(out))
 }
@@ -256,12 +257,8 @@ func handleRequest(req request) (map[string]interface{}, error) {
 		return startUpload(req.Params)
 	case "startDownload":
 		return startDownload(req.Params)
-	case "pauseTransfer":
-		return transferControl(req.Params, "paused"), nil
-	case "resumeTransfer":
-		return transferControl(req.Params, "running"), nil
-	case "cancelTransfer":
-		return transferControl(req.Params, "cancelled"), nil
+	case "pauseTransfer", "resumeTransfer", "cancelTransfer":
+		return nil, &sidecarError{Code: "unsupported_feature", Message: "Interactive transfer control is unavailable in the sequential Go engine."}
 	case "generatePresignedUrl":
 		return generatePresignedURL(req.Params)
 	case "runPutTestData":
@@ -1766,9 +1763,9 @@ func buildTransferJob(jobID, label, direction string, progress float64, status s
 		"partSizeBytes":    partSize,
 		"partsCompleted":   partsCompleted,
 		"partsTotal":       partsTotal,
-		"canPause":         canPause,
-		"canResume":        canResume,
-		"canCancel":        canCancel,
+		"canPause":         false,
+		"canResume":        false,
+		"canCancel":        false,
 		"outputLines":      outputLines,
 	}
 }

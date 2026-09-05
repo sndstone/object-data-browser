@@ -60,6 +60,9 @@ class _StructuredLogListState extends State<StructuredLogList> {
               separatorBuilder: (_, __) => const SizedBox(height: 10),
               itemBuilder: (context, index) {
                 final item = items[index];
+                if (item.upload != null) {
+                  return _UploadBatchCard(entries: item.upload!);
+                }
                 if (item.group != null) {
                   return _ApiTraceCard(group: item.group!);
                 }
@@ -73,7 +76,18 @@ class _StructuredLogListState extends State<StructuredLogList> {
   List<_StructuredLogItem> _buildItems(List<EventLogEntry> entries) {
     final items = <_StructuredLogItem>[];
     final groupsByRequestId = <String, _ApiTraceGroup>{};
+    final uploads = <String, List<EventLogEntry>>{};
     for (final entry in entries) {
+      final uploadId = entry.parentRequestId ??
+          (entry.source == 'upload-batch' ? entry.requestId : null);
+      if (uploadId != null) {
+        if (!uploads.containsKey(uploadId)) {
+          uploads[uploadId] = [];
+          items.add(_StructuredLogItem.upload(uploads[uploadId]!));
+        }
+        uploads[uploadId]!.add(entry);
+        continue;
+      }
       if (_isStructuredApiEntry(entry)) {
         final requestId = entry.requestId!;
         final existing = groupsByRequestId[requestId];
@@ -98,11 +112,61 @@ class _StructuredLogListState extends State<StructuredLogList> {
 }
 
 class _StructuredLogItem {
-  const _StructuredLogItem.group(this.group) : entry = null;
-  const _StructuredLogItem.entry(this.entry) : group = null;
+  const _StructuredLogItem.group(this.group)
+      : entry = null,
+        upload = null;
+  const _StructuredLogItem.entry(this.entry)
+      : group = null,
+        upload = null;
+  const _StructuredLogItem.upload(this.upload)
+      : group = null,
+        entry = null;
 
   final _ApiTraceGroup? group;
   final EventLogEntry? entry;
+  final List<EventLogEntry>? upload;
+}
+
+class _UploadBatchCard extends StatelessWidget {
+  const _UploadBatchCard({required this.entries});
+  final List<EventLogEntry> entries;
+  @override
+  Widget build(BuildContext context) {
+    final parents = entries.where((e) => e.source == 'upload-batch');
+    final parent = parents.isEmpty ? entries.first : parents.first;
+    final files = <String, List<EventLogEntry>>{};
+    for (final entry in entries.where((e) => e.source == 'upload-file')) {
+      files.putIfAbsent(entry.requestId!, () => []).add(entry);
+    }
+    return Card(
+        child: ExpansionTile(
+      key: PageStorageKey(
+          'upload-log-${parent.parentRequestId ?? parent.requestId}'),
+      leading: const Icon(Icons.upload_file),
+      title: Text(parents.isEmpty ? 'Upload batch' : parent.message),
+      subtitle: Text(
+          '${parent.bucketName ?? ''} · ${parent.responseStatus ?? 'running'} · ${files.length} file records'),
+      children: [
+        for (final group in files.values)
+          ExpansionTile(
+            key: PageStorageKey('upload-file-${group.first.requestId}'),
+            leading: Icon(group.first.responseStatus == 'completed'
+                ? Icons.check_circle_outline
+                : group.first.responseStatus == 'failed'
+                    ? Icons.error_outline
+                    : Icons.insert_drive_file_outlined),
+            title: Text(group.first.objectKey ?? 'File'),
+            subtitle: Text(group.first.responseStatus ?? ''),
+            children: [
+              for (final entry in group.reversed)
+                Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+                    child: _EventEntryCard(entry: entry))
+            ],
+          ),
+      ],
+    ));
+  }
 }
 
 class _ApiTraceGroup {
@@ -321,7 +385,9 @@ class _EventEntryCard extends StatelessWidget {
               ),
             ],
             const SizedBox(height: 8),
-            SelectableText(entry.message),
+            SelectableText(entry.message,
+                key: PageStorageKey(
+                    'event-text-${entry.requestId}-${entry.timestamp.microsecondsSinceEpoch}-${entry.message.hashCode}')),
           ],
         ),
       ),
@@ -446,7 +512,8 @@ class _CodeBlock extends StatelessWidget {
         borderRadius: BorderRadius.circular(14),
         color: Theme.of(context).colorScheme.surfaceContainerHighest,
       ),
-      child: SelectableText(value),
+      child: SelectableText(value,
+          key: PageStorageKey('code-text-${value.hashCode}')),
     );
   }
 }

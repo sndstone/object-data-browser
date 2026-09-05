@@ -23,59 +23,62 @@ Legend:
 - `Required`: must be implemented for all engines on supported platforms
 - `Capability-Gated`: UI may expose only when the target reports support
 - `Desktop Only`: required on Windows, macOS, and Linux
-- `Android`: required on Android engines
+- `Android` / `iOS`: required on the native mobile engines
 
 ## Core Browser Features
 
-| Feature | Python | Go | Rust | Java | Android | Status |
-| --- | --- | --- | --- | --- | --- | --- |
-| Health and engine descriptor | Required | Required | Required | Required | Rust/Go | Stubbed |
-| Endpoint profile validation | Required | Required | Required | Required | Rust/Go | Stubbed |
-| Capability detection | Required | Required | Required | Required | Rust/Go | Stubbed |
-| Bucket listing | Required | Required | Required | Required | Rust/Go | Stubbed |
-| Bucket create/delete | Required | Required | Required | Required | Rust/Go | Planned |
-| Bucket versioning get/set | Required | Required | Required | Required | Rust/Go | Planned |
-| Bucket lifecycle CRUD | Capability-Gated | Capability-Gated | Capability-Gated | Capability-Gated | Rust/Go | Planned |
-| Bucket policy CRUD | Capability-Gated | Capability-Gated | Capability-Gated | Capability-Gated | Rust/Go | Planned |
-| Bucket CORS CRUD | Capability-Gated | Capability-Gated | Capability-Gated | Capability-Gated | Rust/Go | Planned |
-| Bucket encryption read/write | Capability-Gated | Capability-Gated | Capability-Gated | Capability-Gated | Rust/Go | Planned |
-| Bucket tagging read/write | Capability-Gated | Capability-Gated | Capability-Gated | Capability-Gated | Rust/Go | Planned |
-| Object list pagination | Required | Required | Required | Required | Rust/Go | Stubbed |
-| Flat and hierarchical listing | Required | Required | Required | Required | Rust/Go | Planned |
-| Metadata, headers, and tags | Required | Required | Required | Required | Rust/Go | Planned |
-| Version listing and delete markers | Required | Required | Required | Required | Rust/Go | Planned |
-| Upload | Required | Required | Required | Required | Rust/Go | Planned |
-| Download | Required | Required | Required | Required | Rust/Go | Planned |
-| Delete single and batch | Required | Required | Required | Required | Rust/Go | Planned |
-| Copy, move, rename | Required | Required | Required | Required | Rust/Go | Planned |
-| Create folder marker | Required | Required | Required | Required | Rust/Go | Planned |
-| Presigned URL generation | Required | Required | Required | Required | Rust/Go | Planned |
-| Resumable transfer jobs | Desktop Only | Desktop Only | Desktop Only | Desktop Only | Optional | Planned |
-| Drag and drop ingest | Desktop Only | Desktop Only | Desktop Only | Desktop Only | N/A | App shell ready |
+| Feature | Python | Go | Rust | Java | Android | iOS | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Health and engine descriptor | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Endpoint profile validation | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Capability detection | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Bucket listing | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Bucket create/delete | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Bucket versioning get/set | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Bucket lifecycle CRUD | Capability-Gated | Capability-Gated | Capability-Gated | Capability-Gated | Native Kotlin | Native Swift | Implemented |
+| Bucket policy CRUD | Capability-Gated | Capability-Gated | Capability-Gated | Capability-Gated | Native Kotlin | Native Swift | Implemented |
+| Bucket CORS CRUD | Capability-Gated | Capability-Gated | Capability-Gated | Capability-Gated | Native Kotlin | Native Swift | Implemented |
+| Bucket encryption read/write | Capability-Gated | Capability-Gated | Capability-Gated | Capability-Gated | Native Kotlin | Unsupported | Capability-gated |
+| Bucket tagging read/write | Capability-Gated | Capability-Gated | Capability-Gated | Capability-Gated | Native Kotlin | Native Swift | Implemented |
+| Object list pagination | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Flat and hierarchical listing | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Metadata, headers, and tags | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Version listing and delete markers | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Upload | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Download | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Delete single and batch | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Copy, move, rename | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Create folder marker | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Presigned URL generation | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Live pause/resume/cancel | Supported | Unsupported | Unsupported | Supported | Capability-gated | Capability-gated | Job capability-gated |
+| Drag and drop ingest | Desktop Only | Desktop Only | Desktop Only | Desktop Only | N/A | N/A | App shell ready |
 
 Transfer notes:
 
-- The Flutter shell selects an automatic S3 multipart upload size from the largest file in each batch and sends that effective size through the existing engine contract.
+- Python and Java accept concurrent controls on the original job process. Go and Rust use sequential request loops and return `unsupported_feature` for interactive controls; their job payloads must not advertise pause/resume/cancel. No engine promises resume across process restarts.
+- Host admission is bounded (four global / two per engine processes, 64 queued requests). Ordinary requests have a two-minute deadline; transfers use a no-progress deadline, suspended while explicitly paused. Control requests have a 15-second deadline. Timeout outcomes can be unknown and must not be automatically retried as successful mutations.
+
+- The Flutter shell sizes each file independently. Multi-file selections use one parent UI job with aggregate bytes/status, sequential single-file engine requests, and nested per-file event records. Part workers remain parallel and bounded inside the active file. Cancellation stops queued files; sequential engines may finish the active file first.
 - Python, Go, Rust, and Java upload parts concurrently with bounded workers. Automatic sizing remains within S3's 5 MiB–5 GiB part range and 10 000-part maximum.
 - Users can disable automatic sizing and supply the manual upload part size in Settings. The manual value also remains the download range size.
 
 ## Benchmark Features
 
-| Feature | Python | Go | Rust | Java | Android | Status |
-| --- | --- | --- | --- | --- | --- | --- |
-| Benchmark config validation | Required | Required | Required | Required | Rust/Go | Planned |
-| Mixed/write/read/delete workloads | Required | Required | Required | Required | Rust/Go | Planned |
-| Duration and operation count modes | Required | Required | Required | Required | Rust/Go | Planned |
-| Pause/resume/stop | Required | Required | Required | Required | Rust/Go | Planned |
-| CSV export | Required | Required | Required | Required | Rust/Go | Planned |
-| In-app charts input schema | Required | Required | Required | Required | Rust/Go | Stubbed |
+| Feature | Python | Go | Rust | Java | Android | iOS | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Benchmark config validation | Required | Required | Required | Required | Native Kotlin | Deferred | Capability-gated |
+| Mixed/write/read/delete workloads | Required | Required | Required | Required | Native Kotlin | Deferred | Capability-gated |
+| Duration and operation count modes | Required | Required | Required | Required | Native Kotlin | Deferred | Capability-gated |
+| Pause/resume/stop | Required | Required | Required | Required | Native Kotlin | Deferred | Capability-gated |
+| CSV export | Required | Required | Required | Required | Native Kotlin | Deferred | Capability-gated |
+| In-app charts input schema | Required | Required | Required | Required | Native Kotlin | Deferred | Capability-gated |
 
 ## Inspector Tools
 
-| Feature | Python | Go | Rust | Java | Android | Status |
-| --- | --- | --- | --- | --- | --- | --- |
-| Put test data (`runPutTestData`) | Required | Required | Required | Required | Rust/Go | Implemented (native, all desktop engines) |
-| Delete all (`runDeleteAll`) | Required | Required | Required | Required | Rust/Go | Implemented (native, all desktop engines) |
+| Feature | Python | Go | Rust | Java | Android | iOS | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Put test data (`runPutTestData`) | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
+| Delete all (`runDeleteAll`) | Required | Required | Required | Required | Native Kotlin | Native Swift | Implemented |
 
 Both tools execute directly inside the selected engine (no external scripts): put-testdata creates the configured object count/size/versions with a bounded worker pool; delete-all pages object versions (falling back to plain listing when versioning is unsupported) and batch-deletes with configurable batch size, workers, and delay.
 

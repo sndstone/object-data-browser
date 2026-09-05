@@ -6,6 +6,16 @@ import 'package:path_provider/path_provider.dart';
 
 import '../models/domain_models.dart';
 import 'profile_secret_store.dart';
+import 'atomic_metadata_store.dart';
+
+class CredentialStoreException implements Exception {
+  const CredentialStoreException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
 
 class StoredAppState {
   const StoredAppState({
@@ -57,15 +67,13 @@ class LocalAppStateRepository implements AppStateRepository {
   String? _persistedSecretBundleJson;
   bool _secureStoreLoadFailed = false;
   String? _credentialStoreError;
+  final AtomicMetadataStore _metadata = AtomicMetadataStore();
 
   @override
   Future<StoredAppState?> loadState() async {
     final file = await _stateFileForLoad();
-    if (!await file.exists()) {
-      return null;
-    }
-    final decoded =
-        jsonDecode(await file.readAsString()) as Map<String, Object?>;
+    final decoded = await _metadata.read(file);
+    if (decoded == null) return null;
     final settingsJson =
         Map<String, Object?>.from(decoded['settings'] as Map? ?? const {});
     final profilesJson = (decoded['profiles'] as List<Object?>? ?? const [])
@@ -92,6 +100,18 @@ class LocalAppStateRepository implements AppStateRepository {
     required List<EndpointProfile> profiles,
     required String? selectedProfileId,
     bool allowCredentialStoreRecovery = false,
+  }) =>
+      _metadata.serialize(() => _saveState(
+          settings: settings,
+          profiles: List.of(profiles),
+          selectedProfileId: selectedProfileId,
+          allowCredentialStoreRecovery: allowCredentialStoreRecovery));
+
+  Future<void> _saveState({
+    required AppSettings settings,
+    required List<EndpointProfile> profiles,
+    required String? selectedProfileId,
+    required bool allowCredentialStoreRecovery,
   }) async {
     final file = await _stateFile();
     final persistedToSecureStore = await _writeProfileSecretBundle(
@@ -99,23 +119,22 @@ class LocalAppStateRepository implements AppStateRepository {
       allowRecovery: allowCredentialStoreRecovery,
     );
     if (!persistedToSecureStore) {
-      throw StateError(
-        'Secure credential storage is unavailable. Profile secrets were not saved to local plaintext state.',
+      throw CredentialStoreException(
+        _credentialStoreError ??
+            'Secure credential storage is unavailable. Profile secrets were not saved to local plaintext state.',
       );
     }
 
     await file.parent.create(recursive: true);
-    await file.writeAsString(
-      const JsonEncoder.withIndent('  ').convert({
-        'settings': settings.toJson(),
-        'selectedProfileId': selectedProfileId,
-        'profiles': profiles
-            .map((profile) => _profileMetadataToJson(
-                  profile,
-                ))
-            .toList(),
-      }),
-    );
+    await _metadata.replace(file, {
+      'settings': settings.toJson(),
+      'selectedProfileId': selectedProfileId,
+      'profiles': profiles
+          .map((profile) => _profileMetadataToJson(
+                profile,
+              ))
+          .toList(),
+    });
   }
 
   @override
@@ -302,16 +321,23 @@ class LocalAppStateRepository implements AppStateRepository {
   void _recordSecureStoreFailure(Object error) {
     _secureStoreLoadFailed = true;
     final detail = _secureStoreErrorDetail(error);
+    final isMissingIosEntitlement = Platform.isIOS &&
+        (detail.contains('-34018') || detail.contains('entitlement'));
+    final storeName = Platform.isIOS ? 'iOS Keychain' : 'macOS Keychain';
+    final recovery = isMissingIosEntitlement
+        ? 'This build has no usable Keychain entitlement. Launch the simulator app from Xcode, or install a provisioned device build, then re-enter and save the credentials.'
+        : 'Credentials were not loaded. Open Settings, re-enter them, and save to repair secure storage.';
     _credentialStoreError =
-        'macOS Keychain access failed${detail.isEmpty ? '' : ' ($detail)'}. '
-        'Credentials were not loaded. Open Settings, re-enter them, and save to repair secure storage.';
+        '$storeName access failed${detail.isEmpty ? '' : ' ($detail)'}. $recovery';
   }
 
   void _recordCredentialMigrationRequired() {
     _secureStoreLoadFailed = true;
-    _credentialStoreError =
-        'Existing profile credentials could not be migrated safely from the legacy macOS Keychain. '
-        'Open Settings, re-enter each profile\'s access and secret keys, and press Save once.';
+    _credentialStoreError = Platform.isIOS
+        ? 'Stored iOS profile metadata has no matching Keychain credential bundle. '
+            'Open Settings, re-enter each profile\'s access and secret keys, and press Save once.'
+        : 'Existing profile credentials could not be migrated safely from the legacy macOS Keychain. '
+            'Open Settings, re-enter each profile\'s access and secret keys, and press Save once.';
   }
 
   String _secureStoreErrorDetail(Object error) {
@@ -349,7 +375,8 @@ class LocalAppStateRepository implements AppStateRepository {
       _secureStoreLoadFailed = false;
       _credentialStoreError = null;
       return true;
-    } catch (_) {
+    } catch (error) {
+      _recordSecureStoreFailure(error);
       return false;
     }
   }

@@ -63,6 +63,14 @@ require_macos_project() {
   fi
 }
 
+require_ios_project() {
+  local app_dir="$ROOT_DIR/apps/flutter_app"
+  if [[ ! -d "$app_dir/ios" ]]; then
+    echo "The checked-in iOS Flutter scaffold is missing at $app_dir/ios." >&2
+    exit 1
+  fi
+}
+
 clean_macos_release_artifacts() {
   local release_dir="$ROOT_DIR/apps/flutter_app/build/macos/Build/Products/Release"
   if [[ -d "$release_dir" ]]; then
@@ -157,6 +165,23 @@ case "$PLATFORM" in
     flutter pub get
     flutter build apk --release --target-platform android-arm64 --split-per-abi
     flutter build appbundle --release --target-platform android-arm64
+    popd >/dev/null
+    ;;
+  ios)
+    require_ios_project
+    flutter pub get
+    if [[ -n "${IOS_SIGNING_IDENTITY:-}" ]]; then
+      : "${IOS_TEAM_ID:?IOS_TEAM_ID is required for a signed iOS archive}"
+      IOS_EXPORT_OPTIONS="${IOS_EXPORT_OPTIONS_PLIST:-$TOOLS_DIR/ios-export-options.plist}"
+      if [[ -z "${IOS_EXPORT_OPTIONS_PLIST:-}" ]]; then
+        sed "s/__TEAM_ID__/$IOS_TEAM_ID/g" \
+          "$ROOT_DIR/packaging/ios/ExportOptions.plist.template" > "$IOS_EXPORT_OPTIONS"
+      fi
+      flutter build ipa --release --export-options-plist="$IOS_EXPORT_OPTIONS"
+    else
+      echo "Building an unsigned iOS device bundle; set IOS_SIGNING_IDENTITY and IOS_TEAM_ID to export an IPA."
+      flutter build ios --release --no-codesign
+    fi
     popd >/dev/null
     ;;
   *)

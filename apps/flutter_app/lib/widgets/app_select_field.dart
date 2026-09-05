@@ -348,6 +348,48 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
           orElse: () => null,
         );
     final baseDecoration = widget.decoration ?? const InputDecoration();
+
+    // OverlayPortal menus can be clipped by the platform view hierarchy on
+    // iOS and Android, leaving an invisible modal barrier over the app. Use
+    // Flutter's route-backed dropdown on touch platforms; it also provides the
+    // expected native tap and accessibility behavior.
+    if (theme.platform == TargetPlatform.iOS ||
+        theme.platform == TargetPlatform.android) {
+      return DropdownButtonFormField<T>(
+        key: ValueKey<T?>(selected?.value),
+        initialValue: selected?.value,
+        items: widget.items
+            .map(
+              (item) => DropdownMenuItem<T>(
+                value: item.value,
+                enabled: item.enabled,
+                child: Row(
+                  children: [
+                    if (item.icon != null) ...[
+                      Icon(item.icon, size: 16),
+                      const SizedBox(width: 8),
+                    ],
+                    Expanded(
+                      child: Text(
+                        item.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            )
+            .toList(growable: false),
+        onChanged: _enabled ? widget.onChanged : null,
+        decoration: baseDecoration,
+        style: widget.style ?? theme.textTheme.bodyMedium,
+        isExpanded: widget.isExpanded,
+        menuMaxHeight: widget.menuMaxHeight,
+        borderRadius: BorderRadius.circular(10),
+      );
+    }
+
     final decoration =
         baseDecoration.applyDefaults(theme.inputDecorationTheme).copyWith(
               enabled: _enabled,

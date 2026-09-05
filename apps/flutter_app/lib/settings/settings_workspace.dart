@@ -2,15 +2,17 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../app/version_details.dart';
 import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
+import '../services/app_platform.dart';
 import '../widgets/app_select_field.dart';
 import 'profile_import_picker.dart';
 import 'version_details_catalog.dart';
 
-class SettingsWorkspace extends StatelessWidget {
+class SettingsWorkspace extends StatefulWidget {
   const SettingsWorkspace({
     super.key,
     required this.controller,
@@ -19,17 +21,36 @@ class SettingsWorkspace extends StatelessWidget {
   final AppController controller;
 
   @override
+  State<SettingsWorkspace> createState() => _SettingsWorkspaceState();
+}
+
+class _SettingsWorkspaceState extends State<SettingsWorkspace> {
+  AppController get controller => widget.controller;
+  String _sectionName = 'Connections';
+  static const _sections = [
+    'Connections',
+    'General',
+    'Transfers',
+    'Downloads & Temp Storage',
+    'Appearance',
+    'Safety & Recovery',
+    'Benchmark',
+    'Diagnostics',
+    'Version Details'
+  ];
+
+  @override
   Widget build(BuildContext context) {
     final settings = controller.settings;
     final phone = MediaQuery.sizeOf(context).width < 700;
-    final isAndroid = Platform.isAndroid;
-    final dependencyVersions = visibleDependencyVersions(isAndroid: isAndroid);
+    final isMobile = AppPlatform.isMobile;
+    final dependencyVersions = visibleDependencyVersions(isMobile: isMobile);
     final bundledComponentVersions = visibleBundledComponentVersions(
-      isAndroid: isAndroid,
+      isMobile: isMobile,
       engines: controller.engines,
     );
 
-    return ListView(
+    final content = ListView(
       padding: const EdgeInsets.all(16),
       children: [
         _sectionIntro(
@@ -109,7 +130,7 @@ class SettingsWorkspace extends StatelessWidget {
                       : () async {
                           final defaultPath =
                               '${controller.settings.downloadPath}${Platform.pathSeparator}s3-browser-profiles.json';
-                          final exportPath = Platform.isAndroid
+                          final exportPath = isMobile
                               ? defaultPath
                               : (await FilePicker.platform.saveFile(
                                     dialogTitle: 'Export profiles',
@@ -119,6 +140,19 @@ class SettingsWorkspace extends StatelessWidget {
                                   ) ??
                                   defaultPath);
                           await controller.exportProfilesToPath(exportPath);
+                          if (Platform.isIOS && context.mounted) {
+                            final box =
+                                context.findRenderObject() as RenderBox?;
+                            await SharePlus.instance.share(
+                              ShareParams(
+                                files: [XFile(exportPath)],
+                                subject: 'Object Data Browser profiles',
+                                sharePositionOrigin: box == null
+                                    ? null
+                                    : box.localToGlobal(Offset.zero) & box.size,
+                              ),
+                            );
+                          }
                         },
                   icon: const Icon(Icons.upload_file_outlined),
                   label: const Text('Export profiles'),
@@ -127,10 +161,10 @@ class SettingsWorkspace extends StatelessWidget {
                   onPressed: () async {
                     final picked = await FilePicker.platform.pickFiles(
                       type: profileImportPickerType(
-                        isAndroid: Platform.isAndroid,
+                        isMobile: AppPlatform.isMobile,
                       ),
                       allowedExtensions: profileImportAllowedExtensions(
-                        isAndroid: Platform.isAndroid,
+                        isMobile: AppPlatform.isMobile,
                       ),
                       dialogTitle: 'Import profiles',
                     );
@@ -219,7 +253,7 @@ class SettingsWorkspace extends StatelessWidget {
               ),
               title: const Text('Automatically size upload parts'),
               subtitle: const Text(
-                'Choose an S3-compliant part size from the largest selected file. Disable this to use the manual chunk size for uploads.',
+                'Choose an S3-compliant part size independently for each file. Files share one upload job, while each file has its own multipart schedule. Disable this to use manual part sizes.',
               ),
             ),
             const SizedBox(height: 4),
@@ -331,14 +365,14 @@ class SettingsWorkspace extends StatelessWidget {
               contentPadding: EdgeInsets.zero,
               title: Text('UI scale: ${settings.uiScalePercent}%'),
               subtitle: const Text(
-                'Smaller values fit more controls onscreen. Below 80% also reduces padding and element sizing. 70% is the default.',
+                'Text size is independent of row density. Default: 100%. OS accessibility enlargement is always respected.',
               ),
             ),
             Slider(
               min: 60,
-              max: 110,
-              divisions: 10,
-              value: settings.uiScalePercent.toDouble().clamp(60, 110),
+              max: 150,
+              divisions: 18,
+              value: settings.uiScalePercent.toDouble().clamp(60, 150),
               label: '${settings.uiScalePercent}%',
               onChanged: (value) {
                 controller.updateSettings(
@@ -568,7 +602,7 @@ class SettingsWorkspace extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             Text(
-              isAndroid ? 'Android app dependencies' : 'Flutter dependencies',
+              isMobile ? 'Mobile app dependencies' : 'Flutter dependencies',
               style: Theme.of(context).textTheme.titleMedium,
             ),
             const SizedBox(height: 8),
@@ -583,7 +617,7 @@ class SettingsWorkspace extends StatelessWidget {
             if (bundledComponentVersions.isNotEmpty) ...[
               const Divider(height: 24),
               Text(
-                isAndroid ? 'Android engines' : 'Bundled engines',
+                isMobile ? 'Mobile engines' : 'Bundled engines',
                 style: Theme.of(context).textTheme.titleMedium,
               ),
               const SizedBox(height: 8),
@@ -600,6 +634,32 @@ class SettingsWorkspace extends StatelessWidget {
         ),
       ],
     );
+    return LayoutBuilder(builder: (context, constraints) {
+      if (constraints.maxWidth < 900) return content;
+      return Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        SizedBox(
+            width: 190,
+            child: ListView(padding: const EdgeInsets.all(12), children: [
+              for (final section in _sections
+                  .where((s) => s != 'Benchmark' || !AppPlatform.isMobile))
+                Padding(
+                    padding: const EdgeInsets.only(bottom: 4),
+                    child: Material(
+                        color: Colors.transparent,
+                        child: ListTile(
+                            selected: _sectionName == section,
+                            shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8)),
+                            selectedTileColor:
+                                Theme.of(context).colorScheme.primaryContainer,
+                            title: Text(section),
+                            onTap: () =>
+                                setState(() => _sectionName = section)))),
+            ])),
+        const VerticalDivider(width: 1),
+        Expanded(child: content),
+      ]);
+    });
   }
 
   Widget _section(
@@ -609,28 +669,43 @@ class SettingsWorkspace extends StatelessWidget {
   }) {
     final theme = Theme.of(context);
     final phone = MediaQuery.sizeOf(context).width < 700;
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 16),
-      child: Container(
-        decoration: BoxDecoration(
-          color: phone ? theme.colorScheme.surface : theme.cardTheme.color,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: theme.colorScheme.outlineVariant),
-        ),
-        padding: const EdgeInsets.all(16),
-        child: Material(
-          color: Colors.transparent,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(title, style: theme.textTheme.titleLarge),
-              const SizedBox(height: 8),
-              ...children,
-            ],
-          ),
-        ),
-      ),
-    );
+    return Offstage(
+        offstage: title != _sectionName,
+        child: TickerMode(
+            enabled: title == _sectionName,
+            child: Padding(
+              padding: const EdgeInsets.only(bottom: 16),
+              child: Container(
+                decoration: BoxDecoration(
+                  color:
+                      phone ? theme.colorScheme.surface : theme.cardTheme.color,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: theme.colorScheme.outlineVariant),
+                ),
+                padding: const EdgeInsets.all(16),
+                child: Material(
+                  color: Colors.transparent,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(title, style: theme.textTheme.titleLarge),
+                      if (title == 'Appearance')
+                        SwitchListTile.adaptive(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Compact desktop rows'),
+                          subtitle: const Text(
+                              'Keep text readable while reducing row padding. Touch targets remain comfortable.'),
+                          value: controller.settings.compactRows,
+                          onChanged: (value) => controller.updateSettings(
+                              controller.settings.copyWith(compactRows: value)),
+                        ),
+                      const SizedBox(height: 8),
+                      ...children,
+                    ],
+                  ),
+                ),
+              ),
+            )));
   }
 
   Widget _sectionIntro(
@@ -652,6 +727,19 @@ class SettingsWorkspace extends StatelessWidget {
           Text(title, style: theme.textTheme.headlineSmall),
           const SizedBox(height: 10),
           Text(description, style: theme.textTheme.bodyLarge),
+          const SizedBox(height: 16),
+          if (MediaQuery.sizeOf(context).width < 1100)
+            AppSelectField<String>(
+                value: _sectionName,
+                decoration:
+                    const InputDecoration(labelText: 'Settings section'),
+                items: _sections
+                    .where((s) => s != 'Benchmark' || !AppPlatform.isMobile)
+                    .map((s) => AppSelectItem(value: s, label: s))
+                    .toList(),
+                onChanged: (value) {
+                  if (value != null) setState(() => _sectionName = value);
+                }),
         ],
       ),
     );
@@ -723,6 +811,21 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
     super.initState();
     _syncFromProfile();
     _expanded = !_looksConfigured(widget.profile);
+    for (final field in [
+      _nameController,
+      _endpointController,
+      _regionController,
+      _accessKeyController,
+      _secretKeyController,
+      _sessionTokenController,
+      _connectTimeoutController,
+      _readTimeoutController,
+      _notesController
+    ]) {
+      field.addListener(() {
+        if (mounted) setState(() {});
+      });
+    }
   }
 
   @override
@@ -960,21 +1063,31 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 : widget.profile.name,
             style: Theme.of(context).textTheme.titleMedium,
           ),
-          subtitle: Text(
-            _normalizedEndpointPreview.isEmpty
-                ? 'Connection details not configured yet.'
-                : _normalizedEndpointPreview,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          trailing: Wrap(
-            spacing: 8,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              if (isSelected) const Chip(label: Text('Selected')),
-              Icon(_expanded ? Icons.expand_less : Icons.expand_more),
-            ],
-          ),
+          subtitle:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(
+                _normalizedEndpointPreview.isEmpty
+                    ? 'Connection details not configured yet.'
+                    : _normalizedEndpointPreview,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis),
+            Wrap(
+              spacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                if (isSelected) const Chip(label: Text('Active')),
+                Chip(
+                    label: Text(_buildProfile().toJson().toString() !=
+                            widget.profile.toJson().toString()
+                        ? 'Unsaved edits'
+                        : widget.controller.profilePersistenceStatus)),
+                if (widget.controller.settings.defaultProfileId ==
+                    widget.profile.id)
+                  const Chip(label: Text('Startup default')),
+              ],
+            ),
+          ]),
+          trailing: Icon(_expanded ? Icons.expand_less : Icons.expand_more),
           childrenPadding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
           children: [
             TextField(
@@ -1141,79 +1254,81 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                   labelText: 'Session token (optional)',
                 ),
               ),
-            SwitchListTile(
-              value: _pathStyle,
-              onChanged: _endpointType == EndpointProfileType.s3Compatible
-                  ? (value) => setState(() => _pathStyle = value)
-                  : null,
-              title: const Text('Force path-style requests'),
-              subtitle: Text(switch (_endpointType) {
-                EndpointProfileType.awsS3 =>
-                  'AWS S3 uses the standard virtual-hosted endpoint layout.',
-                EndpointProfileType.azureBlob =>
-                  'Not applicable to Azure Blob Storage.',
-                EndpointProfileType.s3Compatible =>
-                  'Useful for MinIO and other S3-compatible endpoints.',
-              }),
-            ),
-            SwitchListTile(
-              value: _verifyTls,
-              onChanged:
-                  (_endpointType != EndpointProfileType.awsS3 && _useHttps)
-                      ? (value) => setState(() => _verifyTls = value)
-                      : null,
-              title: const Text('Verify TLS certificates'),
-              subtitle: Text(
-                _endpointType == EndpointProfileType.awsS3
-                    ? 'AWS S3 always uses HTTPS with certificate verification enabled.'
-                    : (_useHttps
-                        ? 'Disable this only for self-signed or lab endpoints.'
-                        : 'TLS verification is off because this endpoint uses HTTP.'),
+            ExpansionTile(title: const Text('Advanced transport'), children: [
+              SwitchListTile(
+                value: _pathStyle,
+                onChanged: _endpointType == EndpointProfileType.s3Compatible
+                    ? (value) => setState(() => _pathStyle = value)
+                    : null,
+                title: const Text('Force path-style requests'),
+                subtitle: Text(switch (_endpointType) {
+                  EndpointProfileType.awsS3 =>
+                    'AWS S3 uses the standard virtual-hosted endpoint layout.',
+                  EndpointProfileType.azureBlob =>
+                    'Not applicable to Azure Blob Storage.',
+                  EndpointProfileType.s3Compatible =>
+                    'Useful for MinIO and other S3-compatible endpoints.',
+                }),
               ),
-            ),
-            phone
-                ? Column(
-                    children: [
-                      TextField(
-                        controller: _connectTimeoutController,
-                        keyboardType: TextInputType.number,
-                        decoration: const InputDecoration(
-                          labelText: 'Connect timeout (s)',
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      TextField(
-                        controller: _readTimeoutController,
-                        keyboardType: TextInputType.number,
-                        decoration: const InputDecoration(
-                          labelText: 'Read timeout (s)',
-                        ),
-                      ),
-                    ],
-                  )
-                : Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
+              SwitchListTile(
+                value: _verifyTls,
+                onChanged:
+                    (_endpointType != EndpointProfileType.awsS3 && _useHttps)
+                        ? (value) => setState(() => _verifyTls = value)
+                        : null,
+                title: const Text('Verify TLS certificates'),
+                subtitle: Text(
+                  _endpointType == EndpointProfileType.awsS3
+                      ? 'AWS S3 always uses HTTPS with certificate verification enabled.'
+                      : (_useHttps
+                          ? 'Disable this only for self-signed or lab endpoints.'
+                          : 'TLS verification is off because this endpoint uses HTTP.'),
+                ),
+              ),
+              phone
+                  ? Column(
+                      children: [
+                        TextField(
                           controller: _connectTimeoutController,
                           keyboardType: TextInputType.number,
                           decoration: const InputDecoration(
                             labelText: 'Connect timeout (s)',
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: TextField(
+                        const SizedBox(height: 8),
+                        TextField(
                           controller: _readTimeoutController,
                           keyboardType: TextInputType.number,
                           decoration: const InputDecoration(
                             labelText: 'Read timeout (s)',
                           ),
                         ),
-                      ),
-                    ],
-                  ),
+                      ],
+                    )
+                  : Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _connectTimeoutController,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(
+                              labelText: 'Connect timeout (s)',
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: TextField(
+                            controller: _readTimeoutController,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(
+                              labelText: 'Read timeout (s)',
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+            ]),
             const SizedBox(height: 8),
             TextField(
               controller: _notesController,

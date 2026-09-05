@@ -17,6 +17,9 @@
 - After a Keychain hydration failure, ordinary state persistence must remain blocked so empty in-memory credentials cannot replace stored values. An explicit profile Save is the recovery boundary: it may create a fresh consolidated credential item and clears the error only after that secure write succeeds.
 - Public macOS releases must use the Developer ID signing/notarization path, its embedded provisioning profile, and the stable `TEAM_ID.com.example.s3BrowserCrossplat` Keychain group. Ad-hoc artifacts are development-only and must never be published as update-safe releases.
 - When changing sandbox state, load the newest metadata state from the sandboxed and unsandboxed Application Support locations. Credentials remain in Keychain; never copy them into the state file during this migration.
+- iOS uses the Data Protection Keychain only. Keep credentials in the consolidated `profiles.credentials.v2` item and preserve the same secure-recovery boundaries used on macOS.
+- Public iOS builds require a provisioned Apple signing identity and the stable `TEAM_ID.com.example.s3BrowserCrossplat` Keychain group. Unsigned builds are compile-verification artifacts only.
+- Keep iOS cleartext access limited to local-network endpoints through `NSAllowsLocalNetworking`; do not enable global arbitrary loads without an explicit App Review and security decision.
 
 ## Object previews
 
@@ -30,10 +33,10 @@
 
 ## Multipart transfers
 
-- Automatic upload sizing is enabled by default and is calculated in `MultipartSizing` from the largest file in the selected upload batch.
+- Automatic upload sizing is enabled by default and is calculated in `MultipartSizing` independently for each file. Multi-file selections are coordinated as one parent UI job with sequential per-file engine requests and bounded parallel part workers inside each request.
 - Keep sizing within S3 limits: 5 MiB–5 GiB per part, no more than 10,000 parts, and no more than 50,000 GiB per object. The last part may be smaller than 5 MiB.
 - The automatic policy targets about 128 parts for ordinary large files, caps normal performance-oriented parts at 128 MiB to bound worker memory, and grows beyond that only when required to remain below 10,000 parts.
-- All files in one dispatched upload use the chosen batch part size so the existing engine contract remains stable.
+- Each dispatched upload contains one file and its chosen part size; the existing engine request shape remains stable. Aggregate bytes/status belong to the parent upload, and per-file outcomes nest beneath it in the event log. Stop queued files on cancellation or unknown engine outcomes.
 - When `dynamicMultipartSizing` is disabled, pass the user’s manual `multipartChunkMiB` value, clamped to the S3 part-size range. Downloads continue using the manual range size.
 - Preserve bounded parallel part workers and abort incomplete multipart uploads on failure.
 
@@ -42,3 +45,4 @@
 - Run `flutter analyze` and the full Flutter test suite after app changes.
 - Add boundary tests when changing multipart sizing.
 - For macOS packaging changes, build the release app, verify its signature, and inspect the effective signed entitlements.
+- For iOS changes, build the simulator target and verify both the Keychain and local-network flows on a physical device before release.

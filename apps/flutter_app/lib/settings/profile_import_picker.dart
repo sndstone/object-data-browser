@@ -1,11 +1,11 @@
 import 'package:file_picker/file_picker.dart';
 
-FileType profileImportPickerType({required bool isAndroid}) {
-  return isAndroid ? FileType.any : FileType.custom;
+FileType profileImportPickerType({required bool isMobile}) {
+  return isMobile ? FileType.any : FileType.custom;
 }
 
-List<String>? profileImportAllowedExtensions({required bool isAndroid}) {
-  return isAndroid ? null : const ['json'];
+List<String>? profileImportAllowedExtensions({required bool isMobile}) {
+  return isMobile ? null : const ['json'];
 }
 
 bool isJsonProfileImportSelection(PlatformFile file) {

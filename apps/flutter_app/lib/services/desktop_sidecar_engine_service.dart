@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import '../models/domain_models.dart';
 import 'desktop_engine_host.dart';
+import 'diagnostic_safety.dart';
 import 'engine_service.dart';
 import 'mock_engine_service.dart';
 
@@ -33,6 +35,9 @@ class DesktopSidecarEngineService
   Map<String, _EngineManifestEntry>? _cachedManifest;
   String? _cachedEngineRoot;
   final Map<String, String> _benchmarkEngines = <String, String>{};
+  final Map<String, String> _jobEngines = <String, String>{};
+  int _requestSequence = 0;
+  void cancelQueuedListings() => _host.cancelQueuedListings();
 
   @override
   bool get isMock => false;
@@ -76,7 +81,7 @@ class DesktopSidecarEngineService
         version: entry?.version ?? engine.version,
         available: entry != null || (_allowFallback && engine.available),
         desktopSupported: engine.desktopSupported,
-        androidSupported: engine.androidSupported,
+        mobileSupported: engine.mobileSupported,
       );
     }).toList(growable: false);
   }
@@ -1089,6 +1094,8 @@ class DesktopSidecarEngineService
     Map<String, Object?>? params,
     void Function(Map<String, Object?> event)? onEvent,
   }) async {
+    final jobId = params?['jobId']?.toString();
+    if (jobId != null) engineId = _jobEngines[jobId] ?? engineId;
     final entry = await _tryGetEngine(engineId);
     if (entry == null) {
       if (!_allowFallback) {
@@ -1130,6 +1137,14 @@ class DesktopSidecarEngineService
         return onFallback();
       }
       rethrow;
+    } on TimeoutException catch (error) {
+      throw EngineException(
+          code: ErrorCode.timeout,
+          message: error.message ??
+              'Engine request timed out. Check the outcome before retrying.');
+    } on StateError catch (error) {
+      throw EngineException(
+          code: ErrorCode.invalidConfig, message: error.message);
     } on ProcessException catch (error) {
       _log(
         level: 'ERROR',
@@ -1169,7 +1184,8 @@ class DesktopSidecarEngineService
     void Function(Map<String, Object?> event)? onEvent,
   }) async {
     final engineRoot = await _resolveEngineRoot();
-    final requestId = DateTime.now().microsecondsSinceEpoch.toString();
+    final requestId =
+        '${DateTime.now().microsecondsSinceEpoch}-${++_requestSequence}';
     final request = <String, Object?>{
       'requestId': requestId,
       'method': method,
@@ -1208,7 +1224,18 @@ class DesktopSidecarEngineService
           ? engineRoot
           : _join(engineRoot, entry.workingDirectory!),
       request: request,
-      onEvent: onEvent,
+      concurrentControls: entry.id == 'python' || entry.id == 'java',
+      timeout: method == 'health' ? const Duration(seconds: 15) : null,
+      onEvent: (event) {
+        final job = event['job'];
+        if (job is Map && job['id'] != null) {
+          _jobEngines[job['id'].toString()] = entry.id;
+          if (_jobEngines.length > 500) {
+            _jobEngines.remove(_jobEngines.keys.first);
+          }
+        }
+        onEvent?.call(event);
+      },
     );
     final latencyMs = DateTime.now().difference(startedAt).inMilliseconds;
     _handleStructuredLogs(response.stderrOutput, params: params);
@@ -1381,21 +1408,7 @@ class DesktopSidecarEngineService
   }
 
   Object? _sanitizeForLogging(Object? value) {
-    if (value is Map) {
-      return value.map(
-        (key, entry) => MapEntry(
-          key.toString(),
-          switch (key.toString()) {
-            'accessKey' || 'secretKey' || 'sessionToken' => '[redacted]',
-            _ => _sanitizeForLogging(entry),
-          },
-        ),
-      );
-    }
-    if (value is List) {
-      return value.map(_sanitizeForLogging).toList();
-    }
-    return value;
+    return DiagnosticSafety.sanitize(value);
   }
 
   String _stringifyForLogging(Object? value) {
@@ -2068,7 +2081,7 @@ class _EngineManifestEntry {
   factory _EngineManifestEntry.fromJson(Map<String, Object?> json) {
     return _EngineManifestEntry(
       id: json['id'] as String? ?? '',
-      version: json['version'] as String? ?? '2.2.4',
+      version: json['version'] as String? ?? '2.2.5',
       executable: json['executable'] as String? ?? '',
       arguments: (json['arguments'] as List<Object?>? ?? const [])
           .map((item) => item.toString())

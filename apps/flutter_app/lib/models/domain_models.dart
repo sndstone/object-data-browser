@@ -57,6 +57,7 @@ enum BrowserInspectorTab {
   bucketAdmin,
   bucketInfo,
   objectDetails,
+  objectPreview,
   versions,
   presign,
   tools,
@@ -112,6 +113,7 @@ class EventLogEntry {
     this.objectKey,
     this.source,
     this.requestId,
+    this.parentRequestId,
     this.tracePhase,
     this.engineId,
     this.method,
@@ -130,6 +132,7 @@ class EventLogEntry {
   final String? objectKey;
   final String? source;
   final String? requestId;
+  final String? parentRequestId;
   final String? tracePhase;
   final String? engineId;
   final String? method;
@@ -149,6 +152,7 @@ class EventLogEntry {
       'objectKey': objectKey,
       'source': source,
       'requestId': requestId,
+      'parentRequestId': parentRequestId,
       'tracePhase': tracePhase,
       'engineId': engineId,
       'method': method,
@@ -300,7 +304,7 @@ class EngineDescriptor {
     required this.version,
     required this.available,
     required this.desktopSupported,
-    required this.androidSupported,
+    required this.mobileSupported,
   });
 
   final String id;
@@ -309,7 +313,7 @@ class EngineDescriptor {
   final String version;
   final bool available;
   final bool desktopSupported;
-  final bool androidSupported;
+  final bool mobileSupported;
 }
 
 class CapabilityDescriptor {
@@ -1396,6 +1400,8 @@ class AppSettings {
     required this.relistObjectsAfterMutation,
     required this.uiScalePercent,
     required this.logTextScalePercent,
+    this.compactRows = false,
+    this.browserInspectorVisible = true,
   });
 
   final bool darkMode;
@@ -1430,10 +1436,14 @@ class AppSettings {
   final bool relistObjectsAfterMutation;
   final int uiScalePercent;
   final int logTextScalePercent;
+  final bool compactRows;
+  final bool browserInspectorVisible;
 
   Map<String, Object?> toJson() {
     return {
       'darkMode': darkMode,
+      'compactRows': compactRows,
+      'browserInspectorVisible': browserInspectorVisible,
       'defaultEngineId': defaultEngineId,
       'defaultProfileId': defaultProfileId,
       'downloadPath': downloadPath,
@@ -1469,7 +1479,7 @@ class AppSettings {
   }
 
   factory AppSettings.fromJson(Map<String, Object?> json) {
-    final uiScalePercent = (json['uiScalePercent'] as num?)?.toInt() ?? 70;
+    final uiScalePercent = (json['uiScalePercent'] as num?)?.toInt() ?? 100;
     return AppSettings(
       darkMode: json['darkMode'] as bool? ?? false,
       defaultEngineId: (json['defaultEngineId'] as String?) ?? 'python',
@@ -1511,6 +1521,8 @@ class AppSettings {
       relistObjectsAfterMutation:
           json['relistObjectsAfterMutation'] as bool? ?? true,
       uiScalePercent: uiScalePercent,
+      compactRows: json['compactRows'] as bool? ?? false,
+      browserInspectorVisible: json['browserInspectorVisible'] as bool? ?? true,
       logTextScalePercent: (json['logTextScalePercent'] as num?)?.toInt() ?? 80,
     );
   }
@@ -1547,6 +1559,8 @@ class AppSettings {
     int? browserInspectorSize,
     bool? relistObjectsAfterMutation,
     int? uiScalePercent,
+    bool? compactRows,
+    bool? browserInspectorVisible,
     int? logTextScalePercent,
   }) {
     return AppSettings(
@@ -1588,6 +1602,9 @@ class AppSettings {
       relistObjectsAfterMutation:
           relistObjectsAfterMutation ?? this.relistObjectsAfterMutation,
       uiScalePercent: uiScalePercent ?? this.uiScalePercent,
+      compactRows: compactRows ?? this.compactRows,
+      browserInspectorVisible:
+          browserInspectorVisible ?? this.browserInspectorVisible,
       logTextScalePercent: logTextScalePercent ?? this.logTextScalePercent,
     );
   }

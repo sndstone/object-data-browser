@@ -170,24 +170,38 @@ class _TaskCard extends StatelessWidget {
               runSpacing: 8,
               children: [
                 Chip(label: Text(task.status)),
-                if (task.strategyLabel != null)
-                  Chip(label: Text(task.strategyLabel!)),
-                Chip(label: Text(task.kind.name)),
               ],
             ),
             const SizedBox(height: 8),
             LinearProgressIndicator(
-              value: task.progress == 0 ? null : task.progress,
+              value: task.isRunningLike &&
+                      task.status != 'paused' &&
+                      task.progress == 0 &&
+                      (task.totalBytes == null || task.totalBytes == 0)
+                  ? null
+                  : task.progress.clamp(0.0, 1.0),
             ),
             const SizedBox(height: 8),
-            if (metricLines.isNotEmpty)
+            if (task.isFailedLike)
               Text(
-                metricLines.join('\n'),
+                  task.outputLines.isEmpty
+                      ? 'This operation failed. Expand for details before retrying.'
+                      : task.outputLines.last,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error)),
+            if (metricLines.isNotEmpty && !task.isFailedLike)
+              Text(
+                metricLines.first,
                 style: Theme.of(context).textTheme.bodySmall,
               ),
           ],
         ),
         children: [
+          if (metricLines.length > 1)
+            Align(
+                alignment: Alignment.centerLeft,
+                child: Text(metricLines.skip(1).join('\n'))),
           if (details.isNotEmpty)
             Align(
               alignment: Alignment.centerLeft,

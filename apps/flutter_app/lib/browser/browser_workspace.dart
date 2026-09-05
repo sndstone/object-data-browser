@@ -9,16 +9,18 @@ import 'package:flutter_widget_from_html_core/flutter_widget_from_html_core.dart
 import '../controllers/app_controller.dart';
 import '../logs/structured_log_list.dart';
 import '../models/domain_models.dart';
+import '../services/app_platform.dart';
 import '../services/source_preview.dart';
 import '../theme/app_theme.dart';
 import '../theme/breakpoints.dart';
 import '../widgets/app_select_field.dart';
 import '../widgets/compact_selector.dart';
 import '../widgets/source_code_preview.dart';
+import 'object_panel.dart';
+import '../theme/app_motion.dart';
 
 const _bucketActionBarKey = ValueKey('bucket-panel-actions');
 const _bucketListKey = ValueKey('bucket-panel-scroll');
-const _objectListKey = ValueKey('object-panel-list');
 
 enum _MobileBrowserSection {
   buckets,
@@ -44,7 +46,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   AppController get controller => widget.controller;
   double? _pendingInspectorSize;
   _MobileBrowserSection _mobileSection = _MobileBrowserSection.buckets;
-  bool _desktopInspectorVisible = true;
+  bool _dragging = false;
 
   AppSettings get _settings => controller.settings;
 
@@ -215,11 +217,12 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                 title: const Text('Upload files'),
                 onTap: () => Navigator.of(context).pop('files'),
               ),
-              ListTile(
-                leading: const Icon(Icons.drive_folder_upload_outlined),
-                title: const Text('Upload folder'),
-                onTap: () => Navigator.of(context).pop('folder'),
-              ),
+              if (!Platform.isIOS)
+                ListTile(
+                  leading: const Icon(Icons.drive_folder_upload_outlined),
+                  title: const Text('Upload folder'),
+                  onTap: () => Navigator.of(context).pop('folder'),
+                ),
             ],
           ),
         ),
@@ -279,9 +282,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         : (!hasBucket && _mobileSection != _MobileBrowserSection.buckets)
             ? _MobileBrowserSection.buckets
             : _mobileSection;
-    final duration = controller.settings.enableAnimations
-        ? const Duration(milliseconds: 260)
-        : Duration.zero;
+    final duration = AppMotion.duration(context,
+        enabled: controller.settings.enableAnimations, milliseconds: 260);
 
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
@@ -317,43 +319,12 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             ),
           ),
           const SizedBox(height: 14),
-          AnimatedSwitcher(
+          DirectionalSwitcher(
+            position: effectiveSection.index,
             duration: duration,
-            switchInCurve: Curves.easeOutCubic,
-            switchOutCurve: Curves.easeInCubic,
-            layoutBuilder: (currentChild, previousChildren) {
-              return Stack(
+            layoutBuilder: (current, previous) => Stack(
                 alignment: Alignment.topCenter,
-                children: [
-                  ...previousChildren,
-                  if (currentChild != null) currentChild,
-                ],
-              );
-            },
-            transitionBuilder: (child, animation) {
-              final curved = CurvedAnimation(
-                parent: animation,
-                curve: Curves.easeOutCubic,
-                reverseCurve: Curves.easeInCubic,
-              );
-              return FadeTransition(
-                opacity: curved,
-                child: SlideTransition(
-                  position: Tween<Offset>(
-                    begin: const Offset(0, -0.04),
-                    end: Offset.zero,
-                  ).animate(curved),
-                  child: ScaleTransition(
-                    alignment: Alignment.topCenter,
-                    scale: Tween<double>(
-                      begin: 0.96,
-                      end: 1,
-                    ).animate(curved),
-                    child: child,
-                  ),
-                ),
-              );
-            },
+                children: [...previous, if (current != null) current]),
             child: KeyedSubtree(
               key: ValueKey(effectiveSection),
               child: switch (effectiveSection) {
@@ -392,7 +363,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             !smallDesktop &&
             !compactRightInspector &&
             _settings.browserInspectorLayout == BrowserInspectorLayout.right;
-        final showDockedInspector = !tablet && _desktopInspectorVisible;
+        final showDockedInspector =
+            !tablet && controller.settings.browserInspectorVisible;
         final inspectorSize =
             _resolveInspectorSize(context, constraints, inspectorOnRight);
         final roomy = width >= Breakpoints.desktopWide;
@@ -432,9 +404,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         }
 
         return AnimatedPadding(
-          duration: controller.settings.enableAnimations
-              ? const Duration(milliseconds: 220)
-              : Duration.zero,
+          duration: AppMotion.duration(context,
+              enabled: controller.settings.enableAnimations, milliseconds: 220),
           curve: Curves.easeOutCubic,
           padding: EdgeInsets.all(outerPadding),
           child: Row(
@@ -454,17 +425,33 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       },
     );
 
-    if (Platform.isAndroid ||
+    if (AppPlatform.isMobile ||
         Breakpoints.isPhone(MediaQuery.sizeOf(context).width)) {
       return content;
     }
 
     return DropTarget(
+      onDragEntered: (_) => setState(() => _dragging = true),
+      onDragExited: (_) => setState(() => _dragging = false),
       onDragDone: (detail) async {
+        setState(() => _dragging = false);
         final files = detail.files.map((file) => file.path).toList();
         await _uploadPaths(files);
       },
-      child: content,
+      child: Stack(children: [
+        content,
+        if (_dragging)
+          Positioned.fill(
+              child: IgnorePointer(
+                  child: ColoredBox(
+                      color: Theme.of(context)
+                          .colorScheme
+                          .primaryContainer
+                          .withValues(alpha: .9),
+                      child: const Center(
+                          child: Text(
+                              'Drop files to upload into the current prefix'))))),
+      ]),
     );
   }
 
@@ -481,121 +468,12 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     await controller.createFolderMarker(prefix);
   }
 
-  Future<void> _showMobileObjectActions(BuildContext context) async {
-    final hasBucket = controller.selectedBucket != null;
-    final hasSelectedObject = controller.selectedObject != null;
-    final rootContext = context;
-    await showModalBottomSheet<void>(
-      context: context,
-      showDragHandle: true,
-      builder: (context) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Object actions',
-                style: Theme.of(context).textTheme.titleLarge,
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'Choose an action for the current bucket or selected object.',
-                style: Theme.of(context).textTheme.bodyMedium,
-              ),
-              const SizedBox(height: 18),
-              Wrap(
-                spacing: 10,
-                runSpacing: 10,
-                children: [
-                  OutlinedButton.icon(
-                    onPressed: hasBucket
-                        ? () {
-                            Navigator.of(context).pop();
-                            controller.refreshObjects();
-                          }
-                        : null,
-                    icon: const Icon(Icons.refresh),
-                    label: const Text('Refresh'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: () {
-                      Navigator.of(context).pop();
-                      _showInspectorDialog(rootContext);
-                    },
-                    icon: const Icon(Icons.info_outline),
-                    label: const Text('Inspector'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: hasBucket
-                        ? () {
-                            Navigator.of(context).pop();
-                            _showCreatePrefixDialog(rootContext);
-                          }
-                        : null,
-                    icon: const Icon(Icons.create_new_folder_outlined),
-                    label: const Text('Create prefix'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: hasSelectedObject
-                        ? () {
-                            Navigator.of(context).pop();
-                            controller.deleteSelectedObject();
-                          }
-                        : null,
-                    icon: const Icon(Icons.delete_outline),
-                    label: const Text('Delete'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: hasBucket
-                        ? () {
-                            Navigator.of(context).pop();
-                            controller.showAllObjectsNow();
-                          }
-                        : null,
-                    icon: const Icon(Icons.unfold_more),
-                    label: const Text('Show loaded rows'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: hasBucket &&
-                            controller.objectCursor.hasMore &&
-                            !controller.isBusy('refresh-objects')
-                        ? () {
-                            Navigator.of(context).pop();
-                            controller.listAllObjectsForCurrentBucket();
-                          }
-                        : null,
-                    icon: const Icon(Icons.playlist_add_check),
-                    label: const Text('List all'),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              SwitchListTile(
-                value: controller.flatView,
-                onChanged: hasBucket
-                    ? (value) {
-                        Navigator.of(context).pop();
-                        controller.toggleFlatView(value);
-                      }
-                    : null,
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Flat view'),
-                subtitle: const Text('Show objects as a single list.'),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
   Future<void> _showObjectContextMenu(
     BuildContext context,
     ObjectEntry object,
     Offset position,
   ) async {
+    controller.clearObjectSelection();
     await controller.setSelectedObject(
       object,
       openFolderOnSelect: false,
@@ -672,7 +550,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         await controller.generateSelectedPresignedUrl();
         return;
       case 'delete':
-        await controller.deleteSelectedObject();
+        if (!context.mounted) return;
+        await _confirmDeleteObjects(context);
         return;
       default:
         return;
@@ -781,577 +660,60 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     );
   }
 
-  Widget _objectPanel(BuildContext context, {required bool compact}) {
-    final width = MediaQuery.sizeOf(context).width;
-    final phone = Breakpoints.isPhone(width);
-    final mobileTablet = !phone && Platform.isAndroid;
-    final desktopCompact = _desktopCompact(context);
-    final compactDesktop = compact && !phone;
-    final denseObjectControls = phone || mobileTablet || desktopCompact;
-    final availableWidth = width - (phone ? 32 : (desktopCompact ? 48 : 64));
-    final phonePanelHeight =
-        (MediaQuery.sizeOf(context).height * 0.78).clamp(560.0, 920.0);
-    final hasProfile = controller.selectedProfile != null;
-    final hasBucket = controller.selectedBucket != null;
-    final hasSelectedObject = controller.selectedObject != null;
-    final objects = controller.pagedVisibleObjects;
-    final filteredObjectCount = controller.visibleObjects.length;
-    final loadedObjectCount = controller.objects.length;
-    final currentPrefix = controller.currentPrefix;
-    final isRefreshingObjects = controller.isBusy('refresh-objects');
-    final isUploading = controller.isBusy('upload');
-    final isDownloading = controller.isBusy('download');
-    final isDeleting = controller.isBusy('delete-object');
-    final isSelectingObject = controller.isBusy('select-object');
-    final panelPadding = denseObjectControls ? 12.0 : 16.0;
-    final controlSpacing = denseObjectControls ? 8.0 : 12.0;
-    final mobileControlSpacing = phone ? 8.0 : controlSpacing;
-    final mobileFilterWidth = (availableWidth * 0.34).clamp(112.0, 156.0);
-
-    Widget filterModeControl({double? width}) {
-      final child = AppSelectField<BrowserFilterMode>(
-        value: controller.objectFilterMode,
-        isExpanded: true,
-        decoration: const InputDecoration(
-          labelText: 'Filter',
-        ),
-        items: const [
-          AppSelectItem(
-            value: BrowserFilterMode.prefix,
-            label: 'Prefix',
-          ),
-          AppSelectItem(
-            value: BrowserFilterMode.text,
-            label: 'Text',
-          ),
-          AppSelectItem(
-            value: BrowserFilterMode.regex,
-            label: 'Regex',
-          ),
-        ],
-        onChanged: hasBucket
-            ? (value) {
-                if (value != null) {
-                  controller.setObjectFilterMode(value);
-                }
-              }
-            : null,
-      );
-      return width == null ? child : SizedBox(width: width, child: child);
+  Future<void> _confirmDeleteObjects(BuildContext context) async {
+    final keys = controller.objectSelection.isEmpty
+        ? [
+            if (controller.selectedObject != null)
+              controller.selectedObject!.key
+          ]
+        : controller.objectSelection.keys.toList();
+    if (keys.isEmpty) return;
+    final profileId = controller.selectedProfile?.id;
+    final bucketName = controller.selectedBucket?.name;
+    final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+                title: Text('Delete ${keys.length} object(s)?'),
+                content: Text(
+                    'Bucket: $bucketName\n${keys.take(5).join('\n')}${keys.length > 5 ? '\n…' : ''}\n\nIn versioned buckets this may create delete markers. Permanent deletion cannot always be undone.'),
+                actions: [
+                  TextButton(
+                      onPressed: () => Navigator.pop(context, false),
+                      child: const Text('Cancel')),
+                  FilledButton(
+                      onPressed: () => Navigator.pop(context, true),
+                      child: const Text('Delete'))
+                ]));
+    if (confirmed == true &&
+        controller.selectedProfile?.id == profileId &&
+        controller.selectedBucket?.name == bucketName) {
+      await controller.deleteObjectKeys(keys);
     }
-
-    Widget filterValueControl({double? width}) {
-      final child = TextFormField(
-        key: ValueKey(
-          'object-filter-${controller.objectFilterMode.name}-${controller.objectFilterValue}',
-        ),
-        initialValue: controller.objectFilterValue,
-        enabled: hasBucket,
-        decoration: InputDecoration(
-          labelText: switch (controller.objectFilterMode) {
-            BrowserFilterMode.prefix => 'Prefix',
-            BrowserFilterMode.text => 'Search text',
-            BrowserFilterMode.regex => 'Regex',
-          },
-          prefixIcon: Icon(
-            switch (controller.objectFilterMode) {
-              BrowserFilterMode.prefix => Icons.folder_open_outlined,
-              BrowserFilterMode.text => Icons.search,
-              BrowserFilterMode.regex => Icons.code,
-            },
-          ),
-        ),
-        onFieldSubmitted: (value) async {
-          await controller.applyObjectFilter(value);
-        },
-      );
-      return width == null ? child : SizedBox(width: width, child: child);
-    }
-
-    Widget sortFieldControl({double? width}) {
-      final child = AppSelectField<BrowserObjectSortField>(
-        value: controller.objectSortField,
-        isExpanded: true,
-        decoration: const InputDecoration(
-          labelText: 'Sort by',
-        ),
-        items: const [
-          AppSelectItem(
-            value: BrowserObjectSortField.lastModified,
-            label: 'Last modified',
-          ),
-          AppSelectItem(
-            value: BrowserObjectSortField.name,
-            label: 'Name',
-          ),
-          AppSelectItem(
-            value: BrowserObjectSortField.size,
-            label: 'Object size',
-          ),
-          AppSelectItem(
-            value: BrowserObjectSortField.contentType,
-            label: 'Content type',
-          ),
-        ],
-        onChanged: hasBucket
-            ? (value) {
-                if (value != null) {
-                  controller.setObjectSortField(value);
-                }
-              }
-            : null,
-      );
-      return width == null ? child : SizedBox(width: width, child: child);
-    }
-
-    Widget sortDirectionButton({bool compactButton = false}) {
-      return IconButton(
-        tooltip: controller.objectSortDescending
-            ? 'Sort descending'
-            : 'Sort ascending',
-        onPressed: hasBucket ? controller.toggleObjectSortDirection : null,
-        icon: Icon(
-          controller.objectSortDescending
-              ? Icons.arrow_downward
-              : Icons.arrow_upward,
-        ),
-        constraints: compactButton
-            ? const BoxConstraints.tightFor(width: 40, height: 40)
-            : null,
-        padding: compactButton ? EdgeInsets.zero : null,
-        visualDensity:
-            compactButton ? VisualDensity.compact : VisualDensity.standard,
-      );
-    }
-
-    Widget mobileUploadButton() {
-      return IconButton.filled(
-        tooltip: isUploading ? 'Uploading...' : 'Upload',
-        onPressed:
-            hasBucket && !isUploading ? () => _showUploadPicker(context) : null,
-        icon: isUploading ? _inlineSpinner() : const Icon(Icons.upload_file),
-        constraints: const BoxConstraints.tightFor(width: 40, height: 40),
-        padding: EdgeInsets.zero,
-        visualDensity: VisualDensity.compact,
-      );
-    }
-
-    Widget mobileDownloadButton() {
-      return IconButton.filledTonal(
-        tooltip: isDownloading ? 'Downloading...' : 'Download',
-        onPressed: hasSelectedObject && !isDownloading
-            ? controller.startSampleDownload
-            : null,
-        icon: isDownloading ? _inlineSpinner() : const Icon(Icons.download),
-        constraints: const BoxConstraints.tightFor(width: 40, height: 40),
-        padding: EdgeInsets.zero,
-        visualDensity: VisualDensity.compact,
-      );
-    }
-
-    Widget compactInspectorButton() {
-      return IconButton.filledTonal(
-        tooltip: 'Inspector',
-        onPressed: () => _showInspectorDialog(context),
-        icon: const Icon(Icons.info_outline),
-        constraints: const BoxConstraints.tightFor(width: 40, height: 40),
-        padding: EdgeInsets.zero,
-        visualDensity: VisualDensity.compact,
-      );
-    }
-
-    Widget desktopInspectorToggle() {
-      return OutlinedButton.icon(
-        onPressed: () {
-          setState(() {
-            _desktopInspectorVisible = !_desktopInspectorVisible;
-          });
-        },
-        icon: Icon(_desktopInspectorVisible
-            ? Icons.visibility_off_outlined
-            : Icons.visibility_outlined),
-        label: Text(
-            _desktopInspectorVisible ? 'Hide inspector' : 'Show inspector'),
-      );
-    }
-
-    final Widget listView = objects.isEmpty
-        ? Center(
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: Text(
-                hasBucket
-                    ? 'No objects were returned for this bucket and prefix.'
-                    : 'Select a bucket to load objects.',
-                textAlign: TextAlign.center,
-              ),
-            ),
-          )
-        : KeyedSubtree(
-            key: _objectListKey,
-            child: _ObjectTable(
-              objects: objects,
-              selectedKey: controller.selectedObject?.key,
-              contentTypeFor: controller.objectContentType,
-              onSelect: controller.setSelectedObject,
-              onShowContextMenu: (object, position) =>
-                  _showObjectContextMenu(context, object, position),
-            ),
-          );
-
-    final panel = Card(
-      clipBehavior: Clip.antiAlias,
-      child: Padding(
-        padding: EdgeInsets.all(panelPadding),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(
-                  Icons.folder_copy_outlined,
-                  color: Theme.of(context).colorScheme.primary,
-                  size: 22,
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    controller.selectedBucket?.name ?? 'Objects',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.titleLarge,
-                  ),
-                ),
-                if (hasBucket)
-                  Chip(
-                    visualDensity: VisualDensity.compact,
-                    label: Text('$filteredObjectCount objects'),
-                  ),
-              ],
-            ),
-            const SizedBox(height: 14),
-            if (!hasProfile)
-              const Text(
-                'Create and select an endpoint profile to browse objects.',
-              )
-            else if (!hasBucket)
-              const Text(
-                'Select a bucket to browse objects.',
-              )
-            else
-              Wrap(
-                spacing: denseObjectControls ? 6 : 8,
-                runSpacing: denseObjectControls ? 6 : 8,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  ActionChip(
-                    visualDensity: denseObjectControls
-                        ? VisualDensity.compact
-                        : VisualDensity.standard,
-                    avatar: const Icon(Icons.home_outlined, size: 16),
-                    label: const Text('Root'),
-                    onPressed: () => controller.refreshObjects(prefix: ''),
-                  ),
-                  if (currentPrefix.isNotEmpty)
-                    ActionChip(
-                      visualDensity: denseObjectControls
-                          ? VisualDensity.compact
-                          : VisualDensity.standard,
-                      avatar:
-                          const Icon(Icons.subdirectory_arrow_left, size: 16),
-                      label: Text(currentPrefix),
-                      onPressed: controller.navigateUp,
-                    ),
-                ],
-              ),
-            const SizedBox(height: 12),
-            if (phone || compactDesktop)
-              Column(
-                children: [
-                  Row(
-                    children: [
-                      filterModeControl(width: mobileFilterWidth),
-                      SizedBox(width: mobileControlSpacing),
-                      Expanded(child: filterValueControl()),
-                    ],
-                  ),
-                  SizedBox(height: mobileControlSpacing),
-                  Row(
-                    children: [
-                      Expanded(child: sortFieldControl()),
-                      SizedBox(width: mobileControlSpacing),
-                      sortDirectionButton(compactButton: true),
-                      SizedBox(width: mobileControlSpacing),
-                      mobileUploadButton(),
-                      SizedBox(width: mobileControlSpacing),
-                      mobileDownloadButton(),
-                      SizedBox(width: mobileControlSpacing),
-                      if (compactDesktop) ...[
-                        compactInspectorButton(),
-                        SizedBox(width: mobileControlSpacing),
-                      ],
-                      IconButton.filledTonal(
-                        tooltip: 'More actions',
-                        onPressed: hasBucket || compactDesktop
-                            ? () => _showMobileObjectActions(context)
-                            : null,
-                        icon: const Icon(Icons.tune),
-                        constraints: const BoxConstraints.tightFor(
-                            width: 40, height: 40),
-                        padding: EdgeInsets.zero,
-                        visualDensity: VisualDensity.compact,
-                      ),
-                    ],
-                  ),
-                ],
-              )
-            else
-              Wrap(
-                spacing: controlSpacing,
-                runSpacing: controlSpacing,
-                children: [
-                  filterModeControl(width: denseObjectControls ? 144 : 168),
-                  filterValueControl(width: denseObjectControls ? 200 : 240),
-                  sortFieldControl(width: denseObjectControls ? 176 : 220),
-                  sortDirectionButton(),
-                  FilledButton.icon(
-                    onPressed: hasBucket && !isUploading
-                        ? () => _showUploadPicker(context)
-                        : null,
-                    icon: isUploading
-                        ? _inlineSpinner()
-                        : const Icon(Icons.upload_file),
-                    label: Text(isUploading ? 'Uploading...' : 'Upload'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: hasSelectedObject && !isDownloading
-                        ? controller.startSampleDownload
-                        : null,
-                    icon: isDownloading
-                        ? _inlineSpinner()
-                        : const Icon(Icons.download),
-                    label: Text(isDownloading ? 'Downloading...' : 'Download'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: hasSelectedObject && !isDeleting
-                        ? controller.deleteSelectedObject
-                        : null,
-                    icon: isDeleting
-                        ? _inlineSpinner()
-                        : const Icon(Icons.delete_outline),
-                    label: Text(isDeleting ? 'Deleting...' : 'Delete'),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: hasBucket
-                        ? () => _showCreatePrefixDialog(context)
-                        : null,
-                    icon: const Icon(Icons.create_new_folder_outlined),
-                    label: const Text('Create prefix'),
-                  ),
-                  desktopInspectorToggle(),
-                  OutlinedButton.icon(
-                    onPressed: hasBucket ? controller.showAllObjectsNow : null,
-                    icon: const Icon(Icons.unfold_more),
-                    label: const Text('Show loaded rows'),
-                  ),
-                  FilterChip(
-                    selected: controller.flatView,
-                    onSelected: hasBucket ? controller.toggleFlatView : null,
-                    showCheckmark: false,
-                    avatar: Icon(
-                      controller.flatView
-                          ? Icons.view_list
-                          : Icons.view_list_outlined,
-                      size: 18,
-                    ),
-                    label: const Text('Flat view'),
-                  ),
-                  if (isRefreshingObjects)
-                    OutlinedButton.icon(
-                      onPressed: controller.cancelListing,
-                      icon: const Icon(Icons.stop_circle_outlined, size: 18),
-                      label: const Text('Cancel'),
-                    )
-                  else
-                    IconButton(
-                      tooltip: 'Refresh object list',
-                      onPressed: hasBucket ? controller.refreshObjects : null,
-                      icon: const Icon(Icons.refresh),
-                    ),
-                ],
-              ),
-            const SizedBox(height: 10),
-            if (isRefreshingObjects || isSelectingObject)
-              const Padding(
-                padding: EdgeInsets.only(bottom: 12),
-                child: LinearProgressIndicator(),
-              ),
-            if (hasBucket)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: Wrap(
-                  spacing: controlSpacing,
-                  runSpacing: controlSpacing,
-                  crossAxisAlignment: WrapCrossAlignment.center,
-                  children: [
-                    Text(
-                      _objectListingStatus(
-                        filteredObjectCount: filteredObjectCount,
-                        loadedObjectCount: loadedObjectCount,
-                        compact: phone || compactDesktop,
-                      ),
-                    ),
-                    if (!compactDesktop) ...[
-                      FilterChip(
-                        selected: controller.listAllKeys,
-                        onSelected: hasBucket &&
-                                controller.objectCursor.hasMore &&
-                                !isRefreshingObjects
-                            ? (_) => controller.listAllObjectsForCurrentBucket()
-                            : null,
-                        avatar: Icon(
-                          controller.objectCursor.hasMore
-                              ? Icons.playlist_add_check
-                              : Icons.done_all,
-                          size: 18,
-                        ),
-                        label: Text(
-                          controller.objectCursor.hasMore
-                              ? 'List all'
-                              : 'All listed',
-                        ),
-                      ),
-                      if (!controller.showAllObjects &&
-                          controller.objectPageCount > 1) ...[
-                        SizedBox(
-                          width: 180,
-                          child: AppSelectField<int>(
-                            value: controller.objectPage
-                                .clamp(1, controller.objectPageCount)
-                                .toInt(),
-                            decoration:
-                                const InputDecoration(labelText: 'Page'),
-                            items: List<AppSelectItem<int>>.generate(
-                              controller.objectPageCount,
-                              (index) => AppSelectItem<int>(
-                                value: index + 1,
-                                label: 'Page ${index + 1}',
-                              ),
-                            ),
-                            onChanged: (value) {
-                              if (value != null) {
-                                controller.setObjectPage(value);
-                              }
-                            },
-                          ),
-                        ),
-                        OutlinedButton.icon(
-                          onPressed: controller.objectPage > 1
-                              ? controller.previousObjectPage
-                              : null,
-                          icon: const Icon(Icons.chevron_left),
-                          label: const Text('Prev'),
-                        ),
-                        OutlinedButton.icon(
-                          onPressed:
-                              controller.objectPage < controller.objectPageCount
-                                  ? controller.nextObjectPage
-                                  : null,
-                          icon: const Icon(Icons.chevron_right),
-                          label: const Text('Next'),
-                        ),
-                      ],
-                      if (controller.showAllObjects)
-                        OutlinedButton.icon(
-                          onPressed: () => controller.setShowAllObjects(false),
-                          icon: const Icon(Icons.grid_view_outlined),
-                          label: const Text('Use pages'),
-                        ),
-                    ],
-                    Text(
-                      '${AppController.objectPageSize} per page',
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                  ],
-                ),
-              ),
-            if (!phone && !Platform.isAndroid && !compactDesktop) ...[
-              Container(
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surface,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: Theme.of(context).colorScheme.outlineVariant,
-                  ),
-                ),
-                padding: EdgeInsets.all(desktopCompact ? 10 : 12),
-                child: Row(
-                  children: [
-                    const Icon(Icons.cloud_upload_outlined),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(hasBucket
-                          ? (Platform.isAndroid
-                              ? 'Use the system picker or share sheet to add files on Android.'
-                              : 'Drag and drop files here to upload them into the current bucket prefix.')
-                          : 'Uploads are enabled after you select an endpoint profile and bucket.'),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-            ],
-            if (phone || compactDesktop)
-              Expanded(child: listView)
-            else if (compact)
-              SizedBox(
-                height: (MediaQuery.sizeOf(context).height *
-                        (mobileTablet ? 0.58 : 0.42))
-                    .clamp(mobileTablet ? 360.0 : 280.0,
-                        mobileTablet ? 760.0 : 520.0),
-                child: listView,
-              )
-            else
-              Expanded(child: listView),
-          ],
-        ),
-      ),
-    );
-
-    if (phone) {
-      return SizedBox(
-        height: phonePanelHeight,
-        child: panel,
-      );
-    }
-
-    return panel;
   }
 
-  String _objectListingStatus({
-    required int filteredObjectCount,
-    required int loadedObjectCount,
-    bool compact = false,
-  }) {
-    if (compact) {
-      final range = controller.showAllObjects
-          ? 'All $filteredObjectCount loaded'
-          : '${controller.currentObjectPageStart}-${controller.currentObjectPageEnd} of $filteredObjectCount';
-      if (filteredObjectCount == loadedObjectCount) {
-        return range;
-      }
-      return '$range - $loadedObjectCount total';
-    }
-
-    final range = controller.showAllObjects
-        ? 'Showing all $filteredObjectCount loaded'
-        : 'Showing ${controller.currentObjectPageStart}-${controller.currentObjectPageEnd} of $filteredObjectCount loaded';
-    final listingState =
-        controller.objectCursor.hasMore ? 'more available' : 'all loaded';
-    if (filteredObjectCount == loadedObjectCount) {
-      return '$range - $listingState';
-    }
-    return '$range - $loadedObjectCount loaded total - $listingState';
+  Widget _objectPanel(BuildContext context, {required bool compact}) {
+    final panel = ObjectPanel(
+        controller: controller,
+        onUpload: () => _showUploadPicker(context),
+        onDelete: () => _confirmDeleteObjects(context),
+        onCreatePrefix: () => _showCreatePrefixDialog(context),
+        onInspector: () {
+          if (MediaQuery.sizeOf(context).width >= 1000) {
+            controller.updateSettings(controller.settings.copyWith(
+                browserInspectorVisible:
+                    !controller.settings.browserInspectorVisible));
+          } else {
+            _showInspectorDialog(context);
+          }
+        },
+        onContextMenu: (object, position) =>
+            _showObjectContextMenu(context, object, position));
+    return Breakpoints.isPhone(MediaQuery.sizeOf(context).width)
+        ? SizedBox(
+            height:
+                (MediaQuery.sizeOf(context).height * .78).clamp(520.0, 920.0),
+            child: panel)
+        : panel;
   }
 
   Widget _inspectorPanel(BuildContext context, {required bool compact}) {
@@ -1359,7 +721,26 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     // Object versioning and presigned URLs are S3-only features.
     final isAzure = controller.selectedProfile?.endpointType ==
         EndpointProfileType.azureBlob;
-    final availableTabs = BrowserInspectorTab.values
+    final contextualTabs = controller.selectedObject == null
+        ? [
+            BrowserInspectorTab.bucketInfo,
+            BrowserInspectorTab.bucketAdmin,
+            BrowserInspectorTab.versions
+          ]
+        : [
+            BrowserInspectorTab.objectDetails,
+            BrowserInspectorTab.objectPreview,
+            BrowserInspectorTab.versions,
+          ];
+    contextualTabs.addAll([
+      if (!contextualTabs.contains(BrowserInspectorTab.bucketAdmin))
+        BrowserInspectorTab.bucketAdmin,
+      BrowserInspectorTab.tools,
+      BrowserInspectorTab.eventsAndDebug,
+      if (controller.selectedObject != null && !isAzure)
+        BrowserInspectorTab.presign,
+    ]);
+    final availableTabs = contextualTabs
         .where(
           (entry) =>
               !isAzure ||
@@ -1369,19 +750,32 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         .toList();
     final tab = availableTabs.contains(controller.inspectorTab)
         ? controller.inspectorTab
-        : BrowserInspectorTab.objectDetails;
+        : availableTabs.first;
     final desktopCompact = _desktopCompact(context);
-    final panelBody = AnimatedSwitcher(
-      duration: const Duration(milliseconds: 220),
-      child: switch (tab) {
-        BrowserInspectorTab.bucketAdmin => _bucketAdminView(context),
-        BrowserInspectorTab.bucketInfo => _bucketInfoView(context),
-        BrowserInspectorTab.objectDetails => _objectDetailsView(context),
-        BrowserInspectorTab.versions => _versionsView(context),
-        BrowserInspectorTab.presign => _presignView(context),
-        BrowserInspectorTab.tools => _toolsView(context),
-        BrowserInspectorTab.eventsAndDebug => _eventsAndDebugView(context),
-      },
+    final panelBody = DirectionalSwitcher(
+      position: availableTabs.indexOf(tab),
+      duration: AppMotion.duration(context,
+          enabled: controller.settings.enableAnimations),
+      child: KeyedSubtree(
+          key: ValueKey(tab),
+          child: switch (tab) {
+            BrowserInspectorTab.bucketAdmin => _bucketAdminView(context),
+            BrowserInspectorTab.bucketInfo => _bucketInfoView(context),
+            BrowserInspectorTab.objectDetails => _objectDetailsView(context),
+            BrowserInspectorTab.objectPreview => controller.selectedObject ==
+                    null
+                ? const Center(child: Text('Select an object to preview.'))
+                : _adaptivePanelListView(context,
+                    key: const ValueKey('object-preview'),
+                    children: [
+                        _objectPreviewSection(
+                            context, controller.selectedObject!)
+                      ]),
+            BrowserInspectorTab.versions => _versionsView(context),
+            BrowserInspectorTab.presign => _presignView(context),
+            BrowserInspectorTab.tools => _toolsView(context),
+            BrowserInspectorTab.eventsAndDebug => _eventsAndDebugView(context),
+          }),
     );
 
     return Card(
@@ -1391,7 +785,14 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Inspector', style: Theme.of(context).textTheme.titleLarge),
+            Row(children: [
+              Expanded(
+                  child: Text(
+                      controller.selectedObject?.name ?? 'Bucket inspector',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.titleLarge)),
+            ]),
             const SizedBox(height: 12),
             CompactSelector<BrowserInspectorTab>(
               selected: tab,
@@ -1430,6 +831,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       BrowserInspectorTab.bucketAdmin => Icons.admin_panel_settings_outlined,
       BrowserInspectorTab.bucketInfo => Icons.info_outline,
       BrowserInspectorTab.objectDetails => Icons.article_outlined,
+      BrowserInspectorTab.objectPreview => Icons.preview_outlined,
       BrowserInspectorTab.versions => Icons.history,
       BrowserInspectorTab.presign => Icons.link,
       BrowserInspectorTab.tools => Icons.build_circle_outlined,
@@ -1442,8 +844,9 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       BrowserInspectorTab.bucketAdmin => 'Bucket config',
       BrowserInspectorTab.bucketInfo => 'Bucket info',
       BrowserInspectorTab.objectDetails => 'Object',
+      BrowserInspectorTab.objectPreview => 'Preview',
       BrowserInspectorTab.versions => 'Versions',
-      BrowserInspectorTab.presign => 'Presign',
+      BrowserInspectorTab.presign => 'Share link',
       BrowserInspectorTab.tools => 'Tools',
       BrowserInspectorTab.eventsAndDebug => 'Events & Debug',
     };
@@ -1460,10 +863,26 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       context,
       key: const ValueKey('bucket-admin'),
       children: [
-        Text(
-          'Manage bucket actions from the bucket list context menu.',
-          style: Theme.of(context).textTheme.bodyMedium,
-        ),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          OutlinedButton(
+              onPressed: () => _showJsonEditorDialog(context,
+                  title: 'Lifecycle JSON',
+                  initialValue: admin.lifecycleJson,
+                  onSave: controller.saveBucketLifecycle),
+              child: const Text('Edit lifecycle')),
+          OutlinedButton(
+              onPressed: () => _showJsonEditorDialog(context,
+                  title: 'Policy JSON',
+                  initialValue: admin.policyJson,
+                  onSave: controller.saveBucketPolicy),
+              child: const Text('Edit policy')),
+          OutlinedButton(
+              onPressed: () => _showJsonEditorDialog(context,
+                  title: 'Encryption JSON',
+                  initialValue: admin.encryptionJson,
+                  onSave: controller.saveBucketEncryption),
+              child: const Text('Edit encryption')),
+        ]),
         const SizedBox(height: 12),
         _inlineStat('Selected bucket', admin.bucketName),
         _inlineStat(
@@ -1648,8 +1067,6 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         _inlineStat('Storage class', object.storageClass),
         _inlineStat('Last modified', _formatDateTime(object.modifiedAt)),
         _inlineStat('Size', _formatBytes(object.size)),
-        const Divider(height: 16),
-        _objectPreviewSection(context, object),
         const Divider(height: 16),
         Text('Metadata', style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 8),
@@ -1941,27 +1358,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                                 ),
                               ),
                             )
-                          : AnimatedSwitcher(
-                              duration: const Duration(milliseconds: 220),
-                              switchInCurve: Curves.easeOutCubic,
-                              switchOutCurve: Curves.easeInCubic,
-                              transitionBuilder: (child, animation) {
-                                final isPage = child.key ==
-                                    const ValueKey('expanded-html-preview');
-                                final offset = isPage
-                                    ? const Offset(0.06, 0)
-                                    : const Offset(-0.06, 0);
-                                return FadeTransition(
-                                  opacity: animation,
-                                  child: SlideTransition(
-                                    position: Tween<Offset>(
-                                      begin: offset,
-                                      end: Offset.zero,
-                                    ).animate(animation),
-                                    child: child,
-                                  ),
-                                );
-                              },
+                          : DirectionalSwitcher(
+                              position: renderHtml ? 1 : 0,
+                              duration: AppMotion.duration(dialogContext,
+                                  enabled: controller.settings.enableAnimations,
+                                  milliseconds: 220),
                               child: renderHtml
                                   ? _expandedHtmlPreview(preview)
                                   : _expandedSourcePreview(
@@ -3004,274 +2405,6 @@ class _CreatePrefixDialogState extends State<_CreatePrefixDialog> {
         ),
       ],
     );
-  }
-}
-
-class _ObjectTable extends StatelessWidget {
-  const _ObjectTable({
-    required this.objects,
-    required this.selectedKey,
-    required this.contentTypeFor,
-    required this.onSelect,
-    required this.onShowContextMenu,
-  });
-
-  final List<ObjectEntry> objects;
-  final String? selectedKey;
-  final String Function(ObjectEntry object) contentTypeFor;
-  final ValueChanged<ObjectEntry> onSelect;
-  final Future<void> Function(ObjectEntry object, Offset position)
-      onShowContextMenu;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final headerStyle = theme.textTheme.labelSmall?.copyWith(
-      color: theme.colorScheme.onSurfaceVariant,
-      fontWeight: FontWeight.w800,
-    );
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final narrow = constraints.maxWidth < 520;
-        final veryNarrow = constraints.maxWidth < 380;
-        // Wide desktop panels get extra detail columns.
-        final showStorageClass = constraints.maxWidth >= 860;
-        final showEtag = constraints.maxWidth >= 1100;
-        final selectWidth = narrow ? 26.0 : 32.0;
-        final modifiedWidth = veryNarrow ? 72.0 : (narrow ? 86.0 : 128.0);
-        final sizeWidth = veryNarrow ? 52.0 : (narrow ? 64.0 : 86.0);
-        final typeWidth = veryNarrow ? 48.0 : (narrow ? 62.0 : 84.0);
-        const storageClassWidth = 110.0;
-        const etagWidth = 150.0;
-        final horizontalPadding = narrow ? 4.0 : 8.0;
-        final nameGap = narrow ? 6.0 : 10.0;
-
-        return Column(
-          children: [
-            Container(
-              height: narrow ? 32 : 34,
-              padding: EdgeInsets.symmetric(horizontal: horizontalPadding),
-              decoration: BoxDecoration(
-                border: Border(
-                  bottom: BorderSide(color: theme.colorScheme.outlineVariant),
-                ),
-              ),
-              child: Row(
-                children: [
-                  SizedBox(width: selectWidth),
-                  Expanded(
-                    child: Text('Name', style: headerStyle),
-                  ),
-                  SizedBox(
-                    width: modifiedWidth,
-                    child: Text('Modified', style: headerStyle),
-                  ),
-                  SizedBox(
-                    width: sizeWidth,
-                    child: Text('Size', style: headerStyle),
-                  ),
-                  SizedBox(
-                    width: typeWidth,
-                    child: Text('Type', style: headerStyle),
-                  ),
-                  if (showStorageClass)
-                    SizedBox(
-                      width: storageClassWidth,
-                      child: Text('Storage class', style: headerStyle),
-                    ),
-                  if (showEtag)
-                    SizedBox(
-                      width: etagWidth,
-                      child: Text('ETag', style: headerStyle),
-                    ),
-                ],
-              ),
-            ),
-            Expanded(
-              child: ListView.separated(
-                primary: false,
-                physics: const AlwaysScrollableScrollPhysics(),
-                itemCount: objects.length,
-                separatorBuilder: (_, __) => Divider(
-                  height: 1,
-                  color:
-                      theme.colorScheme.outlineVariant.withValues(alpha: 0.55),
-                ),
-                itemBuilder: (context, index) {
-                  final object = objects[index];
-                  final selected = selectedKey == object.key;
-                  return Material(
-                    color: selected
-                        ? theme.colorScheme.primaryContainer
-                            .withValues(alpha: 0.72)
-                        : Colors.transparent,
-                    borderRadius: BorderRadius.circular(6),
-                    child: InkWell(
-                      borderRadius: BorderRadius.circular(6),
-                      onTap: () => onSelect(object),
-                      onSecondaryTapDown: (details) => onShowContextMenu(
-                        object,
-                        details.globalPosition,
-                      ),
-                      child: Container(
-                        height: narrow ? 36 : 38,
-                        padding:
-                            EdgeInsets.symmetric(horizontal: horizontalPadding),
-                        child: Row(
-                          children: [
-                            SizedBox(
-                              width: selectWidth,
-                              child: Icon(
-                                selected
-                                    ? Icons.check_box
-                                    : Icons.check_box_outline_blank,
-                                size: narrow ? 16 : 18,
-                                color: selected
-                                    ? theme.colorScheme.primary
-                                    : theme.colorScheme.outline,
-                              ),
-                            ),
-                            Expanded(
-                              child: Row(
-                                children: [
-                                  Icon(
-                                    object.isFolder
-                                        ? Icons.folder
-                                        : Icons.insert_drive_file_outlined,
-                                    size: narrow ? 16 : 18,
-                                    color: object.isFolder
-                                        ? theme.colorScheme.onSurfaceVariant
-                                        : theme.colorScheme.primary,
-                                  ),
-                                  SizedBox(width: nameGap),
-                                  Expanded(
-                                    child: Text(
-                                      object.name,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style:
-                                          theme.textTheme.bodyMedium?.copyWith(
-                                        color: theme.colorScheme.onSurface,
-                                        fontWeight: selected
-                                            ? FontWeight.w700
-                                            : FontWeight.w500,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            SizedBox(
-                              width: modifiedWidth,
-                              child: Text(
-                                _formatTableDateTime(
-                                  object.modifiedAt,
-                                  compact: narrow,
-                                ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: theme.textTheme.bodySmall,
-                              ),
-                            ),
-                            SizedBox(
-                              width: sizeWidth,
-                              child: Text(
-                                object.isFolder
-                                    ? '--'
-                                    : _formatTableBytes(
-                                        object.size,
-                                        compact: narrow,
-                                      ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: theme.textTheme.bodySmall,
-                              ),
-                            ),
-                            SizedBox(
-                              width: typeWidth,
-                              child: Text(
-                                object.isFolder
-                                    ? 'Folder'
-                                    : _shortObjectType(contentTypeFor(object)),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: theme.textTheme.bodySmall,
-                              ),
-                            ),
-                            if (showStorageClass)
-                              SizedBox(
-                                width: storageClassWidth,
-                                child: Text(
-                                  object.isFolder || object.storageClass.isEmpty
-                                      ? '--'
-                                      : object.storageClass,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: theme.textTheme.bodySmall,
-                                ),
-                              ),
-                            if (showEtag)
-                              SizedBox(
-                                width: etagWidth,
-                                child: Text(
-                                  object.isFolder
-                                      ? '--'
-                                      : _shortEtag(object.etag),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: theme.textTheme.bodySmall,
-                                ),
-                              ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  );
-                },
-              ),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  static String _shortEtag(String? value) {
-    if (value == null || value.isEmpty) {
-      return '--';
-    }
-    return value.replaceAll('"', '');
-  }
-
-  static String _shortObjectType(String value) {
-    if (value.contains('/')) {
-      return value.split('/').last;
-    }
-    return value.isEmpty ? '--' : value;
-  }
-
-  static String _formatTableBytes(int value, {bool compact = false}) {
-    if (value >= 1024 * 1024 * 1024) {
-      return '${(value / (1024 * 1024 * 1024)).toStringAsFixed(1)}${compact ? 'G' : ' GB'}';
-    }
-    if (value >= 1024 * 1024) {
-      return '${(value / (1024 * 1024)).toStringAsFixed(1)}${compact ? 'M' : ' MB'}';
-    }
-    if (value >= 1024) {
-      return '${(value / 1024).toStringAsFixed(1)}${compact ? 'K' : ' KB'}';
-    }
-    return compact ? '$value' : '$value B';
-  }
-
-  static String _formatTableDateTime(DateTime value, {bool compact = false}) {
-    final month = value.month.toString().padLeft(2, '0');
-    final day = value.day.toString().padLeft(2, '0');
-    final hour = value.hour.toString().padLeft(2, '0');
-    final minute = value.minute.toString().padLeft(2, '0');
-    if (compact) {
-      return '$month-$day $hour:$minute';
-    }
-    return '${value.year}-$month-$day $hour:$minute';
   }
 }
 

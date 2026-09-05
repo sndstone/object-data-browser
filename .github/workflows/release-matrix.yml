@@ -2,6 +2,15 @@ name: Release Matrix
 
 on:
   workflow_dispatch:
+    inputs:
+      build_macos:
+        description: Build signed/notarized macOS (requires Apple secrets)
+        type: boolean
+        default: false
+      build_mobile:
+        description: Include Android and iOS builds
+        type: boolean
+        default: false
   push:
     tags:
       - "v*"
@@ -10,7 +19,11 @@ permissions:
   contents: read
 
 jobs:
+  verify:
+    uses: ./.github/workflows/verification.yml
+
   windows:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -34,8 +47,10 @@ jobs:
         with:
           name: windows-${{ matrix.arch }}
           path: dist/windows/*
+          if-no-files-found: error
 
   linux:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -55,6 +70,10 @@ jobs:
     runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libsecret-1-dev libstdc++-12-dev liblzma-dev rpm
       - name: Cache toolchains
         uses: actions/cache@v4
         with:
@@ -65,9 +84,14 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.package }}-${{ matrix.arch }}
-          path: dist/linux/*
+          path: |
+            dist/linux/*.deb
+            dist/linux/*.rpm
+          if-no-files-found: error
 
   macos:
+    if: ${{ inputs.build_macos == true || vars.ENABLE_APPLE_RELEASES == 'true' }}
+    needs: verify
     runs-on: macos-14
     env:
       MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
@@ -137,6 +161,8 @@ jobs:
             dist/macos/*.dmg
 
   android:
+    if: ${{ inputs.build_mobile == true }}
+    needs: verify
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -153,3 +179,53 @@ jobs:
           path: |
             apps/flutter_app/build/app/outputs/flutter-apk/*.apk
             apps/flutter_app/build/app/outputs/bundle/release/*.aab
+
+  ios:
+    if: ${{ inputs.build_mobile == true }}
+    needs: verify
+    runs-on: macos-14
+    env:
+      IOS_SIGNING_IDENTITY: ${{ secrets.IOS_SIGNING_IDENTITY }}
+      IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+      IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
+      IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+      IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: .tmp/toolchains
+          key: toolchains-${{ runner.os }}-ios-${{ hashFiles('scripts/bootstrap.*', 'apps/flutter_app/ios/Runner.xcodeproj/project.pbxproj') }}
+      - name: Configure iOS distribution signing
+        if: ${{ env.IOS_SIGNING_IDENTITY != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in IOS_TEAM_ID IOS_CERTIFICATE_P12_BASE64 IOS_CERTIFICATE_PASSWORD IOS_PROVISIONING_PROFILE_BASE64; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required iOS release secret: $name" >&2
+              exit 1
+            fi
+          done
+          SIGNING_KEYCHAIN="$RUNNER_TEMP/object-browser-ios.keychain-db"
+          SIGNING_PASSWORD="$(openssl rand -hex 24)"
+          CERTIFICATE_PATH="$RUNNER_TEMP/ios-distribution.p12"
+          PROFILE_PATH="$RUNNER_TEMP/object-browser.mobileprovision"
+          printf '%s' "$IOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+          printf '%s' "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
+          security create-keychain -p "$SIGNING_PASSWORD" "$SIGNING_KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$SIGNING_KEYCHAIN"
+          security unlock-keychain -p "$SIGNING_PASSWORD" "$SIGNING_KEYCHAIN"
+          security import "$CERTIFICATE_PATH" -k "$SIGNING_KEYCHAIN" -P "$IOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$SIGNING_PASSWORD" "$SIGNING_KEYCHAIN"
+          security list-keychains -d user -s "$SIGNING_KEYCHAIN" login.keychain-db
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/object-browser.mobileprovision"
+      - name: Build iOS target
+        run: ./scripts/build.sh ios arm64
+      - uses: actions/upload-artifact@v4
+        if: ${{ env.IOS_SIGNING_IDENTITY != '' }}
+        with:
+          name: ios-arm64
+          path: apps/flutter_app/build/ios/ipa/*.ipa

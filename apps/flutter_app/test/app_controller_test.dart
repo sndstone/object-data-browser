@@ -57,9 +57,28 @@ class MemoryAppStateRepository implements AppStateRepository {
   }
 }
 
+class DeniedDeleteEngine extends MockEngineService {
+  @override
+  Future<BatchOperationResult> deleteObjects(
+          {required String engineId,
+          required EndpointProfile profile,
+          required String bucketName,
+          required List<String> keys}) async =>
+      BatchOperationResult(
+          successCount: 0,
+          failureCount: keys.length,
+          failures: keys
+              .map((key) => BatchOperationFailure(
+                  target: key,
+                  code: 'AccessDenied',
+                  message: 'Permission denied'))
+              .toList());
+}
+
 class RecordingMockEngineService extends MockEngineService {
   DiagnosticsOptions? lastDiagnostics;
   int? lastUploadChunkMiB;
+  final uploadCalls = <List<String>>[];
 
   @override
   void configureDiagnostics(DiagnosticsOptions options) {
@@ -79,6 +98,7 @@ class RecordingMockEngineService extends MockEngineService {
     required int multipartChunkMiB,
   }) {
     lastUploadChunkMiB = multipartChunkMiB;
+    uploadCalls.add(List.of(filePaths));
     return super.startUpload(
       engineId: engineId,
       profile: profile,
@@ -90,6 +110,30 @@ class RecordingMockEngineService extends MockEngineService {
       multipartChunkMiB: multipartChunkMiB,
     );
   }
+}
+
+class MobileEngineService extends MockEngineService {
+  @override
+  Future<List<EngineDescriptor>> listEngines() async => const [
+        EngineDescriptor(
+          id: 'go',
+          label: 'Go (iOS)',
+          language: 'go',
+          version: '2.2.5',
+          available: true,
+          desktopSupported: false,
+          mobileSupported: true,
+        ),
+        EngineDescriptor(
+          id: 'rust',
+          label: 'Rust (iOS)',
+          language: 'rust',
+          version: '2.2.5',
+          available: true,
+          desktopSupported: false,
+          mobileSupported: true,
+        ),
+      ];
 }
 
 class MetadataOnlyImportRepository extends MemoryAppStateRepository {
@@ -107,6 +151,20 @@ class MetadataOnlyImportRepository extends MemoryAppStateRepository {
         verifyTls: false,
       ),
     ];
+  }
+}
+
+class CredentialFailingAppStateRepository extends MemoryAppStateRepository {
+  @override
+  Future<void> saveState({
+    required AppSettings settings,
+    required List<EndpointProfile> profiles,
+    required String? selectedProfileId,
+    bool allowCredentialStoreRecovery = false,
+  }) async {
+    throw const CredentialStoreException(
+      'iOS Keychain access failed (-34018). Launch the simulator app from Xcode.',
+    );
   }
 }
 
@@ -167,6 +225,72 @@ const _secondProfile = EndpointProfile(
 );
 
 void main() {
+  test('multi-file controller upload exposes one job and nested file events',
+      () async {
+    final dir = await Directory.systemTemp.createTemp('batch-controller-');
+    addTearDown(() => dir.delete(recursive: true));
+    final paths = [
+      for (final name in ['a.txt', 'b.txt']) '${dir.path}/$name'
+    ];
+    for (final path in paths) {
+      await File(path).writeAsString('fixture');
+    }
+    final engine = RecordingMockEngineService();
+    final controller = AppController(
+        engineService: engine,
+        initialSettings: _settings.copyWith(relistObjectsAfterMutation: false),
+        initialProfiles: const [_profile]);
+    addTearDown(controller.dispose);
+    await controller.initialize();
+    await controller.startSampleUpload(paths);
+    expect(engine.uploadCalls, [
+      [paths[0]],
+      [paths[1]]
+    ]);
+    final jobs = controller.transferJobs
+        .where((j) => j.id.startsWith('upload-batch-'))
+        .toList();
+    expect(jobs, hasLength(1));
+    expect(controller.transferJobs.where((j) => j.direction == 'upload'),
+        hasLength(1));
+    expect(jobs.single.status, 'completed');
+    expect(jobs.single.itemsCompleted, 2);
+    final files = controller.eventLog
+        .where((e) => e.parentRequestId == jobs.single.id)
+        .toList();
+    expect(files.map((e) => e.requestId).toSet(), hasLength(2));
+    expect(files.where((e) => e.responseStatus == 'completed'), hasLength(2));
+    expect(controller.bannerTaskId, jobs.single.id);
+  });
+  test('denied delete keeps the row and selected key visible', () async {
+    final controller = AppController(
+        engineService: DeniedDeleteEngine(),
+        initialSettings: _settings,
+        initialProfiles: const [_profile]);
+    addTearDown(controller.dispose);
+    await controller.initialize();
+    final object = controller.objects.firstWhere((o) => !o.isFolder);
+    await controller.setSelectedObject(object);
+    controller.toggleObjectSelection(object);
+    await controller.deleteSelectedObject();
+    expect(controller.objects.any((o) => o.key == object.key), true);
+    expect(controller.objectSelection.keys, contains(object.key));
+    expect(controller.bannerMessage, contains('Permission denied'));
+  });
+  test('controller selects the first available mobile engine when needed',
+      () async {
+    final controller = AppController(
+      engineService: MobileEngineService(),
+      initialSettings: _settings.copyWith(defaultEngineId: 'python'),
+      initialProfiles: const [],
+    );
+
+    await controller.initialize();
+
+    expect(controller.activeEngineId, 'go');
+    expect(controller.benchmarkDraft.engineId, 'go');
+  });
+
   test('controller uses dynamic upload sizing or the manual override',
       () async {
     final tempDir = await Directory.systemTemp.createTemp('multipart-sizing');
@@ -239,6 +363,20 @@ void main() {
       controller.bannerMessage,
       contains('securely stored credentials for 1 profile'),
     );
+  });
+
+  test('profile save surfaces the actionable Keychain failure', () async {
+    final controller = AppController(
+      engineService: MockEngineService(),
+      appStateRepository: CredentialFailingAppStateRepository(),
+      initialSettings: _settings,
+      initialProfiles: const [_profile],
+    );
+
+    await controller.saveProfile(_profile);
+
+    expect(controller.bannerMessage, contains('iOS Keychain access failed'));
+    expect(controller.bannerMessage, contains('Launch the simulator app'));
   });
 
   test('configured default endpoint wins over the previous runtime selection',

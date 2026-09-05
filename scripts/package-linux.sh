@@ -30,10 +30,12 @@ fi
 
 export PATH="$TOOLS_DIR/nfpm:$PATH"
 
-APP_DIR="$ROOT_DIR/apps/flutter_app/build/linux/${ARCH}/release/bundle"
-if [[ ! -d "$APP_DIR" ]]; then
-  APP_DIR="$ROOT_DIR/apps/flutter_app/build/linux/x64/release/bundle"
-fi
+case "$ARCH" in
+  x86_64|amd64|x64) FLUTTER_ARCH=x64 ;;
+  aarch64|arm64) FLUTTER_ARCH=arm64 ;;
+  *) echo "Unsupported Linux architecture: $ARCH" >&2; exit 1 ;;
+esac
+APP_DIR="$ROOT_DIR/apps/flutter_app/build/linux/$FLUTTER_ARCH/release/bundle"
 if [[ ! -d "$APP_DIR" ]]; then
   echo "Linux Flutter bundle was not found. Run ./scripts/build.sh linux $ARCH first." >&2
   exit 1

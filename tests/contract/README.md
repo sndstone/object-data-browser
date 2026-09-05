@@ -40,9 +40,9 @@ ENGINE_CMD="engines/go/build/x64/s3-browser-go-engine.exe" pytest tests/contract
 $env:ENGINE_CMD = "engines\java\...\run-java-engine.bat"; pytest tests/contract
 ```
 
-If the resolved binary is not present, the engine-dependent tests skip
-cleanly instead of failing; the fixture-shape tests (which only read
-`tests/fixtures/*.json`) still run regardless of engine availability.
+Set `REQUIRE_ENGINE=1` for verification. Missing binaries fail in this mode
+and in CI; only optional local runs may skip an absent binary. The verification
+workflow builds all four engines before running this same suite.
 
 The suite covers: `health` (advertised methods must be a subset of the
 `contracts/engine_contract.json` method enum), `getCapabilities`, an unknown
@@ -52,3 +52,10 @@ and structural validation of the `health_response.json` and
 `list_objects_response.json` fixtures (including the `nextCursor` field).
 All scenarios are offline-only and require no cloud credentials.
 
+`test_storage_failures.py` starts a loopback HTTP storage fixture. It exercises
+S3 cursor continuation, partial-delete identities, multipart failure/abort,
+nonexistent control IDs, and live Python/Java pause/resume/cancel while part
+requests are held open. Azure cursor and partial-delete checks run on Python
+and Go; unsupported provider/control combinations are explicitly skipped.
+These fixtures validate response semantics and cleanup, not production cloud
+compatibility, throughput, or pause boundaries of already-in-flight requests.

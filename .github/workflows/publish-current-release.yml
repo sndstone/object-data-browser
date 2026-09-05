@@ -12,7 +12,10 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    uses: ./.github/workflows/verification.yml
   publish:
+    needs: verify
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -46,21 +49,18 @@ jobs:
           if [ ! -s release-notes.md ]; then
             printf 'Release %s.\n' "$VERSION" > release-notes.md
           fi
-      - name: Create or update GitHub Release
+      - name: Create draft release pending package verification
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           tag="v$VERSION"
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release edit "$tag" \
-              --title "Version $VERSION" \
-              --notes-file release-notes.md \
-              --latest
+            echo "Release already exists; leaving published notes and assets unchanged."
           else
             gh release create "$tag" \
               --target "$GITHUB_SHA" \
               --title "Version $VERSION" \
               --notes-file release-notes.md \
-              --latest
+              --draft
           fi

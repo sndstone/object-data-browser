@@ -6,13 +6,14 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../benchmark/benchmark_workspace.dart';
-import '../browser/browser_workspace.dart';
+import '../browser/browser_workspace_frame.dart';
 import '../controllers/app_controller.dart';
 import '../event_log/event_log_workspace.dart';
 import '../models/domain_models.dart';
 import '../settings/settings_workspace.dart';
 import '../tasks/tasks_workspace.dart';
 import '../theme/app_theme.dart';
+import '../theme/app_motion.dart';
 import '../theme/breakpoints.dart';
 import '../widgets/app_select_field.dart';
 import '../widgets/compact_selector.dart';
@@ -99,10 +100,12 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
     final theme = controller.settings.darkMode
         ? AppTheme.dark(
             scalePercent: controller.settings.uiScalePercent,
+            compactRows: controller.settings.compactRows,
             desktopCompact: desktopCompact,
           )
         : AppTheme.light(
             scalePercent: controller.settings.uiScalePercent,
+            compactRows: controller.settings.compactRows,
             desktopCompact: desktopCompact,
           );
 
@@ -113,8 +116,8 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
       home: Builder(
         builder: (context) => MediaQuery(
           data: MediaQuery.of(context).copyWith(
-            textScaler:
-                TextScaler.linear(controller.settings.uiScalePercent / 100),
+            textScaler: PreferenceTextScaler(MediaQuery.textScalerOf(context),
+                controller.settings.uiScalePercent / 100),
           ),
           child: LayoutBuilder(
             builder: (context, constraints) {
@@ -134,14 +137,14 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
                   }
                 });
               }
-              final body = AnimatedSwitcher(
-                duration: controller.settings.enableAnimations
-                    ? const Duration(milliseconds: 280)
-                    : Duration.zero,
-                switchInCurve: Curves.easeOutCubic,
-                switchOutCurve: Curves.easeInCubic,
+              final body = DirectionalSwitcher(
+                position: navTabs.indexOf(activeTab),
+                axis: compact ? Axis.horizontal : Axis.vertical,
+                duration: AppMotion.duration(context,
+                    enabled: controller.settings.enableAnimations,
+                    milliseconds: 280),
                 child: switch (activeTab) {
-                  WorkspaceTab.browser => BrowserWorkspace(
+                  WorkspaceTab.browser => BrowserWorkspaceFrame(
                       key: const ValueKey('browser'),
                       controller: controller,
                       compact: compact,
@@ -167,9 +170,9 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
 
               return Scaffold(
                 bottomNavigationBar: AnimatedSwitcher(
-                  duration: controller.settings.enableAnimations
-                      ? const Duration(milliseconds: 220)
-                      : Duration.zero,
+                  duration: AppMotion.duration(context,
+                      enabled: controller.settings.enableAnimations,
+                      milliseconds: 220),
                   child: phone
                       ? KeyedSubtree(
                           key: const ValueKey('phone-navigation'),
@@ -190,9 +193,9 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
                           children: [
                             AnimatedContainer(
                               key: const ValueKey('workspace-navigation-rail'),
-                              duration: controller.settings.enableAnimations
-                                  ? const Duration(milliseconds: 220)
-                                  : Duration.zero,
+                              duration: AppMotion.duration(context,
+                                  enabled: controller.settings.enableAnimations,
+                                  milliseconds: 220),
                               curve: Curves.easeOutCubic,
                               width: compact ? 0 : (compactRail ? 72 : 126),
                               child: ClipRect(
@@ -225,35 +228,22 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
                                       phone: phone,
                                     ),
                                     AnimatedSize(
-                                      duration: controller
-                                              .settings.enableAnimations
-                                          ? const Duration(milliseconds: 220)
-                                          : Duration.zero,
+                                      duration: AppMotion.duration(context,
+                                          enabled: controller
+                                              .settings.enableAnimations,
+                                          milliseconds: 220),
                                       curve: Curves.easeOutCubic,
                                       child: AnimatedSwitcher(
-                                        duration: controller
-                                                .settings.enableAnimations
-                                            ? const Duration(milliseconds: 220)
-                                            : Duration.zero,
+                                        duration: AppMotion.duration(context,
+                                            enabled: controller
+                                                .settings.enableAnimations,
+                                            milliseconds: 220),
                                         switchInCurve: Curves.easeOutCubic,
                                         switchOutCurve: Curves.easeInCubic,
-                                        transitionBuilder: (child, animation) {
-                                          final curved = CurvedAnimation(
-                                            parent: animation,
-                                            curve: Curves.easeOutCubic,
-                                            reverseCurve: Curves.easeInCubic,
-                                          );
-                                          return FadeTransition(
-                                            opacity: curved,
-                                            child: SlideTransition(
-                                              position: Tween<Offset>(
-                                                begin: const Offset(-0.06, 0),
-                                                end: Offset.zero,
-                                              ).animate(curved),
-                                              child: child,
-                                            ),
-                                          );
-                                        },
+                                        transitionBuilder: (child, animation) =>
+                                            FadeTransition(
+                                                opacity: animation,
+                                                child: child),
                                         child: tablet
                                             ? KeyedSubtree(
                                                 key: const ValueKey(
@@ -526,9 +516,8 @@ class _AppHeader extends StatelessWidget {
       ),
       child: TweenAnimationBuilder<double>(
         tween: Tween(begin: 0, end: 1),
-        duration: controller.settings.enableAnimations
-            ? const Duration(milliseconds: 220)
-            : Duration.zero,
+        duration: AppMotion.duration(context,
+            enabled: controller.settings.enableAnimations, milliseconds: 220),
         curve: Curves.easeOutCubic,
         builder: (context, value, child) {
           return Transform.translate(
@@ -653,7 +642,7 @@ class _HeaderSearchField extends StatelessWidget {
         enabled: hasOpenBucket,
         decoration: InputDecoration(
           hintText: hasOpenBucket
-              ? 'Search current bucket...'
+              ? 'Search loaded objects...'
               : 'Open a bucket to search objects...',
           prefixIcon: const Icon(Icons.search, size: 20),
           suffixIcon: Padding(
@@ -1026,7 +1015,9 @@ class _BannerOverlayState extends State<_BannerOverlay> {
     return IgnorePointer(
       ignoring: !visible,
       child: AnimatedSwitcher(
-        duration: const Duration(milliseconds: 180),
+        duration: AppMotion.duration(context,
+            enabled: widget.controller.settings.enableAnimations,
+            milliseconds: 180),
         transitionBuilder: (child, animation) {
           return FadeTransition(
             opacity: animation,

@@ -1,0 +1,59 @@
+name: Verification
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  flutter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+        working-directory: apps/flutter_app
+      - run: flutter analyze
+        working-directory: apps/flutter_app
+      - run: flutter test
+        working-directory: apps/flutter_app
+  engines:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [python, go, rust, java]
+    env:
+      REQUIRE_ENGINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pytest boto3
+      - uses: actions/setup-go@v5
+        if: matrix.engine == 'go'
+        with:
+          go-version-file: engines/go/go.mod
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.engine == 'rust'
+      - uses: actions/setup-java@v4
+        if: matrix.engine == 'java'
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build required engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ matrix.engine }}' in
+            python) echo 'ENGINE_CMD=python engines/python/src/main.py' >> "$GITHUB_ENV" ;;
+            go) (cd engines/go && go build -o ../../engine-test ./src); echo 'ENGINE_CMD=./engine-test' >> "$GITHUB_ENV" ;;
+            rust) cargo build --manifest-path engines/rust/Cargo.toml; echo 'ENGINE_CMD=engines/rust/target/debug/s3-browser-rust-engine' >> "$GITHUB_ENV" ;;
+            java) bash apps/flutter_app/android/gradlew -p engines/java installDist --no-daemon; echo 'ENGINE_CMD=engines/java/build/install/s3-browser-java-engine/bin/s3-browser-java-engine' >> "$GITHUB_ENV" ;;
+          esac
+      - run: python -m pytest tests/contract -q

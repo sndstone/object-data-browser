@@ -199,7 +199,15 @@ void main() {
         profiles: const [_profile],
         selectedProfileId: _profile.id,
       ),
-      throwsStateError,
+      throwsA(
+        isA<CredentialStoreException>()
+            .having((error) => error.message, 'message', contains('Keychain'))
+            .having(
+              (error) => error.message,
+              'detail',
+              contains('FileSystemException'),
+            ),
+      ),
     );
 
     final storedFile = File(
@@ -268,7 +276,7 @@ void main() {
         profiles: const [_profile],
         selectedProfileId: _profile.id,
       ),
-      throwsStateError,
+      throwsA(isA<CredentialStoreException>()),
     );
     expect(store.writeCalls, isEmpty);
 

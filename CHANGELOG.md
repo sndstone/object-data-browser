@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### iOS support
+- Added an iOS 13+ Flutter target with a native AWS SDK for Swift engine bridge for S3-compatible and AWS S3 endpoints.
+- Added iPhone/iPad browsing, object versions and metadata, core bucket/object mutations, transfers, presigned URLs, inspector tools, Files.app downloads, and profile export sharing.
+- Added local-network privacy/ATS configuration, Keychain sharing entitlements, unsigned compile verification, signed IPA packaging configuration, and an iOS CI lane.
+- Fixed simulator credential persistence guidance after confirming unsigned direct launches fail with Keychain error `-34018`; Keychain failures now retain their platform detail and direct users to an Xcode or provisioned launch instead of showing only a generic session warning.
+- Generalized Android-only mobile UI and engine metadata branches so iOS uses the mobile layouts without desktop drag/drop or unsupported directory picking.
+- Benchmark and bucket-encryption mutations are explicitly capability-gated in the first iOS release.
+
+## 2.2.5
+
+### Testing feedback revision (build 2)
+- Replaced the long View & actions menu with an expandable icon tray; Name, Modified and Size headers now sort directly and reverse direction on repeated clicks.
+- Made bucket configuration, tools, events and sharing visible alongside inspector tabs.
+- Aligned workspace, mobile browser and preview transitions with destination order; outgoing panels leave through the opposite edge.
+- Split multi-file uploads into independently sized, sequential engine requests under one aggregate job, with nested per-file logs and truthful failure/cancellation outcomes.
+
+- Simplified browser actions, explicit loaded-window search, separate Preview tab, contextual inspector, and genuine checkbox/range batch selection with destructive confirmation.
+- Separated row density from accessible text sizing, organized settings into sections with visible save states, and simplified job summaries with honest progress/capabilities.
+- Added short eased slide/fade transitions and reduced-motion support; cached the browser frame to avoid rebuilding it for unrelated task events.
+- Fixed partial-delete reporting, job-owner control routing, bounded process admission/queues, operation deadlines, diagnostic redaction/bounds, and atomic recoverable metadata writes. Credentials remain in Keychain.
+- Added bounded listing windows and isolated/cancellable large or regex queries, four-engine CI contract verification, loopback storage failure fixtures, and reliability regressions.
+- Go/Rust live controls now explicitly report unsupported instead of fabricated success.
+
 ## 2.2.4 - 2026-07-20
 
 ### Benchmark workspace refresh

@@ -6,22 +6,22 @@ void main() {
   test('android import picker uses any file type without extension filters',
       () {
     expect(
-      profileImportPickerType(isAndroid: true),
+      profileImportPickerType(isMobile: true),
       FileType.any,
     );
     expect(
-      profileImportAllowedExtensions(isAndroid: true),
+      profileImportAllowedExtensions(isMobile: true),
       isNull,
     );
   });
 
   test('desktop import picker keeps json extension filter', () {
     expect(
-      profileImportPickerType(isAndroid: false),
+      profileImportPickerType(isMobile: false),
       FileType.custom,
     );
     expect(
-      profileImportAllowedExtensions(isAndroid: false),
+      profileImportAllowedExtensions(isMobile: false),
       const ['json'],
     );
   });

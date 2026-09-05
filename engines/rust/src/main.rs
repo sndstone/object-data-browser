@@ -36,7 +36,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-const ENGINE_VERSION: &str = "2.2.4";
+const ENGINE_VERSION: &str = "2.2.5";
 
 const SUPPORTED_METHODS: &[&str] = &[
     "health",
@@ -242,7 +242,10 @@ fn main() {
                     }
                 }
             }
-            Err(_) => continue,
+            Err(_) => {
+                println!("{}", json!({"requestId": null, "ok": false, "error": {"code": "invalid_config", "message": "Malformed JSON request."}}));
+                continue;
+            },
         };
 
         if let Ok(output) = serde_json::to_string(&response) {
@@ -329,9 +332,8 @@ async fn handle_request(request: Request) -> SidecarResult {
         "deleteObjectVersions" => delete_object_versions(request.params).await,
         "startUpload" => start_upload(request.params).await,
         "startDownload" => start_download(request.params).await,
-        "pauseTransfer" => Ok(transfer_control(&request.params, "paused")),
-        "resumeTransfer" => Ok(transfer_control(&request.params, "running")),
-        "cancelTransfer" => Ok(transfer_control(&request.params, "cancelled")),
+        "pauseTransfer" | "resumeTransfer" | "cancelTransfer" => Err(SidecarError::new(
+            "unsupported_feature", "Interactive transfer control is unavailable in the sequential Rust engine.")),
         "generatePresignedUrl" => generate_presigned_url(request.params).await,
         "runPutTestData" => run_put_test_data(request.params).await,
         "runDeleteAll" => run_delete_all(request.params).await,
@@ -2895,9 +2897,9 @@ fn transfer_job(
     part_size_bytes: Option<u64>,
     parts_completed: Option<u64>,
     parts_total: Option<u64>,
-    can_pause: bool,
-    can_resume: bool,
-    can_cancel: bool,
+    _can_pause: bool,
+    _can_resume: bool,
+    _can_cancel: bool,
     output_lines: Vec<String>,
 ) -> Value {
     json!({
@@ -2915,9 +2917,9 @@ fn transfer_job(
         "partSizeBytes": part_size_bytes,
         "partsCompleted": parts_completed,
         "partsTotal": parts_total,
-        "canPause": can_pause,
-        "canResume": can_resume,
-        "canCancel": can_cancel,
+        "canPause": false,
+        "canResume": false,
+        "canCancel": false,
         "outputLines": output_lines,
     })
 }

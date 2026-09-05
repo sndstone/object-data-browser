@@ -6,8 +6,21 @@ section: utils
 priority: optional
 maintainer: Object Data Browser
 description: Cross-platform object data browser with pluggable backend engines
-homepage: https://example.invalid/object-data-browser
+homepage: https://github.com/sndstone/object-data-browser
 license: Proprietary
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.39)
+      - libgtk-3-0
+      - libsecret-1-0
+      - libstdc++6
+  rpm:
+    depends:
+      - glibc >= 2.39
+      - gtk3
+      - libsecret
+      - libstdc++
 contents:
   - src: {{ROOT}}/usr/lib/object-data-browser/
     dst: /usr/lib/object-data-browser

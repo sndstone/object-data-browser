@@ -7,9 +7,15 @@ import 'package:flutter/foundation.dart';
 
 import '../models/domain_models.dart';
 import '../services/app_state_repository.dart';
+import '../services/app_platform.dart';
 import '../services/engine_service.dart';
 import '../services/multipart_sizing.dart';
 import '../services/source_preview.dart';
+import '../services/desktop_sidecar_engine_service.dart';
+import 'object_selection.dart';
+import 'object_query.dart';
+import 'upload_batch.dart';
+import '../services/diagnostic_safety.dart';
 
 const List<String> kAwsRegions = <String>[
   'us-east-1',
@@ -254,6 +260,11 @@ class AppController extends ChangeNotifier {
   final String? _initialSelectedProfileId;
   final AppStateRepository? _appStateRepository;
   String? _credentialStoreError;
+  bool _lastProfileSaveSucceeded = true;
+  String get profilePersistenceStatus =>
+      _credentialStoreError == null && _lastProfileSaveSucceeded
+          ? 'Saved'
+          : 'Session only';
   int _taskSequence = 0;
   int _guardErrorSequence = 0;
   final Map<String, String> _busyTaskIds = <String, String>{};
@@ -297,6 +308,25 @@ class AppController extends ChangeNotifier {
   EndpointProfile? selectedProfile;
   BucketSummary? selectedBucket;
   ObjectEntry? selectedObject;
+  final ObjectSelection objectSelection = ObjectSelection();
+  String? objectFilterError;
+  static const int objectListingBudget = 100000;
+  bool listingBudgetReached = false;
+  void toggleObjectSelection(ObjectEntry object, {bool range = false}) {
+    objectSelection.toggle(object, visibleObjects, range: range);
+    notifyListeners();
+  }
+
+  void selectAllLoadedObjects() {
+    objectSelection.selectAll(visibleObjects);
+    notifyListeners();
+  }
+
+  void clearObjectSelection() {
+    objectSelection.clear();
+    notifyListeners();
+  }
+
   String activeEngineId = 'rust';
   String currentPrefix = '';
   String objectFilterValue = '';
@@ -343,6 +373,9 @@ class AppController extends ChangeNotifier {
   /// The loop will stop after the current page completes and partial results
   /// will be displayed immediately.
   void cancelListing() {
+    if (_engineService is DesktopSidecarEngineService) {
+      _engineService.cancelQueuedListings();
+    }
     // Invalidate whatever listing loop is currently running. The loop notices
     // the generation change and sets [_listingCancelled] for its summary.
     _listingGeneration++;
@@ -368,7 +401,17 @@ class AppController extends ChangeNotifier {
       );
       engines = await _engineService.listEngines();
       selectedProfile = _selectBootstrapProfile();
-      activeEngineId = settings.defaultEngineId;
+      final preferredEngineId = settings.defaultEngineId;
+      final preferredEngineAvailable = engines.any(
+        (engine) => engine.id == preferredEngineId && engine.available,
+      );
+      final availableEngines = engines.where((engine) => engine.available);
+      activeEngineId = preferredEngineAvailable
+          ? preferredEngineId
+          : availableEngines.isNotEmpty
+              ? availableEngines.first.id
+              : preferredEngineId;
+      benchmarkDraft = benchmarkDraft.copyWith(engineId: activeEngineId);
       _addEvent(
         level: 'INFO',
         category: 'Engine',
@@ -622,6 +665,7 @@ class AppController extends ChangeNotifier {
       return;
     }
     final nextPrefix = prefix ?? currentPrefix;
+    if (nextPrefix != currentPrefix) objectSelection.clear();
     final previousSelectionKey = selectedObject?.key;
     await _runBusy(
         'refresh-objects',
@@ -651,7 +695,13 @@ class AppController extends ChangeNotifier {
           listAll: listAll,
           fetchFirstPageWithoutCursor: true,
         );
+        if (selectedProfile?.id != profile.id ||
+            selectedBucket?.name != bucket.name ||
+            currentPrefix != nextPrefix) {
+          return;
+        }
         objects = page.items;
+        objectSelection.retain(objects.map((o) => o.key));
         objectCursor = page.cursor;
         final pageNumber = page.pageNumber;
         _resetObjectPagination();
@@ -686,7 +736,9 @@ class AppController extends ChangeNotifier {
     });
   }
 
-  Future<void> listAllObjectsForCurrentBucket() async {
+  Future<void> listAllObjectsForCurrentBucket(
+      {bool all = true, bool nextWindow = false}) async {
+    final operationPrefix = currentPrefix;
     final profile = selectedProfile;
     final bucket = selectedBucket;
     if (profile == null || bucket == null) {
@@ -707,13 +759,19 @@ class AppController extends ChangeNotifier {
           final page = await _pageThroughObjects(
             profile: profile,
             bucket: bucket,
-            initialItems: objects.toList(),
+            initialItems: nextWindow ? <ObjectEntry>[] : objects.toList(),
             initialCursor: objectCursor,
             initialPageNumber: (objects.length / objectPageSize).ceil(),
-            listAll: true,
+            listAll: all,
             fetchFirstPageWithoutCursor: false,
           );
+          if (selectedProfile?.id != profile.id ||
+              selectedBucket?.name != bucket.name ||
+              currentPrefix != operationPrefix) {
+            return;
+          }
           objects = page.items;
+          objectSelection.retain(objects.map((o) => o.key));
           objectCursor = page.cursor;
           final cursor = page.cursor;
           final pageNumber = page.pageNumber;
@@ -755,12 +813,24 @@ class AppController extends ChangeNotifier {
     required bool fetchFirstPageWithoutCursor,
   }) async {
     _listingCancelled = false;
+    listingBudgetReached = false;
     final listingGeneration = ++_listingGeneration;
     final allItems = initialItems;
+    final prefix = currentPrefix;
+    final engineId = activeEngineId;
+    final isFlat = flatView;
+    var keyCharacters = allItems.fold<int>(0, (n, o) => n + o.key.length);
     var cursor = initialCursor;
     var pageNumber = initialPageNumber;
     var isFirstIteration = true;
     while (fetchFirstPageWithoutCursor || cursor.hasMore) {
+      if (allItems.length >= objectListingBudget ||
+          keyCharacters >= 16 * 1024 * 1024) {
+        listingBudgetReached = true;
+        _appendBusyTaskLine('refresh-objects',
+            'Listing memory budget reached. Continue with the next window to release loaded rows.');
+        break;
+      }
       if (listingGeneration != _listingGeneration) {
         _listingCancelled = true;
         _appendBusyTaskLine(
@@ -772,16 +842,18 @@ class AppController extends ChangeNotifier {
       final useCursor =
           fetchFirstPageWithoutCursor && isFirstIteration ? null : cursor;
       final objectResult = await _engineService.listObjects(
-        engineId: activeEngineId,
+        engineId: engineId,
         profile: profile,
         bucketName: bucket.name,
-        prefix: currentPrefix,
-        flat: flatView,
+        prefix: prefix,
+        flat: isFlat,
         cursor: useCursor,
       );
       isFirstIteration = false;
       pageNumber += 1;
       allItems.addAll(objectResult.items);
+      keyCharacters +=
+          objectResult.items.fold<int>(0, (n, o) => n + o.key.length);
       cursor = objectResult.cursor;
       _appendBusyTaskLine(
         'refresh-objects',
@@ -802,6 +874,7 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> setSelectedBucket(BucketSummary bucket) async {
+    objectSelection.clear();
     await _runBusy('select-bucket', 'Loading bucket ${bucket.name}...',
         () async {
       selectedBucket = bucket;
@@ -951,6 +1024,25 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> applyObjectFilter(String value) async {
+    if (objectFilterMode == BrowserFilterMode.regex) {
+      try {
+        RegExp(value);
+      } on FormatException catch (error) {
+        objectFilterError = 'Invalid regular expression: ${error.message}';
+        notifyListeners();
+        return;
+      }
+      // Backtracking regexes run synchronously in Dart. Limit the accepted
+      // expression size until the isolated filter worker validates execution.
+      if (value.length > 256) {
+        objectFilterError =
+            'Use a regular expression of at most 256 characters.';
+        notifyListeners();
+        return;
+      }
+    }
+    objectFilterError = null;
+    objectSelection.clear();
     objectFilterValue = value;
     objectPage = 1;
     _addEvent(
@@ -969,6 +1061,8 @@ class AppController extends ChangeNotifier {
   }
 
   void setObjectFilterMode(BrowserFilterMode mode) {
+    objectFilterError = null;
+    objectSelection.clear();
     objectFilterMode = mode;
     objectPage = 1;
     if (mode == BrowserFilterMode.prefix) {
@@ -1116,33 +1210,53 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> deleteSelectedObject() async {
+    await deleteObjectKeys(objectSelection.isEmpty
+        ? [if (selectedObject != null) selectedObject!.key]
+        : objectSelection.keys.toList());
+  }
+
+  Future<void> deleteObjectKeys(List<String> keys) async {
     final profile = selectedProfile;
     final bucket = selectedBucket;
     final object = selectedObject;
-    if (profile == null || bucket == null || object == null) {
+    if (profile == null || bucket == null || keys.isEmpty) {
       return;
     }
-    await _runBusy('delete-object', 'Deleting ${object.name}...', () async {
+    await _runBusy('delete-object', 'Deleting ${keys.length} object(s)...',
+        () async {
       await _guard('Objects', () async {
         final result = await _engineService.deleteObjects(
           engineId: activeEngineId,
           profile: profile,
           bucketName: bucket.name,
-          keys: [object.key],
+          keys: keys,
         );
-        bannerMessage = 'Deleted ${result.successCount} objects.';
+        final deleted = ObjectSelection.confirmedDeletes(keys, result);
+        bannerMessage = result.failureCount > 0
+            ? 'Deleted ${result.successCount}; ${result.failureCount} failed. ${result.failures.map((f) => '${f.target}: ${f.message}').join('; ')}'
+            : deleted.length != keys.length
+                ? 'Delete outcome could not be confirmed. Refresh before retrying.'
+                : 'Deleted ${result.successCount} objects.';
         _addEvent(
           level: 'INFO',
           category: 'Objects',
           message:
-              'Delete request for ${object.key} completed with ${result.successCount} successes and ${result.failureCount} failures.',
+              'Delete request completed with ${result.successCount} successes and ${result.failureCount} failures.',
           includeSelectionContext: true,
-          objectKey: object.key,
+          objectKey: object?.key,
           source: 'object-browser',
         );
-        objects = objects.where((entry) => entry.key != object.key).toList();
-        selectedObject = null;
-        selectedObjectPreview = null;
+        if (selectedProfile?.id != profile.id ||
+            selectedBucket?.name != bucket.name) {
+          return;
+        }
+        objects =
+            objects.where((entry) => !deleted.contains(entry.key)).toList();
+        objectSelection.removeAll(deleted);
+        if (deleted.contains(selectedObject?.key)) {
+          selectedObject = null;
+          selectedObjectPreview = null;
+        }
         await _loadSelectionArtifacts();
       });
     });
@@ -1159,6 +1273,11 @@ class AppController extends ChangeNotifier {
     }
     await _runBusy('upload', 'Starting upload...', () async {
       await _guard('Transfers', () async {
+        if (filePaths.length > 1) {
+          await _startUploadBatch(
+              profile, bucket.name, filePaths, objectKeyByPath);
+          return;
+        }
         final uploadChunkMiB = await _uploadChunkSizeMiB(filePaths);
         final job = await _engineService.startUpload(
           engineId: activeEngineId,
@@ -1207,11 +1326,96 @@ class AppController extends ChangeNotifier {
     return MultipartSizing.recommendedPartSizeMiB(largestFileBytes);
   }
 
+  UploadBatch? _uploadBatch;
+
+  Future<void> _startUploadBatch(EndpointProfile profile, String bucket,
+      List<String> paths, Map<String, String> keys) async {
+    final id = 'upload-batch-${DateTime.now().microsecondsSinceEpoch}';
+    final engineId = activeEngineId;
+    final prefix = currentPrefix;
+    final batch = UploadBatch(
+        id: id,
+        engine: _engineService,
+        engineId: engineId,
+        profile: profile,
+        bucket: bucket,
+        prefix: prefix,
+        paths: List.of(paths),
+        objectKeys: Map.of(keys),
+        settings: settings,
+        onUpdate: (job) {
+          bannerTaskId = id;
+          _replaceTransfer(job);
+          _trackTransferJob(job);
+        },
+        onFile: (index, path, status, message, job) {
+          _addEvent(
+              level: status == 'failed' || status == 'error' ? 'ERROR' : 'INFO',
+              category: 'Transfers',
+              message: message,
+              source: 'upload-file',
+              requestId: '$id/file-$index',
+              parentRequestId: id,
+              profileId: profile.id,
+              bucketName: bucket,
+              engineId: engineId,
+              objectKey:
+                  '$prefix${keys[path] ?? path.split(Platform.pathSeparator).last}',
+              responseStatus: status,
+              traceBody: {
+                'file': path,
+                'status': status,
+                if (job != null) 'bytesTransferred': job.bytesTransferred,
+                if (job != null) 'partsCompleted': job.partsCompleted,
+                if (job != null) 'partsTotal': job.partsTotal
+              });
+          notifyListeners();
+        });
+    await batch.prepare();
+    _uploadBatch = batch;
+    _pendingUploadRelists[id] = _PendingObjectRelist(
+        profileId: profile.id,
+        bucketName: bucket,
+        prefix: prefix,
+        listAll: listAllKeys);
+    _addEvent(
+        level: 'INFO',
+        category: 'Transfers',
+        source: 'upload-batch',
+        requestId: id,
+        profileId: profile.id,
+        bucketName: bucket,
+        engineId: engineId,
+        message: 'Upload ${paths.length} files to $bucket',
+        responseStatus: 'running');
+    try {
+      final job = await batch.run();
+      _addEvent(
+          level: job.status == 'failed' ? 'ERROR' : 'INFO',
+          category: 'Transfers',
+          source: 'upload-batch',
+          requestId: id,
+          profileId: profile.id,
+          bucketName: bucket,
+          engineId: engineId,
+          message:
+              '${job.label}: ${job.status} · ${job.itemsCompleted}/${job.itemCount} files completed.',
+          responseStatus: job.status);
+      _maybeRelistAfterUpload(job);
+    } finally {
+      _uploadBatch = null;
+      notifyListeners();
+    }
+  }
+
   Future<void> startSampleDownload() async {
     final profile = selectedProfile;
     final bucket = selectedBucket;
     final object = selectedObject;
-    if (profile == null || bucket == null || object == null) {
+    final keys = objectSelection.isEmpty
+        ? [if (object != null && !object.isFolder) object.key]
+        : objectSelection.keys.toList();
+    if (profile == null || bucket == null || keys.isEmpty) {
       return;
     }
     await _runBusy('download', 'Starting download...', () async {
@@ -1220,7 +1424,7 @@ class AppController extends ChangeNotifier {
           engineId: activeEngineId,
           profile: profile,
           bucketName: bucket.name,
-          keys: [object.key],
+          keys: keys,
           destinationPath: settings.downloadPath,
           multipartThresholdMiB: settings.multipartThresholdMiB,
           multipartChunkMiB: settings.multipartChunkMiB,
@@ -1230,14 +1434,14 @@ class AppController extends ChangeNotifier {
         bannerTaskId = job.id;
         bannerMessage = _transferBannerMessage(job);
         final destinationLabel =
-            Platform.isAndroid ? 'Downloads' : settings.downloadPath;
+            AppPlatform.isMobile ? 'Downloads' : settings.downloadPath;
         _addEvent(
           level: 'INFO',
           category: 'Transfers',
           message:
-              'Started download job ${job.id} for ${object.key} into $destinationLabel.',
+              'Started download job ${job.id} for ${keys.length} object(s) into $destinationLabel.',
           includeSelectionContext: true,
-          objectKey: object.key,
+          objectKey: object?.key,
           source: 'task-tray',
         );
       });
@@ -1245,54 +1449,72 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> pauseTransfer(String jobId) async {
-    final job = await _engineService.pauseTransfer(
-      engineId: activeEngineId,
-      jobId: jobId,
-    );
-    _replaceTransfer(job);
-    _trackTransferJob(job);
-    _addEvent(
-      level: 'INFO',
-      category: 'Transfers',
-      message: 'Paused transfer $jobId.',
-      includeSelectionContext: true,
-      source: 'task-tray',
-    );
-    notifyListeners();
+    await _runBusy('control-$jobId', 'Pause transfer', () async {
+      if (_uploadBatch?.id == jobId) {
+        await _uploadBatch!.control('pause');
+        return;
+      }
+      final job = await _engineService.pauseTransfer(
+        engineId: activeEngineId,
+        jobId: jobId,
+      );
+      _replaceTransfer(job);
+      _trackTransferJob(job);
+      _addEvent(
+        level: 'INFO',
+        category: 'Transfers',
+        message: 'Paused transfer $jobId.',
+        includeSelectionContext: true,
+        source: 'task-tray',
+      );
+      notifyListeners();
+    }, trackTask: false);
   }
 
   Future<void> resumeTransfer(String jobId) async {
-    final job = await _engineService.resumeTransfer(
-      engineId: activeEngineId,
-      jobId: jobId,
-    );
-    _replaceTransfer(job);
-    _addEvent(
-      level: 'INFO',
-      category: 'Transfers',
-      message: 'Resumed transfer $jobId.',
-      includeSelectionContext: true,
-      source: 'task-tray',
-    );
-    _trackTransferJob(job);
-    notifyListeners();
+    await _runBusy('control-$jobId', 'Resume transfer', () async {
+      if (_uploadBatch?.id == jobId) {
+        await _uploadBatch!.control('resume');
+        return;
+      }
+      final job = await _engineService.resumeTransfer(
+        engineId: activeEngineId,
+        jobId: jobId,
+      );
+      _replaceTransfer(job);
+      _addEvent(
+        level: 'INFO',
+        category: 'Transfers',
+        message: 'Resumed transfer $jobId.',
+        includeSelectionContext: true,
+        source: 'task-tray',
+      );
+      _trackTransferJob(job);
+      notifyListeners();
+    }, trackTask: false);
   }
 
   Future<void> cancelTransfer(String jobId) async {
-    final job = await _engineService.cancelTransfer(
-      engineId: activeEngineId,
-      jobId: jobId,
-    );
-    _replaceTransfer(job);
-    _addEvent(
-      level: 'INFO',
-      category: 'Transfers',
-      message: 'Cancelled transfer $jobId.',
-      includeSelectionContext: true,
-      source: 'task-tray',
-    );
-    _trackTransferJob(job);
-    notifyListeners();
+    await _runBusy('control-$jobId', 'Cancel transfer', () async {
+      if (_uploadBatch?.id == jobId) {
+        await _uploadBatch!.control('cancel');
+        return;
+      }
+      final job = await _engineService.cancelTransfer(
+        engineId: activeEngineId,
+        jobId: jobId,
+      );
+      _replaceTransfer(job);
+      _addEvent(
+        level: 'INFO',
+        category: 'Transfers',
+        message: 'Cancelled transfer $jobId.',
+        includeSelectionContext: true,
+        source: 'task-tray',
+      );
+      _trackTransferJob(job);
+      notifyListeners();
+    }, trackTask: false);
   }
 
   Future<void> cancelToolTask(BrowserTaskRecord task) async {
@@ -1921,20 +2143,23 @@ class AppController extends ChangeNotifier {
         secretKey: profile.secretKey,
       );
     }
-    _addEvent(
-      level: 'INFO',
-      category: 'Profiles',
-      message: 'Saved endpoint profile ${profile.name}.',
-      profileId: profile.id,
-      source: 'profiles',
-    );
     final persisted = await _persistState(
       allowCredentialStoreRecovery: true,
     );
     if (persisted) _credentialStoreError = null;
+    _lastProfileSaveSucceeded = persisted;
+    _addEvent(
+        level: persisted ? 'INFO' : 'ERROR',
+        category: 'Profiles',
+        message: persisted
+            ? 'Saved endpoint profile ${profile.name}.'
+            : 'Profile ${profile.name} is session-only: secure persistence failed.',
+        profileId: profile.id,
+        source: 'profiles');
     bannerMessage = persisted
         ? 'Saved endpoint profile ${profile.name}.'
-        : 'Profile is available for this session, but its credentials could not be saved securely.';
+        : _credentialStoreError ??
+            'Profile is available for this session, but its credentials could not be saved securely.';
     notifyListeners();
   }
 
@@ -2369,52 +2594,17 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
-  List<ObjectEntry>? _visibleObjectsCache;
-  List<ObjectEntry>? _visibleObjectsInputObjects;
-  String? _visibleObjectsInputFilterValue;
-  BrowserFilterMode? _visibleObjectsInputFilterMode;
-  BrowserObjectSortField? _visibleObjectsInputSortField;
-  bool? _visibleObjectsInputSortDescending;
-
-  /// Filtered + sorted view of [objects]. A single build pass reads this
-  /// getter several times, so the O(n log n) result is memoized and only
-  /// recomputed when the objects list identity or the filter/sort inputs
-  /// change.
-  List<ObjectEntry> get visibleObjects {
-    if (_visibleObjectsCache != null &&
-        identical(_visibleObjectsInputObjects, objects) &&
-        _visibleObjectsInputFilterValue == objectFilterValue &&
-        _visibleObjectsInputFilterMode == objectFilterMode &&
-        _visibleObjectsInputSortField == objectSortField &&
-        _visibleObjectsInputSortDescending == objectSortDescending) {
-      return _visibleObjectsCache!;
-    }
-    List<ObjectEntry> results;
-    if (objectFilterMode == BrowserFilterMode.prefix ||
-        objectFilterValue.trim().isEmpty) {
-      results = objects.toList();
-    } else if (objectFilterMode == BrowserFilterMode.regex) {
-      try {
-        final regex = RegExp(objectFilterValue, caseSensitive: false);
-        results = objects.where((entry) => regex.hasMatch(entry.key)).toList();
-      } catch (_) {
-        results = objects.toList();
-      }
-    } else {
-      final query = objectFilterValue.toLowerCase();
-      results = objects
-          .where((entry) => entry.key.toLowerCase().contains(query))
-          .toList();
-    }
-    results.sort(_compareObjectsForDisplay);
-    _visibleObjectsCache = results;
-    _visibleObjectsInputObjects = objects;
-    _visibleObjectsInputFilterValue = objectFilterValue;
-    _visibleObjectsInputFilterMode = objectFilterMode;
-    _visibleObjectsInputSortField = objectSortField;
-    _visibleObjectsInputSortDescending = objectSortDescending;
-    return results;
-  }
+  late final ObjectQuery _objectQuery = ObjectQuery((error) {
+    objectFilterError = error;
+    notifyListeners();
+  });
+  bool get filteringObjects => _objectQuery.loading;
+  List<ObjectEntry> get visibleObjects => _objectQuery.resolve(
+      objects,
+      objectFilterMode,
+      objectFilterValue,
+      objectSortField,
+      objectSortDescending);
 
   List<ObjectEntry> get pagedVisibleObjects {
     final results = visibleObjects;
@@ -3060,6 +3250,7 @@ class AppController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _objectQuery.dispose();
     _busyLineNotifyTimer?.cancel();
     shutdownEngines();
     super.dispose();
@@ -3137,6 +3328,7 @@ class AppController extends ChangeNotifier {
     String? objectKey,
     String? source,
     String? requestId,
+    String? parentRequestId,
     String? tracePhase,
     String? engineId,
     String? method,
@@ -3156,7 +3348,7 @@ class AppController extends ChangeNotifier {
         timestamp: DateTime.now(),
         level: level,
         category: category,
-        message: message,
+        message: DiagnosticSafety.text(message),
         profileId:
             profileId ?? (includeSelectionContext ? selectedProfile?.id : null),
         bucketName: bucketName ??
@@ -3165,13 +3357,14 @@ class AppController extends ChangeNotifier {
             objectKey ?? (includeSelectionContext ? selectedObject?.key : null),
         source: source,
         requestId: requestId,
+        parentRequestId: parentRequestId,
         tracePhase: tracePhase,
         engineId: engineId,
         method: method,
         responseStatus: responseStatus,
         latencyMs: latencyMs,
-        traceHead: traceHead,
-        traceBody: traceBody,
+        traceHead: DiagnosticSafety.sanitize(traceHead),
+        traceBody: DiagnosticSafety.sanitize(traceBody),
       ),
       ...eventLog,
     ];
@@ -3568,6 +3761,15 @@ class AppController extends ChangeNotifier {
         allowCredentialStoreRecovery: allowCredentialStoreRecovery,
       );
       return true;
+    } on CredentialStoreException catch (error) {
+      _credentialStoreError = error.message;
+      _addEvent(
+        level: 'ERROR',
+        category: 'Persistence',
+        message: 'Failed to persist application state: $error',
+        source: 'persistence',
+      );
+      return false;
     } catch (error) {
       _addEvent(
         level: 'ERROR',
@@ -3627,12 +3829,17 @@ class AppController extends ChangeNotifier {
         label: job.label,
         status: job.status,
         startedAt: currentTask?.startedAt ?? DateTime.now(),
-        completedAt: job.status == 'running' || job.status == 'paused'
-            ? null
-            : DateTime.now(),
+        completedAt:
+            ['running', 'queued', 'paused', 'cancelling'].contains(job.status)
+                ? null
+                : DateTime.now(),
         progress: job.progress,
-        profileId: selectedProfile?.id,
-        bucketName: selectedBucket?.name,
+        profileId: _pendingUploadRelists[job.id]?.profileId ??
+            currentTask?.profileId ??
+            selectedProfile?.id,
+        bucketName: _pendingUploadRelists[job.id]?.bucketName ??
+            currentTask?.bucketName ??
+            selectedBucket?.name,
         outputLines: job.outputLines,
         bytesTransferred: job.bytesTransferred,
         totalBytes: job.totalBytes,
@@ -3657,6 +3864,12 @@ class AppController extends ChangeNotifier {
   String _transferBannerMessage(TransferJob job) {
     final percent = (job.progress.clamp(0, 1) * 100).round();
     final direction = job.direction == 'download' ? 'Download' : 'Upload';
+    if (job.status == 'cancelled' || job.status == 'canceled') {
+      return '$direction cancelled - $percent%';
+    }
+    if (job.status == 'cancelling') {
+      return 'Stopping upload after in-flight work - $percent%';
+    }
     if (job.status == 'completed') {
       return '$direction complete - 100%';
     }
@@ -3670,6 +3883,7 @@ class AppController extends ChangeNotifier {
   }
 
   void _handleTransferJobUpdate(TransferJob job) {
+    if (_uploadBatch?.consume(job) ?? false) return;
     if (_busyActions.contains(job.direction)) {
       bannerTaskId = job.id;
     }
@@ -3805,26 +4019,6 @@ class AppController extends ChangeNotifier {
       bucketName: bucketName,
       source: 'bucket-admin',
     );
-  }
-
-  int _compareObjectsForDisplay(ObjectEntry left, ObjectEntry right) {
-    if (left.isFolder != right.isFolder) {
-      return left.isFolder ? -1 : 1;
-    }
-    final multiplier = objectSortDescending ? -1 : 1;
-    final comparison = switch (objectSortField) {
-      BrowserObjectSortField.lastModified =>
-        left.modifiedAt.compareTo(right.modifiedAt),
-      BrowserObjectSortField.name =>
-        left.name.toLowerCase().compareTo(right.name.toLowerCase()),
-      BrowserObjectSortField.size => left.size.compareTo(right.size),
-      BrowserObjectSortField.contentType =>
-        _objectContentType(left).compareTo(_objectContentType(right)),
-    };
-    if (comparison != 0) {
-      return comparison * multiplier;
-    }
-    return left.name.toLowerCase().compareTo(right.name.toLowerCase());
   }
 
   String objectContentType(ObjectEntry object) => _objectContentType(object);

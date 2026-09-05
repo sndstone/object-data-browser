@@ -1,8 +1,8 @@
 import '../app/version_details.dart';
 import '../models/domain_models.dart';
 
-Map<String, String> visibleDependencyVersions({required bool isAndroid}) {
-  if (!isAndroid) {
+Map<String, String> visibleDependencyVersions({required bool isMobile}) {
+  if (!isMobile) {
     return kFlutterDependencyVersions;
   }
   return Map<String, String>.fromEntries(
@@ -13,15 +13,15 @@ Map<String, String> visibleDependencyVersions({required bool isAndroid}) {
 }
 
 Map<String, String> visibleBundledComponentVersions({
-  required bool isAndroid,
+  required bool isMobile,
   required List<EngineDescriptor> engines,
 }) {
-  if (!isAndroid) {
+  if (!isMobile) {
     return kBundledEngineVersions;
   }
   return <String, String>{
     for (final engine in engines)
-      if (engine.androidSupported && engine.available)
+      if (engine.mobileSupported && engine.available)
         engine.label: engine.version,
   };
 }

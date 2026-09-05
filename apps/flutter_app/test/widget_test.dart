@@ -10,6 +10,8 @@ import 'package:s3_browser_crossplat/controllers/app_controller.dart';
 import 'package:s3_browser_crossplat/models/domain_models.dart';
 import 'package:s3_browser_crossplat/services/mock_engine_service.dart';
 import 'package:s3_browser_crossplat/theme/breakpoints.dart';
+import 'package:s3_browser_crossplat/theme/app_motion.dart';
+import 'package:s3_browser_crossplat/logs/structured_log_list.dart';
 
 class TestAppController extends AppController {
   TestAppController({
@@ -216,6 +218,161 @@ EventLogEntry _apiTraceEntry({
 }
 
 void main() {
+  for (final axis in Axis.values) {
+    testWidgets('ordered $axis transitions reverse incoming and outgoing edges',
+        (tester) async {
+      Widget frame(int position) => MaterialApp(
+          home: DirectionalSwitcher(
+              position: position,
+              axis: axis,
+              duration: const Duration(milliseconds: 240),
+              child: SizedBox(
+                  key: ValueKey('motion-panel-$position'),
+                  width: 400,
+                  height: 400,
+                  child: Text('$position'))));
+      double offset(int position, {bool incoming = true}) {
+        final slide = tester
+            .widgetList<SlideTransition>(find.ancestor(
+                of: find.byKey(ValueKey('motion-panel-$position')),
+                matching: find.byKey(const ValueKey('directional-slide'))))
+            .firstWhere((slide) =>
+                slide.child is IgnorePointer &&
+                (slide.child as IgnorePointer).ignoring != incoming);
+        return axis == Axis.horizontal
+            ? slide.position.value.dx
+            : slide.position.value.dy;
+      }
+
+      await tester.pumpWidget(frame(0));
+      await tester.pumpWidget(frame(1));
+      await tester.pump(const Duration(milliseconds: 60));
+      expect(offset(1), greaterThan(0));
+      expect(offset(0, incoming: false), lessThan(0));
+      // Reverse before the first transition finishes.
+      await tester.pumpWidget(frame(0));
+      await tester.pump(const Duration(milliseconds: 60));
+      expect(offset(0), lessThan(0));
+      expect(offset(1, incoming: false), greaterThan(0));
+      await tester.pumpAndSettle();
+    });
+  }
+
+  testWidgets('column sorting toggles and inspector actions remain visible',
+      (tester) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1440, 1024));
+    final controller = await _buildController();
+    await tester.pumpWidget(S3BrowserApp(controller: controller));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Sort by Size'));
+    await tester.pumpAndSettle();
+    expect(controller.objectSortField, BrowserObjectSortField.size);
+    expect(controller.objectSortDescending, false);
+    await tester
+        .tap(find.byTooltip('Sort by Size · ascending; switch to descending'));
+    await tester.pumpAndSettle();
+    expect(controller.objectSortDescending, true);
+    expect(find.text('Bucket config'), findsOneWidget);
+    expect(find.text('Events & Debug'), findsOneWidget);
+    expect(find.byTooltip('Advanced inspector tools'), findsNothing);
+    await tester.tap(find.widgetWithText(OutlinedButton, 'View tools'));
+    await tester.pumpAndSettle();
+    expect(find.byIcon(Icons.create_new_folder_outlined), findsWidgets);
+    expect(find.text('Select all loaded objects'), findsOneWidget);
+    expect(find.text('Show loaded rows'), findsOneWidget);
+  });
+
+  testWidgets('event log nests independent files beneath one parent upload',
+      (tester) async {
+    final time = DateTime(2026);
+    final entries = [
+      EventLogEntry(
+          timestamp: time,
+          level: 'INFO',
+          category: 'Transfers',
+          message: 'Upload two files',
+          source: 'upload-batch',
+          requestId: 'batch',
+          responseStatus: 'completed'),
+      for (final file in ['first.txt', 'second.txt'])
+        EventLogEntry(
+            timestamp: time,
+            level: 'INFO',
+            category: 'Transfers',
+            message: 'Uploaded $file',
+            source: 'upload-file',
+            requestId: file,
+            parentRequestId: 'batch',
+            objectKey: file,
+            responseStatus: 'completed'),
+    ];
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: StructuredLogList(
+                entries: entries,
+                textScalePercent: 100,
+                emptyMessage: 'Empty'))));
+    expect(find.text('first.txt'), findsNothing);
+    await tester.tap(find.text('Upload two files'));
+    await tester.pumpAndSettle();
+    expect(find.text('first.txt'), findsOneWidget);
+    expect(find.text('second.txt'), findsOneWidget);
+    await tester.tap(find.text('first.txt'));
+    await tester.pumpAndSettle();
+    expect(find.text('Uploaded first.txt'), findsOneWidget);
+  });
+  testWidgets('browser and settings remain usable at enlarged text on phone',
+      (tester) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    final controller = await _buildController();
+    controller.settings = controller.settings.copyWith(uiScalePercent: 150);
+    await tester.pumpWidget(S3BrowserApp(controller: controller));
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    controller.selectTab(WorkspaceTab.settings);
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+    controller.dispose();
+  });
+  testWidgets(
+      'text scaling respects OS accessibility over legacy compact preference',
+      (tester) async {
+    expect(const PreferenceTextScaler(TextScaler.linear(2), .7).scale(16), 32);
+    expect(
+        const PreferenceTextScaler(TextScaler.noScaling, .7).scale(16), 11.2);
+  });
+
+  testWidgets('browser subtree is reused on unrelated job progress',
+      (tester) async {
+    final controller = await _buildController();
+    await tester.pumpWidget(S3BrowserApp(controller: controller));
+    await tester.pumpAndSettle();
+    final before =
+        tester.widget<BrowserWorkspace>(find.byType(BrowserWorkspace));
+    controller.showBannerMessage('Background job updated');
+    await tester.pump();
+    final after =
+        tester.widget<BrowserWorkspace>(find.byType(BrowserWorkspace));
+    expect(identical(before, after), isTrue);
+    await tester.pumpWidget(const SizedBox());
+    controller.dispose();
+  });
+
+  testWidgets('reduced motion disables workspace and preview movement',
+      (tester) async {
+    late Duration duration;
+    await tester.pumpWidget(MaterialApp(
+        home: MediaQuery(
+            data: const MediaQueryData(disableAnimations: true),
+            child: Builder(builder: (context) {
+              duration = AppMotion.duration(context);
+              return const SizedBox();
+            }))));
+    expect(duration, Duration.zero);
+  });
   test('window sizes use one shared four-class breakpoint model', () {
     expect(Breakpoints.sizeClass(699), WindowSizeClass.phone);
     expect(Breakpoints.sizeClass(700), WindowSizeClass.tablet);
@@ -435,7 +592,7 @@ void main() {
       'bucket-1',
     );
     expect(find.text('Objects'), findsWidgets);
-    expect(find.byTooltip('More actions'), findsOneWidget);
+    expect(find.widgetWithText(OutlinedButton, 'View tools'), findsOneWidget);
   });
 
   testWidgets('compact desktop browser opens inspector from nested action', (
@@ -478,7 +635,7 @@ void main() {
     await tester.tap(find.byTooltip('Inspector'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Inspector'), findsOneWidget);
+    expect(find.text('Bucket inspector'), findsOneWidget);
     expect(find.text('Bucket info'), findsOneWidget);
   });
 
@@ -500,14 +657,12 @@ void main() {
 
     expect(find.widgetWithText(OutlinedButton, 'Delete'), findsNothing);
     expect(find.widgetWithText(OutlinedButton, 'Create prefix'), findsNothing);
-    await tester.tap(find.byTooltip('More actions'));
+    await tester.tap(find.widgetWithText(OutlinedButton, 'View tools'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Object actions'), findsOneWidget);
-    expect(find.widgetWithText(OutlinedButton, 'Inspector'), findsOneWidget);
-    expect(
-        find.widgetWithText(OutlinedButton, 'Create prefix'), findsOneWidget);
-    expect(find.widgetWithText(OutlinedButton, 'List all'), findsOneWidget);
+    expect(find.text('Name'), findsOneWidget);
+    expect(find.text('Create prefix'), findsOneWidget);
+    expect(find.text('List all'), findsOneWidget);
     expect(find.text('Flat view'), findsOneWidget);
   });
 
@@ -538,7 +693,37 @@ void main() {
     expect(find.text('Delete object'), findsOneWidget);
   });
 
-  testWidgets('wide desktop browser keeps persistent inspector and drag bar', (
+  testWidgets('narrow object rows expose a touch actions button', (
+    WidgetTester tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+
+    final controller = await _buildController();
+    await tester.pumpWidget(
+      _browserApp(
+        controller,
+        size: const Size(390, 844),
+        compact: true,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text(controller.buckets.first.name));
+    await tester.pumpAndSettle();
+
+    final actions = find.byTooltip('Object actions for object-0001.bin');
+    expect(actions, findsOneWidget);
+
+    await tester.tap(actions);
+    await tester.pumpAndSettle();
+
+    expect(controller.selectedObject?.key, 'archive/object-0001.bin');
+    expect(find.text('Inspect object'), findsOneWidget);
+  });
+
+  testWidgets(
+      'wide desktop browser keeps inspector and hides idle drop guidance', (
     WidgetTester tester,
   ) async {
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -554,15 +739,14 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(find.text('Inspector'), findsOneWidget);
+    expect(find.text('Bucket inspector'), findsOneWidget);
     expect(
       find.text(
         'Drag and drop files here to upload them into the current bucket prefix.',
       ),
-      findsOneWidget,
+      findsNothing,
     );
-    expect(
-        find.widgetWithText(OutlinedButton, 'Create prefix'), findsOneWidget);
+    expect(find.widgetWithText(OutlinedButton, 'Create prefix'), findsNothing);
   });
 
   testWidgets('text preview opens in an expanded selectable dialog', (
@@ -580,7 +764,7 @@ void main() {
       isFolder: false,
     );
     controller.selectedObject = object;
-    controller.inspectorTab = BrowserInspectorTab.objectDetails;
+    controller.inspectorTab = BrowserInspectorTab.objectPreview;
     controller.selectedObjectDetails = const ObjectDetails(
       key: 'reports/output.txt',
       metadata: {},
@@ -631,7 +815,7 @@ void main() {
       isFolder: false,
     );
     controller.selectedObject = object;
-    controller.inspectorTab = BrowserInspectorTab.objectDetails;
+    controller.inspectorTab = BrowserInspectorTab.objectPreview;
     controller.selectedObjectDetails = const ObjectDetails(
       key: 'site/index.html',
       metadata: {},
@@ -721,7 +905,9 @@ void main() {
     expect(find.text('Jobs'), findsWidgets);
     expect(find.text('Running'), findsWidgets);
     expect(find.text('Upload 1 file'), findsOneWidget);
-    expect(find.text('Multipart upload'), findsOneWidget);
+    await tester.tap(find.text('Upload 1 file'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Multipart upload'), findsOneWidget);
     expect(find.textContaining('Items: 1/2'), findsOneWidget);
     expect(find.textContaining('Parts: 2/4'), findsOneWidget);
   });
@@ -953,11 +1139,11 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(
-        find.widgetWithText(OutlinedButton, 'Create prefix'), findsOneWidget);
+    expect(find.widgetWithText(OutlinedButton, 'Create prefix'), findsNothing);
     expect(find.text('Create folder'), findsNothing);
-
-    await tester.tap(find.widgetWithText(OutlinedButton, 'Create prefix'));
+    await tester.tap(find.widgetWithText(OutlinedButton, 'View tools'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Create prefix'));
     await tester.pumpAndSettle();
 
     expect(find.text('Create prefix'), findsWidgets);
@@ -988,20 +1174,20 @@ void main() {
     await tester.pumpWidget(S3BrowserApp(controller: controller));
     await tester.pumpAndSettle();
 
+    await tester.tap(find.widgetWithText(ListTile, 'General'));
+    await tester.pumpAndSettle();
     expect(find.text('Default engine'), findsOneWidget);
     expect(find.text('Default endpoint'), findsOneWidget);
-
+    await tester.tap(find.widgetWithText(ListTile, 'Connections'));
+    await tester.pumpAndSettle();
     await tester.tap(find.byType(ExpansionTile).first);
     await tester.pumpAndSettle();
 
     expect(find.text('Endpoint type'), findsOneWidget);
     expect(find.text('Use HTTPS'), findsOneWidget);
     expect(find.text('Normalized endpoint'), findsOneWidget);
-    await tester.scrollUntilVisible(
-      find.text('Automatically size upload parts'),
-      400,
-      scrollable: find.byType(Scrollable).first,
-    );
+    await tester.tap(find.widgetWithText(ListTile, 'Transfers'));
+    await tester.pumpAndSettle();
     expect(find.text('Automatically size upload parts'), findsOneWidget);
   });
 
@@ -1047,9 +1233,14 @@ void main() {
 
     expect(controller.objects.length, 1000);
     expect(controller.objectCursor.hasMore, isTrue);
+    await tester.tap(find.widgetWithText(OutlinedButton, 'View tools'));
+    await tester.pumpAndSettle();
     expect(find.text('List all'), findsOneWidget);
 
     await tester.tap(find.text('List all'));
+    await tester.pumpAndSettle();
+    expect(find.text('List all object keys?'), findsOneWidget);
+    await tester.tap(find.widgetWithText(FilledButton, 'List all'));
     await tester.pumpAndSettle();
     await tester.pumpWidget(
       _browserApp(
@@ -1062,7 +1253,7 @@ void main() {
 
     expect(controller.objects.length, 2354);
     expect(controller.objectCursor.hasMore, isFalse);
-    expect(find.text('All listed'), findsOneWidget);
+    expect(find.textContaining('2354 loaded'), findsOneWidget);
   });
 
   testWidgets(
@@ -1076,7 +1267,7 @@ void main() {
     await tester.pumpWidget(S3BrowserApp(controller: controller));
     await tester.pumpAndSettle();
 
-    expect(find.text('Search current bucket...'), findsOneWidget);
+    expect(find.text('Search loaded objects...'), findsOneWidget);
     expect(
       controller.visibleObjects.map((object) => object.name),
       containsAll(['photo-001.jpg', 'report-2026-03.csv']),
@@ -1098,7 +1289,7 @@ void main() {
     controller.emitChange();
     await tester.pumpAndSettle();
 
-    expect(find.text('Search current bucket...'), findsNothing);
+    expect(find.text('Search loaded objects...'), findsNothing);
   });
 
   testWidgets('header theme toggle switches dark and light modes', (

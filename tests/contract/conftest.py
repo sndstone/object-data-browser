@@ -179,6 +179,8 @@ def engine_cmd() -> list[str]:
 @pytest.fixture()
 def engine(engine_cmd: list[str]):
     if not _binary_available(engine_cmd):
+        if os.environ.get("REQUIRE_ENGINE") == "1" or os.environ.get("CI") == "true":
+            pytest.fail(f"Required engine binary not available: {engine_cmd!r}")
         pytest.skip(f"Engine binary not available: {engine_cmd[0]!r} (cmd={engine_cmd!r})")
 
     proc = EngineProcess(engine_cmd)

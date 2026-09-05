@@ -37,6 +37,7 @@ class AppTheme {
   static ThemeData light({
     required int scalePercent,
     required bool desktopCompact,
+    bool compactRows = false,
   }) {
     const baseScheme = ColorScheme(
       brightness: Brightness.light,
@@ -72,6 +73,7 @@ class AppTheme {
     return _themeFromScheme(
       scheme: baseScheme,
       scalePercent: scalePercent,
+      compactRows: compactRows,
       desktopCompact: desktopCompact,
       scaffoldBackground: lightCanvas,
       railBackground: lightRail,
@@ -83,6 +85,7 @@ class AppTheme {
   static ThemeData dark({
     required int scalePercent,
     required bool desktopCompact,
+    bool compactRows = false,
   }) {
     const baseScheme = ColorScheme(
       brightness: Brightness.dark,
@@ -118,6 +121,7 @@ class AppTheme {
     return _themeFromScheme(
       scheme: baseScheme,
       scalePercent: scalePercent,
+      compactRows: compactRows,
       desktopCompact: desktopCompact,
       scaffoldBackground: darkCanvas,
       railBackground: darkRail,
@@ -129,13 +133,14 @@ class AppTheme {
   static ThemeData _themeFromScheme({
     required ColorScheme scheme,
     required int scalePercent,
+    required bool compactRows,
     required bool desktopCompact,
     required Color scaffoldBackground,
     required Color railBackground,
     required Color navigationBarBackground,
     required Color cardColor,
   }) {
-    final isUltraCompact = scalePercent < 80;
+    final isUltraCompact = desktopCompact && compactRows;
     final cardRadius = isUltraCompact ? 8.0 : (desktopCompact ? 8.0 : 10.0);
     final fieldRadius = isUltraCompact ? 6.0 : (desktopCompact ? 8.0 : 10.0);
     final buttonRadius = isUltraCompact ? 6.0 : (desktopCompact ? 7.0 : 8.0);
@@ -153,7 +158,7 @@ class AppTheme {
       useMaterial3: true,
       colorScheme: scheme,
       visualDensity: _visualDensity(
-        scalePercent,
+        compactRows,
         desktopCompact: desktopCompact,
       ),
       materialTapTargetSize: desktopCompact
@@ -373,8 +378,8 @@ class AppTheme {
       ),
       iconButtonTheme: IconButtonThemeData(
         style: IconButton.styleFrom(
-          fixedSize: Size.square(desktopCompact ? 34 : 38),
-          minimumSize: Size.square(desktopCompact ? 34 : 38),
+          fixedSize: Size.square(desktopCompact ? 36 : 48),
+          minimumSize: Size.square(desktopCompact ? 36 : 48),
           padding: EdgeInsets.zero,
           tapTargetSize: desktopCompact
               ? MaterialTapTargetSize.shrinkWrap
@@ -443,15 +448,10 @@ class AppTheme {
   }
 
   static VisualDensity _visualDensity(
-    int scalePercent, {
+    bool compactRows, {
     required bool desktopCompact,
   }) {
-    // Allow a wider range so values below 80% produce genuinely denser layouts.
-    final baseOffset =
-        ((scalePercent - 100) / 10.0).clamp(-4.0, 1.5).toDouble();
-    final offset = desktopCompact
-        ? (baseOffset - 0.5).clamp(-4.0, 1.0).toDouble()
-        : baseOffset;
+    final offset = desktopCompact && compactRows ? -2.0 : 0.0;
     return VisualDensity(horizontal: offset, vertical: offset);
   }
 }
