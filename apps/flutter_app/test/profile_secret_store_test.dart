@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:s3_browser_crossplat/services/profile_secret_store.dart';
@@ -56,7 +58,7 @@ void main() {
       fallback.lastReadAllOptions?.toMap()['usesDataProtectionKeychain'],
       'false',
     );
-  });
+  }, skip: !Platform.isMacOS);
 
   test('ad-hoc macOS mode migrates from the Data Protection Keychain',
       () async {
@@ -75,5 +77,15 @@ void main() {
       fallback.lastReadOptions?.toMap()['usesDataProtectionKeychain'],
       'true',
     );
-  });
+  }, skip: !Platform.isMacOS);
+
+  test('non-macOS storage has no macOS migration fallback', () async {
+    final fallback = RecordingFlutterSecureStorage();
+    final store = ProfileSecretStore(fallbackMacStorage: fallback);
+    expect(store.supportsPrimaryBulkRead, isTrue);
+    expect(await store.readFallbackMacSecret('key'), isNull);
+    expect(await store.readAllFallbackMacSecrets(), isEmpty);
+    expect(fallback.lastReadOptions, isNull);
+    expect(fallback.lastReadAllOptions, isNull);
+  }, skip: Platform.isMacOS);
 }
