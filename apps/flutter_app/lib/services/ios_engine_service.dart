@@ -60,7 +60,7 @@ class IosEngineService
       final items =
           await _channel.invokeListMethod<Map<dynamic, dynamic>>('listEngines');
       if (items == null || items.isEmpty) {
-        return _fallback.listEngines();
+        return await _fallback.listEngines();
       }
       return items.map((entry) {
         final value = Map<String, Object?>.from(entry.cast<String, Object?>());
