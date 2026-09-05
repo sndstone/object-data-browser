@@ -7,7 +7,13 @@ ARCH="${2:-$(uname -m)}"
 PACKAGE_FORMAT="${3:-}"
 TOOLS_DIR="$ROOT_DIR/.tmp/toolchains"
 
-"$ROOT_DIR/scripts/bootstrap.sh" --arch "$ARCH"
+# Mobile targets are cross-compiled: the build tools must run on the host,
+# even when the Android/iOS output architecture is arm64.
+BOOTSTRAP_ARCH="$ARCH"
+case "$PLATFORM" in
+  android|ios) BOOTSTRAP_ARCH="$(uname -m)" ;;
+esac
+"$ROOT_DIR/scripts/bootstrap.sh" --arch "$BOOTSTRAP_ARCH"
 
 export PATH="$TOOLS_DIR/flutter/bin:$TOOLS_DIR/go/bin:$TOOLS_DIR/cargo/bin:$TOOLS_DIR/java/bin:$TOOLS_DIR/nfpm:$PATH"
 export JAVA_HOME="$TOOLS_DIR/java"
