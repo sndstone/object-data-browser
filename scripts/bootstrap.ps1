@@ -179,6 +179,31 @@ function Ensure-Flutter {
         Move-Item -Path $ExtractedFlutterDir -Destination $Dir
         Remove-DirectoryIfExists $StageDir
     }
+
+    # The Windows release archive includes an x64 Dart SDK even on ARM64.
+    # Flutter selects the app architecture from the running Dart executable,
+    # so let its own bootstrap fetch the native SDK before building ARM64.
+    if ($Arch -eq "arm64") {
+        if ($env:PROCESSOR_ARCHITECTURE -ne "ARM64") {
+            throw "Windows ARM64 builds require a native ARM64 shell and runner."
+        }
+        $DartExe = Join-Path $Dir "bin\cache\dart-sdk\bin\dart.exe"
+        $DartVersion = (& $DartExe --version 2>&1 | Out-String)
+        if ($DartVersion -notmatch 'windows_arm64') {
+            $DartStamp = Join-Path $Dir "bin\cache\engine-dart-sdk.stamp"
+            if (Test-Path $DartStamp) {
+                Remove-Item -LiteralPath $DartStamp -Force
+            }
+            & $FlutterBat --version
+            if ($LASTEXITCODE -ne 0) {
+                throw "Flutter native ARM64 SDK bootstrap failed."
+            }
+            $DartVersion = (& $DartExe --version 2>&1 | Out-String)
+            if ($DartVersion -notmatch 'windows_arm64') {
+                throw "This Flutter release did not provide a native Windows ARM64 Dart SDK."
+            }
+        }
+    }
 }
 
 function Ensure-Go {
