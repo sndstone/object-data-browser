@@ -41,6 +41,7 @@ jobs:
             runs_on: windows-2022
           - arch: arm64
             runs_on: windows-11-arm
+    timeout-minutes: 90
     runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
@@ -77,6 +78,7 @@ jobs:
           - arch: aarch64
             package: rpm
             runs_on: ubuntu-24.04-arm
+    timeout-minutes: 90
     runs-on: ${{ matrix.runs_on }}
     container: ubuntu:20.04
     defaults:
@@ -97,6 +99,13 @@ jobs:
         with:
           path: .tmp/toolchains
           key: toolchains-focal-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('scripts/bootstrap.*') }}
+      - name: Check Linux build prerequisites
+        run: |
+          for tool in clang cmake ninja pkg-config rpm python3 readelf xvfb-run; do
+            command -v "$tool" || exit 1
+          done
+          pkg-config --exists gtk+-3.0 libsecret-1
+          pkg-config --modversion gtk+-3.0 libsecret-1
       - name: Build Linux package
         run: ./scripts/build.sh linux ${{ matrix.arch }} ${{ matrix.package }}
       - name: Verify Linux compatibility and startup
