@@ -6,13 +6,15 @@ import '../models/domain_models.dart';
 import 'desktop_engine_host.dart';
 import 'diagnostic_safety.dart';
 import 'engine_service.dart';
+import 'listing_cancellation.dart';
 import 'mock_engine_service.dart';
 
 class DesktopSidecarEngineService
     implements
         EngineService,
         EngineLogSinkRegistrant,
-        TransferJobSinkRegistrant {
+        TransferJobSinkRegistrant,
+        ListingCancellationRegistrant {
   DesktopSidecarEngineService({
     DesktopEngineHost? host,
     EngineService? fallback,
@@ -37,7 +39,16 @@ class DesktopSidecarEngineService
   final Map<String, String> _benchmarkEngines = <String, String>{};
   final Map<String, String> _jobEngines = <String, String>{};
   int _requestSequence = 0;
+  final Set<ListingCancellation> _listingRequests = {};
   void cancelQueuedListings() => _host.cancelQueuedListings();
+
+  @override
+  void cancelListings() {
+    for (final cancellation in _listingRequests.toList()) {
+      cancellation.cancel();
+    }
+    _host.cancelListings();
+  }
 
   @override
   bool get isMock => false;
@@ -1094,9 +1105,40 @@ class DesktopSidecarEngineService
     Map<String, Object?>? params,
     void Function(Map<String, Object?> event)? onEvent,
   }) async {
+    final cancellation =
+        isCancellableListingMethod(method) ? ListingCancellation() : null;
+    if (cancellation != null) _listingRequests.add(cancellation);
+    try {
+      final request = _dispatchWithFallback(
+        engineId: engineId,
+        method: method,
+        onSuccess: onSuccess,
+        onFallback: onFallback,
+        params: params,
+        onEvent: onEvent,
+        cancellation: cancellation,
+      );
+      return cancellation == null
+          ? await request
+          : await cancellation.wait(request);
+    } finally {
+      if (cancellation != null) _listingRequests.remove(cancellation);
+    }
+  }
+
+  Future<T> _dispatchWithFallback<T>({
+    required String engineId,
+    required String method,
+    required T Function(Map<String, Object?> result) onSuccess,
+    required Future<T> Function() onFallback,
+    Map<String, Object?>? params,
+    void Function(Map<String, Object?> event)? onEvent,
+    ListingCancellation? cancellation,
+  }) async {
     final jobId = params?['jobId']?.toString();
     if (jobId != null) engineId = _jobEngines[jobId] ?? engineId;
     final entry = await _tryGetEngine(engineId);
+    if (cancellation?.isCancelled ?? false) throw const ListingCancelled();
     if (entry == null) {
       if (!_allowFallback) {
         throw _engineUnavailable(engineId, method);
@@ -1118,8 +1160,11 @@ class DesktopSidecarEngineService
         method: method,
         params: params,
         onEvent: onEvent,
+        cancellation: cancellation,
       );
       return onSuccess(result);
+    } on ListingCancelled {
+      rethrow;
     } on EngineException catch (error) {
       if (error.code == ErrorCode.unsupportedFeature ||
           error.code == ErrorCode.engineUnavailable) {
@@ -1182,8 +1227,10 @@ class DesktopSidecarEngineService
     required String method,
     Map<String, Object?>? params,
     void Function(Map<String, Object?> event)? onEvent,
+    ListingCancellation? cancellation,
   }) async {
     final engineRoot = await _resolveEngineRoot();
+    if (cancellation?.isCancelled ?? false) throw const ListingCancelled();
     final requestId =
         '${DateTime.now().microsecondsSinceEpoch}-${++_requestSequence}';
     final request = <String, Object?>{
@@ -1218,6 +1265,7 @@ class DesktopSidecarEngineService
     }
     final startedAt = DateTime.now();
     final response = await _host.send(
+      listingCancellation: cancellation,
       executablePath: _join(engineRoot, entry.executable),
       arguments: entry.arguments,
       workingDirectory: entry.workingDirectory == null

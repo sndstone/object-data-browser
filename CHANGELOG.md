@@ -10,6 +10,14 @@
 - Generalized Android-only mobile UI and engine metadata branches so iOS uses the mobile layouts without desktop drag/drop or unsupported directory picking.
 - Benchmark and bucket-encryption mutations are explicitly capability-gated in the first iOS release.
 
+## 2.2.7
+
+- Fixed Cancel for stalled bucket/object listings: stop waiting immediately, retain completed pages and ignore late responses or timeouts.
+- Stop desktop listing processes and queued reads without interrupting transfer workers; cancellation also covers version/inspector reads in the listing workflow.
+- Added regression coverage for the Cancel button, retry after cancellation, response races, process recovery and unaffected uploads.
+- Build Linux packages against Ubuntu 20.04 / glibc 2.31 to target Linux Mint 20 and newer, with bundled-ELF compatibility checks and a headless startup smoke test.
+- Added the backend/settings improvement plan and reproducible local review evidence. The other proposed backend fixes and settings redesign are not implemented in this release.
+
 ## 2.2.6
 
 - Implemented the GUI improvement plan: consistent destructive confirmations, severity-aware banners, one debounced object search, desktop shortcuts and copy actions.

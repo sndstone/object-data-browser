@@ -1,0 +1,28 @@
+[
+  {
+    "finding": "B02 collision",
+    "jobStatus": "completed",
+    "files": [
+      "report.txt"
+    ],
+    "reportContents": "SECOND"
+  },
+  {
+    "finding": "B02 failure truncates existing destination",
+    "remainingBytes": 0
+  },
+  {
+    "finding": "B03 truncated range",
+    "jobStatus": "completed",
+    "reportedBytes": 1048576,
+    "actualPayloadBytes": 3,
+    "fileSize": 1048576
+  },
+  {
+    "finding": "B01 Go Azure pending copy",
+    "ok": true,
+    "headPolls": 20,
+    "sourceDeleteSent": true,
+    "allCopyResponses": "pending"
+  }
+]

@@ -11,7 +11,7 @@ import '../services/app_platform.dart';
 import '../services/engine_service.dart';
 import '../services/multipart_sizing.dart';
 import '../services/source_preview.dart';
-import '../services/desktop_sidecar_engine_service.dart';
+import '../services/listing_cancellation.dart';
 import 'object_selection.dart';
 import 'object_query.dart';
 import 'upload_batch.dart';
@@ -415,18 +415,36 @@ class AppController extends ChangeNotifier {
 
   bool get hasBusyActions => _busyActions.isNotEmpty;
 
-  /// Requests cancellation of any in-progress listing loop.
-  /// The loop will stop after the current page completes and partial results
-  /// will be displayed immediately.
+  final Set<ListingCancellation> _listingRequests = {};
+
+  /// Stop waiting for stalled reads immediately; late responses cannot update
+  /// the browser. Desktop additionally terminates only listing-owned workers.
   void cancelListing() {
-    if (_engineService is DesktopSidecarEngineService) {
-      _engineService.cancelQueuedListings();
-    }
-    // Invalidate whatever listing loop is currently running. The loop notices
-    // the generation change and sets [_listingCancelled] for its summary.
     _listingGeneration++;
+    _listingCancelled = true;
+    for (final cancellation in _listingRequests.toList()) {
+      cancellation.cancel();
+    }
+    if (_engineService is ListingCancellationRegistrant) {
+      (_engineService as ListingCancellationRegistrant).cancelListings();
+    }
     _markListingTasksCancelling();
     notifyListeners();
+  }
+
+  Future<T> _awaitListing<T>(Future<T> Function() request) async {
+    final cancellation = ListingCancellation();
+    _listingRequests.add(cancellation);
+    try {
+      return await cancellation.wait(request());
+    } finally {
+      _listingRequests.remove(cancellation);
+    }
+  }
+
+  void _showListingCancelled() {
+    bannerMessage = 'Listing cancelled. Keeping the results already loaded.';
+    bannerSeverity = BannerSeverity.info;
   }
 
   Future<void> initialize() async {
@@ -649,18 +667,20 @@ class AppController extends ChangeNotifier {
           _listingCancelled = true;
           return;
         }
-        buckets = await _engineService.listBuckets(
-          engineId: activeEngineId,
-          profile: profile,
-        );
+        final listedBuckets =
+            await _awaitListing(() => _engineService.listBuckets(
+                  engineId: activeEngineId,
+                  profile: profile,
+                ));
         if (listingGeneration != _listingGeneration) {
           _listingCancelled = true;
           _appendBusyTaskLine(
             'refresh-buckets',
-            'Bucket listing cancelled by user after the current request completed.',
+            'Bucket listing cancelled. Late results were ignored.',
           );
           return;
         }
+        buckets = listedBuckets;
         selectedBucket = previousBucketName == null
             ? (buckets.isEmpty ? null : buckets.first)
             : (_bucketByName(previousBucketName) ??
@@ -702,7 +722,9 @@ class AppController extends ChangeNotifier {
           );
         }
         await refreshObjects(prefix: currentPrefix);
-        await refreshBucketAdminState();
+        if (!_listingCancelled) {
+          await refreshBucketAdminState(cancellableListing: true);
+        }
       });
     });
   }
@@ -722,6 +744,7 @@ class AppController extends ChangeNotifier {
       notifyListeners();
       return;
     }
+    final previousPrefix = currentPrefix;
     final nextPrefix = prefix ?? currentPrefix;
     if (nextPrefix != currentPrefix) objectSelection.clear();
     final previousSelectionKey = selectedObject?.key;
@@ -758,6 +781,12 @@ class AppController extends ChangeNotifier {
             currentPrefix != nextPrefix) {
           return;
         }
+        if (_listingCancelled &&
+            page.pageNumber == 0 &&
+            previousPrefix == nextPrefix) {
+          _showListingCancelled();
+          return;
+        }
         objects = page.items;
         objectSelection.retain(objects.map((o) => o.key));
         objectCursor = page.cursor;
@@ -766,6 +795,10 @@ class AppController extends ChangeNotifier {
         selectedObject = previousSelectionKey == null
             ? null
             : _objectByKey(previousSelectionKey);
+        if (_listingCancelled) {
+          _showListingCancelled();
+          return;
+        }
         if (objects.isEmpty) {
           bannerMessage = 'No objects found in ${bucket.name}.';
           _addEvent(
@@ -789,7 +822,7 @@ class AppController extends ChangeNotifier {
             source: 'object-browser',
           );
         }
-        await _loadSelectionArtifacts();
+        await _loadSelectionArtifacts(cancellableListing: true);
       });
     });
   }
@@ -837,6 +870,10 @@ class AppController extends ChangeNotifier {
           selectedObject = previousSelectionKey == null
               ? null
               : _objectByKey(previousSelectionKey);
+          if (_listingCancelled) {
+            _showListingCancelled();
+            return;
+          }
           bannerMessage = cursor.hasMore
               ? 'Listed ${objects.length} objects in ${bucket.name}. More are available.'
               : 'Listed all ${objects.length} objects in ${bucket.name}.';
@@ -849,7 +886,7 @@ class AppController extends ChangeNotifier {
             includeSelectionContext: true,
             source: 'object-browser',
           );
-          await _loadSelectionArtifacts();
+          await _loadSelectionArtifacts(cancellableListing: true);
         });
       },
     );
@@ -899,14 +936,26 @@ class AppController extends ChangeNotifier {
       }
       final useCursor =
           fetchFirstPageWithoutCursor && isFirstIteration ? null : cursor;
-      final objectResult = await _engineService.listObjects(
-        engineId: engineId,
-        profile: profile,
-        bucketName: bucket.name,
-        prefix: prefix,
-        flat: isFlat,
-        cursor: useCursor,
-      );
+      late final ObjectListResult objectResult;
+      try {
+        objectResult = await _awaitListing(() => _engineService.listObjects(
+              engineId: engineId,
+              profile: profile,
+              bucketName: bucket.name,
+              prefix: prefix,
+              flat: isFlat,
+              cursor: useCursor,
+            ));
+      } on ListingCancelled {
+        _listingCancelled = true;
+        _appendBusyTaskLine('refresh-objects',
+            'Listing cancelled after $pageNumber page(s). Keeping ${allItems.length} loaded objects.');
+        break;
+      }
+      if (listingGeneration != _listingGeneration) {
+        _listingCancelled = true;
+        break;
+      }
       isFirstIteration = false;
       pageNumber += 1;
       allItems.addAll(objectResult.items);
@@ -953,7 +1002,9 @@ class AppController extends ChangeNotifier {
         source: 'bucket-browser',
       );
       await refreshObjects();
-      await refreshBucketAdminState();
+      if (!_listingCancelled) {
+        await refreshBucketAdminState(cancellableListing: true);
+      }
     });
   }
 
@@ -3055,7 +3106,8 @@ class AppController extends ChangeNotifier {
     return engines.firstWhere((engine) => engine.id == engineId).label;
   }
 
-  Future<void> _loadSelectionArtifacts() async {
+  Future<void> _loadSelectionArtifacts(
+      {bool cancellableListing = false}) async {
     final profile = selectedProfile;
     final bucket = selectedBucket;
     final object = selectedObject;
@@ -3067,13 +3119,15 @@ class AppController extends ChangeNotifier {
       notifyListeners();
       return;
     }
-    final versionResult = await _engineService.listObjectVersions(
-      engineId: activeEngineId,
-      profile: profile,
-      bucketName: bucket.name,
-      key: object?.key,
-      options: versionBrowserOptions,
-    );
+    Future<T> read<T>(Future<T> Function() request) =>
+        cancellableListing ? _awaitListing(request) : request();
+    final versionResult = await read(() => _engineService.listObjectVersions(
+          engineId: activeEngineId,
+          profile: profile,
+          bucketName: bucket.name,
+          key: object?.key,
+          options: versionBrowserOptions,
+        ));
     versions = versionResult.items;
     versionCursor = versionResult.cursor;
     if (object == null) {
@@ -3090,12 +3144,12 @@ class AppController extends ChangeNotifier {
       notifyListeners();
       return;
     }
-    selectedObjectDetails = await _engineService.getObjectDetails(
-      engineId: activeEngineId,
-      profile: profile,
-      bucketName: bucket.name,
-      key: object.key,
-    );
+    selectedObjectDetails = await read(() => _engineService.getObjectDetails(
+          engineId: activeEngineId,
+          profile: profile,
+          bucketName: bucket.name,
+          key: object.key,
+        ));
     _primeSelectedObjectPreview(object, notify: false);
     _addEvent(
       level: 'INFO',
@@ -3292,6 +3346,10 @@ class AppController extends ChangeNotifier {
   ) async {
     try {
       await operation();
+    } on ListingCancelled {
+      _listingCancelled = true;
+      _showListingCancelled();
+      notifyListeners();
     } on EngineException catch (error) {
       _guardErrorSequence += 1;
       bannerMessage = '${error.code.displayLabel}: ${error.message}';
@@ -3486,7 +3544,7 @@ class AppController extends ChangeNotifier {
             canCancel: false,
             outputLines: <String>[
               ...task.outputLines,
-              'Cancellation requested. Waiting for the current listing request to finish.',
+              'Cancellation requested. Stopping the listing and ignoring late results.',
             ],
           ),
         );
@@ -3691,7 +3749,8 @@ class AppController extends ChangeNotifier {
     );
   }
 
-  Future<void> refreshBucketAdminState() async {
+  Future<void> refreshBucketAdminState(
+      {bool cancellableListing = false}) async {
     final profile = selectedProfile;
     final bucket = selectedBucket;
     if (profile == null || bucket == null) {
@@ -3702,11 +3761,14 @@ class AppController extends ChangeNotifier {
     await _runBusy('refresh-bucket-admin', 'Loading bucket admin state...',
         () async {
       await _guard('Buckets', () async {
-        adminState = await _engineService.getBucketAdminState(
-          engineId: activeEngineId,
-          profile: profile,
-          bucketName: bucket.name,
-        );
+        Future<BucketAdminState> request() =>
+            _engineService.getBucketAdminState(
+              engineId: activeEngineId,
+              profile: profile,
+              bucketName: bucket.name,
+            );
+        adminState =
+            cancellableListing ? await _awaitListing(request) : await request();
         notifyListeners();
       });
     });

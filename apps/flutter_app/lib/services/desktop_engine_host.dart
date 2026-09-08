@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'diagnostic_safety.dart';
+import 'listing_cancellation.dart';
 
 class DesktopEngineHostResponse {
   const DesktopEngineHostResponse({
@@ -39,6 +40,7 @@ class DesktopEngineHost {
   final Map<String, int> _activeByKey = {};
   final List<_HostWaiter> _waiters = [];
   final Map<String, _EngineProcess> _jobOwners = {};
+  final Map<ListingCancellation, _EngineProcess?> _listings = {};
   int get liveProcessCount => _liveProcesses.length;
   int get queuedRequestCount => _waiters.length;
 
@@ -58,6 +60,7 @@ class DesktopEngineHost {
     void Function(Map<String, Object?> event)? onEvent,
     bool concurrentControls = false,
     Duration? timeout,
+    ListingCancellation? listingCancellation,
   }) async {
     if (_disposed) {
       throw StateError('DesktopEngineHost has been disposed.');
@@ -84,16 +87,26 @@ class DesktopEngineHost {
       }
       return response;
     }
-    await _enter(key, method);
+    final cancellation = isCancellableListingMethod(method)
+        ? listingCancellation ?? ListingCancellation()
+        : null;
+    if (cancellation != null) _listings[cancellation] = null;
+    var entered = false;
     _EngineProcess? acquired;
     try {
+      if (cancellation?.isCancelled ?? false) throw const ListingCancelled();
+      await _enter(key, method);
+      entered = true;
+      if (cancellation?.isCancelled ?? false) throw const ListingCancelled();
       final process = acquired = await _acquireProcess(
         key: key,
         executablePath: executablePath,
         arguments: arguments,
         workingDirectory: workingDirectory,
       );
-      final response = await process.send(
+      if (cancellation != null) _listings[cancellation] = process;
+      if (cancellation?.isCancelled ?? false) throw const ListingCancelled();
+      final pending = process.send(
           request: request,
           timeout: timeout ?? requestTimeout,
           progressDeadline: {
@@ -119,6 +132,10 @@ class DesktopEngineHost {
             }
             onEvent?.call(event);
           });
+      final response = cancellation == null
+          ? await pending
+          : await cancellation.wait(pending);
+      if (cancellation?.isCancelled ?? false) throw const ListingCancelled();
       _jobOwners.removeWhere((_, owner) => identical(owner, process));
       _releaseProcess(key, process);
       return response;
@@ -126,10 +143,14 @@ class DesktopEngineHost {
       // The process can no longer be trusted to pair responses with
       // requests; drop it so the next request respawns a fresh one.
       if (acquired != null) _discardProcess(key, acquired);
+      if (cancellation?.isCancelled ?? false) throw const ListingCancelled();
       rethrow;
     } finally {
-      _active--;
-      _activeByKey[key] = (_activeByKey[key] ?? 1) - 1;
+      if (cancellation != null) _listings.remove(cancellation);
+      if (entered) {
+        _active--;
+        _activeByKey[key] = (_activeByKey[key] ?? 1) - 1;
+      }
       _wakeWaiters();
     }
   }
@@ -156,6 +177,23 @@ class DesktopEngineHost {
       _waiters.remove(waiter);
       waiter.ready.completeError(StateError('Queued listing cancelled.'));
     }
+  }
+
+  /// Each ordinary request exclusively owns its process, so terminating a
+  /// listing cannot kill a transfer running on another process in the pool.
+  void cancelListings() {
+    for (final entry in _listings.entries.toList()) {
+      entry.key.cancel();
+      entry.value?.kill();
+    }
+    for (final waiter in _waiters.toList()) {
+      if (!isCancellableListingMethod(waiter.method)) {
+        continue;
+      }
+      _waiters.remove(waiter);
+      waiter.ready.completeError(const ListingCancelled());
+    }
+    _wakeWaiters();
   }
 
   void _wakeWaiters() {

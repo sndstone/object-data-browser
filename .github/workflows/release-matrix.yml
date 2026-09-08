@@ -78,25 +78,48 @@ jobs:
             package: rpm
             runs_on: ubuntu-24.04-arm
     runs-on: ${{ matrix.runs_on }}
+    container: ubuntu:20.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Linux build dependencies
+      - name: Install Ubuntu 20.04 build and smoke-test dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libsecret-1-dev libstdc++-12-dev liblzma-dev rpm
+          apt-get update
+          apt-get install -y git ca-certificates curl unzip xz-utils build-essential clang cmake ninja-build pkg-config libgtk-3-dev libsecret-1-dev libstdc++-9-dev liblzma-dev rpm python3 binutils xvfb dbus-x11
+      - uses: actions/checkout@v4
+      - name: Trust the mounted checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Cache toolchains
         uses: actions/cache@v4
         with:
           path: .tmp/toolchains
-          key: toolchains-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('scripts/bootstrap.*') }}
+          key: toolchains-focal-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('scripts/bootstrap.*') }}
       - name: Build Linux package
         run: ./scripts/build.sh linux ${{ matrix.arch }} ${{ matrix.package }}
+      - name: Verify Linux compatibility and startup
+        run: |
+          arch="${{ matrix.arch }}"
+          if [[ "$arch" == "x86_64" ]]; then flutter_arch=x64; else flutter_arch=arm64; fi
+          bundle="apps/flutter_app/build/linux/$flutter_arch/release/bundle"
+          mkdir -p dist/linux
+          python3 scripts/verify-linux-compatibility.py "$bundle" > dist/linux/compatibility.txt
+          set +e
+          xvfb-run -a timeout 12s dbus-run-session -- "$bundle/s3_browser_crossplat" > dist/linux/startup-smoke.log 2>&1
+          status=$?
+          set -e
+          if [[ "$status" != 124 ]]; then cat dist/linux/startup-smoke.log; exit 1; fi
+          echo 'Headless GTK startup remained running for 12 seconds on Ubuntu 20.04.' >> dist/linux/compatibility.txt
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.package }}-${{ matrix.arch }}
           path: |
             dist/linux/*.deb
             dist/linux/*.rpm
+            dist/linux/compatibility.txt
+            dist/linux/startup-smoke.log
           if-no-files-found: error
 
   macos:
