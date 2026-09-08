@@ -37,6 +37,23 @@ This repository now includes:
   object operations, transfers, Files.app downloads, profile export sharing,
   local-network access, and Keychain credential storage
 
+## 2.2.7 cancellation and settings review
+
+Cancel now releases a stuck bucket/object listing immediately, preserves completed
+pages, and prevents late responses from changing a newer listing. Desktop read
+processes are stopped without terminating active transfers. See the
+[cancellation implementation and tests](docs/listing-cancellation-fix.md).
+
+The [backend and Settings improvement plan](docs/backend-settings-improvement-plan.html)
+includes interactive before/after mockups and prioritized findings. The proposed
+Settings redesign and other backend findings are not implemented in this release.
+
+Linux packaging targets Ubuntu 20.04 / glibc 2.31 for Linux Mint 20 and newer.
+Release CI checks bundled ELF requirements and runs a headless GTK startup test
+on that baseline. This does not replace installation testing on each Mint version.
+Use the DEB package for Mint; RPM packages target distributions providing GTK 3,
+libsecret, libstdc++, and glibc 2.31 or newer.
+
 ## Bootstrap
 
 Linux/macOS:

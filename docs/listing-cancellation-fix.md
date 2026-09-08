@@ -1,7 +1,7 @@
 # Listing cancellation fix
 
-Follow-up to the 2.2.6 backend/settings review. Implemented locally; the app
-version and release packages have not changed.
+Follow-up to the 2.2.6 backend/settings review. Included in application version 2.2.7. See the GitHub release for published
+Windows/Linux packages; the macOS DMG is a local development build.
 
 Cancel previously changed a paging generation and removed queued object-list
 requests, but left the controller awaiting the current engine response. A
@@ -35,8 +35,8 @@ button was pressed. Late errors remain observed and cannot fail a newer listing.
   suppression, process-slot recovery and an unaffected active upload.
 - Local host fixtures exercise actual sidecar process termination on macOS.
   Shell-based host tests skip Windows; Windows process behavior was not run here.
-- No real storage endpoint or credentials were used. No release build, signing
-  change, engine wire-contract change or deployment was performed.
+- No real storage endpoint or credentials were used. The engine wire contract is unchanged. Release packaging is tracked separately
+  from these regression checks.
 
 Native mobile adapters benefit from immediate UI cancellation and stale-result
 suppression; their underlying SDK calls are not forcibly aborted by this change
