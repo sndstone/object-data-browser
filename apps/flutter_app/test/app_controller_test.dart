@@ -296,9 +296,20 @@ void main() {
     final tempDir = await Directory.systemTemp.createTemp('multipart-sizing');
     addTearDown(() => tempDir.delete(recursive: true));
     final uploadFile = File('${tempDir.path}/ten-gib.bin');
+    await uploadFile.create();
+    if (Platform.isWindows) {
+      final result =
+          await Process.run('fsutil', ['sparse', 'setflag', uploadFile.path]);
+      if (result.exitCode != 0) {
+        throw StateError('Cannot create sparse test fixture: ${result.stderr}');
+      }
+    }
     await uploadFile.open(mode: FileMode.write).then((file) async {
-      await file.truncate(10 * 1024 * 1024 * 1024);
-      await file.close();
+      try {
+        await file.truncate(10 * 1024 * 1024 * 1024);
+      } finally {
+        await file.close();
+      }
     });
     final engine = RecordingMockEngineService();
     final controller = AppController(

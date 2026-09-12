@@ -97,9 +97,19 @@ void main() {
   });
   Future<String> file(String name, int size) async {
     final path = '${dir.path}/$name';
+    await File(path).create();
+    if (Platform.isWindows) {
+      final result = await Process.run('fsutil', ['sparse', 'setflag', path]);
+      if (result.exitCode != 0) {
+        throw StateError('Cannot create sparse test fixture: ${result.stderr}');
+      }
+    }
     final handle = await File(path).open(mode: FileMode.write);
-    await handle.truncate(size);
-    await handle.close();
+    try {
+      await handle.truncate(size);
+    } finally {
+      await handle.close();
+    }
     return path;
   }
 
