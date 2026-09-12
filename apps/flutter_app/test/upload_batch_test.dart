@@ -1,3 +1,4 @@
+import 'sparse_file_fixture.dart';
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
@@ -97,19 +98,7 @@ void main() {
   });
   Future<String> file(String name, int size) async {
     final path = '${dir.path}/$name';
-    await File(path).create();
-    if (Platform.isWindows) {
-      final result = await Process.run('fsutil', ['sparse', 'setflag', path]);
-      if (result.exitCode != 0) {
-        throw StateError('Cannot create sparse test fixture: ${result.stderr}');
-      }
-    }
-    final handle = await File(path).open(mode: FileMode.write);
-    try {
-      await handle.truncate(size);
-    } finally {
-      await handle.close();
-    }
+    await createSparseFixture(File(path), size);
     return path;
   }
 

@@ -1,3 +1,4 @@
+import 'sparse_file_fixture.dart';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -296,21 +297,7 @@ void main() {
     final tempDir = await Directory.systemTemp.createTemp('multipart-sizing');
     addTearDown(() => tempDir.delete(recursive: true));
     final uploadFile = File('${tempDir.path}/ten-gib.bin');
-    await uploadFile.create();
-    if (Platform.isWindows) {
-      final result =
-          await Process.run('fsutil', ['sparse', 'setflag', uploadFile.path]);
-      if (result.exitCode != 0) {
-        throw StateError('Cannot create sparse test fixture: ${result.stderr}');
-      }
-    }
-    await uploadFile.open(mode: FileMode.write).then((file) async {
-      try {
-        await file.truncate(10 * 1024 * 1024 * 1024);
-      } finally {
-        await file.close();
-      }
-    });
+    await createSparseFixture(uploadFile, 10 * 1024 * 1024 * 1024);
     final engine = RecordingMockEngineService();
     final controller = AppController(
       engineService: engine,

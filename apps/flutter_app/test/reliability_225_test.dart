@@ -160,7 +160,9 @@ for line in sys.stdin:
           maxProcesses: 2,
           maxProcessesPerEngine: 1,
           maxQueuedRequests: 1,
-          requestTimeout: const Duration(milliseconds: 250));
+          // Shared runners may need more than 250 ms to start Python. Keep a
+          // bounded timeout without confusing startup load with a hung engine.
+          requestTimeout: const Duration(seconds: 3));
     });
     tearDown(() async {
       host.dispose();
