@@ -240,7 +240,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
                                     ? 'Cancel listing'
                                     : 'Refresh object list',
                                 onPressed: busy
-                                    ? c.cancelListing
+                                    ? () => c.cancelAction('refresh-objects')
                                     : hasBucket
                                         ? c.refreshObjects
                                         : null,

@@ -1,3 +1,4 @@
+import '../controllers/action_scope.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -87,15 +88,15 @@ class DesktopEngineHost {
       }
       return response;
     }
-    final cancellation = isCancellableListingMethod(method)
-        ? listingCancellation ?? ListingCancellation()
-        : null;
-    if (cancellation != null) _listings[cancellation] = null;
+    final cancellation = listingCancellation ??
+        (isCancellableListingMethod(method) ? ListingCancellation() : null);
+    final isListing = isCancellableListingMethod(method);
+    if (cancellation != null && isListing) _listings[cancellation] = null;
     var entered = false;
     _EngineProcess? acquired;
     try {
       if (cancellation?.isCancelled ?? false) throw const ListingCancelled();
-      await _enter(key, method);
+      await _enter(key, method, cancellation);
       entered = true;
       if (cancellation?.isCancelled ?? false) throw const ListingCancelled();
       final process = acquired = await _acquireProcess(
@@ -104,7 +105,7 @@ class DesktopEngineHost {
         arguments: arguments,
         workingDirectory: workingDirectory,
       );
-      if (cancellation != null) _listings[cancellation] = process;
+      if (cancellation != null && isListing) _listings[cancellation] = process;
       if (cancellation?.isCancelled ?? false) throw const ListingCancelled();
       final pending = process.send(
           request: request,
@@ -140,6 +141,12 @@ class DesktopEngineHost {
       _releaseProcess(key, process);
       return response;
     } catch (_) {
+      if (cancellation is ActionScope &&
+          cancellation.isCancelled &&
+          acquired != null &&
+          !isListing) {
+        cancellation.outcomeUnknown = true;
+      }
       // The process can no longer be trusted to pair responses with
       // requests; drop it so the next request respawns a fresh one.
       if (acquired != null) _discardProcess(key, acquired);
@@ -155,13 +162,20 @@ class DesktopEngineHost {
     }
   }
 
-  Future<void> _enter(String key, String method) async {
+  Future<void> _enter(
+      String key, String method, ListingCancellation? cancellation) async {
     if (_waiters.length >= maxQueuedRequests) {
       throw StateError(
           'Engine request queue is full. Wait for active jobs to finish.');
     }
     final waiter = _HostWaiter(key, method);
     _waiters.add(waiter);
+    cancellation?.whenCancelled.then((_) {
+      if (_waiters.remove(waiter)) {
+        waiter.ready.completeError(const ListingCancelled());
+        _wakeWaiters();
+      }
+    });
     _wakeWaiters();
     try {
       await waiter.ready.future.timeout(queueTimeout);

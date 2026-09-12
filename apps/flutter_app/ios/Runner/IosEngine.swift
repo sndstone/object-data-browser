@@ -12,6 +12,7 @@ import UIKit
 final class IosEngine {
   private static let channelName = "s3_browser_crossplat/ios_engine"
   private let channel: FlutterMethodChannel
+  private var requests: [String: Task<Void, Never>] = [:]
   private var transfers: [String: TransferState] = [:]
   private var backgroundPausedTransfers: Set<String> = []
 
@@ -48,13 +49,20 @@ final class IosEngine {
         descriptor(id: "go", label: "Go (iOS)", language: "go"),
         descriptor(id: "rust", label: "Rust (iOS)", language: "rust"),
       ])
+    case "cancelRequest":
+      let args = call.arguments as? [String: Any] ?? [:]
+      if let id = args["requestId"] as? String { requests[id]?.cancel() }
+      result(nil)
     case "dispatch":
       let args = call.arguments as? [String: Any] ?? [:]
       let engineID = args["engineId"] as? String ?? "ios"
       let method = args["method"] as? String ?? "unknown"
       let params = args["params"] as? [String: Any] ?? [:]
-      Task {
+      let requestID = args["requestId"] as? String ?? UUID().uuidString
+      let task = Task { @MainActor in
+        defer { requests.removeValue(forKey: requestID) }
         do {
+          try Task.checkCancellation()
           let payload = try await self.dispatch(
             engineID: engineID,
             method: method,
@@ -68,6 +76,7 @@ final class IosEngine {
           await MainActor.run { result(["error": failure.map]) }
         }
       }
+      requests[requestID] = task
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -111,7 +120,7 @@ final class IosEngine {
     case "generatePresignedUrl": return try await presignedURL(params)
     case "runPutTestData": return try await runPutTestData(params)
     case "runDeleteAll": return try await runDeleteAll(params)
-    case "cancelToolExecution": return cancelTool(params)
+    case "cancelToolExecution": return try cancelTool(params)
     case "putBucketEncryption", "deleteBucketEncryption":
       throw EngineFailure(
         code: "unsupported_feature",
@@ -197,6 +206,7 @@ final class IosEngine {
   private func listBuckets(_ params: [String: Any]) async throws -> [String: Any] {
     let profile = try profile(params)
     let service = try client(profile)
+    try Task.checkCancellation()
     let output = try await service.listBuckets(input: ListBucketsInput())
     var items: [[String: Any]] = []
     for bucket in output.buckets ?? [] {
@@ -224,6 +234,7 @@ final class IosEngine {
     let location = profile.region == "us-east-1"
       ? nil
       : S3ClientTypes.BucketLocationConstraint(rawValue: profile.region)
+    try Task.checkCancellation()
     _ = try await service.createBucket(input: CreateBucketInput(
       bucket: name,
       createBucketConfiguration: location.map {
@@ -232,6 +243,7 @@ final class IosEngine {
       objectLockEnabledForBucket: objectLock
     ))
     if enableVersioning {
+      try Task.checkCancellation()
       _ = try await service.putBucketVersioning(input: PutBucketVersioningInput(
         bucket: name,
         versioningConfiguration: S3ClientTypes.VersioningConfiguration(status: .enabled)
@@ -411,6 +423,7 @@ final class IosEngine {
     let key = try required(params, "key", "Object key is required.")
     let service = try client(profile)
     let started = Date()
+    try Task.checkCancellation()
     let head = try await service.headObject(input: HeadObjectInput(bucket: bucket, key: key))
     let tags = try? await service.getObjectTagging(
       input: GetObjectTaggingInput(bucket: bucket, key: key)
@@ -614,12 +627,14 @@ final class IosEngine {
     let service = try client(profile)
     let source = "\(sourceBucket)/\(sourceKey)"
       .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? "\(sourceBucket)/\(sourceKey)"
+    try Task.checkCancellation()
     _ = try await service.copyObject(input: CopyObjectInput(
       bucket: destinationBucket,
       copySource: source,
       key: destinationKey
     ))
     if deleteSource {
+      try Task.checkCancellation()
       _ = try await service.deleteObject(input: DeleteObjectInput(
         bucket: sourceBucket,
         key: sourceKey
@@ -634,6 +649,7 @@ final class IosEngine {
     let keys = params["keys"] as? [String] ?? []
     let service = try client(profile)
     for key in keys {
+      try Task.checkCancellation()
       _ = try await service.deleteObject(input: DeleteObjectInput(bucket: bucket, key: key))
     }
     return batchResult(success: keys.count)
@@ -646,6 +662,7 @@ final class IosEngine {
     let service = try client(profile)
     for version in versions {
       guard let key = version["key"] as? String else { continue }
+      try Task.checkCancellation()
       _ = try await service.deleteObject(input: DeleteObjectInput(
         bucket: bucket,
         key: key,
@@ -721,6 +738,7 @@ final class IosEngine {
       try await waitUntilRunnable(job)
       guard job.status != "cancelled" else { return false }
       let data = try Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe)
+      try Task.checkCancellation()
       _ = try await service.putObject(input: PutObjectInput(
         body: .data(data),
         bucket: bucket,
@@ -738,6 +756,7 @@ final class IosEngine {
         message: "The selected part size would exceed S3's 10,000-part limit."
       )
     }
+    try Task.checkCancellation()
     let initiated = try await service.createMultipartUpload(
       input: CreateMultipartUploadInput(bucket: bucket, key: key)
     )
@@ -789,6 +808,7 @@ final class IosEngine {
           .sorted { $0.partNumber < $1.partNumber }
           .map { S3ClientTypes.CompletedPart(eTag: $0.etag, partNumber: $0.partNumber) }
       }
+      try Task.checkCancellation()
       _ = try await service.completeMultipartUpload(input: CompleteMultipartUploadInput(
         bucket: bucket,
         key: key,
@@ -821,10 +841,13 @@ final class IosEngine {
     let service = try client(profile)
     var total = 0
     var sizes: [String: Int] = [:]
+    var validators: [String: String] = [:]
     for key in keys {
+      try Task.checkCancellation()
       let head = try await service.headObject(input: HeadObjectInput(bucket: bucket, key: key))
       let size = head.contentLength ?? 0
       sizes[key] = size
+      validators[key] = head.eTag
       total += size
     }
     let job = TransferState(
@@ -845,18 +868,29 @@ final class IosEngine {
     for (index, key) in keys.enumerated() {
       guard job.status != "cancelled" else { break }
       let fileName = URL(fileURLWithPath: key).lastPathComponent
-      let url = uniqueDestination(directory: destination, fileName: fileName)
+      let temporary = URL(fileURLWithPath: destination).appendingPathComponent(".odb-\(UUID().uuidString).part")
+      defer { try? FileManager.default.removeItem(at: temporary) }
+      var url = uniqueDestination(directory: destination, fileName: fileName)
       let downloaded = try await downloadObject(
         service: service,
         bucket: bucket,
         key: key,
+        validator: validators[key],
         size: sizes[key] ?? 0,
-        destination: url,
+        destination: temporary,
         multipartThresholdBytes: threshold * 1_048_576,
         partSizeBytes: chunk * 1_048_576,
         job: job
       )
-      guard downloaded else { break }
+      guard downloaded, job.status != "cancelled" else { break }
+      while true {
+        do { try FileManager.default.linkItem(at: temporary, to: url); break }
+        catch {
+          if FileManager.default.fileExists(atPath: url.path) {
+            url = uniqueDestination(directory: destination, fileName: fileName)
+          } else { throw error }
+        }
+      }
       job.itemsCompleted = index + 1
       job.currentItem = key
       job.outputLines.append("Downloaded \(key) to \(url.path).")
@@ -880,6 +914,7 @@ final class IosEngine {
       let offset = (partNumber - 1) * partSizeBytes
       let length = min(partSizeBytes, size - offset)
       let data = try Self.readFilePart(path: path, offset: offset, length: length)
+      try Task.checkCancellation()
       let output = try await service.uploadPart(input: UploadPartInput(
         body: .data(data),
         bucket: bucket,
@@ -902,6 +937,7 @@ final class IosEngine {
     service: S3Client,
     bucket: String,
     key: String,
+    validator: String?,
     size: Int,
     destination: URL,
     multipartThresholdBytes: Int,
@@ -911,11 +947,13 @@ final class IosEngine {
     try await waitUntilRunnable(job)
     guard job.status != "cancelled" else { return false }
     if size < multipartThresholdBytes {
-      let output = try await service.getObject(input: GetObjectInput(bucket: bucket, key: key))
+      try Task.checkCancellation()
+      let output = try await service.getObject(input: GetObjectInput(bucket: bucket, ifMatch: validator, key: key))
       guard let data = try await output.body?.readData() else {
         throw EngineFailure(code: "unknown", message: "S3 returned no data for \(key).")
       }
       guard job.status != "cancelled" else { return false }
+      guard data.count == size else { throw EngineFailure(code: "object_conflict", message: "Download size mismatch; partial file discarded.") }
       try data.write(to: destination, options: .atomic)
       job.bytesTransferred += data.count
       return true
@@ -935,6 +973,7 @@ final class IosEngine {
             service: service,
             bucket: bucket,
             key: key,
+            validator: validator,
             size: size,
             partSizeBytes: partSizeBytes,
             partNumber: partNumber
@@ -955,6 +994,7 @@ final class IosEngine {
               service: service,
               bucket: bucket,
               key: key,
+              validator: validator,
               size: size,
               partSizeBytes: partSizeBytes,
               partNumber: nextPart
@@ -981,6 +1021,7 @@ final class IosEngine {
     service: S3Client,
     bucket: String,
     key: String,
+    validator: String?,
     size: Int,
     partSizeBytes: Int,
     partNumber: Int
@@ -989,8 +1030,10 @@ final class IosEngine {
       let offset = (partNumber - 1) * partSizeBytes
       let length = min(partSizeBytes, size - offset)
       let end = offset + length - 1
+      try Task.checkCancellation()
       let output = try await service.getObject(input: GetObjectInput(
         bucket: bucket,
+        ifMatch: validator,
         key: key,
         range: "bytes=\(offset)-\(end)"
       ))
@@ -999,6 +1042,9 @@ final class IosEngine {
           code: "unknown",
           message: "S3 returned no data for range \(offset)-\(end) of \(key)."
         )
+      }
+      guard data.count == length, output.contentRange == "bytes \(offset)-\(end)/\(size)" else {
+        throw EngineFailure(code: "object_conflict", message: "Download range mismatch; partial file discarded.")
       }
       return DownloadedPart(offset: offset, data: data)
     }
@@ -1056,6 +1102,7 @@ final class IosEngine {
       for versionIndex in 0..<versions {
         let key = "\(prefix.hasSuffix("/") ? prefix : prefix + "/")sample-\(objectIndex + 1)-v\(versionIndex + 1).bin"
         let bytes = Data((0..<size).map { UInt8(($0 + objectIndex + versionIndex) % 255) })
+        try Task.checkCancellation()
         _ = try await service.putObject(input: PutObjectInput(
           body: .data(bytes), bucket: bucket, contentLength: bytes.count, key: key
         ))
@@ -1078,6 +1125,7 @@ final class IosEngine {
     var deleted = 0
     var continuation: String?
     repeat {
+      try Task.checkCancellation()
       let output = try await service.listObjectsV2(input: ListObjectsV2Input(
         bucket: bucket,
         continuationToken: continuation,
@@ -1085,6 +1133,7 @@ final class IosEngine {
       ))
       for object in output.contents ?? [] {
         guard let key = object.key else { continue }
+        try Task.checkCancellation()
         _ = try await service.deleteObject(input: DeleteObjectInput(bucket: bucket, key: key))
         deleted += 1
       }
@@ -1098,14 +1147,8 @@ final class IosEngine {
     )
   }
 
-  private func cancelTool(_ params: [String: Any]) -> [String: Any] {
-    let id = params["jobId"] as? String ?? "tool"
-    return toolState(
-      label: id,
-      status: "Cancelled tool execution \(id).",
-      lines: ["Tool execution cancellation is best-effort on iOS."],
-      exitCode: 130
-    )
+  private func cancelTool(_ params: [String: Any]) throws -> [String: Any] {
+    throw EngineFailure(code: "unsupported_feature", message: "Use the active action cancellation handle; tool job IDs are returned only after completion.")
   }
 
   private func toolState(

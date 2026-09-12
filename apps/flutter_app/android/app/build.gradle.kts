@@ -22,7 +22,7 @@ android {
     defaultConfig {
         applicationId = "com.example.s3_browser_crossplat"
         // flutter_secure_storage 10 uses the modern Android Keystore APIs.
-        minSdk = 23
+        minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName

@@ -395,7 +395,7 @@ void main() {
 
     await controller.setDefaultProfile(_profile.id);
     expect(controller.settings.defaultProfileId, _profile.id);
-    expect(controller.selectedProfile?.id, _profile.id);
+    expect(controller.selectedProfile?.id, _secondProfile.id);
     expect(repository.storedState?.settings.defaultProfileId, _profile.id);
   });
 

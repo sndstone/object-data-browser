@@ -255,9 +255,18 @@ EOF
 
 ensure_flutter() {
   local dir="$TOOLS_DIR/flutter"
+  local flutter_version
+  flutter_version="$(cat "$ROOT_DIR/.flutter-version")"
   if [[ ! -x "$dir/bin/flutter" ]]; then
     rm -rf "$dir"
-    git clone https://github.com/flutter/flutter.git --depth 1 -b stable "$dir"
+    git clone https://github.com/flutter/flutter.git --depth 1 -b "$flutter_version" "$dir"
+  fi
+
+  local installed_version
+  installed_version="$(git -C "$dir" describe --tags --exact-match HEAD 2>/dev/null || true)"
+  if [[ "$installed_version" != "$flutter_version" ]]; then
+    echo "Flutter cache is $installed_version; expected $flutter_version. Move $dir aside and rerun bootstrap." >&2
+    exit 1
   fi
 
   if [[ "$TARGET_OS" == "darwin" ]]; then

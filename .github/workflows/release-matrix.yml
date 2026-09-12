@@ -7,6 +7,10 @@ on:
         description: Build Windows and Linux packages
         type: boolean
         default: true
+      build_linux:
+        description: Include Linux packages when building desktop
+        type: boolean
+        default: true
       build_android:
         description: Include Android builds without iOS
         type: boolean
@@ -49,7 +53,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .tmp/toolchains
-          key: toolchains-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('scripts/bootstrap.*') }}
+          key: toolchains-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('.flutter-version', 'scripts/bootstrap.*') }}
       - name: Build Windows MSI
         shell: pwsh
         run: .\scripts\build.ps1 -Platform windows -Arch ${{ matrix.arch }} -Installer msi
@@ -60,7 +64,7 @@ jobs:
           if-no-files-found: error
 
   linux:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_desktop == true }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.build_desktop == true && inputs.build_linux == true) }}
     needs: verify
     strategy:
       fail-fast: false
@@ -98,7 +102,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .tmp/toolchains
-          key: toolchains-focal-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('scripts/bootstrap.*') }}
+          key: toolchains-focal-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('.flutter-version', 'scripts/bootstrap.*') }}
       - name: Check Linux build prerequisites
         run: |
           for tool in clang cmake ninja pkg-config rpm python3 readelf xvfb-run; do
@@ -150,7 +154,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .tmp/toolchains
-          key: toolchains-${{ runner.os }}-${{ hashFiles('scripts/bootstrap.*') }}
+          key: toolchains-${{ runner.os }}-${{ hashFiles('.flutter-version', 'scripts/bootstrap.*') }}
       - name: Configure Developer ID signing
         shell: bash
         run: |
@@ -212,7 +216,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .tmp/toolchains
-          key: toolchains-${{ runner.os }}-${{ hashFiles('scripts/bootstrap.*') }}
+          key: toolchains-${{ runner.os }}-${{ hashFiles('.flutter-version', 'scripts/bootstrap.*') }}
       - name: Build Android arm64 artifacts
         run: ./scripts/build.sh android arm64
       - uses: actions/upload-artifact@v4
@@ -238,7 +242,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .tmp/toolchains
-          key: toolchains-${{ runner.os }}-ios-${{ hashFiles('scripts/bootstrap.*', 'apps/flutter_app/ios/Runner.xcodeproj/project.pbxproj') }}
+          key: toolchains-${{ runner.os }}-ios-${{ hashFiles('.flutter-version', 'scripts/bootstrap.*', 'apps/flutter_app/ios/Runner.xcodeproj/project.pbxproj') }}
       - name: Configure iOS distribution signing
         if: ${{ env.IOS_SIGNING_IDENTITY != '' }}
         shell: bash

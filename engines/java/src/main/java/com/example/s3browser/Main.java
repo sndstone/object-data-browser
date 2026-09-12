@@ -120,7 +120,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class Main {
-    private static final String ENGINE_VERSION = "2.2.5";
+    private static final String ENGINE_VERSION = "2.2.8";
     private static final int REQUEST_POOL_SIZE = 8;
     private static final int DELETE_BATCH_LIMIT = 1000;
     private static final Object STDOUT_LOCK = new Object();
@@ -1032,7 +1032,7 @@ public final class Main {
         int multipartThresholdMiB = Math.max(params.path("multipartThresholdMiB").asInt(32), 1);
         int multipartChunkMiB = Math.max(params.path("multipartChunkMiB").asInt(8), 1);
         long multipartThresholdBytes = multipartThresholdMiB * 1024L * 1024L;
-        int multipartChunkBytes = multipartChunkMiB * 1024 * 1024;
+        long multipartChunkBytes = multipartChunkMiB * 1024L * 1024L;
         List<Path> paths = filePaths.stream().map(Path::of).toList();
         long totalBytes = paths.stream().mapToLong(path -> {
             try {
@@ -1058,7 +1058,7 @@ public final class Main {
                 throw new RuntimeException(error);
             }
         }).sum();
-        Integer partSizeBytes = partsTotal > 0 ? multipartChunkBytes : null;
+        Long partSizeBytes = partsTotal > 0 ? multipartChunkBytes : null;
         Integer partCount = partsTotal > 0 ? partsTotal : null;
         String jobId = "upload-" + UUID.randomUUID().toString().substring(0, 8);
         JobControl control = new JobControl();
@@ -1122,12 +1122,11 @@ public final class Main {
                         for (int index = 0; index < filePartCount; index += 1) {
                             final int partNumber = index + 1;
                             final long partOffset = (long) index * multipartChunkBytes;
-                            final int partLength = (int) Math.min(multipartChunkBytes, fileSize - partOffset);
+                            final long partLength = Math.min(multipartChunkBytes, fileSize - partOffset);
                             futures.add(executor.submit(() -> {
                                 if (!control.awaitRunnable()) {
                                     throw new TransferCancelledException();
                                 }
-                                byte[] chunk = readChunk(channel, partOffset, partLength);
                                 var partResult = client.uploadPart(
                                     UploadPartRequest.builder()
                                         .bucket(context.bucketName())
@@ -1135,7 +1134,13 @@ public final class Main {
                                         .uploadId(uploadId)
                                         .partNumber(partNumber)
                                         .build(),
-                                    RequestBody.fromBytes(chunk)
+                                    RequestBody.fromContentProvider(() -> {
+                                        try {
+                                            return new FilePartStream(path, partOffset, partLength, () -> {
+                                                if (!control.awaitRunnable()) throw new TransferCancelledException();
+                                            });
+                                        } catch (IOException error) { throw new java.io.UncheckedIOException(error); }
+                                    }, partLength, "application/octet-stream")
                                 );
                                 long transferredNow = bytesTransferred.addAndGet(partLength);
                                 int partsCompletedNow = partsCompleted.incrementAndGet();
@@ -1312,19 +1317,6 @@ public final class Main {
         }
     }
 
-    private static byte[] readChunk(FileChannel channel, long offset, int length) throws IOException {
-        ByteBuffer buffer = ByteBuffer.allocate(length);
-        long position = offset;
-        while (buffer.hasRemaining()) {
-            int read = channel.read(buffer, position);
-            if (read < 0) {
-                throw new IOException("Unexpected end of file at offset " + position + ".");
-            }
-            position += read;
-        }
-        return buffer.array();
-    }
-
     private static RuntimeException unwrapTransferFailure(Throwable cause) throws IOException {
         if (cause instanceof IOException ioCause) {
             throw ioCause;
@@ -1347,7 +1339,7 @@ public final class Main {
         int multipartThresholdMiB = Math.max(params.path("multipartThresholdMiB").asInt(32), 1);
         int multipartChunkMiB = Math.max(params.path("multipartChunkMiB").asInt(8), 1);
         long multipartThresholdBytes = multipartThresholdMiB * 1024L * 1024L;
-        int multipartChunkBytes = multipartChunkMiB * 1024 * 1024;
+        long multipartChunkBytes = multipartChunkMiB * 1024L * 1024L;
         String jobId = "download-" + UUID.randomUUID().toString().substring(0, 8);
         JobControl control = new JobControl();
         TRANSFER_REGISTRY.put(jobId, control);
@@ -1363,14 +1355,17 @@ public final class Main {
         ExecutorService executor = Executors.newFixedThreadPool(transferPoolSize(context.profile()));
         try (S3Client client = context.client()) {
             Map<String, Long> sizes = new LinkedHashMap<>();
+            Map<String, String> validators = new LinkedHashMap<>();
             long totalBytesTally = 0L;
             for (String key : keys) {
-                long size = client.headObject(
+                var head = client.headObject(
                     HeadObjectRequest.builder()
                         .bucket(context.bucketName())
                         .key(key)
                         .build()
-                ).contentLength();
+                );
+                long size = head.contentLength();
+                validators.put(key, head.eTag());
                 sizes.put(key, size);
                 totalBytesTally += size;
             }
@@ -1381,7 +1376,7 @@ public final class Main {
                     ? (int) ((size + multipartChunkBytes - 1L) / multipartChunkBytes)
                     : 0)
                 .sum();
-            Integer partSizeBytes = partsTotal > 0 ? multipartChunkBytes : null;
+            Long partSizeBytes = partsTotal > 0 ? multipartChunkBytes : null;
             Integer partCount = partsTotal > 0 ? partsTotal : null;
             String strategyLabel = transferStrategyLabel("download", usesMultipart);
             emitTransferEvent(transferJob(
@@ -1412,7 +1407,9 @@ public final class Main {
                     break;
                 }
                 long size = sizes.getOrDefault(key, 0L);
-                Path target = destination.resolve(Path.of(key).getFileName());
+                long beforeObject = bytesTransferred.get();
+                try (DownloadDestination staged = new DownloadDestination(destination)) {
+                Path target = staged.path;
                 synchronized (progressLock) {
                     outputLines.add("Downloading " + key + " (" + size + " bytes) to " + target + ".");
                 }
@@ -1428,26 +1425,26 @@ public final class Main {
                                 if (!control.awaitRunnable()) {
                                     throw new TransferCancelledException();
                                 }
-                                byte[] bytes;
-                                try (ResponseInputStream<?> stream = client.getObject(GetObjectRequest.builder()
-                                    .bucket(context.bucketName())
-                                    .key(key)
-                                    .range("bytes=" + rangeStart + "-" + rangeEnd)
-                                    .build())) {
-                                    bytes = stream.readAllBytes();
+                                long rangeBytes = 0;
+                                try (ResponseInputStream<software.amazon.awssdk.services.s3.model.GetObjectResponse> stream = client.getObject(GetObjectRequest.builder()
+                                    .bucket(context.bucketName()).key(key).ifMatch(validators.get(key))
+                                    .range("bytes=" + rangeStart + "-" + rangeEnd).build())) {
+                                    if (!("bytes " + rangeStart + "-" + rangeEnd + "/" + size).equals(stream.response().contentRange())) {
+                                        throw new IOException("Download range mismatch.");
+                                    }
+                                    byte[] bytes = new byte[1024 * 1024];
+                                    int read;
+                                    while ((read = stream.read(bytes)) != -1) {
+                                        if (!control.awaitRunnable()) throw new TransferCancelledException();
+                                        if (rangeBytes + read > rangeEnd - rangeStart + 1) throw new IOException("Oversized range body.");
+                                        ByteBuffer buffer = ByteBuffer.wrap(bytes, 0, read);
+                                        long position = rangeStart + rangeBytes;
+                                        while (buffer.hasRemaining()) position += channel.write(buffer, position);
+                                        rangeBytes += read;
+                                    }
                                 }
-                                long expectedLength = rangeEnd - rangeStart + 1L;
-                                if (bytes.length != expectedLength) {
-                                    throw new IOException("Short read for byte range " + rangeStart + "-" + rangeEnd
-                                        + " of " + key + ": expected " + expectedLength + " byte(s), received "
-                                        + bytes.length + ".");
-                                }
-                                ByteBuffer buffer = ByteBuffer.wrap(bytes);
-                                long position = rangeStart;
-                                while (buffer.hasRemaining()) {
-                                    position += channel.write(buffer, position);
-                                }
-                                long transferredNow = bytesTransferred.addAndGet(bytes.length);
+                                if (rangeBytes != rangeEnd - rangeStart + 1) throw new IOException("Incomplete range body.");
+                                long transferredNow = bytesTransferred.addAndGet(rangeBytes);
                                 int partsCompletedNow = partsCompleted.incrementAndGet();
                                 List<String> linesSnapshot;
                                 int itemsCompletedNow;
@@ -1502,8 +1499,9 @@ public final class Main {
                          ResponseInputStream<?> stream = client.getObject(GetObjectRequest.builder()
                              .bucket(context.bucketName())
                              .key(key)
+                             .ifMatch(validators.get(key))
                              .build())) {
-                        byte[] buffer = new byte[Math.min(multipartChunkBytes, 1024 * 1024)];
+                        byte[] buffer = new byte[(int) Math.min(multipartChunkBytes, 1024 * 1024)];
                         int read;
                         while ((read = stream.read(buffer)) != -1) {
                             if (!control.awaitRunnable()) {
@@ -1537,12 +1535,17 @@ public final class Main {
                         }
                     }
                 }
-                if (cancelled) {
+                if (cancelled || !control.awaitRunnable()) {
+                    cancelled = true;
                     break;
                 }
+                if (bytesTransferred.get() - beforeObject != size) { throw new IOException("Download size mismatch; partial file discarded."); }
+                Path finalPath = staged.publish(destination, key, params.path("conflictPolicy").asText("keepBoth"));
+                outputLines.add("Saved " + key + " to " + finalPath + ".");
                 itemsCompleted.incrementAndGet();
                 synchronized (progressLock) {
                     outputLines.add("Finished downloading " + key + ".");
+                }
                 }
             }
             if (cancelled) {
@@ -1622,8 +1625,8 @@ public final class Main {
             jobId,
             "Transfer " + status,
             "transfer",
-            cancelled ? 1.0 : 0.0,
-            status,
+            0.0,
+            cancelled ? "cancelling" : status,
             0,
             0,
             "",
@@ -2365,7 +2368,7 @@ public final class Main {
         String currentItemLabel,
         int itemCount,
         int itemsCompleted,
-        Integer partSizeBytes,
+        Long partSizeBytes,
         Integer partsCompleted,
         Integer partsTotal,
         boolean canPause,

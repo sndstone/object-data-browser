@@ -1,3 +1,5 @@
+import '../controllers/action_scope.dart';
+import 'listing_cancellation.dart';
 import 'dart:async';
 import 'dart:convert';
 
@@ -610,6 +612,7 @@ class AndroidEngineService
     required String bucketName,
     required List<String> keys,
     required String destinationPath,
+    String conflictPolicy = 'keepBoth',
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
   }) async {
@@ -621,6 +624,7 @@ class AndroidEngineService
         'bucketName': bucketName,
         'keys': keys,
         'destinationPath': destinationPath,
+        'conflictPolicy': conflictPolicy,
         'multipartThresholdMiB': multipartThresholdMiB,
         'multipartChunkMiB': multipartChunkMiB,
       },
@@ -906,14 +910,38 @@ class AndroidEngineService
     }
 
     try {
-      final result = await _channel.invokeMethod<Object?>(
+      final scope = ActionScope.current;
+      scope?.check();
+      var completed = false;
+      if (scope != null) {
+        unawaited(scope.whenCancelled.then((_) async {
+          if (!completed) {
+            if (!isCancellableListingMethod(method)) {
+              scope.outcomeUnknown = true;
+            }
+            try {
+              await _channel.invokeMethod<void>(
+                  'cancelRequest', {'requestId': requestId});
+            } catch (_) {}
+          }
+        }));
+      }
+      final pending = _channel.invokeMethod<Object?>(
         'dispatch',
         <String, Object?>{
           'engineId': engineId,
           'method': method,
+          'requestId': requestId,
           'params': params,
         },
       );
+      Object? result;
+      try {
+        result = scope != null ? await scope.wait(pending) : await pending;
+        scope?.check();
+      } finally {
+        completed = true;
+      }
       final payload = _stringKeyedMap(result);
       final latencyMs = DateTime.now().difference(startedAt).inMilliseconds;
 

@@ -46,7 +46,9 @@ processes are stopped without terminating active transfers. See the
 
 The [backend and Settings improvement plan](docs/backend-settings-improvement-plan.html)
 includes interactive before/after mockups and prioritized findings. The proposed
-Settings redesign and other backend findings are not implemented in this release.
+Settings redesign and other backend findings were not part of that release;
+their 2.2.8 implementation is recorded in the
+[September ledger](docs/improvements-implementation-2026-09.md).
 
 Linux packaging targets Ubuntu 20.04 / glibc 2.31 for Linux Mint 20 and newer.
 Release CI checks bundled ELF requirements and runs a headless GTK startup test
@@ -128,8 +130,8 @@ device Keychain/local-network checks.
 ### 2.2.6 GUI improvements
 
 The GUI plan implementation and verification notes are recorded in
-[the 2.2.6 ledger](docs/2.2.6-gui-implementation.md). The application is 2.2.6+1;
-the unchanged bundled engine implementations remain 2.2.5.
+[the 2.2.6 ledger](docs/2.2.6-gui-implementation.md). The application is 2.2.8+1;
+bundled desktop engines are version 2.2.8.
 
 The [2.2.6 release](https://github.com/sndstone/object-data-browser/releases/tag/v2.2.6)
 provides Windows x64/ARM64 MSI installers, Linux x64/ARM64 DEB and RPM packages,
@@ -142,3 +144,15 @@ The Release Matrix workflow can select Windows/Linux with `build_desktop` and
 Android independently with `build_android`; `build_mobile` includes both Android
 and iOS. Mobile builds bootstrap tools for the host architecture and cross-compile
 the ARM64 app. Release checksums are supplied in `SHA256SUMS`.
+
+## September reliability and Settings changes
+
+The [implementation ledger](docs/improvements-implementation-2026-09.md) tracks
+the [September improvement plan](docs/improvement-plan-2026-09.md): staged and
+validated downloads, confirmed Azure moves, action-specific cancellation,
+measured benchmark results, independent profile actions, and six Settings groups.
+
+Flutter is pinned in `.flutter-version`. Bootstrap and CI use that release;
+bootstrap rejects a mismatched existing cache with instructions to replace it.
+Update the pin in a dedicated change and run Flutter analysis/tests, desktop
+contract checks, and affected native builds before adopting a new version.

@@ -2859,7 +2859,7 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
                         style: Theme.of(context).textTheme.titleLarge)),
                 if (isRefreshing)
                   OutlinedButton.icon(
-                    onPressed: controller.cancelListing,
+                    onPressed: () => controller.cancelAction('refresh-buckets'),
                     icon: const Icon(Icons.stop_circle_outlined, size: 18),
                     label: const Text('Cancel'),
                   )

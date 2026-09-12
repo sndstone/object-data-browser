@@ -1,3 +1,4 @@
+import '../controllers/action_scope.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -749,6 +750,7 @@ class DesktopSidecarEngineService
     required String bucketName,
     required List<String> keys,
     required String destinationPath,
+    String conflictPolicy = 'keepBoth',
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
   }) {
@@ -760,6 +762,7 @@ class DesktopSidecarEngineService
         'bucketName': bucketName,
         'keys': keys,
         'destinationPath': destinationPath,
+        'conflictPolicy': conflictPolicy,
         'multipartThresholdMiB': multipartThresholdMiB,
         'multipartChunkMiB': multipartChunkMiB,
       },
@@ -771,6 +774,7 @@ class DesktopSidecarEngineService
         bucketName: bucketName,
         keys: keys,
         destinationPath: destinationPath,
+        conflictPolicy: conflictPolicy,
         multipartThresholdMiB: multipartThresholdMiB,
         multipartChunkMiB: multipartChunkMiB,
       ),
@@ -1105,8 +1109,9 @@ class DesktopSidecarEngineService
     Map<String, Object?>? params,
     void Function(Map<String, Object?> event)? onEvent,
   }) async {
-    final cancellation =
-        isCancellableListingMethod(method) ? ListingCancellation() : null;
+    final cancellation = isCancellableListingMethod(method)
+        ? ActionScope.current ?? ListingCancellation()
+        : null;
     if (cancellation != null) _listingRequests.add(cancellation);
     try {
       final request = _dispatchWithFallback(
@@ -1135,6 +1140,7 @@ class DesktopSidecarEngineService
     void Function(Map<String, Object?> event)? onEvent,
     ListingCancellation? cancellation,
   }) async {
+    engineId = ActionScope.current?.engineId ?? engineId;
     final jobId = params?['jobId']?.toString();
     if (jobId != null) engineId = _jobEngines[jobId] ?? engineId;
     final entry = await _tryGetEngine(engineId);
@@ -1229,6 +1235,8 @@ class DesktopSidecarEngineService
     void Function(Map<String, Object?> event)? onEvent,
     ListingCancellation? cancellation,
   }) async {
+    ActionScope.current?.check();
+    cancellation ??= ActionScope.current;
     final engineRoot = await _resolveEngineRoot();
     if (cancellation?.isCancelled ?? false) throw const ListingCancelled();
     final requestId =
@@ -1312,6 +1320,7 @@ class DesktopSidecarEngineService
     }
 
     final payload = response.payload;
+    ActionScope.current?.check();
     final ok = payload['ok'] as bool? ?? false;
     if (!ok) {
       final error = Map<String, Object?>.from(

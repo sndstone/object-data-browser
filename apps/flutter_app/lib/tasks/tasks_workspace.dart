@@ -286,6 +286,8 @@ class _TaskCardState extends State<_TaskCard> {
                   icon: const Icon(Icons.stop_circle_outlined),
                   label: const Text('Cancel'),
                 ),
+              if (task.kind == BrowserTaskKind.transfer && task.isRunningLike && !task.canCancel && task.status != 'cancelling')
+                const Text('This engine cannot interrupt the active file. Cancelling a batch stops its remaining files.'),
               if (task.kind == BrowserTaskKind.transfer)
                 OutlinedButton(
                   onPressed: task.canPause
@@ -302,9 +304,8 @@ class _TaskCardState extends State<_TaskCard> {
                 ),
               if (task.kind == BrowserTaskKind.transfer)
                 OutlinedButton(
-                  onPressed: task.canCancel
-                      ? () => controller.cancelTransfer(task.id)
-                      : null,
+                  onPressed:
+                      task.canCancel ? () => controller.cancelTask(task) : null,
                   child: const Text('Cancel'),
                 ),
               if (task.kind == BrowserTaskKind.benchmark)
@@ -334,9 +335,8 @@ class _TaskCardState extends State<_TaskCard> {
                 ),
               if (task.kind == BrowserTaskKind.tool)
                 OutlinedButton(
-                  onPressed: task.canCancel
-                      ? () => controller.cancelToolTask(task)
-                      : null,
+                  onPressed:
+                      task.canCancel ? () => controller.cancelTask(task) : null,
                   child: const Text('Cancel'),
                 ),
             ],

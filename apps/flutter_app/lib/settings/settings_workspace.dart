@@ -1,3 +1,4 @@
+import 'settings_sections.dart';
 import 'dart:async';
 import '../widgets/setting_fields.dart';
 import '../widgets/danger_button.dart';
@@ -29,7 +30,9 @@ class SettingsWorkspace extends StatefulWidget {
 
 class _SettingsWorkspaceState extends State<SettingsWorkspace> {
   AppController get controller => widget.controller;
-  String get _sectionName => controller.settingsSectionName;
+  String get _sectionName =>
+      canonicalSettingsSection(controller.settingsSectionName);
+  String? _editingProfileId;
   final Map<String, EndpointProfile> _profileDrafts = {};
   static const _sectionDescriptions = {
     'Connections':
@@ -39,17 +42,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
     'Appearance': 'Theme, text size and row density.',
     'Diagnostics': 'Choose which engine activity is recorded.',
   };
-  static const _sections = [
-    'Connections',
-    'General',
-    'Transfers',
-    'Downloads & Temp Storage',
-    'Appearance',
-    'Safety & Recovery',
-    'Benchmark',
-    'Diagnostics',
-    'Version Details'
-  ];
+  static const _sections = settingsSections;
 
   @override
   Widget build(BuildContext context) {
@@ -63,8 +56,10 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
     );
 
     return LayoutBuilder(builder: (context, constraints) {
-      final wide = constraints.maxWidth >= 900;
-      final sections = <_SettingsSection>[
+      final navigationWidth =
+          220 * MediaQuery.textScalerOf(context).scale(14) / 14;
+      final wide = constraints.maxWidth >= navigationWidth + 650;
+      final rawSections = <_SettingsSection>[
         _SettingsSection(
             'General',
             Icons.settings_outlined,
@@ -73,13 +68,6 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                   context,
                   title: 'General',
                   children: () => [
-                    SwitchListTile(
-                      value: settings.enableAnimations,
-                      onChanged: (value) => controller.updateSettings(
-                        settings.copyWith(enableAnimations: value),
-                      ),
-                      title: const Text('Enable animations'),
-                    ),
                     AppSelectField<String>(
                       value: settings.defaultEngineId,
                       decoration:
@@ -221,30 +209,59 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                           'Create a profile, enter endpoint URL and credentials, save it, then test it by listing buckets.',
                         ),
                       )
-                    else
-                      ...controller.profiles.map(
-                        (profile) => Padding(
-                          padding: const EdgeInsets.only(bottom: 12),
-                          child: _ProfileEditorCard(
-                            key: ValueKey(profile.id),
-                            controller: controller,
-                            profile: profile,
-                            initialDraft: _profileDrafts[profile.id],
-                            onDraftChanged: (draft) {
-                              if (draft == null) {
-                                _profileDrafts.remove(profile.id);
-                              } else {
-                                _profileDrafts[profile.id] = draft;
-                              }
-                            },
+                    else ...[
+                      if (!phone || _editingProfileId == null)
+                        for (final profile in controller.profiles)
+                          ListTile(
+                              selected: _editingProfileId == profile.id,
+                              title: Text(profile.name),
+                              subtitle: Text(profile.endpointUrl),
+                              trailing: const Icon(Icons.chevron_right),
+                              onTap: () => setState(
+                                  () => _editingProfileId = profile.id)),
+                      if (phone && _editingProfileId != null)
+                        TextButton.icon(
+                            onPressed: () =>
+                                setState(() => _editingProfileId = null),
+                            icon: const Icon(Icons.arrow_back),
+                            label: const Text('All connections')),
+                      ...controller.profiles
+                          .where((profile) =>
+                              profile.id ==
+                              (_editingProfileId ??
+                                  (phone
+                                      ? null
+                                      : controller.profiles.first.id)))
+                          .map(
+                            (profile) => Padding(
+                              padding: const EdgeInsets.only(bottom: 12),
+                              child: _ProfileEditorCard(
+                                key: ValueKey(profile.id),
+                                controller: controller,
+                                profile: profile,
+                                openEditor:
+                                    phone || _editingProfileId == profile.id,
+                                initialDraft: _profileDrafts[profile.id],
+                                onDraftChanged: (draft) {
+                                  if (draft == null) {
+                                    _profileDrafts.remove(profile.id);
+                                  } else {
+                                    _profileDrafts[profile.id] = draft;
+                                  }
+                                },
+                              ),
+                            ),
                           ),
-                        ),
-                      ),
+                    ],
                     Align(
                       alignment: Alignment.centerLeft,
                       child: OutlinedButton.icon(
                         onPressed: () async {
                           await controller.addSampleProfile();
+                          if (mounted) {
+                            setState(() => _editingProfileId =
+                                controller.profiles.last.id);
+                          }
                         },
                         icon: const Icon(Icons.add),
                         label: const Text('Create profile'),
@@ -261,15 +278,31 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                   context,
                   title: 'Transfers',
                   children: () => [
-                    _numberField(
-                      label: 'Concurrent transfers',
-                      min: 1,
-                      max: 256,
-                      initialValue: settings.transferConcurrency,
-                      onSubmitted: (value) => controller.updateSettings(
-                        settings.copyWith(transferConcurrency: value),
+                    Text(!isMobile &&
+                            controller.selectedProfile?.endpointType !=
+                                EndpointProfileType.azureBlob
+                        ? 'Files: one at a time. Parallel S3 parts: up to ${(controller.selectedProfile?.maxConcurrentRequests ?? 8).clamp(1, 8)}. Change the limit in connection settings.'
+                        : 'Files: one at a time. Parallel parts are managed by this engine.'),
+                    const SizedBox(height: 12),
+                    if (!isMobile)
+                      AppSelectField<String>(
+                        value: settings.downloadConflictPolicy,
+                        decoration:
+                            const InputDecoration(labelText: 'Existing files'),
+                        items: const [
+                          AppSelectItem(value: 'keepBoth', label: 'Keep both'),
+                          AppSelectItem(
+                              value: 'replace', label: 'Replace on success')
+                        ],
+                        onChanged: (value) {
+                          if (value != null) {
+                            controller.updateSettings(settings.copyWith(
+                                downloadConflictPolicy: value));
+                          }
+                        },
                       ),
-                    ),
+                    const Text(
+                        'Downloads are validated before publishing. Failed downloads preserve existing files.'),
                     const SizedBox(height: 12),
                     _numberField(
                       label: 'Multipart threshold (MiB)',
@@ -347,6 +380,13 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                   context,
                   title: 'Appearance',
                   children: () => [
+                    SwitchListTile(
+                      value: settings.enableAnimations,
+                      onChanged: (value) => controller.updateSettings(
+                        settings.copyWith(enableAnimations: value),
+                      ),
+                      title: const Text('Enable animations'),
+                    ),
                     SwitchListTile.adaptive(
                       contentPadding: EdgeInsets.zero,
                       title: const Text('Compact desktop rows'),
@@ -470,121 +510,14 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                   context,
                   title: 'Safety & Recovery',
                   children: () => [
-                    _numberField(
-                      label: 'Safe retries',
-                      min: 0,
-                      max: 100,
-                      initialValue: settings.safeRetries,
-                      onSubmitted: (value) => controller.updateSettings(
-                          settings.copyWith(safeRetries: value)),
-                    ),
+                    const Text(
+                        'Credentials are stored securely and excluded from profile exports. A failed save remains session-only until retried successfully.'),
                     const SizedBox(height: 12),
-                    _numberField(
-                      label: 'Retry base delay (ms)',
-                      min: 0,
-                      max: 2147483647,
-                      initialValue: settings.retryBaseDelayMs,
-                      onSubmitted: (value) => controller.updateSettings(
-                        settings.copyWith(retryBaseDelayMs: value),
-                      ),
-                    ),
+                    const Text(
+                        'Cancellation preserves completed work. Unconfirmed remote changes must be inspected before retrying. Engine restarts do not resume interrupted transfers.'),
                     const SizedBox(height: 12),
-                    _numberField(
-                      label: 'Retry max delay (ms)',
-                      min: 0,
-                      max: 2147483647,
-                      initialValue: settings.retryMaxDelayMs,
-                      onSubmitted: (value) => controller.updateSettings(
-                        settings.copyWith(retryMaxDelayMs: value),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    _numberField(
-                      label: 'Request delay (ms)',
-                      min: 0,
-                      max: 2147483647,
-                      initialValue: settings.requestDelayMs,
-                      onSubmitted: (value) => controller.updateSettings(
-                        settings.copyWith(requestDelayMs: value),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    phone
-                        ? Column(
-                            children: [
-                              _numberField(
-                                label: 'Connect timeout (s)',
-                                initialValue: settings.connectTimeoutSeconds,
-                                onSubmitted: (value) =>
-                                    controller.updateSettings(
-                                  settings.copyWith(
-                                      connectTimeoutSeconds: value),
-                                ),
-                              ),
-                              const SizedBox(height: 12),
-                              _numberField(
-                                label: 'Read timeout (s)',
-                                initialValue: settings.readTimeoutSeconds,
-                                onSubmitted: (value) =>
-                                    controller.updateSettings(
-                                  settings.copyWith(readTimeoutSeconds: value),
-                                ),
-                              ),
-                            ],
-                          )
-                        : Row(
-                            children: [
-                              Expanded(
-                                child: _numberField(
-                                  label: 'Connect timeout (s)',
-                                  initialValue: settings.connectTimeoutSeconds,
-                                  onSubmitted: (value) =>
-                                      controller.updateSettings(
-                                    settings.copyWith(
-                                        connectTimeoutSeconds: value),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: _numberField(
-                                  label: 'Read timeout (s)',
-                                  initialValue: settings.readTimeoutSeconds,
-                                  onSubmitted: (value) =>
-                                      controller.updateSettings(
-                                    settings.copyWith(
-                                        readTimeoutSeconds: value),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                    const SizedBox(height: 12),
-                    _numberField(
-                      label: 'Max pool connections',
-                      initialValue: settings.maxPoolConnections,
-                      onSubmitted: (value) => controller.updateSettings(
-                        settings.copyWith(maxPoolConnections: value),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    _numberField(
-                      label: 'Max requests per second (0 = unlimited)',
-                      min: 0,
-                      max: 2147483647,
-                      initialValue: settings.maxRequestsPerSecond,
-                      onSubmitted: (value) => controller.updateSettings(
-                        settings.copyWith(maxRequestsPerSecond: value),
-                      ),
-                    ),
-                    SwitchListTile(
-                      value: settings.enableCrashRecovery,
-                      onChanged: (value) => controller.updateSettings(
-                        settings.copyWith(enableCrashRecovery: value),
-                      ),
-                      title: const Text(
-                          'Crash isolation and engine restart recovery'),
-                    ),
+                    const Text(
+                        'Transport timeouts and maximum attempts belong to each connection. Benchmark overrides are configured in Benchmark.'),
                   ],
                 )),
         if (!isMobile)
@@ -597,6 +530,86 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                     context,
                     title: 'Benchmark',
                     children: () => [
+                      _numberField(
+                        label: 'Benchmark workers',
+                        min: 1,
+                        max: 256,
+                        initialValue: settings.transferConcurrency,
+                        onSubmitted: (value) => controller.updateSettings(
+                          settings.copyWith(transferConcurrency: value),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      _numberField(
+                        label: 'Benchmark maximum attempts',
+                        min: 1,
+                        max: 100,
+                        initialValue: settings.safeRetries,
+                        onSubmitted: (value) => controller.updateSettings(
+                            settings.copyWith(safeRetries: value)),
+                      ),
+                      const SizedBox(height: 12),
+                      phone
+                          ? Column(
+                              children: [
+                                _numberField(
+                                  label: 'Benchmark connect timeout (s)',
+                                  initialValue: settings.connectTimeoutSeconds,
+                                  onSubmitted: (value) =>
+                                      controller.updateSettings(
+                                    settings.copyWith(
+                                        connectTimeoutSeconds: value),
+                                  ),
+                                ),
+                                const SizedBox(height: 12),
+                                _numberField(
+                                  label: 'Benchmark read timeout (s)',
+                                  initialValue: settings.readTimeoutSeconds,
+                                  onSubmitted: (value) =>
+                                      controller.updateSettings(
+                                    settings.copyWith(
+                                        readTimeoutSeconds: value),
+                                  ),
+                                ),
+                              ],
+                            )
+                          : Row(
+                              children: [
+                                Expanded(
+                                  child: _numberField(
+                                    label: 'Benchmark connect timeout (s)',
+                                    initialValue:
+                                        settings.connectTimeoutSeconds,
+                                    onSubmitted: (value) =>
+                                        controller.updateSettings(
+                                      settings.copyWith(
+                                          connectTimeoutSeconds: value),
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: _numberField(
+                                    label: 'Benchmark read timeout (s)',
+                                    initialValue: settings.readTimeoutSeconds,
+                                    onSubmitted: (value) =>
+                                        controller.updateSettings(
+                                      settings.copyWith(
+                                          readTimeoutSeconds: value),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                      const SizedBox(height: 12),
+                      _numberField(
+                        label: 'Benchmark connection pool',
+                        initialValue: settings.maxPoolConnections,
+                        onSubmitted: (value) => controller.updateSettings(
+                          settings.copyWith(maxPoolConnections: value),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
                       SwitchListTile(
                         value: settings.benchmarkChartSmoothing,
                         onChanged: (value) => controller.updateSettings(
@@ -740,18 +753,56 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                   ],
                 )),
       ];
+      rawSections.sort((a, b) => a.title == 'General'
+          ? 1
+          : b.title == 'General'
+              ? -1
+              : 0);
+      final sections = <_SettingsSection>[
+        for (final name in settingsSections)
+          if (rawSections.any(
+              (section) => canonicalSettingsSection(section.title) == name))
+            _SettingsSection(
+                name,
+                rawSections
+                    .firstWhere((section) =>
+                        canonicalSettingsSection(section.title) == name)
+                    .icon,
+                name == 'Connections'
+                    ? 'Test drafts, save credentials, and activate connections independently.'
+                    : 'Configure $name.',
+                () => Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          for (final section in rawSections)
+                            if (canonicalSettingsSection(section.title) == name)
+                              section.builder(),
+                        ])),
+      ];
       final active = sections.firstWhere((s) => s.title == _sectionName,
           orElse: () => sections.first);
       final content = ListView(padding: const EdgeInsets.all(16), children: [
         _sectionIntro(context,
             title: active.title, description: active.description, wide: wide),
         const SizedBox(height: 16),
+        if (controller.persistenceState.warning != null)
+          Card(
+              child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(controller.persistenceState.warning!),
+                        TextButton(
+                            onPressed: controller.retrySaveSettings,
+                            child: const Text('Retry saving')),
+                      ]))),
         active.builder(),
       ]);
       if (!wide) return content;
       return Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         SizedBox(
-            width: 190,
+            width: navigationWidth,
             child: ListView(padding: const EdgeInsets.all(12), children: [
               for (final section in sections)
                 Padding(
@@ -782,11 +833,13 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
   }) {
     final theme = Theme.of(context);
     final phone = MediaQuery.sizeOf(context).width < 700;
-    if (title != _sectionName) return const SizedBox.shrink();
+    if (canonicalSettingsSection(title) != _sectionName) {
+      return const SizedBox.shrink();
+    }
     return Offstage(
         offstage: false,
         child: TickerMode(
-            enabled: title == _sectionName,
+            enabled: canonicalSettingsSection(title) == _sectionName,
             child: Padding(
               padding: const EdgeInsets.only(bottom: 16),
               child: Container(
@@ -884,12 +937,14 @@ class _ProfileEditorCard extends StatefulWidget {
     required this.controller,
     required this.profile,
     this.initialDraft,
+    this.openEditor = false,
     required this.onDraftChanged,
   });
 
   final AppController controller;
   final EndpointProfile profile;
   final EndpointProfile? initialDraft;
+  final bool openEditor;
   final ValueChanged<EndpointProfile?> onDraftChanged;
 
   @override
@@ -897,6 +952,7 @@ class _ProfileEditorCard extends StatefulWidget {
 }
 
 class _ProfileEditorCardState extends State<_ProfileEditorCard> {
+  final _editorExpansion = ExpansibleController();
   late final TextEditingController _nameController;
   late final TextEditingController _endpointController;
   late final TextEditingController _regionController;
@@ -907,6 +963,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   late final TextEditingController _readTimeoutController;
   late final TextEditingController _notesController;
   late EndpointProfileType _endpointType;
+  late int _connectionLimit;
+  late int _maxAttempts;
   late bool _pathStyle;
   late bool _useHttps;
   late bool _verifyTls;
@@ -936,7 +994,10 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   void initState() {
     super.initState();
     _syncFromProfile();
-    _expanded = !_looksConfigured(widget.profile);
+    _connectionLimit =
+        (widget.initialDraft ?? widget.profile).maxConcurrentRequests;
+    _maxAttempts = (widget.initialDraft ?? widget.profile).maxAttempts;
+    _expanded = widget.openEditor || !_looksConfigured(widget.profile);
     for (final field in [
       _nameController,
       _endpointController,
@@ -957,6 +1018,9 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   @override
   void didUpdateWidget(covariant _ProfileEditorCard oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (widget.openEditor && !oldWidget.openEditor) {
+      _editorExpansion.expand();
+    }
     if (oldWidget.profile != widget.profile) {
       widget.onDraftChanged(null);
       _revealSecret = false;
@@ -974,13 +1038,15 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
       _syncText(_readTimeoutController, '${widget.profile.readTimeoutSeconds}');
       _syncText(_notesController, widget.profile.notes ?? '');
       _endpointType = widget.profile.endpointType;
+      _connectionLimit = widget.profile.maxConcurrentRequests;
+      _maxAttempts = widget.profile.maxAttempts;
       _pathStyle = widget.profile.pathStyle;
       _useHttps = endpointUsesHttps(
         widget.profile.endpointUrl,
         fallback: widget.profile.verifyTls,
       );
       _verifyTls = widget.profile.verifyTls;
-      _expanded = !_looksConfigured(widget.profile);
+      _expanded = widget.openEditor || !_looksConfigured(widget.profile);
     }
   }
 
@@ -1140,8 +1206,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
         readTimeoutSeconds:
             int.tryParse(_readTimeoutController.text.trim()) ?? 60,
         signerOverride: widget.profile.signerOverride,
-        maxConcurrentRequests: widget.profile.maxConcurrentRequests,
-        maxAttempts: widget.profile.maxAttempts,
+        maxConcurrentRequests: _connectionLimit,
+        maxAttempts: _maxAttempts,
         maxRequestsPerSecond: widget.profile.maxRequestsPerSecond,
         notes: _notesController.text.trim(),
       ),
@@ -1164,6 +1230,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
     _revealTimer?.cancel();
     _endpointController.removeListener(_handleEndpointInputChanged);
     _accessKeyController.removeListener(_handleAccessKeyChanged);
+    _editorExpansion.dispose();
     _nameController.dispose();
     _endpointController.dispose();
     _regionController.dispose();
@@ -1200,6 +1267,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         child: ExpansionTile(
+          controller: _editorExpansion,
           initiallyExpanded: _expanded,
           onExpansionChanged: (value) => setState(() {
             _expanded = value;
@@ -1233,7 +1301,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         : null,
                     label: Text(isDirty
                         ? 'Unsaved edits'
-                        : widget.controller.profilePersistenceStatus)),
+                        : widget.controller
+                            .profilePersistenceStatusFor(widget.profile.id))),
                 if (widget.controller.settings.defaultProfileId ==
                     widget.profile.id)
                   const Chip(label: Text('Startup default')),
@@ -1243,6 +1312,22 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
           trailing: Icon(_expanded ? Icons.expand_less : Icons.expand_more),
           childrenPadding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
           children: [
+            if (!widget.controller.supportsProfile(_buildProfile()))
+              const ListTile(
+                  leading: Icon(Icons.info_outline),
+                  title: Text('This engine does not support Azure.'),
+                  subtitle: Text(
+                      'Select Python or Go on desktop before testing or activating this connection.')),
+            if (!AppPlatform.isMobile &&
+                !widget.controller.supportsProfile(_buildProfile()))
+              Wrap(spacing: 8, children: [
+                for (final engine in widget.controller.engines)
+                  if (engine.available &&
+                      const {'python', 'go'}.contains(engine.id))
+                    TextButton(
+                        onPressed: () => widget.controller.setEngine(engine.id),
+                        child: Text('Switch to ${engine.label}')),
+              ]),
             TextField(
               controller: _nameController,
               decoration: const InputDecoration(labelText: 'Profile name'),
@@ -1440,6 +1525,27 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 ),
               ),
             ExpansionTile(title: const Text('Advanced transport'), children: [
+              if (!AppPlatform.isMobile &&
+                  _endpointType != EndpointProfileType.azureBlob) ...[
+                SettingNumberField(
+                    label:
+                        'Connection pool limit (S3 part workers capped at 8)',
+                    value: _connectionLimit,
+                    min: 1,
+                    max: 256,
+                    onCommit: (value) =>
+                        setState(() => _connectionLimit = value)),
+                const SizedBox(height: 12),
+                SettingNumberField(
+                    label: 'Maximum attempts',
+                    value: _maxAttempts,
+                    min: 1,
+                    max: 100,
+                    onCommit: (value) => setState(() => _maxAttempts = value)),
+                const SizedBox(height: 12),
+              ] else
+                const Text(
+                    'This engine manages connection pools and retry limits.'),
               SwitchListTile(
                 value: _pathStyle,
                 onChanged: _endpointType == EndpointProfileType.s3Compatible
@@ -1532,8 +1638,9 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 FilledButton.icon(
                   onPressed: !valid ||
                           !isDirty &&
-                              widget.controller.profilePersistenceStatus ==
-                                  'Saved securely'
+                              widget.controller.profilePersistenceStatusFor(
+                                      widget.profile.id) ==
+                                  'Saved'
                       ? null
                       : () async {
                           final profile = _buildProfile();
@@ -1543,22 +1650,25 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                   label: const Text('Save'),
                 ),
                 OutlinedButton.icon(
-                  onPressed: !valid || isTesting
+                  onPressed: !valid ||
+                          !widget.controller.supportsProfile(_buildProfile()) ||
+                          isTesting
                       ? null
                       : () async {
                           final profile = _buildProfile();
-                          await widget.controller.saveProfile(profile);
-                          await widget.controller.testProfileById(profile.id);
+                          await widget.controller.testProfileDraft(profile);
                         },
                   icon: const Icon(Icons.playlist_add_check_circle_outlined),
                   label: Text(isTesting ? 'Testing...' : 'Test'),
                 ),
                 OutlinedButton.icon(
-                  onPressed: !valid || isSelecting
+                  onPressed: !valid ||
+                          !widget.controller.supportsProfile(_buildProfile()) ||
+                          isSelecting
                       ? null
                       : () async {
                           final profile = _buildProfile();
-                          await widget.controller.saveProfile(profile);
+                          widget.controller.updateProfile(profile);
                           await widget.controller
                               .setSelectedProfileById(profile.id);
                         },

@@ -1,3 +1,4 @@
+import 'benchmark_metrics.dart';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -1333,7 +1334,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                         const SizedBox(height: 4),
                         if (run.resultSummary == null)
                           Text(
-                            'Live estimate while the benchmark is still running.',
+                            'Detailed measurements have not been supplied by the engine.',
                             style: Theme.of(context).textTheme.bodySmall,
                           ),
                       ],
@@ -1481,11 +1482,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
 
   Widget _metricCards(BuildContext context, BenchmarkResultSummary summary) {
     final totalOps = summary.totalOperations;
-    final avgLatency = summary.latencyPercentilesMs.isEmpty
-        ? 0.0
-        : summary.latencyPercentilesMs.values
-                .reduce((left, right) => left + right) /
-            summary.latencyPercentilesMs.length;
+    final medianLatency = summary.latencyPercentilesMs['p50'];
     final peakThroughput = summary.throughputSeries.fold<double>(
       0,
       (current, point) {
@@ -1506,14 +1503,18 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
         ),
         _metricCard(
           context,
-          'Latency',
-          '${avgLatency.toStringAsFixed(1)} ms avg',
+          'Median latency (P50)',
+          medianLatency == null
+              ? 'Unavailable'
+              : '${medianLatency.toStringAsFixed(1)} ms',
           icon: Icons.timer_outlined,
         ),
         _metricCard(
           context,
           'Peak throughput',
-          '${peakThroughput.toStringAsFixed(0)} ops/s',
+          summary.throughputSeries.any((p) => p['opsPerSecond'] is num)
+              ? '${peakThroughput.toStringAsFixed(0)} ops/s'
+              : 'Unavailable',
           icon: Icons.speed_outlined,
         ),
         _metricCard(
@@ -1924,7 +1925,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     final cards = <MapEntry<String, String>>[
       MapEntry(
         'Sample windows',
-        '${_intMetric(detailMetrics['sampleCount'])} x ${_intMetric(detailMetrics['sampleWindowSeconds'])}s',
+        '${formatMeasuredCount(detailMetrics['sampleCount'])} x ${formatMeasuredCount(detailMetrics['sampleWindowSeconds'])}s',
       ),
       MapEntry(
         'Average bandwidth',
@@ -1936,11 +1937,11 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
       ),
       MapEntry(
         'Retries',
-        '${_intMetric(detailMetrics['retryCount'])}',
+        formatMeasuredCount(detailMetrics['retryCount']),
       ),
       MapEntry(
         'Checksum validated',
-        '${_intMetric(detailMetrics['checksumValidated'])}',
+        formatMeasuredCount(detailMetrics['checksumValidated']),
       ),
       MapEntry(
         'Object sizes',
@@ -2024,25 +2025,25 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                   (detail) => DataRow(
                     cells: [
                       DataCell(Text('${detail['operation'] ?? '-'}')),
-                      DataCell(Text('${_intMetric(detail['count'])}')),
+                      DataCell(Text(formatMeasuredCount(detail['count']))),
                       DataCell(
                         Text(
-                            '${_doubleMetric(detail['sharePct']).toStringAsFixed(1)}%'),
+                            '${formatMeasuredMetric(detail['sharePct'], decimals: 1)}%'),
                       ),
                       DataCell(
-                        Text(_doubleMetric(detail['avgOpsPerSecond'])
-                            .toStringAsFixed(1)),
+                        Text(formatMeasuredMetric(detail['avgOpsPerSecond'],
+                            decimals: 1)),
                       ),
                       DataCell(
-                        Text(_doubleMetric(detail['peakOpsPerSecond'])
-                            .toStringAsFixed(1)),
+                        Text(formatMeasuredMetric(detail['peakOpsPerSecond'],
+                            decimals: 1)),
                       ),
                       DataCell(Text(
-                          '${_doubleMetric(detail['p50LatencyMs']).toStringAsFixed(1)} ms')),
+                          '${formatMeasuredMetric(detail['p50LatencyMs'], decimals: 1)} ms')),
                       DataCell(Text(
-                          '${_doubleMetric(detail['p95LatencyMs']).toStringAsFixed(1)} ms')),
+                          '${formatMeasuredMetric(detail['p95LatencyMs'], decimals: 1)} ms')),
                       DataCell(Text(
-                          '${_doubleMetric(detail['p99LatencyMs']).toStringAsFixed(1)} ms')),
+                          '${formatMeasuredMetric(detail['p99LatencyMs'], decimals: 1)} ms')),
                     ],
                   ),
                 )
@@ -2088,15 +2089,15 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                     cells: [
                       DataCell(Text(_formatSizeLabel(
                           (bucket['sizeBytes'] as num?)?.toInt() ?? 0))),
-                      DataCell(Text('${_intMetric(bucket['count'])}')),
+                      DataCell(Text(formatMeasuredCount(bucket['count']))),
                       DataCell(Text(
-                          '${_doubleMetric(bucket['avgLatencyMs']).toStringAsFixed(1)} ms')),
+                          '${formatMeasuredMetric(bucket['avgLatencyMs'], decimals: 1)} ms')),
                       DataCell(Text(
-                          '${_doubleMetric(bucket['p50LatencyMs']).toStringAsFixed(1)} ms')),
+                          '${formatMeasuredMetric(bucket['p50LatencyMs'], decimals: 1)} ms')),
                       DataCell(Text(
-                          '${_doubleMetric(bucket['p95LatencyMs']).toStringAsFixed(1)} ms')),
+                          '${formatMeasuredMetric(bucket['p95LatencyMs'], decimals: 1)} ms')),
                       DataCell(Text(
-                          '${_doubleMetric(bucket['p99LatencyMs']).toStringAsFixed(1)} ms')),
+                          '${formatMeasuredMetric(bucket['p99LatencyMs'], decimals: 1)} ms')),
                     ],
                   ),
                 )
@@ -2144,14 +2145,15 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                   (window) => DataRow(
                     cells: [
                       DataCell(Text(_pointLabel(window))),
-                      DataCell(Text('${_intMetric(window['opsPerSecond'])}')),
+                      DataCell(
+                          Text(formatMeasuredCount(window['opsPerSecond']))),
                       DataCell(
                         Text(_formatBytesPerSecond(window['bytesPerSecond'])),
                       ),
                       DataCell(Text(
-                          '${_doubleMetric(window['averageLatencyMs']).toStringAsFixed(1)} ms')),
+                          '${formatMeasuredMetric(window['averageLatencyMs'], decimals: 1)} ms')),
                       DataCell(Text(
-                          '${_doubleMetric(window['p95LatencyMs']).toStringAsFixed(1)} ms')),
+                          '${formatMeasuredMetric(window['p95LatencyMs'], decimals: 1)} ms')),
                       DataCell(Text(_formatOperationMix(window['operations']))),
                     ],
                   ),
@@ -2355,14 +2357,15 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                               context,
                               title: operation,
                               entries: percentiles
+                                  .where((entry) =>
+                                      summary.latencyPercentilesByOperationMs[
+                                          operation]?[entry.key] !=
+                                      null)
                                   .map(
                                     (entry) => MapEntry(
                                       entry.key.toUpperCase(),
                                       summary.latencyPercentilesByOperationMs[
-                                              operation]?[entry.key] ??
-                                          (entry.value *
-                                              _operationLatencyFactor(
-                                                  operation)),
+                                          operation]![entry.key]!,
                                     ),
                                   )
                                   .toList(),
@@ -2482,31 +2485,13 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     BenchmarkResultSummary summary,
     double maxWidth,
   ) {
-    final entries = summary.sizeLatencyBuckets.map((item) {
-      final sizeBytes = (item['sizeBytes'] as num?)?.toInt() ?? 0;
-      return MapEntry(
-        _formatSizeLabel(sizeBytes),
-        switch (_latencyMetric) {
-          _LatencyMetric.average =>
-            (item['avgLatencyMs'] as num?)?.toDouble() ?? 0,
-          _LatencyMetric.p50 => (item['p50LatencyMs'] as num?)?.toDouble() ??
-              _sizeMetricValue(
-                (item['avgLatencyMs'] as num?)?.toDouble() ?? 0,
-                _latencyMetric,
-              ),
-          _LatencyMetric.p95 => (item['p95LatencyMs'] as num?)?.toDouble() ??
-              _sizeMetricValue(
-                (item['avgLatencyMs'] as num?)?.toDouble() ?? 0,
-                _latencyMetric,
-              ),
-          _LatencyMetric.p99 => (item['p99LatencyMs'] as num?)?.toDouble() ??
-              _sizeMetricValue(
-                (item['avgLatencyMs'] as num?)?.toDouble() ?? 0,
-                _latencyMetric,
-              ),
-        },
-      );
-    }).toList();
+    final field = sizeLatencyField(_latencyMetric.name);
+    final entries = summary.sizeLatencyBuckets
+        .where((item) => item[field] is num)
+        .map((item) => MapEntry(
+            _formatSizeLabel((item['sizeBytes'] as num?)?.toInt() ?? 0),
+            (item[field] as num).toDouble()))
+        .toList();
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -3506,141 +3491,53 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     );
   }
 
-  List<_ChartSeries> _operationSeries(BenchmarkResultSummary summary) {
-    final selected = _enabledOperationsFor(summary);
-    final weights = _operationWeights(summary);
-    return selected
-        .map(
-          (operation) => _ChartSeries(
-            id: operation,
-            color: _seriesColor(operation),
-            points: summary.throughputSeries
-                .map(
-                  (point) => _ChartPoint(
-                    label: _pointLabel(point),
-                    x: _pointX(point),
-                    value: _operationValueForPoint(
-                      point,
-                      operation,
-                      fallback:
-                          ((point['opsPerSecond'] as num?)?.toDouble() ?? 0) *
-                              (weights[operation] ?? 0),
-                    ),
-                  ),
-                )
-                .toList(),
-          ),
-        )
-        .toList();
-  }
+  List<_ChartSeries> _operationSeries(BenchmarkResultSummary summary) =>
+      _enabledOperationsFor(summary)
+          .map((operation) => _ChartSeries(
+                id: operation,
+                color: _seriesColor(operation),
+                points: summary.throughputSeries
+                    .where((point) =>
+                        point['operations'] is Map &&
+                        (point['operations'] as Map)[operation] is num)
+                    .map((point) => _ChartPoint(
+                        label: _pointLabel(point),
+                        x: _pointX(point),
+                        value: ((point['operations'] as Map)[operation] as num)
+                            .toDouble()))
+                    .toList(),
+              ))
+          .where((series) => series.points.isNotEmpty)
+          .toList();
 
-  List<_ChartSeries> _throughputSeries(BenchmarkResultSummary summary) {
-    final selected = _enabledOperationsFor(summary);
-    final allOperations = _availableOperations(summary);
-    final weights = _operationWeights(summary);
-    if (_throughputStyle != _BenchmarkLineStyle.area &&
-        selected.length == allOperations.length) {
-      return <_ChartSeries>[
-        _ChartSeries(
-          id: 'All operations',
-          color: Theme.of(context).colorScheme.primary,
-          points: summary.throughputSeries
-              .map(
-                (point) => _ChartPoint(
-                  label: _pointLabel(point),
-                  x: _pointX(point),
-                  value: (point['opsPerSecond'] as num?)?.toDouble() ?? 0,
-                ),
-              )
-              .toList(),
-        ),
-      ];
-    }
-    return selected
-        .map(
-          (operation) => _ChartSeries(
-            id: operation,
-            color: _seriesColor(operation),
-            points: summary.throughputSeries
-                .map(
-                  (point) => _ChartPoint(
-                    label: _pointLabel(point),
-                    x: _pointX(point),
-                    value: _operationValueForPoint(
-                      point,
-                      operation,
-                      fallback:
-                          ((point['opsPerSecond'] as num?)?.toDouble() ?? 0) *
-                              (weights[operation] ?? 0),
-                    ),
-                  ),
-                )
-                .toList(),
-          ),
-        )
-        .toList();
-  }
+  List<_ChartSeries> _throughputSeries(BenchmarkResultSummary summary) =>
+      _operationSeries(summary);
 
   List<_ChartSeries> _latencyTimeSeries(BenchmarkResultSummary summary) {
-    final requestTimeline = _latencyTimeline(summary);
-    if (requestTimeline.isNotEmpty) {
-      return _latencyTimelineSeries(summary, requestTimeline);
-    }
-    final selected = _enabledOperationsFor(summary);
-    final throughputEntries = summary.throughputSeries
-        .map(
-          (point) => MapEntry<int, double>(
-            (point['second'] as num?)?.toInt() ?? 0,
-            (point['opsPerSecond'] as num?)?.toDouble() ?? 0,
-          ),
-        )
-        .where((entry) => entry.key > 0)
-        .toList();
-    if (throughputEntries.isEmpty) {
-      return const <_ChartSeries>[];
-    }
-    final minOps = throughputEntries
-        .map((entry) => entry.value)
-        .reduce((left, right) => left < right ? left : right);
-    final maxOps = throughputEntries
-        .map((entry) => entry.value)
-        .reduce((left, right) => left > right ? left : right);
-    final spread = math.max((maxOps - minOps).abs(), 1);
-    final averageLatency = summary.latencyPercentilesMs.isEmpty
-        ? 0.0
-        : summary.latencyPercentilesMs.values
-                .reduce((left, right) => left + right) /
-            summary.latencyPercentilesMs.length;
-
-    return selected
-        .map(
-          (operation) => _ChartSeries(
-            id: operation,
-            color: _seriesColor(operation),
-            points: throughputEntries.map((entry) {
-              final rawPoint = summary.throughputSeries.firstWhere(
-                (point) =>
-                    ((point['second'] as num?)?.toInt() ?? 0) == entry.key,
-                orElse: () => const <String, Object?>{},
-              );
-              final latencyByOperation = rawPoint['latencyByOperationMs'];
-              final load = (entry.value - minOps) / spread;
-              final latencyValue = latencyByOperation is Map
-                  ? latencyByOperation[operation]
-                  : null;
-              final latency = latencyValue is! num
-                  ? averageLatency *
-                      (0.8 + (load * 0.4)) *
-                      _operationLatencyFactor(operation)
-                  : latencyValue.toDouble();
-              return _ChartPoint(
-                label: _pointLabel(rawPoint, fallbackSecond: entry.key),
-                x: _pointX(rawPoint, fallbackSecond: entry.key),
-                value: double.parse(latency.toStringAsFixed(1)),
-              );
-            }).toList(),
-          ),
-        )
+    final timeline = _latencyTimeline(summary);
+    if (timeline.isNotEmpty) return _latencyTimelineSeries(summary, timeline);
+    return _enabledOperationsFor(summary)
+        .map((operation) => _ChartSeries(
+              id: operation,
+              color: _seriesColor(operation),
+              points: summary.throughputSeries
+                  .where((point) =>
+                      point['latencyByOperationMs'] is Map &&
+                      (point['latencyByOperationMs'] as Map)[operation] is num)
+                  .map((point) => _ChartPoint(
+                        label: _pointLabel(point,
+                            fallbackSecond:
+                                (point['second'] as num?)?.toInt() ?? 0),
+                        x: _pointX(point,
+                            fallbackSecond:
+                                (point['second'] as num?)?.toInt() ?? 0),
+                        value: ((point['latencyByOperationMs']
+                                as Map)[operation] as num)
+                            .toDouble(),
+                      ))
+                  .toList(),
+            ))
+        .where((series) => series.points.isNotEmpty)
         .toList();
   }
 
@@ -3653,6 +3550,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
         normalized: true,
       );
     }
+    if (summary.sizeLatencyBuckets.isEmpty) return const [];
     final selected = _enabledOperationsFor(summary);
     final sizeMiB =
         _averageObjectSizeMiB(summary).clamp(0.001, 1 << 20).toDouble();
@@ -3744,20 +3642,6 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
         .toList();
   }
 
-  Map<String, double> _operationWeights(BenchmarkResultSummary summary) {
-    final total = summary.operationsByType.values
-        .fold<int>(0, (left, right) => left + right);
-    if (total == 0) {
-      return <String, double>{
-        for (final operation in summary.operationsByType.keys) operation: 0,
-      };
-    }
-    return <String, double>{
-      for (final entry in summary.operationsByType.entries)
-        entry.key: entry.value / total,
-    };
-  }
-
   Color _seriesColor(String operation) {
     return switch (operation.toUpperCase()) {
       'PUT' => const Color(0xFF0F766E),
@@ -3766,17 +3650,6 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
       'POST' => const Color(0xFFF59E0B),
       'HEAD' => const Color(0xFF7C3AED),
       _ => const Color(0xFF475569),
-    };
-  }
-
-  double _operationLatencyFactor(String operation) {
-    return switch (operation.toUpperCase()) {
-      'PUT' => 1.18,
-      'GET' => 0.92,
-      'DELETE' => 0.86,
-      'POST' => 1.06,
-      'HEAD' => 0.74,
-      _ => 1.0,
     };
   }
 
@@ -3791,15 +3664,6 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
           (((item['sizeBytes'] as num?)?.toDouble() ?? 0) / (1024 * 1024)),
     );
     return total / summary.sizeLatencyBuckets.length;
-  }
-
-  double _sizeMetricValue(double averageLatency, _LatencyMetric metric) {
-    return switch (metric) {
-      _LatencyMetric.average => averageLatency,
-      _LatencyMetric.p50 => averageLatency * 0.82,
-      _LatencyMetric.p95 => averageLatency * 1.18,
-      _LatencyMetric.p99 => averageLatency * 1.42,
-    };
   }
 
   String _previewLabel(_BenchmarkPreviewSection section) {
@@ -3973,21 +3837,6 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     return '${seconds.toStringAsFixed(fractionDigits)}s intervals';
   }
 
-  double _operationValueForPoint(
-    Map<String, Object?> point,
-    String operation, {
-    required double fallback,
-  }) {
-    final operations = point['operations'];
-    if (operations is Map) {
-      final value = operations[operation];
-      if (value is num) {
-        return value.toDouble();
-      }
-    }
-    return fallback;
-  }
-
   String _formatOperationMix(Object? operations) {
     if (operations is! Map) {
       return '-';
@@ -4006,6 +3855,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
   }
 
   String _formatBytesPerSecond(Object? value) {
+    if (value is! num) return 'Unavailable';
     final bytesPerSecond = (value as num?)?.toDouble() ?? 0;
     if (bytesPerSecond >= 1024 * 1024 * 1024) {
       return '${(bytesPerSecond / (1024 * 1024 * 1024)).toStringAsFixed(2)} GiB/s';

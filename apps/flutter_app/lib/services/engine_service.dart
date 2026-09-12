@@ -237,6 +237,7 @@ abstract class EngineService {
     required String bucketName,
     required List<String> keys,
     required String destinationPath,
+    String conflictPolicy = 'keepBoth',
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
   });

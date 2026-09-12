@@ -730,6 +730,7 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     required String bucketName,
     required List<String> keys,
     required String destinationPath,
+    String conflictPolicy = 'keepBoth',
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
   }) async {

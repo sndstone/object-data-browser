@@ -1,3 +1,4 @@
+import 'package:s3_browser_crossplat/controllers/action_scope.dart';
 import 'dart:async';
 import 'dart:io';
 
@@ -17,7 +18,7 @@ void main() {
 while IFS= read -r line; do
   rid=$(printf '%s' "$line" | sed -n 's/.*"requestId":"\([^"]*\)".*/\1/p')
   case "$line" in
-    *'"listObjects"'*|*'"listBuckets"'*)
+    *'"listObjects"'*|*'"listBuckets"'*|*'"copyObject"'*)
       printf '{"event":"listingStarted"}\n' ;;
     *'"startUpload"'*)
       upload_id=$rid
@@ -47,6 +48,41 @@ done
             request: {'requestId': id, 'method': method, 'params': params},
             onEvent: event,
             concurrentControls: true);
+
+    test(
+        'scoped cancellation stops only its own request and records unknown mutations',
+        () async {
+      final readScope = ActionScope();
+      final mutationScope = ActionScope();
+      final readStarted = Completer<void>();
+      final mutationStarted = Completer<void>();
+      Future<DesktopEngineHostResponse> scoped(
+              String method, ActionScope scope, Completer<void> started) =>
+          host.send(
+              executablePath: '/bin/sh',
+              arguments: [script],
+              request: {'requestId': method, 'method': method},
+              listingCancellation: scope,
+              onEvent: (_) {
+                if (!started.isCompleted) started.complete();
+              });
+      final read = scoped('listObjects', readScope, readStarted);
+      final mutation = scoped('copyObject', mutationScope, mutationStarted);
+      final readDone = expectLater(read, throwsA(isA<ListingCancelled>()));
+      final mutationDone =
+          expectLater(mutation, throwsA(isA<ListingCancelled>()));
+      await Future.wait([readStarted.future, mutationStarted.future])
+          .timeout(const Duration(seconds: 5));
+      readScope.cancel();
+      await readDone.timeout(const Duration(seconds: 1));
+      expect(host.liveProcessCount, 1);
+      expect(mutationScope.isCancelled, isFalse);
+      expect(readScope.outcomeUnknown, isFalse);
+      mutationScope.cancel();
+      await mutationDone.timeout(const Duration(seconds: 1));
+      expect(mutationScope.outcomeUnknown, isTrue);
+      expect(host.liveProcessCount, 0);
+    });
 
     for (final method in ['listBuckets', 'listObjects']) {
       test('interrupts an in-flight $method and releases its process slot',

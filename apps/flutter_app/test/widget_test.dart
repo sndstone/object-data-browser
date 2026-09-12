@@ -1177,7 +1177,7 @@ void main() {
     await tester.pumpWidget(S3BrowserApp(controller: controller));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.widgetWithText(ListTile, 'General'));
+    await tester.tap(find.widgetWithText(ListTile, 'Connections'));
     await tester.pumpAndSettle();
     expect(find.text('Default engine'), findsOneWidget);
     expect(find.text('Default endpoint'), findsOneWidget);
@@ -1189,7 +1189,7 @@ void main() {
     expect(find.text('Endpoint type'), findsOneWidget);
     expect(find.text('Use HTTPS'), findsOneWidget);
     expect(find.text('Normalized endpoint'), findsOneWidget);
-    await tester.tap(find.widgetWithText(ListTile, 'Transfers'));
+    await tester.tap(find.widgetWithText(ListTile, 'Transfers & Storage'));
     await tester.pumpAndSettle();
     expect(find.text('Automatically size upload parts'), findsOneWidget);
   });

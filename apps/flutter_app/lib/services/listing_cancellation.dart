@@ -10,6 +10,7 @@ class ListingCancelled implements Exception {
 class ListingCancellation {
   final _cancelled = Completer<void>();
   bool get isCancelled => _cancelled.isCompleted;
+  Future<void> get whenCancelled => _cancelled.future;
 
   void cancel() {
     if (!isCancelled) _cancelled.complete();
@@ -39,6 +40,8 @@ abstract interface class ListingCancellationRegistrant {
 
 /// Read-only requests that can belong to a browser listing and its inspector.
 bool isCancellableListingMethod(String method) => const {
+      'testProfile',
+      'getCapabilities',
       'listBuckets',
       'listObjects',
       'listObjectVersions',

@@ -10,6 +10,17 @@
 - Generalized Android-only mobile UI and engine metadata branches so iOS uses the mobile layouts without desktop drag/drop or unsupported directory picking.
 - Benchmark and bucket-encryption mutations are explicitly capability-gated in the first iOS release.
 
+## 2.2.8
+
+### Reliability and Settings
+- Stage and validate downloads before publishing; preserve existing files on failure and offer keep-both or validated replacement on desktop.
+- Require confirmed matching Azure copy success before move deletion, and reject same-object moves.
+- Route Cancel to the action shown in details, preserve transfer counters, and report unconfirmed mutation outcomes honestly.
+- Remove fabricated production benchmark metrics; separate profile Test, Save, activation, and startup preferences with durable save-failure feedback.
+- Group Settings into six sections with one connection editor, effective transport controls, and capability guidance.
+- Extract action/persistence/metric/destination helpers, pin Flutter 3.44.6, and add cross-engine safety and responsive Settings regressions.
+- See [implementation and verification limits](docs/improvements-implementation-2026-09.md).
+
 ## 2.2.7
 
 - Fixed Cancel for stalled bucket/object listings: stop waiting immediately, retain completed pages and ignore late responses or timeouts.

@@ -753,6 +753,11 @@ func azureCopyObject(params map[string]interface{}) (map[string]interface{}, err
 		return nil, err
 	}
 	copyStatus := strings.ToLower(strings.TrimSpace(resp.Header.Get("x-ms-copy-status")))
+	copyID := resp.Header.Get("x-ms-copy-id")
+	if copyID == "" {
+		drainAndClose(resp.Body)
+		return nil, &sidecarError{Code: "unknown", Message: "Azure copy identity missing; source retained."}
+	}
 	drainAndClose(resp.Body)
 	for attempt := 0; copyStatus == "pending" && attempt < azureCopyPollAttempts; attempt++ {
 		time.Sleep(azureCopyPollInterval)
@@ -760,19 +765,30 @@ func azureCopyObject(params map[string]interface{}) (map[string]interface{}, err
 		if headErr != nil {
 			return nil, headErr
 		}
+		if head.Header.Get("x-ms-copy-id") != copyID {
+			drainAndClose(head.Body)
+			return nil, &sidecarError{Code: "object_conflict", Message: "Azure copy identity changed; source retained."}
+		}
 		copyStatus = strings.ToLower(strings.TrimSpace(head.Header.Get("x-ms-copy-status")))
 		drainAndClose(head.Body)
 	}
-	if copyStatus == "failed" || copyStatus == "aborted" {
+	if copyStatus != "success" {
+		code := "unknown"
+		if copyStatus == "pending" {
+			code = "timeout"
+		}
 		return nil, &sidecarError{
-			Code:    "unknown",
-			Message: fmt.Sprintf("Azure blob copy finished with status %q.", copyStatus),
+			Code:    code,
+			Message: fmt.Sprintf("Azure copy not confirmed (%q); source retained. Inspect destination before retrying.", copyStatus),
 		}
 	}
 	return map[string]interface{}{"successCount": 1, "failureCount": 0, "failures": []interface{}{}}, nil
 }
 
 func azureMoveObject(params map[string]interface{}) (map[string]interface{}, error) {
+	if strings.TrimSpace(asString(params["sourceBucketName"])) == strings.TrimSpace(asString(params["destinationBucketName"])) && strings.TrimSpace(asString(params["sourceKey"])) == strings.TrimSpace(asString(params["destinationKey"])) {
+		return nil, &sidecarError{Code: "invalid_config", Message: "Move source and destination must differ."}
+	}
 	result, err := azureCopyObject(params)
 	if err != nil {
 		return nil, err
@@ -998,6 +1014,7 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 	partsTotal := 0
 	usesMultipart := false
 	objectSizes := make(map[string]int64, len(keys))
+	validators := make(map[string]string, len(keys))
 	for _, key := range keys {
 		head, headErr := client.do(ctx, http.MethodHead, bucketName, key, nil, nil, nil)
 		if headErr != nil {
@@ -1006,6 +1023,7 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 		size, _ := strconv.ParseInt(head.Header.Get("Content-Length"), 10, 64)
 		drainAndClose(head.Body)
 		objectSizes[key] = size
+		validators[key] = head.Header.Get("ETag")
 		totalBytes += size
 		if size >= thresholdBytes {
 			usesMultipart = true
@@ -1029,11 +1047,14 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 	emitTransferEvent(buildTransferJob(jobID, label, "download", 0, "queued", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), keys[0], len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
 	for _, key := range keys {
 		size := objectSizes[key]
-		target := filepath.Join(destinationPath, filepath.Base(key))
-		handle, createErr := os.Create(target)
+		beforeObject := bytesTransferred
+		handle, createErr := os.CreateTemp(destinationPath, ".odb-*.part")
 		if createErr != nil {
 			return nil, createErr
 		}
+		target := handle.Name()
+		defer os.Remove(target)
+		defer handle.Close()
 		outputLines = append(outputLines, fmt.Sprintf("Downloading %s (%d bytes) to %s.", key, size, target))
 		if size >= thresholdBytes {
 			for start := int64(0); start < size; start += chunkBytes {
@@ -1042,12 +1063,15 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 					end = size - 1
 				}
 				rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
-				resp, getErr := client.do(ctx, http.MethodGet, bucketName, key, nil, map[string]string{"Range": rangeHeader}, nil)
+				resp, getErr := client.do(ctx, http.MethodGet, bucketName, key, nil, map[string]string{"Range": rangeHeader, "If-Match": validators[key]}, nil)
 				if getErr != nil {
 					handle.Close()
 					return nil, getErr
 				}
-				copied, copyErr := io.Copy(handle, resp.Body)
+				copied, copyErr := io.Copy(handle, io.LimitReader(resp.Body, end-start+2))
+				if copyErr == nil && (copied != end-start+1 || resp.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", start, end, size)) {
+					copyErr = fmt.Errorf("download range mismatch; partial file discarded")
+				}
 				resp.Body.Close()
 				if copyErr != nil {
 					handle.Close()
@@ -1060,7 +1084,7 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 				emitTransferEvent(buildTransferJob(jobID, label, "download", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), key, len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
 			}
 		} else {
-			resp, getErr := client.do(ctx, http.MethodGet, bucketName, key, nil, nil, nil)
+			resp, getErr := client.do(ctx, http.MethodGet, bucketName, key, nil, map[string]string{"If-Match": validators[key]}, nil)
 			if getErr != nil {
 				handle.Close()
 				return nil, getErr
@@ -1088,7 +1112,21 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 			}
 			resp.Body.Close()
 		}
-		handle.Close()
+		if bytesTransferred-beforeObject != size {
+			return nil, fmt.Errorf("download length mismatch; partial file discarded")
+		}
+		if err = handle.Sync(); err != nil {
+			return nil, err
+		}
+		if err = handle.Close(); err != nil {
+			return nil, err
+		}
+		finalPath, publishErr := publishDownload(target, destinationPath, key, asString(params["conflictPolicy"]))
+		if publishErr != nil {
+			return nil, publishErr
+		}
+		os.Remove(target)
+		outputLines = append(outputLines, fmt.Sprintf("Saved %s to %s.", key, finalPath))
 		itemsCompleted++
 		outputLines = append(outputLines, fmt.Sprintf("Finished downloading %s.", key))
 	}

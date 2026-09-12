@@ -130,7 +130,7 @@ def test_live_controls_reach_a_real_running_transfer(engine, storage_fixture, tm
             job_id = event['job']['id']
             break
     assert storage_fixture.handler.part_started.wait(10), 'Transfer did not reach storage'
-    for method, status in [('pauseTransfer', 'paused'), ('resumeTransfer', 'running'), ('cancelTransfer', 'cancelled')]:
+    for method, status in [('pauseTransfer', 'paused'), ('resumeTransfer', 'running'), ('cancelTransfer', 'cancelling')]:
         engine.send({'requestId': method, 'method': method, 'params': {'jobId': job_id}})
         while True:
             response = engine.recv_json(timeout=10)

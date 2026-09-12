@@ -34,6 +34,7 @@ class ProgressEngine extends MockEngineService {
       required String bucketName,
       required List<String> keys,
       required String destinationPath,
+      String conflictPolicy = 'keepBoth',
       required int multipartThresholdMiB,
       required int multipartChunkMiB}) async {
     requests.add((List.of(keys), destinationPath));
@@ -388,7 +389,7 @@ void main() {
     await tester.enterText(name, 'Unsaved connection');
     await tester.pump();
     expect(find.text('Unsaved edits'), findsOneWidget);
-    await tester.tap(find.widgetWithText(ListTile, 'General'));
+    await tester.tap(find.widgetWithText(ListTile, 'Appearance'));
     await tester.pumpAndSettle();
     await tester.tap(find.widgetWithText(ListTile, 'Connections'));
     await tester.pumpAndSettle();

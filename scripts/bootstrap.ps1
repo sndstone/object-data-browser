@@ -151,6 +151,7 @@ function Expand-ZipToStaging {
 }
 
 function Ensure-Flutter {
+    $FlutterVersion = (Get-Content (Join-Path $RootDir ".flutter-version") -Raw).Trim()
     $Dir = Join-Path $ToolsDir "flutter"
     $FlutterBat = Join-Path $Dir "bin\flutter.bat"
     $GitDir = Join-Path $Dir ".git"
@@ -161,11 +162,10 @@ function Ensure-Flutter {
         Remove-DirectoryIfExists $Dir
 
         $ReleaseIndex = Invoke-RestMethod -Uri "https://storage.googleapis.com/flutter_infra_release/releases/releases_windows.json"
-        $StableHash = $ReleaseIndex.current_release.stable
-        $StableRelease = $ReleaseIndex.releases | Where-Object { $_.hash -eq $StableHash } | Select-Object -First 1
+        $StableRelease = $ReleaseIndex.releases | Where-Object { $_.version -eq $FlutterVersion -and $_.channel -eq "stable" } | Select-Object -First 1
 
         if ($null -eq $StableRelease) {
-            throw "Unable to resolve the latest stable Flutter release for Windows."
+            throw "Unable to resolve pinned Flutter $FlutterVersion for Windows."
         }
 
         $Archive = Join-Path $ToolCacheDir "flutter.zip"
@@ -204,6 +204,11 @@ function Ensure-Flutter {
             }
         }
     }
+    $InstalledVersion = ((& $FlutterBat --version --machine) | ConvertFrom-Json).frameworkVersion
+    if ($InstalledVersion -ne $FlutterVersion) {
+        throw "Flutter cache is $InstalledVersion; expected $FlutterVersion. Move $Dir aside and rerun bootstrap."
+    }
+
 }
 
 function Ensure-Go {

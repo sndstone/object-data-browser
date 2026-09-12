@@ -8,6 +8,9 @@ import hashlib
 import hmac
 import io
 import json
+import os
+import re
+from contextlib import contextmanager
 import socket
 import ssl
 import sys
@@ -27,7 +30,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 
-ENGINE_VERSION = "2.2.5"
+ENGINE_VERSION = "2.2.8"
 
 # Serialize every write to stdout so transferProgress events emitted from worker
 # threads never interleave with request/response lines.
@@ -303,7 +306,7 @@ def _build_client(profile: Profile):
         region_name=profile.region,
         connect_timeout=profile.connect_timeout_seconds,
         read_timeout=profile.read_timeout_seconds,
-        retries={"max_attempts": profile.max_attempts, "mode": "adaptive"},
+        retries={"total_max_attempts": profile.max_attempts, "mode": "adaptive"},
         max_pool_connections=profile.max_pool_connections,
         s3={"addressing_style": "path" if profile.path_style else "virtual"},
     )
@@ -1122,19 +1125,23 @@ def _azure_create_folder(params: dict[str, Any]) -> dict[str, Any]:
     return {"created": True, "key": key}
 
 
-def _azure_wait_for_copy(client: _AzureBlobClient, dest_path: str, copy_status: str) -> None:
+def _azure_wait_for_copy(client: _AzureBlobClient, dest_path: str, copy_status: str, copy_id: str) -> None:
+    if not copy_id:
+        raise SidecarError("unknown", "Azure copy identity missing; source retained.")
     attempts = 0
-    while copy_status == "pending" and attempts < 60:
-        time.sleep(0.5)
+    while copy_status == "pending" and attempts < 20:
+        time.sleep(0.25)
         response = client.open("HEAD", dest_path)
         with response:
             response.read()
-            copy_status = str(response.headers.get("x-ms-copy-status", "") or "success").lower()
+            if response.headers.get("x-ms-copy-id", "") != copy_id:
+                raise SidecarError("object_conflict", "Azure copy identity changed; source retained.")
+            copy_status = str(response.headers.get("x-ms-copy-status", "")).lower()
         attempts += 1
-    if copy_status not in {"", "success"}:
+    if copy_status != "success":
         raise SidecarError(
-            "unknown",
-            f"Azure blob copy finished with status '{copy_status}'.",
+            "timeout" if copy_status == "pending" else "unknown",
+            f"Azure copy not confirmed ({copy_status or 'missing status'}); source retained. Inspect destination before retrying.",
         )
 
 
@@ -1155,12 +1162,14 @@ def _azure_copy_object(params: dict[str, Any]) -> dict[str, Any]:
         headers={"x-ms-copy-source": source_url},
         body=b"",
     )
-    copy_status = str(headers.get("x-ms-copy-status", "") or "success").lower()
-    _azure_wait_for_copy(client, dest_path, copy_status)
+    copy_status = str(headers.get("x-ms-copy-status", "")).lower()
+    _azure_wait_for_copy(client, dest_path, copy_status, str(headers.get("x-ms-copy-id", "")))
     return {"successCount": 1, "failureCount": 0, "failures": []}
 
 
 def _azure_move_object(params: dict[str, Any]) -> dict[str, Any]:
+    if (str(params.get("sourceBucketName", "")).strip(), str(params.get("sourceKey", "")).strip()) == (str(params.get("destinationBucketName", "")).strip(), str(params.get("destinationKey", "")).strip()):
+        raise SidecarError("invalid_config", "Move source and destination must differ.")
     result = _azure_copy_object(params)
     profile = _parse_profile(params.get("profile", {}))
     client = _AzureBlobClient(profile)
@@ -1404,6 +1413,57 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _download_name(key: str) -> str:
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', key.replace('\\', '/').split('/')[-1]).rstrip(' .')[:180]
+    if not name or name in {'.', '..'}:
+        name = 'download'
+    if name.split('.')[0].upper() in {'CON', 'PRN', 'AUX', 'NUL', *{f'COM{i}' for i in range(1, 10)}, *{f'LPT{i}' for i in range(1, 10)}}:
+        name = '_' + name
+    return name
+
+
+@contextmanager
+def _staged_download(destination: Path, key: str, policy: str, output_lines: list[str]):
+    """Publish only validated bytes, without replacing any existing directory entry."""
+    if policy not in {"keepBoth", "replace"}:
+        raise SidecarError("invalid_config", "Unknown download conflict policy.")
+    fd, temporary = tempfile.mkstemp(prefix='.odb-', suffix='.part', dir=destination)
+    temporary = Path(temporary)
+    try:
+        with os.fdopen(fd, 'w+b') as handle:
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        name = _download_name(key)
+        base = Path(name)
+        for index in range(100000):
+            target = destination / (name if index == 0 else f'{base.stem} ({index}){base.suffix}')
+            if policy == 'replace':
+                matches = [item for item in destination.iterdir() if item.name.casefold() == target.name.casefold()]
+                target = matches[0] if matches else target
+                os.replace(temporary, target)
+                output_lines.append(f'Saved {key} to {target}.')
+                break
+            # Treat case-only differences as conflicts on every platform.
+            if any(item.name.casefold() == target.name.casefold() for item in destination.iterdir()):
+                continue
+            try:
+                os.link(temporary, target)
+                output_lines.append(f'Saved {key} to {target}.')
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise SidecarError('object_conflict', 'Could not allocate a unique download name.')
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _validate_download_range(header: str, start: int, end: int, size: int, received: int) -> None:
+    if header != f'bytes {start}-{end}/{size}' or received != end - start + 1:
+        raise SidecarError('object_conflict', 'Download range or length does not match the requested object; partial file discarded.')
+
+
 def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     bucket_name = str(params.get("bucketName", "")).strip()
@@ -1417,9 +1477,11 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
     destination = Path(destination_path)
     destination.mkdir(parents=True, exist_ok=True)
     sizes: dict[str, int] = {}
+    validators = {}
     for key in keys:
         _, head_headers, _ = client.request("HEAD", client.blob_path(bucket_name, key))
         sizes[key] = int(head_headers.get("Content-Length", 0) or 0)
+        validators[key] = {"If-Match": head_headers["ETag"]} if head_headers.get("ETag") else {}
     total_bytes = sum(sizes.values())
     uses_multipart = any(size >= multipart_threshold_bytes for size in sizes.values())
     parts_total = sum(
@@ -1470,20 +1532,22 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
     )
     for key in keys:
         _transfer_gate(control)
-        target = destination / Path(key).name
+        target = destination / _download_name(key)
         object_size = sizes[key]
         blob_path = client.blob_path(bucket_name, key)
         output_lines.append(f"Downloading {key} ({object_size} bytes) to {target}.")
-        with target.open("wb") as handle:
+        before_object = bytes_transferred
+        with _staged_download(destination, key, params.get("conflictPolicy", "keepBoth"), output_lines) as handle:
             if object_size >= multipart_threshold_bytes:
                 start = 0
                 while start < object_size:
                     end = min(start + multipart_chunk_bytes - 1, object_size - 1)
-                    _, _, chunk = client.request(
+                    _, range_headers, chunk = client.request(
                         "GET",
                         blob_path,
-                        headers={"Range": f"bytes={start}-{end}"},
+                        headers={"Range": f"bytes={start}-{end}", **validators[key]},
                     )
+                    _validate_download_range(range_headers.get("Content-Range", ""), start, end, object_size, len(chunk))
                     handle.write(chunk)
                     chunk_size = end - start + 1
                     bytes_transferred += chunk_size
@@ -1519,7 +1583,7 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
                     )
                     start = end + 1
             else:
-                response = client.open("GET", blob_path)
+                response = client.open("GET", blob_path, headers=validators[key])
                 with response:
                     while True:
                         chunk = response.read(min(multipart_chunk_bytes, 1024 * 1024))
@@ -1555,6 +1619,9 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
                                 can_cancel=True,
                             )
                         )
+            _transfer_gate(control)
+            if bytes_transferred - before_object != object_size:
+                raise SidecarError("object_conflict", "Download size changed or response was incomplete; partial file discarded.")
         items_completed += 1
         output_lines.append(f"Finished downloading {key}.")
     output_lines.append(f"Downloaded {len(keys)} object(s) into {destination_path}.")
@@ -2865,10 +2932,8 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
     client = _build_client(profile)
     destination = Path(destination_path)
     destination.mkdir(parents=True, exist_ok=True)
-    sizes = {
-        key: int(client.head_object(Bucket=bucket_name, Key=key).get("ContentLength", 0))
-        for key in keys
-    }
+    heads = {key: client.head_object(Bucket=bucket_name, Key=key) for key in keys}
+    sizes = {key: int(heads[key].get("ContentLength", 0)) for key in keys}
     total_bytes = sum(sizes.values())
     uses_multipart = any(size >= multipart_threshold_bytes for size in sizes.values())
     parts_total = sum(
@@ -2919,10 +2984,11 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
     )
     for key in keys:
         _transfer_gate(control)
-        target = destination / Path(key).name
+        target = destination / _download_name(key)
         object_size = sizes[key]
         output_lines.append(f"Downloading {key} ({object_size} bytes) to {target}.")
-        with target.open("wb") as handle:
+        before_object = bytes_transferred
+        with _staged_download(destination, key, params.get("conflictPolicy", "keepBoth"), output_lines) as handle:
             if object_size >= multipart_threshold_bytes:
                 handle.truncate(object_size)
                 write_lock = threading.Lock()
@@ -2945,12 +3011,19 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
                         Bucket=bucket_name,
                         Key=key,
                         Range=f"bytes={start}-{end}",
+                        **({"IfMatch": heads[key]["ETag"]} if heads[key].get("ETag") else {}),
                     )
-                    data = response["Body"].read()
+                    _transfer_gate(control)
+                    try:
+                        data = response["Body"].read(end - start + 2)
+                    finally:
+                        response["Body"].close()
+                    _validate_download_range(response.get("ContentRange", ""), start, end, object_size, len(data))
+                    _transfer_gate(control)
                     with write_lock:
                         handle.seek(start)
                         handle.write(data)
-                    return start, end, end - start + 1
+                    return start, end, len(data)
 
                 with ThreadPoolExecutor(max_workers=max_workers) as pool:
                     futures = [
@@ -2998,41 +3071,47 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
                             pending.cancel()
                         raise
             else:
-                response = client.get_object(Bucket=bucket_name, Key=key)
-                while True:
-                    chunk = response["Body"].read(min(multipart_chunk_bytes, 1024 * 1024))
-                    if not chunk:
-                        break
-                    handle.write(chunk)
-                    bytes_transferred += len(chunk)
-                    _transfer_checkpoint(
-                        control,
-                        bytes_transferred=bytes_transferred,
-                        items_completed=items_completed,
-                        parts_completed=parts_completed,
-                        current_item_label=key,
-                    )
-                    _emit_transfer_event(
-                        _build_transfer_job(
-                            job_id=job_id,
-                            label=label,
-                            direction="download",
-                            progress=bytes_transferred / total_bytes if total_bytes else 1,
-                            status="running",
+                response = client.get_object(Bucket=bucket_name, Key=key, **({"IfMatch": heads[key]["ETag"]} if heads[key].get("ETag") else {}))
+                try:
+                    while True:
+                        chunk = response["Body"].read(min(multipart_chunk_bytes, 1024 * 1024))
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        bytes_transferred += len(chunk)
+                        _transfer_checkpoint(
+                            control,
                             bytes_transferred=bytes_transferred,
-                            total_bytes=total_bytes,
-                            output_lines=list(output_lines),
-                            strategy_label=strategy_label,
-                            current_item_label=key,
-                            item_count=len(keys),
                             items_completed=items_completed,
-                            part_size_bytes=part_size_bytes,
-                            parts_completed=parts_completed if part_size_bytes is not None else None,
-                            parts_total=parts_total if part_size_bytes is not None else None,
-                            can_pause=True,
-                            can_cancel=True,
+                            parts_completed=parts_completed,
+                            current_item_label=key,
                         )
-                    )
+                        _emit_transfer_event(
+                            _build_transfer_job(
+                                job_id=job_id,
+                                label=label,
+                                direction="download",
+                                progress=bytes_transferred / total_bytes if total_bytes else 1,
+                                status="running",
+                                bytes_transferred=bytes_transferred,
+                                total_bytes=total_bytes,
+                                output_lines=list(output_lines),
+                                strategy_label=strategy_label,
+                                current_item_label=key,
+                                item_count=len(keys),
+                                items_completed=items_completed,
+                                part_size_bytes=part_size_bytes,
+                                parts_completed=parts_completed if part_size_bytes is not None else None,
+                                parts_total=parts_total if part_size_bytes is not None else None,
+                                can_pause=True,
+                                can_cancel=True,
+                            )
+                        )
+                finally:
+                    response["Body"].close()
+            _transfer_gate(control)
+            if bytes_transferred - before_object != object_size:
+                raise SidecarError("object_conflict", "Download size changed or response was incomplete; partial file discarded.")
         items_completed += 1
         output_lines.append(f"Finished downloading {key}.")
     output_lines.append(f"Downloaded {len(keys)} object(s) into {destination_path}.")
@@ -3087,7 +3166,7 @@ def _transfer_control(params: dict[str, Any], action: str) -> dict[str, Any]:
         transferred = control.bytes_transferred
         progress = (transferred / total) if total else (1.0 if status == "cancelled" else 0.0)
         output_line = {
-            "cancelled": "Transfer cancelled.",
+            "cancelled": "Cancellation requested; waiting for workers and cleanup.",
             "paused": "Transfer paused.",
             "running": "Transfer resumed.",
         }.get(action, f"Transfer {action}.")
@@ -3096,7 +3175,7 @@ def _transfer_control(params: dict[str, Any], action: str) -> dict[str, Any]:
             label=control.label,
             direction=control.direction,
             progress=progress,
-            status=status,
+            status="cancelling" if status == "cancelled" else status,
             bytes_transferred=transferred,
             total_bytes=total,
             output_lines=[output_line],

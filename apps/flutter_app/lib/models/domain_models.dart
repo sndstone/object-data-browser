@@ -1437,7 +1437,8 @@ class BrowserTaskRecord {
 
   bool get isFailedLike {
     final normalized = status.toLowerCase();
-    return normalized == 'failed' ||
+    return normalized == 'unknown' ||
+        normalized == 'failed' ||
         normalized == 'error' ||
         normalized == 'cancelled' ||
         normalized == 'canceled';
@@ -1450,6 +1451,7 @@ class AppSettings {
     required this.defaultEngineId,
     this.defaultProfileId = '',
     required this.downloadPath,
+    this.downloadConflictPolicy = 'keepBoth',
     required this.tempPath,
     required this.transferConcurrency,
     required this.multipartThresholdMiB,
@@ -1486,6 +1488,7 @@ class AppSettings {
   final String defaultEngineId;
   final String defaultProfileId;
   final String downloadPath;
+  final String downloadConflictPolicy;
   final String tempPath;
   final int transferConcurrency;
   final int multipartThresholdMiB;
@@ -1525,6 +1528,7 @@ class AppSettings {
       'defaultEngineId': defaultEngineId,
       'defaultProfileId': defaultProfileId,
       'downloadPath': downloadPath,
+      'downloadConflictPolicy': downloadConflictPolicy,
       'tempPath': tempPath,
       'transferConcurrency': transferConcurrency,
       'multipartThresholdMiB': multipartThresholdMiB,
@@ -1563,6 +1567,8 @@ class AppSettings {
       defaultEngineId: (json['defaultEngineId'] as String?) ?? 'python',
       defaultProfileId: (json['defaultProfileId'] as String?) ?? '',
       downloadPath: (json['downloadPath'] as String?) ?? '',
+      downloadConflictPolicy:
+          json['downloadConflictPolicy'] == 'replace' ? 'replace' : 'keepBoth',
       tempPath: (json['tempPath'] as String?) ?? '',
       transferConcurrency: (json['transferConcurrency'] as num?)?.toInt() ?? 8,
       multipartThresholdMiB:
@@ -1610,6 +1616,7 @@ class AppSettings {
     String? defaultEngineId,
     String? defaultProfileId,
     String? downloadPath,
+    String? downloadConflictPolicy,
     String? tempPath,
     int? transferConcurrency,
     int? multipartThresholdMiB,
@@ -1646,6 +1653,8 @@ class AppSettings {
       defaultEngineId: defaultEngineId ?? this.defaultEngineId,
       defaultProfileId: defaultProfileId ?? this.defaultProfileId,
       downloadPath: downloadPath ?? this.downloadPath,
+      downloadConflictPolicy:
+          downloadConflictPolicy ?? this.downloadConflictPolicy,
       tempPath: tempPath ?? this.tempPath,
       transferConcurrency: transferConcurrency ?? this.transferConcurrency,
       multipartThresholdMiB:

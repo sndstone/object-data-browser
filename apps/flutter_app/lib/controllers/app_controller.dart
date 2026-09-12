@@ -1,3 +1,6 @@
+import 'transfer_presentation.dart';
+import 'action_scope.dart';
+import 'persistence_state.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -190,6 +193,8 @@ class AppController extends ChangeNotifier {
         _appStateRepository = appStateRepository,
         settings = initialSettings,
         profiles = initialProfiles.map(normalizeEndpointProfile).toList() {
+    _persistedProfiles
+        .addEntries(profiles.map((profile) => MapEntry(profile.id, profile)));
     final bootstrapProfileId = profiles.isEmpty ? '' : profiles.first.id;
     testDataConfig = TestDataToolConfig(
       bucketName: '',
@@ -228,7 +233,7 @@ class AppController extends ChangeNotifier {
       workloadType: 'mixed',
       deleteMode: 'multi-object-post',
       objectSizes: const [65536, 1048576, 8388608],
-      concurrentThreads: math.max(initialSettings.transferConcurrency * 8, 64),
+      concurrentThreads: initialSettings.transferConcurrency,
       testMode: 'duration',
       operationCount: 50000,
       durationSeconds: 60,
@@ -262,6 +267,20 @@ class AppController extends ChangeNotifier {
   final AppStateRepository? _appStateRepository;
   String? _credentialStoreError;
   bool _lastProfileSaveSucceeded = true;
+  final persistenceState = PersistenceState();
+  final Map<String, EndpointProfile> _persistedProfiles = {};
+  final Map<String, ActionScope> _actionScopes = {};
+  final Map<String, String> _jobEngineOwners = {};
+  String profilePersistenceStatusFor(String id) =>
+      _credentialStoreError != null ||
+              persistenceState.profileSaved(id) == false
+          ? 'Session only'
+          : 'Saved';
+  Future<void> retrySaveSettings() async {
+    await _persistState();
+    notifyListeners();
+  }
+
   String get profilePersistenceStatus =>
       _credentialStoreError == null && _lastProfileSaveSucceeded
           ? 'Saved'
@@ -280,7 +299,18 @@ class AppController extends ChangeNotifier {
   int _listingGeneration = 0;
   // Cosmetic flag reflecting whether the most recent listing run stopped due to
   // cancellation; drives the task summary only, not loop control.
-  bool _listingCancelled = false;
+  bool _listingCancelledState = false;
+  bool get _listingCancelled =>
+      ActionScope.current?.listingCancelled ?? _listingCancelledState;
+  set _listingCancelled(bool value) {
+    final scope = ActionScope.current;
+    if (scope == null) {
+      _listingCancelledState = value;
+    } else {
+      scope.listingCancelled = value;
+    }
+  }
+
   bool _benchmarkPollErrorReported = false;
   int _previewRequestSequence = 0;
   final Map<String, _PendingObjectRelist> _pendingUploadRelists =
@@ -433,7 +463,7 @@ class AppController extends ChangeNotifier {
   }
 
   Future<T> _awaitListing<T>(Future<T> Function() request) async {
-    final cancellation = ListingCancellation();
+    final cancellation = ActionScope.current ?? ListingCancellation();
     _listingRequests.add(cancellation);
     try {
       return await cancellation.wait(request());
@@ -606,7 +636,6 @@ class AppController extends ChangeNotifier {
         );
         await refreshCapabilities();
         await refreshBuckets();
-        await _persistState();
       },
     );
   }
@@ -1429,7 +1458,7 @@ class AppController extends ChangeNotifier {
           source: 'task-tray',
         );
       });
-    }, trackTask: false);
+    }, trackTask: AppPlatform.isMobile);
   }
 
   void _registerUploadRetry(
@@ -1567,6 +1596,8 @@ class AppController extends ChangeNotifier {
       await _guard('Transfers', () async {
         final retryEngine = activeEngineId;
         final retryDestination = settings.downloadPath;
+        final retryConflictPolicy =
+            AppPlatform.isMobile ? 'keepBoth' : settings.downloadConflictPolicy;
         final retryThreshold = settings.multipartThresholdMiB;
         final retryChunk = settings.multipartChunkMiB;
         final retryKeys = List<String>.of(keys);
@@ -1576,6 +1607,7 @@ class AppController extends ChangeNotifier {
           bucketName: bucket.name,
           keys: retryKeys,
           destinationPath: retryDestination,
+          conflictPolicy: retryConflictPolicy,
           multipartThresholdMiB: retryThreshold,
           multipartChunkMiB: retryChunk,
         );
@@ -1595,6 +1627,7 @@ class AppController extends ChangeNotifier {
                 bucketName: bucket.name,
                 keys: retryKeys,
                 destinationPath: retryDestination,
+                conflictPolicy: retryConflictPolicy,
                 multipartThresholdMiB: retryThreshold,
                 multipartChunkMiB: retryChunk);
             _retryTransfers[next.id] = replay;
@@ -1626,7 +1659,7 @@ class AppController extends ChangeNotifier {
           source: 'task-tray',
         );
       });
-    }, trackTask: false);
+    }, trackTask: AppPlatform.isMobile);
   }
 
   Future<void> pauseTransfer(String jobId) async {
@@ -1635,10 +1668,12 @@ class AppController extends ChangeNotifier {
         await _uploadBatch!.control('pause');
         return;
       }
-      final job = await _engineService.pauseTransfer(
-        engineId: activeEngineId,
+      final response = await _engineService.pauseTransfer(
+        engineId: _jobEngineOwners[jobId] ?? activeEngineId,
         jobId: jobId,
       );
+      final job = mergeTransferControl(
+          transferJobs.where((job) => job.id == jobId).firstOrNull, response);
       _replaceTransfer(job);
       _trackTransferJob(job);
       _addEvent(
@@ -1658,10 +1693,12 @@ class AppController extends ChangeNotifier {
         await _uploadBatch!.control('resume');
         return;
       }
-      final job = await _engineService.resumeTransfer(
-        engineId: activeEngineId,
+      final response = await _engineService.resumeTransfer(
+        engineId: _jobEngineOwners[jobId] ?? activeEngineId,
         jobId: jobId,
       );
+      final job = mergeTransferControl(
+          transferJobs.where((job) => job.id == jobId).firstOrNull, response);
       _replaceTransfer(job);
       _addEvent(
         level: 'INFO',
@@ -1676,26 +1713,33 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> cancelTransfer(String jobId) async {
-    await _runBusy('control-$jobId', 'Cancel transfer', () async {
-      if (_uploadBatch?.id == jobId) {
-        await _uploadBatch!.control('cancel');
-        return;
-      }
-      final job = await _engineService.cancelTransfer(
-        engineId: activeEngineId,
-        jobId: jobId,
-      );
-      _replaceTransfer(job);
-      _addEvent(
-        level: 'INFO',
-        category: 'Transfers',
-        message: 'Cancelled transfer $jobId.',
-        includeSelectionContext: true,
-        source: 'task-tray',
-      );
-      _trackTransferJob(job);
-      notifyListeners();
-    }, trackTask: false);
+    await _runBusy(
+        'control-$jobId',
+        'Cancel transfer',
+        () => _guard('Transfers', () async {
+              if (_uploadBatch?.id == jobId) {
+                await _uploadBatch!.control('cancel');
+                return;
+              }
+              final response = await _engineService.cancelTransfer(
+                engineId: _jobEngineOwners[jobId] ?? activeEngineId,
+                jobId: jobId,
+              );
+              final job = mergeTransferControl(
+                  transferJobs.where((job) => job.id == jobId).firstOrNull,
+                  response);
+              _replaceTransfer(job);
+              _addEvent(
+                level: 'INFO',
+                category: 'Transfers',
+                message: 'Transfer $jobId: ${job.status}.',
+                includeSelectionContext: true,
+                source: 'task-tray',
+              );
+              _trackTransferJob(job);
+              notifyListeners();
+            }),
+        trackTask: false);
   }
 
   Future<void> cancelToolTask(BrowserTaskRecord task) async {
@@ -1703,7 +1747,7 @@ class AppController extends ChangeNotifier {
       return;
     }
     final state = await _engineService.cancelToolExecution(
-      engineId: activeEngineId,
+      engineId: _jobEngineOwners[task.id] ?? activeEngineId,
       jobId: task.engineJobId!,
     );
     final taskLabel = _normalizeToolLabel(task.label);
@@ -1712,23 +1756,33 @@ class AppController extends ChangeNotifier {
     } else if (taskLabel == _normalizeToolLabel(deleteAllState.label)) {
       deleteAllState = state;
     }
-    _upsertTask(
-      task.copyWith(
-        status: 'cancelled',
-        completedAt: DateTime.now(),
-        progress: 1,
+    final status = state.running
+        ? 'cancelling'
+        : state.exitCode == 130
+            ? 'cancelled'
+            : state.exitCode == 0
+                ? 'completed'
+                : 'failed';
+    _upsertTask(task.copyWith(
+        status: status,
+        completedAt: state.running ? null : DateTime.now(),
+        progress: task.progress,
         outputLines: state.outputLines,
-        canCancel: false,
-      ),
-    );
+        canCancel: state.cancellable));
     _addEvent(
       level: 'INFO',
       category: 'Tools',
-      message: 'Cancelled tool task ${task.label}.',
+      message: 'Tool ${task.label}: $status.',
       includeSelectionContext: true,
       source: 'task-tray',
     );
     notifyListeners();
+  }
+
+  Future<void> cancelAction(String actionKey) async {
+    final id = _busyTaskIds[actionKey];
+    final task = id == null ? null : _taskById(id);
+    if (task != null) await cancelTask(task);
   }
 
   Future<void> cancelTask(BrowserTaskRecord task) async {
@@ -1736,7 +1790,8 @@ class AppController extends ChangeNotifier {
       await cancelTransfer(task.id);
       return;
     }
-    if (task.kind == BrowserTaskKind.tool) {
+    if (task.kind == BrowserTaskKind.tool &&
+        !_actionScopes.containsKey(task.id)) {
       await cancelToolTask(task);
       return;
     }
@@ -1746,7 +1801,18 @@ class AppController extends ChangeNotifier {
       }
       return;
     }
-    if (task.actionKey != null && _isListingActionKey(task.actionKey!)) {
+    final scope = _actionScopes[task.id];
+    if (scope != null && !scope.isCancelled) {
+      scope.cancel();
+      _upsertTask(
+          task.copyWith(status: 'cancelling', canCancel: false, outputLines: [
+        ...task.outputLines,
+        'Cancellation requested. Stopping this action; completed work is retained.'
+      ]));
+      notifyListeners();
+    } else if (scope == null &&
+        task.actionKey != null &&
+        _isListingActionKey(task.actionKey!)) {
       cancelListing();
     }
   }
@@ -1849,59 +1915,81 @@ class AppController extends ChangeNotifier {
       return;
     }
     final taskId = _nextTaskId('put-testdata');
-    await _guard('Tools', () async {
-      putTestDataState = putTestDataState.copyWith(running: true);
-      _upsertTask(
-        BrowserTaskRecord(
-          id: taskId,
-          engineJobId: putTestDataState.jobId,
-          kind: BrowserTaskKind.tool,
-          label: 'put-testdata',
-          status: 'running',
-          startedAt: DateTime.now(),
-          progress: 0,
-          profileId: profile.id,
-          bucketName: selectedBucket?.name ?? testDataConfig.bucketName,
-          canCancel: putTestDataState.cancellable,
-          outputLines: putTestDataState.outputLines,
-        ),
-      );
-      notifyListeners();
-      try {
-        putTestDataState = await _engineService.runPutTestData(
-          engineId: activeEngineId,
-          profile: profile,
-          config: testDataConfig,
-        );
-      } catch (error) {
-        putTestDataState = _failToolState(putTestDataState, error);
-        _failToolTask(taskId, putTestDataState);
-        notifyListeners();
-        // Rethrow so _guard still surfaces the error banner and event.
-        rethrow;
-      }
-      bannerMessage = putTestDataState.lastStatus;
-      _upsertTask(
-        _taskById(taskId)!.copyWith(
-          status: (putTestDataState.exitCode == null ||
-                  putTestDataState.exitCode == 0)
-              ? 'completed'
-              : 'failed',
-          completedAt: DateTime.now(),
-          progress: 1,
-          outputLines: putTestDataState.outputLines,
-          canCancel: putTestDataState.cancellable,
-        ),
-      );
-      _addEvent(
-        level: 'INFO',
-        category: 'Tools',
-        message: putTestDataState.lastStatus,
-        includeSelectionContext: true,
-        source: 'task-tray',
-      );
-      notifyListeners();
-    });
+    final scope = ActionScope(engineId: activeEngineId);
+    _actionScopes[taskId] = scope;
+    _jobEngineOwners[taskId] = activeEngineId;
+    await scope.run(() => _guard('Tools', () async {
+          putTestDataState = putTestDataState.copyWith(running: true);
+          _upsertTask(
+            BrowserTaskRecord(
+              id: taskId,
+              engineJobId: putTestDataState.jobId,
+              kind: BrowserTaskKind.tool,
+              label: 'put-testdata',
+              status: 'running',
+              startedAt: DateTime.now(),
+              progress: 0,
+              profileId: profile.id,
+              bucketName: selectedBucket?.name ?? testDataConfig.bucketName,
+              canCancel: true,
+              outputLines: putTestDataState.outputLines,
+            ),
+          );
+          notifyListeners();
+          try {
+            putTestDataState = await _engineService.runPutTestData(
+              engineId: activeEngineId,
+              profile: profile,
+              config: testDataConfig,
+            );
+          } on ListingCancelled {
+            final current = _taskById(taskId)!;
+            putTestDataState = putTestDataState.copyWith(
+                running: false,
+                cancellable: false,
+                lastStatus: scope.outcomeUnknown
+                    ? 'Stopped; remote outcome unknown.'
+                    : 'Cancelled.');
+            _upsertTask(current.copyWith(
+                status: scope.outcomeUnknown ? 'unknown' : 'cancelled',
+                canCancel: false,
+                completedAt: DateTime.now(),
+                outputLines: [
+                  ...current.outputLines,
+                  putTestDataState.lastStatus
+                ]));
+            notifyListeners();
+            rethrow;
+          } catch (error) {
+            putTestDataState = _failToolState(putTestDataState, error);
+            _failToolTask(taskId, putTestDataState);
+            notifyListeners();
+            // Rethrow so _guard still surfaces the error banner and event.
+            rethrow;
+          }
+          bannerMessage = putTestDataState.lastStatus;
+          _upsertTask(
+            _taskById(taskId)!.copyWith(
+              status: (putTestDataState.exitCode == null ||
+                      putTestDataState.exitCode == 0)
+                  ? 'completed'
+                  : 'failed',
+              completedAt: DateTime.now(),
+              progress: 1,
+              outputLines: putTestDataState.outputLines,
+              canCancel: putTestDataState.cancellable,
+            ),
+          );
+          _addEvent(
+            level: 'INFO',
+            category: 'Tools',
+            message: putTestDataState.lastStatus,
+            includeSelectionContext: true,
+            source: 'task-tray',
+          );
+          notifyListeners();
+        }));
+    _actionScopes.remove(taskId);
   }
 
   Future<void> runDeleteAllTool() async {
@@ -1910,59 +1998,81 @@ class AppController extends ChangeNotifier {
       return;
     }
     final taskId = _nextTaskId('delete-all');
-    await _guard('Tools', () async {
-      deleteAllState = deleteAllState.copyWith(running: true);
-      _upsertTask(
-        BrowserTaskRecord(
-          id: taskId,
-          engineJobId: deleteAllState.jobId,
-          kind: BrowserTaskKind.tool,
-          label: 'delete-all',
-          status: 'running',
-          startedAt: DateTime.now(),
-          progress: 0,
-          profileId: profile.id,
-          bucketName: selectedBucket?.name ?? deleteAllConfig.bucketName,
-          canCancel: deleteAllState.cancellable,
-          outputLines: deleteAllState.outputLines,
-        ),
-      );
-      notifyListeners();
-      try {
-        deleteAllState = await _engineService.runDeleteAll(
-          engineId: activeEngineId,
-          profile: profile,
-          config: deleteAllConfig,
-        );
-      } catch (error) {
-        deleteAllState = _failToolState(deleteAllState, error);
-        _failToolTask(taskId, deleteAllState);
-        notifyListeners();
-        // Rethrow so _guard still surfaces the error banner and event.
-        rethrow;
-      }
-      bannerMessage = deleteAllState.lastStatus;
-      _upsertTask(
-        _taskById(taskId)!.copyWith(
-          status:
-              (deleteAllState.exitCode == null || deleteAllState.exitCode == 0)
+    final scope = ActionScope(engineId: activeEngineId);
+    _actionScopes[taskId] = scope;
+    _jobEngineOwners[taskId] = activeEngineId;
+    await scope.run(() => _guard('Tools', () async {
+          deleteAllState = deleteAllState.copyWith(running: true);
+          _upsertTask(
+            BrowserTaskRecord(
+              id: taskId,
+              engineJobId: deleteAllState.jobId,
+              kind: BrowserTaskKind.tool,
+              label: 'delete-all',
+              status: 'running',
+              startedAt: DateTime.now(),
+              progress: 0,
+              profileId: profile.id,
+              bucketName: selectedBucket?.name ?? deleteAllConfig.bucketName,
+              canCancel: true,
+              outputLines: deleteAllState.outputLines,
+            ),
+          );
+          notifyListeners();
+          try {
+            deleteAllState = await _engineService.runDeleteAll(
+              engineId: activeEngineId,
+              profile: profile,
+              config: deleteAllConfig,
+            );
+          } on ListingCancelled {
+            final current = _taskById(taskId)!;
+            deleteAllState = deleteAllState.copyWith(
+                running: false,
+                cancellable: false,
+                lastStatus: scope.outcomeUnknown
+                    ? 'Stopped; remote outcome unknown.'
+                    : 'Cancelled.');
+            _upsertTask(current.copyWith(
+                status: scope.outcomeUnknown ? 'unknown' : 'cancelled',
+                canCancel: false,
+                completedAt: DateTime.now(),
+                outputLines: [
+                  ...current.outputLines,
+                  deleteAllState.lastStatus
+                ]));
+            notifyListeners();
+            rethrow;
+          } catch (error) {
+            deleteAllState = _failToolState(deleteAllState, error);
+            _failToolTask(taskId, deleteAllState);
+            notifyListeners();
+            // Rethrow so _guard still surfaces the error banner and event.
+            rethrow;
+          }
+          bannerMessage = deleteAllState.lastStatus;
+          _upsertTask(
+            _taskById(taskId)!.copyWith(
+              status: (deleteAllState.exitCode == null ||
+                      deleteAllState.exitCode == 0)
                   ? 'completed'
                   : 'failed',
-          completedAt: DateTime.now(),
-          progress: 1,
-          outputLines: deleteAllState.outputLines,
-          canCancel: deleteAllState.cancellable,
-        ),
-      );
-      _addEvent(
-        level: 'INFO',
-        category: 'Tools',
-        message: deleteAllState.lastStatus,
-        includeSelectionContext: true,
-        source: 'task-tray',
-      );
-      notifyListeners();
-    });
+              completedAt: DateTime.now(),
+              progress: 1,
+              outputLines: deleteAllState.outputLines,
+              canCancel: deleteAllState.cancellable,
+            ),
+          );
+          _addEvent(
+            level: 'INFO',
+            category: 'Tools',
+            message: deleteAllState.lastStatus,
+            includeSelectionContext: true,
+            source: 'task-tray',
+          );
+          notifyListeners();
+        }));
+    _actionScopes.remove(taskId);
   }
 
   Future<void> startBenchmark() async {
@@ -2243,6 +2353,9 @@ class AppController extends ChangeNotifier {
 
   void updateProfile(EndpointProfile profile) {
     profile = normalizeEndpointProfile(profile);
+    if (!profiles.contains(profile)) {
+      persistenceState.recordProfile(profile.id, false);
+    }
     final updatedExisting = profiles.any((item) => item.id == profile.id);
     profiles = updatedExisting
         ? profiles
@@ -2266,49 +2379,35 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> testProfileById(String profileId) async {
-    final profile = normalizeEndpointProfile(
-      profiles.firstWhere((item) => item.id == profileId),
-    );
-    updateProfile(profile);
-    await _runBusy('test-profile-${profile.id}',
-        'Testing ${profile.name}: validating credentials and listing buckets...',
+  Future<void> testProfileById(String profileId) =>
+      testProfileDraft(profiles.firstWhere((item) => item.id == profileId));
+
+  bool supportsProfile(EndpointProfile profile) =>
+      profile.endpointType != EndpointProfileType.azureBlob ||
+      (!AppPlatform.isMobile && const {'python', 'go'}.contains(activeEngineId));
+
+  Future<void> testProfileDraft(EndpointProfile draft) async {
+    final profile = normalizeEndpointProfile(draft);
+    final engine = activeEngineId;
+    await _runBusy('test-profile-${profile.id}', 'Testing ${profile.name}...',
         () async {
       await _guard('Profiles', () async {
-        _addEvent(
-          level: 'INFO',
-          category: 'Profiles',
-          message:
-              'Testing endpoint profile ${profile.name} by validating the connection and then listing buckets.',
-          profileId: profile.id,
-          source: 'profiles',
-        );
-        await _engineService.testProfile(
-            engineId: activeEngineId, profile: profile);
-        final foundBuckets = await _engineService.listBuckets(
-          engineId: activeEngineId,
-          profile: profile,
-        );
-        if (selectedProfile?.id == profile.id) {
-          buckets = foundBuckets;
-          selectedBucket = foundBuckets.isEmpty ? null : foundBuckets.first;
-          await refreshObjects(prefix: currentPrefix);
-        }
+        final scope = ActionScope.current;
+        Future<T> read<T>(Future<T> request) =>
+            scope == null ? request : scope.wait(request);
+        await read(
+            _engineService.testProfile(engineId: engine, profile: profile));
+        final found = await read(
+            _engineService.listBuckets(engineId: engine, profile: profile));
+        scope?.check();
         bannerMessage =
-            'Endpoint ${profile.name} responded successfully. Bucket list returned ${foundBuckets.length} bucket(s).';
-        _addEvent(
-          level: foundBuckets.isEmpty ? 'WARN' : 'INFO',
-          category: 'Profiles',
-          message:
-              'Profile ${profile.name} test completed. Bucket list returned ${foundBuckets.length} bucket(s).',
-          profileId: profile.id,
-          source: 'profiles',
-        );
+            'Connection test succeeded: ${found.length} bucket(s). Draft was not saved or activated.';
+        bannerSeverity = BannerSeverity.success;
       });
     });
   }
 
-  Future<void> saveProfile(EndpointProfile profile) async {
+  Future<bool> saveProfile(EndpointProfile profile) async {
     profile = normalizeEndpointProfile(profile);
     updateProfile(profile);
     if (selectedProfile == null) {
@@ -2327,9 +2426,11 @@ class AppController extends ChangeNotifier {
     }
     final persisted = await _persistState(
       allowCredentialStoreRecovery: true,
+      explicitProfileIds: {profile.id},
     );
     if (persisted) _credentialStoreError = null;
     _lastProfileSaveSucceeded = persisted;
+    persistenceState.recordProfile(profile.id, persisted);
     _addEvent(
         level: persisted ? 'INFO' : 'ERROR',
         category: 'Profiles',
@@ -2345,6 +2446,7 @@ class AppController extends ChangeNotifier {
     bannerSeverity =
         persisted ? BannerSeverity.success : BannerSeverity.warning;
     notifyListeners();
+    return persisted;
   }
 
   Future<void> deleteProfile(String profileId) async {
@@ -2371,7 +2473,7 @@ class AppController extends ChangeNotifier {
         defaultProfileId: profiles.isEmpty ? '' : profiles.first.id,
       );
     }
-    bannerMessage = 'Deleted endpoint profile.';
+    bannerMessage = 'Removed endpoint profile from this session.';
     _addEvent(
       level: 'INFO',
       category: 'Profiles',
@@ -2379,7 +2481,11 @@ class AppController extends ChangeNotifier {
       profileId: profileId,
       source: 'profiles',
     );
-    await _persistState();
+    final saved = await _persistState();
+    bannerMessage = saved
+        ? 'Deleted endpoint profile.'
+        : 'Profile removed for this session; deletion could not be saved.';
+    bannerSeverity = saved ? BannerSeverity.success : BannerSeverity.warning;
     notifyListeners();
   }
 
@@ -2391,7 +2497,8 @@ class AppController extends ChangeNotifier {
       message: 'Updated default engine to $engineId.',
       source: 'engine',
     );
-    await setEngine(engineId);
+    await _persistState();
+    notifyListeners();
   }
 
   Future<void> setDefaultProfile(String profileId) async {
@@ -2404,7 +2511,8 @@ class AppController extends ChangeNotifier {
       profileId: profile.id,
       source: 'profiles',
     );
-    await setSelectedProfileById(profile.id);
+    await _persistState();
+    notifyListeners();
   }
 
   Future<void> addSampleProfile() async {
@@ -2643,6 +2751,7 @@ class AppController extends ChangeNotifier {
         ? null
         : profiles.firstWhere((profile) => profile.id == nextSelectedId);
     final persisted = await _persistState(
+      explicitProfileIds: importedProfiles.map((profile) => profile.id).toSet(),
       allowCredentialStoreRecovery: containsImportedCredentials,
     );
     if (persisted && containsImportedCredentials) {
@@ -3049,7 +3158,7 @@ class AppController extends ChangeNotifier {
     if (run == null) {
       return null;
     }
-    return run.resultSummary ?? _syntheticBenchmarkSummary(run);
+    return run.resultSummary;
   }
 
   Map<String, int> benchmarkOperationsForRun(BenchmarkRun? run) {
@@ -3347,8 +3456,19 @@ class AppController extends ChangeNotifier {
     try {
       await operation();
     } on ListingCancelled {
-      _listingCancelled = true;
-      _showListingCancelled();
+      if (ActionScope.current != null) {
+        ActionScope.current!.cancel();
+        bannerMessage = _isListingActionKey(_busyTaskIds.entries
+                    .where((e) => _actionScopes[e.value] == ActionScope.current)
+                    .firstOrNull
+                    ?.key ??
+                '')
+            ? 'Listing cancelled. Keeping the results already loaded.'
+            : 'Action stopped. Completed work is retained.';
+      } else {
+        _listingCancelled = true;
+        _showListingCancelled();
+      }
       notifyListeners();
     } on EngineException catch (error) {
       _guardErrorSequence += 1;
@@ -3394,6 +3514,9 @@ class AppController extends ChangeNotifier {
       return;
     }
     final taskId = _nextTaskId(actionKey);
+    final parentScope = ActionScope.current;
+    final scope = ActionScope(engineId: activeEngineId);
+    _actionScopes[taskId] = scope;
     final startedAt = DateTime.now();
     final guardMarker = _guardErrorSequence;
     _busyActions.add(actionKey);
@@ -3414,7 +3537,7 @@ class AppController extends ChangeNotifier {
           outputLines: <String>[busyMessage],
           workspaceTab: activeTab,
           actionKey: actionKey,
-          canCancel: _isListingActionKey(actionKey),
+          canCancel: true,
         ),
       );
     }
@@ -3425,7 +3548,9 @@ class AppController extends ChangeNotifier {
     notifyListeners();
     Object? uncaughtError;
     try {
-      await operation();
+      await scope.run(operation);
+    } on ListingCancelled {
+      scope.cancel();
     } catch (error) {
       uncaughtError = error;
       rethrow;
@@ -3434,19 +3559,28 @@ class AppController extends ChangeNotifier {
           uncaughtError != null || _guardErrorSequence != guardMarker;
       final currentTask = trackTask ? _taskById(taskId) : null;
       if (currentTask != null) {
-        final cancelled = _isListingActionKey(actionKey) && _listingCancelled;
-        final summary = cancelled
-            ? 'Cancelled.'
-            : failed
-                ? (bannerMessage ?? 'Action failed.')
-                : 'Completed.';
+        final cancelled = scope.isCancelled || scope.listingCancelled;
+        if (cancelled &&
+            _isListingActionKey(actionKey) &&
+            parentScope != null) {
+          parentScope.listingCancelled = true;
+        }
+        final summary = scope.outcomeUnknown
+            ? 'Action stopped. A remote change may already have completed; inspect the destination before retrying.'
+            : cancelled
+                ? 'Cancelled.'
+                : failed
+                    ? (bannerMessage ?? 'Action failed.')
+                    : 'Completed.';
         _upsertTask(
           currentTask.copyWith(
-            status: cancelled
-                ? 'cancelled'
-                : failed
-                    ? 'failed'
-                    : 'completed',
+            status: scope.outcomeUnknown
+                ? 'unknown'
+                : cancelled
+                    ? 'cancelled'
+                    : failed
+                        ? 'failed'
+                        : 'completed',
             completedAt: DateTime.now(),
             progress: 1,
             outputLines: <String>[
@@ -3457,6 +3591,7 @@ class AppController extends ChangeNotifier {
           ),
         );
       }
+      _actionScopes.remove(taskId);
       _busyActions.remove(actionKey);
       _busyTaskIds.remove(actionKey);
       if (!failed &&
@@ -4004,21 +4139,40 @@ class AppController extends ChangeNotifier {
   }
 
   Future<bool> _persistState({
+    Set<String> explicitProfileIds = const {},
     bool allowCredentialStoreRecovery = false,
   }) async {
     final repository = _appStateRepository;
     if (repository == null) {
+      persistenceState.record(false);
       return false;
     }
+    final durableProfiles = <EndpointProfile>[
+      for (final profile in profiles)
+        if (explicitProfileIds.contains(profile.id) ||
+            persistenceState.profileSaved(profile.id) != false)
+          profile
+        else if (_persistedProfiles.containsKey(profile.id))
+          _persistedProfiles[profile.id]!,
+    ];
     try {
       await repository.saveState(
         settings: settings,
-        profiles: profiles,
+        profiles: durableProfiles,
         selectedProfileId: selectedProfile?.id,
         allowCredentialStoreRecovery: allowCredentialStoreRecovery,
       );
+      _persistedProfiles
+        ..clear()
+        ..addEntries(
+            durableProfiles.map((profile) => MapEntry(profile.id, profile)));
+      for (final id in explicitProfileIds) {
+        persistenceState.recordProfile(id, true);
+      }
+      persistenceState.record(true);
       return true;
     } on CredentialStoreException catch (error) {
+      persistenceState.record(false);
       _credentialStoreError = error.message;
       _addEvent(
         level: 'ERROR',
@@ -4028,6 +4182,7 @@ class AppController extends ChangeNotifier {
       );
       return false;
     } catch (error) {
+      persistenceState.record(false);
       _addEvent(
         level: 'ERROR',
         category: 'Persistence',
@@ -4078,6 +4233,8 @@ class AppController extends ChangeNotifier {
   }
 
   void _trackTransferJob(TransferJob job) {
+    _jobEngineOwners.putIfAbsent(
+        job.id, () => ActionScope.current?.engineId ?? activeEngineId);
     final currentTask = _taskById(job.id);
     final now = DateTime.now();
     var rate = currentTask?.bytesPerSecond ?? 0.0;
@@ -4143,7 +4300,7 @@ class AppController extends ChangeNotifier {
       return '$direction cancelled - $percent%';
     }
     if (job.status == 'cancelling') {
-      return 'Stopping upload after in-flight work - $percent%';
+      return 'Stopping $direction after in-flight work - $percent%';
     }
     if (job.status == 'completed') {
       return '$direction complete - 100%';
@@ -4158,6 +4315,9 @@ class AppController extends ChangeNotifier {
   }
 
   void _handleTransferJobUpdate(TransferJob job) {
+    job = preserveTransferCancellation(
+        transferJobs.where((existing) => existing.id == job.id).firstOrNull,
+        job);
     if (_uploadBatch?.consume(job) ?? false) return;
     if (_busyActions.contains(job.direction)) {
       bannerTaskId = job.id;
@@ -4385,372 +4545,5 @@ class AppController extends ChangeNotifier {
           .toDouble();
     }
     return 0;
-  }
-
-  BenchmarkResultSummary _syntheticBenchmarkSummary(BenchmarkRun run) {
-    final operationsByType = _syntheticBenchmarkOperations(
-      run.processedCount,
-      run.config.workloadType,
-      readPercent: run.config.readPercent,
-      writePercent: run.config.writePercent,
-      deletePercent: run.config.deletePercent,
-    );
-    final throughputBase = run.throughputOpsPerSecond == 0
-        ? run.config.concurrentThreads * 120
-        : run.throughputOpsPerSecond;
-    final sampleCount = math.max(12, math.min(36, run.config.durationSeconds));
-    final throughputSeries =
-        List<Map<String, Object?>>.generate(sampleCount, (index) {
-      final second = index + 1;
-      final progress =
-          sampleCount == 1 ? 1.0 : index / math.max(sampleCount - 1, 1);
-      final swing = ((index % 6) - 2.5) * 0.022;
-      final opsPerSecond =
-          (throughputBase * (0.84 + (progress * 0.22) + swing)).round();
-      final averageLatencyMs = run.averageLatencyMs <= 0
-          ? 0.0
-          : run.averageLatencyMs * (0.88 + (progress * 0.2) + (swing / 2));
-      final operations = <String, int>{
-        for (final entry in operationsByType.entries)
-          entry.key: ((opsPerSecond *
-                      (entry.value /
-                          math.max(
-                            run.processedCount,
-                            1,
-                          )))
-                  .round())
-              .clamp(0, opsPerSecond),
-      };
-      return <String, Object?>{
-        'second': second,
-        'label': _benchmarkSampleLabel(second),
-        'opsPerSecond': opsPerSecond,
-        'bytesPerSecond': opsPerSecond * _syntheticAverageObjectSize(run),
-        'averageLatencyMs': double.parse(averageLatencyMs.toStringAsFixed(1)),
-        'p95LatencyMs':
-            double.parse((averageLatencyMs * 1.42).toStringAsFixed(1)),
-        'operations': operations,
-        'latencyByOperationMs': <String, double>{
-          for (final entry in operations.keys)
-            entry: double.parse(
-              (averageLatencyMs * _syntheticOperationLatencyFactor(entry))
-                  .toStringAsFixed(1),
-            ),
-        },
-      };
-    });
-    final sizeLatencyBuckets = run.config.objectSizes.isEmpty
-        ? const <Map<String, Object?>>[]
-        : run.config.objectSizes.map((sizeBytes) {
-            final latency = run.averageLatencyMs <= 0
-                ? 0.0
-                : (run.averageLatencyMs *
-                    (0.5 + (sizeBytes / run.config.objectSizes.last) * 0.6));
-            return <String, Object?>{
-              'sizeBytes': sizeBytes,
-              'avgLatencyMs': double.parse(latency.toStringAsFixed(1)),
-              'p50LatencyMs': double.parse((latency * 0.82).toStringAsFixed(1)),
-              'p95LatencyMs': double.parse((latency * 1.18).toStringAsFixed(1)),
-              'p99LatencyMs': double.parse((latency * 1.42).toStringAsFixed(1)),
-              'count': math.max(
-                  1,
-                  run.processedCount ~/
-                      math.max(
-                        run.config.objectSizes.length,
-                        1,
-                      )),
-            };
-          }).toList();
-    final validated = run.config.validateChecksum ? run.processedCount : 0;
-    final latencyPercentilesMs = <String, double>{
-      'p50': double.parse((run.averageLatencyMs * 0.75).toStringAsFixed(1)),
-      'p75': double.parse((run.averageLatencyMs * 0.9).toStringAsFixed(1)),
-      'p90': double.parse((run.averageLatencyMs * 1.04).toStringAsFixed(1)),
-      'p95': double.parse((run.averageLatencyMs * 1.15).toStringAsFixed(1)),
-      'p99': double.parse((run.averageLatencyMs * 1.45).toStringAsFixed(1)),
-      'p999': double.parse((run.averageLatencyMs * 1.7).toStringAsFixed(1)),
-    };
-    final latencyTimeline = _syntheticLatencyTimeline(
-      throughputSeries: throughputSeries,
-      operationsByType: operationsByType,
-      objectSizes: run.config.objectSizes,
-      averageLatencyMs: run.averageLatencyMs,
-    );
-    return BenchmarkResultSummary(
-      totalOperations: run.processedCount,
-      operationsByType: operationsByType,
-      latencyPercentilesMs: latencyPercentilesMs,
-      throughputSeries: throughputSeries,
-      sizeLatencyBuckets: sizeLatencyBuckets,
-      checksumStats: <String, int>{
-        'validated_success': validated,
-        'validated_failure': 0,
-        'not_used': run.config.validateChecksum ? 0 : run.processedCount,
-      },
-      detailMetrics: <String, Object?>{
-        'sampleCount': sampleCount,
-        'sampleWindowSeconds': 1,
-        'runMode': run.config.testMode,
-        'workloadType': run.config.workloadType,
-        'averageOpsPerSecond': double.parse(
-            (run.processedCount / math.max(sampleCount, 1)).toStringAsFixed(1)),
-        'peakOpsPerSecond': throughputSeries.fold<int>(
-          0,
-          (current, point) => math.max(
-            current,
-            (point['opsPerSecond'] as num?)?.toInt() ?? 0,
-          ),
-        ),
-        'averageBytesPerSecond': throughputSeries.isEmpty
-            ? 0
-            : throughputSeries
-                    .map((point) =>
-                        (point['bytesPerSecond'] as num?)?.toDouble() ?? 0)
-                    .reduce((left, right) => left + right) /
-                throughputSeries.length,
-        'peakBytesPerSecond': throughputSeries.fold<int>(
-          0,
-          (current, point) => math.max(
-            current,
-            (point['bytesPerSecond'] as num?)?.toInt() ?? 0,
-          ),
-        ),
-        'averageObjectSizeBytes': _syntheticAverageObjectSize(run),
-        'checksumValidated': validated,
-        'errorCount': 0,
-        'retryCount': math.max(1, run.processedCount ~/ 180),
-        'bucket': run.config.bucketName,
-        'prefix': run.config.prefix,
-      },
-      latencyPercentilesByOperationMs:
-          _syntheticLatencyPercentilesByOperation(latencyPercentilesMs),
-      operationDetails: _syntheticOperationDetails(
-        operationsByType: operationsByType,
-        throughputSeries: throughputSeries,
-        latencyPercentilesMs: latencyPercentilesMs,
-      ),
-      latencyTimeline: latencyTimeline,
-    );
-  }
-
-  List<Map<String, Object?>> _syntheticLatencyTimeline({
-    required List<Map<String, Object?>> throughputSeries,
-    required Map<String, int> operationsByType,
-    required List<int> objectSizes,
-    required double averageLatencyMs,
-  }) {
-    final sizes = objectSizes.isEmpty ? const <int>[1024 * 1024] : objectSizes;
-    final operations = operationsByType.keys.toList(growable: false);
-    var sequence = 0;
-    return throughputSeries.expand((point) {
-      final second = (point['second'] as num?)?.toInt() ?? 1;
-      final latencyByOperation = Map<String, double>.from(
-        ((point['latencyByOperationMs'] as Map?) ?? const <String, Object?>{})
-            .map(
-          (key, value) => MapEntry(key.toString(), (value as num).toDouble()),
-        ),
-      );
-      final operationCount = operations.length;
-      return operations.asMap().entries.map((entry) {
-        sequence += 1;
-        final operation = entry.value;
-        final elapsedSeconds =
-            math.max(second - 1, 0) + ((entry.key + 1) / (operationCount + 1));
-        final latency = latencyByOperation[operation] ??
-            (averageLatencyMs * _syntheticOperationLatencyFactor(operation));
-        final sizeBytes = sizes[sequence % sizes.length];
-        return <String, Object?>{
-          'sequence': sequence,
-          'operation': operation,
-          'second': second,
-          'elapsedMs': double.parse((elapsedSeconds * 1000).toStringAsFixed(1)),
-          'label': _benchmarkTimelineLabel(elapsedSeconds),
-          'latencyMs': double.parse(latency.toStringAsFixed(1)),
-          'sizeBytes': sizeBytes,
-        };
-      });
-    }).toList(growable: false);
-  }
-
-  String _benchmarkTimelineLabel(double elapsedSeconds) {
-    final fractionDigits = elapsedSeconds >= 100
-        ? 0
-        : elapsedSeconds >= 10
-            ? 1
-            : 2;
-    return '${elapsedSeconds.toStringAsFixed(fractionDigits)}s';
-  }
-
-  int _syntheticAverageObjectSize(BenchmarkRun run) {
-    if (run.config.objectSizes.isEmpty) {
-      return 1024 * 1024;
-    }
-    final total = run.config.objectSizes.fold<int>(
-      0,
-      (current, item) => current + item,
-    );
-    return (total / run.config.objectSizes.length).round();
-  }
-
-  String _benchmarkSampleLabel(int second) {
-    if (second < 60) {
-      return '${second}s';
-    }
-    final minutes = second ~/ 60;
-    final remainingSeconds = second % 60;
-    return '${minutes}m ${remainingSeconds}s';
-  }
-
-  Map<String, Map<String, double>> _syntheticLatencyPercentilesByOperation(
-    Map<String, double> latencyPercentilesMs,
-  ) {
-    return <String, Map<String, double>>{
-      'PUT': _scalePercentiles(latencyPercentilesMs, 1.18),
-      'GET': _scalePercentiles(latencyPercentilesMs, 0.92),
-      'DELETE': _scalePercentiles(latencyPercentilesMs, 0.86),
-      'POST': _scalePercentiles(latencyPercentilesMs, 1.06),
-      'HEAD': _scalePercentiles(latencyPercentilesMs, 0.74),
-    };
-  }
-
-  Map<String, double> _scalePercentiles(
-    Map<String, double> source,
-    double factor,
-  ) {
-    return <String, double>{
-      for (final entry in source.entries)
-        entry.key: double.parse((entry.value * factor).toStringAsFixed(1)),
-    };
-  }
-
-  double _syntheticOperationLatencyFactor(String operation) {
-    return switch (operation.toUpperCase()) {
-      'PUT' => 1.18,
-      'GET' => 0.92,
-      'DELETE' => 0.86,
-      'POST' => 1.06,
-      'HEAD' => 0.74,
-      _ => 1.0,
-    };
-  }
-
-  List<Map<String, Object?>> _syntheticOperationDetails({
-    required Map<String, int> operationsByType,
-    required List<Map<String, Object?>> throughputSeries,
-    required Map<String, double> latencyPercentilesMs,
-  }) {
-    final totalOperations = math.max(
-      operationsByType.values.fold<int>(0, (left, right) => left + right),
-      1,
-    );
-    final latencyByOperation =
-        _syntheticLatencyPercentilesByOperation(latencyPercentilesMs);
-    return operationsByType.entries.map((entry) {
-      final averageOpsPerSecond = throughputSeries.isEmpty
-          ? 0.0
-          : throughputSeries.map((point) {
-                final operations =
-                    (point['operations'] as Map<String, Object?>?) ??
-                        const <String, Object?>{};
-                return (operations[entry.key] as num?)?.toDouble() ?? 0;
-              }).reduce((left, right) => left + right) /
-              throughputSeries.length;
-      final peakOpsPerSecond = throughputSeries.fold<double>(
-        0,
-        (current, point) {
-          final operations = (point['operations'] as Map<String, Object?>?) ??
-              const <String, Object?>{};
-          final value = (operations[entry.key] as num?)?.toDouble() ?? 0;
-          return value > current ? value : current;
-        },
-      );
-      return <String, Object?>{
-        'operation': entry.key,
-        'count': entry.value,
-        'sharePct': (entry.value / totalOperations) * 100,
-        'avgOpsPerSecond': averageOpsPerSecond,
-        'peakOpsPerSecond': peakOpsPerSecond,
-        'avgLatencyMs': latencyByOperation[entry.key]?['p75'] ??
-            latencyPercentilesMs['p75'],
-        'p50LatencyMs': latencyByOperation[entry.key]?['p50'] ??
-            latencyPercentilesMs['p50'],
-        'p95LatencyMs': latencyByOperation[entry.key]?['p95'] ??
-            latencyPercentilesMs['p95'],
-        'p99LatencyMs': latencyByOperation[entry.key]?['p99'] ??
-            latencyPercentilesMs['p99'],
-      };
-    }).toList();
-  }
-
-  Map<String, int> _syntheticBenchmarkOperations(
-    int processedCount,
-    String workloadType, {
-    int readPercent = 34,
-    int writePercent = 33,
-    int deletePercent = 33,
-  }) {
-    if (processedCount <= 0) {
-      return const <String, int>{'PUT': 0, 'GET': 0, 'DELETE': 0};
-    }
-    // Pure workload types.
-    if (workloadType == 'write-only') {
-      return <String, int>{'PUT': processedCount};
-    }
-    if (workloadType == 'read-only') {
-      return <String, int>{'GET': processedCount};
-    }
-    // Custom percentage mix.
-    if (workloadType == 'custom') {
-      final operations = <String, int>{};
-      var assigned = 0;
-      if (writePercent > 0) {
-        final puts = (processedCount * writePercent / 100).floor();
-        operations['PUT'] = puts;
-        assigned += puts;
-      }
-      if (readPercent > 0) {
-        final gets = (processedCount * readPercent / 100).floor();
-        operations['GET'] = gets;
-        assigned += gets;
-      }
-      if (deletePercent > 0) {
-        // Give the remainder to DELETE so total always equals processedCount.
-        operations['DELETE'] = processedCount - assigned;
-      }
-      return operations;
-    }
-    final ratios = switch (workloadType) {
-      'write-heavy' => const <String, int>{
-          'PUT': 52,
-          'GET': 24,
-          'DELETE': 8,
-          'POST': 16
-        },
-      'read-heavy' => const <String, int>{
-          'PUT': 18,
-          'GET': 62,
-          'DELETE': 8,
-          'POST': 12
-        },
-      'delete' => const <String, int>{
-          'PUT': 0,
-          'GET': 0,
-          'DELETE': 92,
-          'POST': 8
-        },
-      _ => const <String, int>{'PUT': 31, 'GET': 31, 'DELETE': 22, 'POST': 16},
-    };
-    final operations = <String, int>{};
-    var assigned = 0;
-    final keys = ratios.keys.toList();
-    for (var index = 0; index < keys.length; index += 1) {
-      final key = keys[index];
-      final value = index == keys.length - 1
-          ? processedCount - assigned
-          : ((processedCount * ratios[key]!) / 100).floor();
-      operations[key] = value;
-      assigned += value;
-    }
-    return operations;
   }
 }

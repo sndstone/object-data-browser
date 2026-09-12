@@ -64,6 +64,13 @@ class MainActivity : FlutterActivity() {
     private val isoFormatter = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
     }
+    private val cancellationTokens = ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicBoolean>()
+    private val requestToken = ThreadLocal<java.util.concurrent.atomic.AtomicBoolean>()
+    private fun ensureRequestActive() {
+        if (requestToken.get()?.get() == true || Thread.currentThread().isInterrupted) throw EngineFailure("cancelled", "Request stopped; completed work is retained.")
+    }
+    private val requestResults = ConcurrentHashMap<String, MethodChannel.Result>()
+    private val requests = ConcurrentHashMap<String, java.util.concurrent.FutureTask<Unit>>()
     private val transferJobs = ConcurrentHashMap<String, TransferJobState>()
     private val benchmarkRuns = ConcurrentHashMap<String, BenchmarkRunState>()
     private val random = Random()
@@ -95,12 +102,25 @@ class MainActivity : FlutterActivity() {
                 ),
             )
 
+            "cancelRequest" -> {
+                val id = stringAnyMap(call.arguments)["requestId"]?.toString()
+                if (id != null) {
+                    cancellationTokens.remove(id)?.set(true)
+                    requests.remove(id)?.cancel(true)
+                    requestResults.remove(id)?.success(mapOf("error" to mapOf("code" to "cancelled", "message" to "Request cancelled.")))
+                }
+                result.success(null)
+            }
             "dispatch" -> {
                 val args = stringAnyMap(call.arguments)
                 val engineId = args["engineId"]?.toString() ?: "android"
                 val method = args["method"]?.toString() ?: "unknown"
                 val params = stringAnyMap(args["params"])
-                executor.execute {
+                val requestId = args["requestId"]?.toString() ?: java.util.UUID.randomUUID().toString()
+                val token = java.util.concurrent.atomic.AtomicBoolean(false)
+                cancellationTokens[requestId] = token
+                val request = java.util.concurrent.FutureTask<Unit> {
+                    requestToken.set(token)
                     val payload = try {
                         dispatch(engineId, method, params)
                     } catch (error: EngineFailure) {
@@ -108,10 +128,16 @@ class MainActivity : FlutterActivity() {
                     } catch (error: Throwable) {
                         mapOf("error" to mapFailure(error).toMap())
                     }
+                    requestToken.remove()
+                    cancellationTokens.remove(requestId)
+                    requests.remove(requestId)
                     runOnUiThread {
-                        result.success(payload)
+                        requestResults.remove(requestId)?.success(payload)
                     }
                 }
+                requestResults[requestId] = result
+                requests[requestId] = request
+                executor.execute(request)
             }
 
             else -> result.notImplemented()
@@ -872,9 +898,11 @@ class MainActivity : FlutterActivity() {
             throw EngineFailure("invalid_config", "Pick at least one object to download.")
         }
         val client = buildClient(profile)
-        val metadataSizes = keys.sumOf { key ->
-            client.getObjectMetadata(GetObjectMetadataRequest(bucketName, key)).contentLength
-        }.toInt()
+        val heads = keys.associateWith { key -> client.getObjectMetadata(GetObjectMetadataRequest(bucketName, key)) }
+        val sizes = heads.mapValues { it.value.contentLength }
+        val totalSize = sizes.values.sum()
+        if (totalSize > Int.MAX_VALUE) throw EngineFailure("unsupported_feature", "Android downloads currently support batches smaller than 2 GiB.")
+        val metadataSizes = totalSize.toInt()
         val strategyLabel = transferStrategyLabel("download", metadataSizes, multipartThresholdMiB)
         val partSizeBytes = if (strategyLabel.startsWith("Multipart")) {
             multipartChunkMiB * 1024 * 1024
@@ -904,8 +932,8 @@ class MainActivity : FlutterActivity() {
         transferJobs[job.id] = job
         var transferred = 0
         keys.forEachIndexed { index, key ->
-            client.getObject(bucketName, key).objectContent.use { input ->
-                val savedDownload = saveToUserDownloads(key, input)
+            client.getObject(com.amazonaws.services.s3.model.GetObjectRequest(bucketName, key).withMatchingETagConstraint(heads.getValue(key).eTag)).objectContent.use { input ->
+                val savedDownload = saveToUserDownloads(key, input, sizes.getValue(key))
                 transferred += savedDownload.sizeBytes
                 job.currentItemLabel = key
                 job.itemsCompleted = index + 1
@@ -1072,20 +1100,9 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun cancelToolExecution(params: Map<String, Any?>): Map<String, Any?> {
-        val jobId = requireString(params, "jobId", "Tool job id is required.")
-        return mapOf(
-            "label" to jobId,
-            "running" to false,
-            "lastStatus" to "Cancelled tool execution $jobId.",
-            "jobId" to jobId,
-            "cancellable" to false,
-            "outputLines" to listOf("Tool execution cancellation is best-effort on Android."),
-            "exitCode" to 130,
-        )
+        throw EngineFailure("unsupported_feature", "Use the active action cancellation handle; tool job IDs are returned only after completion.")
     }
 
-    // Redirects output artifacts into a per-run folder named after the run id so
-    // repeated Start presses never overwrite an earlier run's results.
     private fun benchmarkConfigWithRunDir(config: Map<String, Any?>, runId: String): Map<String, Any?> {
         val updated = config.toMutableMap()
         val defaults = mapOf(
@@ -1201,6 +1218,11 @@ class MainActivity : FlutterActivity() {
         }
 
         val client = AmazonS3Client(credentials, configuration)
+        client.addRequestHandler(object : com.amazonaws.handlers.RequestHandler2() {
+            override fun beforeRequest(request: com.amazonaws.Request<*>?) { ensureRequestActive() }
+            override fun afterResponse(request: com.amazonaws.Request<*>?, response: com.amazonaws.Response<*>?) {}
+            override fun afterError(request: com.amazonaws.Request<*>?, response: com.amazonaws.Response<*>?, error: Exception?) {}
+        })
         client.setEndpoint(profile.endpointUrl.trim().removeSuffix("/"))
         client.setS3ClientOptions(
             S3ClientOptions.builder()
@@ -1585,7 +1607,6 @@ class MainActivity : FlutterActivity() {
                     run.throughputSeries = buildThroughputSeries(
                         opsPerSecondWindow = opsPerSecondWindow,
                         bytesPerSecondWindow = bytesPerSecondWindow,
-                        averageLatency = run.averageLatencyMs,
                     )
                 }
             }
@@ -1606,7 +1627,7 @@ class MainActivity : FlutterActivity() {
             latencies = latencies,
             latenciesByOperation = latenciesByOperation,
             throughputSeries = if (run.throughputSeries.isEmpty()) {
-                buildThroughputSeries(opsPerSecondWindow, bytesPerSecondWindow, run.averageLatencyMs)
+                buildThroughputSeries(opsPerSecondWindow, bytesPerSecondWindow)
             } else {
                 run.throughputSeries
             },
@@ -1689,19 +1710,10 @@ class MainActivity : FlutterActivity() {
         latenciesByOperation: Map<String, List<Double>> = emptyMap(),
         throughputSeries: List<Map<String, Any?>> = run.throughputSeries,
     ): Map<String, Any?> {
-        val totalOperations = max(1, run.processedCount)
-        val sortedLatencies = latencies.sorted()
-        val percentiles = mapOf(
-            "p50" to percentile(sortedLatencies, 0.50),
-            "p75" to percentile(sortedLatencies, 0.75),
-            "p90" to percentile(sortedLatencies, 0.90),
-            "p95" to percentile(sortedLatencies, 0.95),
-            "p99" to percentile(sortedLatencies, 0.99),
-            "p999" to percentile(sortedLatencies, 0.999),
-        )
-        val opPercentiles = latenciesByOperation.mapValues { (_, values) ->
+        fun measuredPercentiles(values: List<Double>): Map<String, Double> {
+            if (values.isEmpty()) return emptyMap()
             val sorted = values.sorted()
-            mapOf(
+            return mapOf(
                 "p50" to percentile(sorted, 0.50),
                 "p75" to percentile(sorted, 0.75),
                 "p90" to percentile(sorted, 0.90),
@@ -1710,88 +1722,42 @@ class MainActivity : FlutterActivity() {
                 "p999" to percentile(sorted, 0.999),
             )
         }
-        val operationDetails = opCounts.map { (operation, count) ->
-            val opLatencies = latenciesByOperation[operation].orEmpty().sorted()
+        val operationDetails = latenciesByOperation.filterValues { it.isNotEmpty() }.map { (operation, values) ->
+            val sorted = values.sorted()
             mapOf(
                 "operation" to operation,
-                "count" to count,
-                "sharePct" to if (totalOperations == 0) 0.0 else (count * 100.0 / totalOperations),
-                "avgOpsPerSecond" to run.throughputOpsPerSecond,
-                "peakOpsPerSecond" to (
-                    throughputSeries.maxOfOrNull {
-                        (it["opsPerSecond"] as? Number)?.toDouble() ?: 0.0
-                    } ?: 0.0
-                ),
-                "avgLatencyMs" to if (opLatencies.isEmpty()) 0.0 else opLatencies.average(),
-                "p50LatencyMs" to percentile(opLatencies, 0.50),
-                "p95LatencyMs" to percentile(opLatencies, 0.95),
-                "p99LatencyMs" to percentile(opLatencies, 0.99),
+                "count" to (opCounts[operation] ?: values.size),
+                "avgLatencyMs" to values.average(),
+                "p50LatencyMs" to percentile(sorted, 0.50),
+                "p95LatencyMs" to percentile(sorted, 0.95),
+                "p99LatencyMs" to percentile(sorted, 0.99),
             )
         }
         return mapOf(
-            "totalOperations" to totalOperations,
-            "operationsByType" to opCounts,
-            "latencyPercentilesMs" to percentiles,
+            "totalOperations" to run.processedCount,
+            "operationsByType" to if (latencies.isEmpty()) emptyMap<String, Int>() else opCounts,
+            "latencyPercentilesMs" to measuredPercentiles(latencies),
+            "latencyPercentilesByOperationMs" to latenciesByOperation
+                .filterValues { it.isNotEmpty() }.mapValues { measuredPercentiles(it.value) },
+            "operationDetails" to operationDetails,
             "throughputSeries" to throughputSeries,
-            "sizeLatencyBuckets" to run.benchmarkConfig.objectSizes.map { size ->
-                mapOf(
-                    "sizeBytes" to size,
-                    "avgLatencyMs" to run.averageLatencyMs,
-                    "p50LatencyMs" to percentiles["p50"],
-                    "p95LatencyMs" to percentiles["p95"],
-                    "p99LatencyMs" to percentiles["p99"],
-                    "count" to totalOperations,
-                )
-            },
-            "checksumStats" to mapOf(
-                "validated_success" to totalOperations,
-                "validated_failure" to 0,
-                "not_used" to 0,
-            ),
             "detailMetrics" to mapOf(
-                "sampleCount" to totalOperations,
+                "sampleCount" to latencies.size,
                 "sampleWindowSeconds" to 1,
                 "averageOpsPerSecond" to run.throughputOpsPerSecond,
-                "peakOpsPerSecond" to (
-                    throughputSeries.maxOfOrNull {
-                        (it["opsPerSecond"] as? Number)?.toDouble() ?: 0.0
-                    } ?: 0.0
-                ),
-                "averageBytesPerSecond" to (
-                    throughputSeries.map {
-                        (it["bytesPerSecond"] as? Number)?.toDouble() ?: 0.0
-                    }.average().takeIf { !it.isNaN() } ?: 0.0
-                ),
-                "peakBytesPerSecond" to (
-                    throughputSeries.maxOfOrNull {
-                        (it["bytesPerSecond"] as? Number)?.toDouble() ?: 0.0
-                    } ?: 0.0
-                ),
-                "averageObjectSizeBytes" to run.benchmarkConfig.objectSizes.average(),
-                "checksumValidated" to totalOperations,
-                "errorCount" to if (run.status == "failed") 1 else 0,
-                "retryCount" to 0,
+                "peakOpsPerSecond" to throughputSeries.maxOfOrNull {
+                    (it["opsPerSecond"] as? Number)?.toDouble() ?: 0.0
+                },
+                "peakBytesPerSecond" to throughputSeries.maxOfOrNull {
+                    (it["bytesPerSecond"] as? Number)?.toDouble() ?: 0.0
+                },
             ),
-            "latencyPercentilesByOperationMs" to opPercentiles,
-            "operationDetails" to operationDetails,
-            "latencyTimeline" to throughputSeries.mapIndexed { index, point ->
-                mapOf(
-                    "sequence" to (index + 1),
-                    "operation" to "PUT",
-                    "second" to (point["second"] ?: index + 1),
-                    "elapsedMs" to ((index + 1) * 1000.0),
-                    "label" to "${index + 1}s",
-                    "latencyMs" to (point["averageLatencyMs"] ?: run.averageLatencyMs),
-                    "sizeBytes" to run.benchmarkConfig.objectSizes[index % run.benchmarkConfig.objectSizes.size],
-                )
-            },
         )
     }
 
     private fun buildThroughputSeries(
         opsPerSecondWindow: Map<Int, Int>,
         bytesPerSecondWindow: Map<Int, Long>,
-        averageLatency: Double,
     ): List<Map<String, Any?>> {
         return opsPerSecondWindow.keys.sorted().map { second ->
             mapOf(
@@ -1799,20 +1765,6 @@ class MainActivity : FlutterActivity() {
                 "label" to "${second}s",
                 "opsPerSecond" to (opsPerSecondWindow[second] ?: 0),
                 "bytesPerSecond" to (bytesPerSecondWindow[second] ?: 0L),
-                "averageLatencyMs" to averageLatency,
-                "p95LatencyMs" to averageLatency * 1.35,
-                "operations" to mapOf(
-                    "PUT" to ((opsPerSecondWindow[second] ?: 0) * 0.45).toInt(),
-                    "GET" to ((opsPerSecondWindow[second] ?: 0) * 0.35).toInt(),
-                    "DELETE" to ((opsPerSecondWindow[second] ?: 0) * 0.20).toInt(),
-                    "POST" to 0,
-                ),
-                "latencyByOperationMs" to mapOf(
-                    "PUT" to averageLatency * 1.1,
-                    "GET" to averageLatency * 0.9,
-                    "DELETE" to averageLatency * 0.8,
-                    "POST" to averageLatency,
-                ),
             )
         }
     }
@@ -1827,12 +1779,12 @@ class MainActivity : FlutterActivity() {
             "${run.id},${run.status},${run.processedCount},${run.averageLatencyMs},${run.throughputOpsPerSecond}",
         )
         builder.appendLine()
-        builder.appendLine("second,ops_per_second,bytes_per_second,average_latency_ms")
+        builder.appendLine("second,ops_per_second,bytes_per_second")
         val series = summary["throughputSeries"] as? List<*> ?: emptyList<Any?>()
         series.forEach { point ->
             val row = point as? Map<*, *> ?: return@forEach
             builder.appendLine(
-                "${row["second"]},${row["opsPerSecond"]},${row["bytesPerSecond"]},${row["averageLatencyMs"]}",
+                "${row["second"]},${row["opsPerSecond"]},${row["bytesPerSecond"]}",
             )
         }
         return builder.toString()
@@ -2102,9 +2054,10 @@ class MainActivity : FlutterActivity() {
         return Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
     }
 
-    private fun saveToUserDownloads(key: String, input: InputStream): SavedDownload {
+    private fun saveToUserDownloads(key: String, input: InputStream, expectedSize: Long): SavedDownload {
         val safeKey = key.removePrefix("/").ifBlank { "download.bin" }
-        val segments = safeKey.split("/").filter { it.isNotBlank() }
+        val segments = safeKey.replace('\\', '/').split("/").filter { it.isNotBlank() }
+        if (segments.any { it == "." || it == ".." }) throw EngineFailure("invalid_config", "Unsafe download key.")
         val displayName = segments.lastOrNull()?.ifBlank { "download.bin" } ?: "download.bin"
         val relativeChildPath = segments.dropLast(1).joinToString(File.separator)
 
@@ -2128,8 +2081,9 @@ class MainActivity : FlutterActivity() {
                 ?: throw EngineFailure("io_error", "Could not create a file in Downloads.")
             try {
                 val sizeBytes = contentResolver.openOutputStream(uri)?.use { output ->
-                    input.copyTo(output).toInt()
+                    input.copyTo(output)
                 } ?: throw EngineFailure("io_error", "Could not open the Downloads destination.")
+                if (sizeBytes.toLong() != expectedSize) throw EngineFailure("object_conflict", "Download size mismatch; partial file discarded.")
                 ContentValues().apply {
                     put(MediaStore.Downloads.IS_PENDING, 0)
                 }.also { contentResolver.update(uri, it, null, null) }
@@ -2142,7 +2096,7 @@ class MainActivity : FlutterActivity() {
                     append(File.separator)
                     append(displayName)
                 }
-                return SavedDownload(visiblePath, sizeBytes)
+                return SavedDownload(visiblePath, sizeBytes.toInt())
             } catch (error: Throwable) {
                 contentResolver.delete(uri, null, null)
                 throw error
@@ -2155,11 +2109,20 @@ class MainActivity : FlutterActivity() {
             File(userDownloadsPath(), relativeChildPath)
         }
         downloadDirectory.mkdirs()
-        val targetFile = uniqueFile(File(downloadDirectory, displayName))
-        val sizeBytes = targetFile.outputStream().use { output ->
-            input.copyTo(output).toInt()
-        }
-        return SavedDownload(targetFile.absolutePath, sizeBytes)
+        val temporary = File.createTempFile(".odb-", ".part", downloadDirectory)
+        try {
+            val sizeBytes = temporary.outputStream().use { output -> input.copyTo(output) }
+            if (sizeBytes != expectedSize) throw EngineFailure("object_conflict", "Download size mismatch; partial file discarded.")
+            var targetFile = uniqueFile(File(downloadDirectory, displayName))
+            while (true) {
+                try { android.system.Os.link(temporary.absolutePath, targetFile.absolutePath); break }
+                catch (error: android.system.ErrnoException) {
+                    if (error.errno != android.system.OsConstants.EEXIST) throw error
+                    targetFile = uniqueFile(File(downloadDirectory, displayName))
+                }
+            }
+            return SavedDownload(targetFile.absolutePath, sizeBytes.toInt())
+        } finally { temporary.delete() }
     }
 
     private fun uniqueFile(candidate: File): File {

@@ -28,7 +28,7 @@ import (
 	"github.com/aws/smithy-go"
 )
 
-const engineVersion = "2.2.5"
+const engineVersion = "2.2.8"
 
 var supportedMethods = []string{
 	"health", "getCapabilities", "testProfile", "listBuckets",
@@ -1554,6 +1554,7 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 	partsTotal := 0
 	usesMultipart := false
 	objectSizes := make(map[string]int64, len(keys))
+	validators := make(map[string]string, len(keys))
 	for _, key := range keys {
 		headOutput, headErr := client.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(bucketName),
@@ -1564,6 +1565,7 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 		}
 		size := aws.ToInt64(headOutput.ContentLength)
 		objectSizes[key] = size
+		validators[key] = aws.ToString(headOutput.ETag)
 		totalBytes += size
 		if size >= thresholdBytes {
 			usesMultipart = true
@@ -1587,11 +1589,14 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 	emitTransferEvent(buildTransferJob(jobID, label, "download", 0, "queued", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), keys[0], len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
 	for _, key := range keys {
 		size := objectSizes[key]
-		target := filepath.Join(destinationPath, filepath.Base(key))
-		handle, createErr := os.Create(target)
+		beforeObject := bytesTransferred
+		handle, createErr := os.CreateTemp(destinationPath, ".odb-*.part")
 		if createErr != nil {
 			return nil, createErr
 		}
+		target := handle.Name()
+		defer os.Remove(target)
+		defer handle.Close()
 		outputLines = append(outputLines, fmt.Sprintf("Downloading %s (%d bytes) to %s.", key, size, target))
 		if size >= thresholdBytes {
 			if err = handle.Truncate(size); err != nil {
@@ -1637,22 +1642,23 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 					}
 					rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
 					output, getErr := client.GetObject(workerCtx, &s3.GetObjectInput{
-						Bucket: aws.String(bucketName),
-						Key:    aws.String(objectKey),
-						Range:  aws.String(rangeHeader),
+						Bucket:  aws.String(bucketName),
+						Key:     aws.String(objectKey),
+						IfMatch: optionalString(validators[objectKey]),
+						Range:   aws.String(rangeHeader),
 					})
 					if getErr != nil {
 						recordFailure(getErr)
 						return
 					}
-					buffer, readErr := io.ReadAll(output.Body)
+					buffer, readErr := io.ReadAll(io.LimitReader(output.Body, end-start+2))
 					output.Body.Close()
 					if readErr != nil {
 						recordFailure(readErr)
 						return
 					}
 					expectedLength := end - start + 1
-					if int64(len(buffer)) != expectedLength {
+					if aws.ToString(output.ContentRange) != fmt.Sprintf("bytes %d-%d/%d", start, end, size) || int64(len(buffer)) != expectedLength {
 						recordFailure(fmt.Errorf("short read for byte range %d-%d of %s: expected %d bytes, received %d", start, end, objectKey, expectedLength, len(buffer)))
 						return
 					}
@@ -1685,8 +1691,9 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 			}
 		} else {
 			output, getErr := client.GetObject(ctx, &s3.GetObjectInput{
-				Bucket: aws.String(bucketName),
-				Key:    aws.String(key),
+				Bucket:  aws.String(bucketName),
+				Key:     aws.String(key),
+				IfMatch: optionalString(validators[key]),
 			})
 			if getErr != nil {
 				handle.Close()
@@ -1715,7 +1722,21 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 			}
 			output.Body.Close()
 		}
-		handle.Close()
+		if bytesTransferred-beforeObject != size {
+			return nil, fmt.Errorf("download length mismatch; partial file discarded")
+		}
+		if err = handle.Sync(); err != nil {
+			return nil, err
+		}
+		if err = handle.Close(); err != nil {
+			return nil, err
+		}
+		finalPath, publishErr := publishDownload(target, destinationPath, key, asString(params["conflictPolicy"]))
+		if publishErr != nil {
+			return nil, publishErr
+		}
+		os.Remove(target)
+		outputLines = append(outputLines, fmt.Sprintf("Saved %s to %s.", key, finalPath))
 		itemsCompleted++
 		outputLines = append(outputLines, fmt.Sprintf("Finished downloading %s.", key))
 	}

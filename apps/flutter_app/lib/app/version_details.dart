@@ -1,5 +1,5 @@
-const String kApplicationVersion = '2.2.7';
-const String kApplicationBuild = '2.2.7+1';
+const String kApplicationVersion = '2.2.8';
+const String kApplicationBuild = '2.2.8+1';
 
 const Map<String, String> kFlutterDependencyVersions = <String, String>{
   'flutter': 'sdk',
@@ -12,8 +12,8 @@ const Map<String, String> kFlutterDependencyVersions = <String, String>{
 };
 
 const Map<String, String> kBundledEngineVersions = <String, String>{
-  'Rust engine': '2.2.5',
-  'Go engine': '2.2.5',
-  'Python engine': '2.2.5',
-  'Java engine': '2.2.5',
+  'Rust engine': '2.2.8',
+  'Go engine': '2.2.8',
+  'Python engine': '2.2.8',
+  'Java engine': '2.2.8',
 };

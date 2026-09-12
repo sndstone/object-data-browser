@@ -103,3 +103,31 @@ Every engine must:
 - Return structured partial-failure payloads for batch operations
 - Provide progress events for long-running transfers and benchmark runs
 - Respect cancellation requests from the UI shell
+
+## September reliability implementation
+
+- Desktop downloads stage and validate data before publishing. Keep-both is the
+  default; explicit replacement commits only validated files. Python/Go Azure
+  downloads follow the same publication boundary. iOS and Android keep unique
+  destinations and validate size before making files available.
+- Azure copy/move success requires an explicit successful copy status and a
+  matching copy ID. Pending, missing, failed, aborted, or replaced copy identities
+  retain the source. Moves to the same source/destination are rejected.
+- Cancel in action details and inline browser controls targets the owning action.
+  Read requests stop independently; cancelling a dispatched mutation can produce
+  an unknown outcome. This does not promise rollback or restart-resume.
+- Python/Java transfer cancellation first reports `cancelling`; the original
+  transfer response confirms completion of cleanup. Go/Rust active transfer
+  controls remain unsupported and are explained in Tasks; batch cancellation
+  still stops remaining files. Native bridges can stop the parent transfer
+  action, with an unresolved remote outcome reported when applicable.
+- Benchmark views use engine measurements. Missing detail stays unavailable;
+  demonstration data remains in MockEngineService.
+- Settings has six groups. Connection Test, Save, Use profile, and startup
+  preferences are independent. Ordinary settings writes do not save unsaved
+  profile credentials. Benchmark-only settings are labeled and grouped as such.
+
+The broad requirements above describe desired parity. Interactive controls and
+provider support are governed by the explicit capability exceptions; they are
+not unconditional guarantees for every engine. See
+[implementation and verification](improvements-implementation-2026-09.md).

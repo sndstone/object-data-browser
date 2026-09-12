@@ -1,3 +1,4 @@
+mod download_destination;
 use aws_config::{retry::RetryConfig, BehaviorVersion};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::interceptors::{
@@ -19,6 +20,7 @@ use aws_sdk_s3::types::{
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use chrono::{SecondsFormat, Utc};
+use download_destination::StagedDownload;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
@@ -36,7 +38,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-const ENGINE_VERSION: &str = "2.2.5";
+const ENGINE_VERSION: &str = "2.2.8";
 
 const SUPPORTED_METHODS: &[&str] = &[
     "health",
@@ -243,9 +245,12 @@ fn main() {
                 }
             }
             Err(_) => {
-                println!("{}", json!({"requestId": null, "ok": false, "error": {"code": "invalid_config", "message": "Malformed JSON request."}}));
+                println!(
+                    "{}",
+                    json!({"requestId": null, "ok": false, "error": {"code": "invalid_config", "message": "Malformed JSON request."}})
+                );
                 continue;
-            },
+            }
         };
 
         if let Ok(output) = serde_json::to_string(&response) {
@@ -333,7 +338,9 @@ async fn handle_request(request: Request) -> SidecarResult {
         "startUpload" => start_upload(request.params).await,
         "startDownload" => start_download(request.params).await,
         "pauseTransfer" | "resumeTransfer" | "cancelTransfer" => Err(SidecarError::new(
-            "unsupported_feature", "Interactive transfer control is unavailable in the sequential Rust engine.")),
+            "unsupported_feature",
+            "Interactive transfer control is unavailable in the sequential Rust engine.",
+        )),
         "generatePresignedUrl" => generate_presigned_url(request.params).await,
         "runPutTestData" => run_put_test_data(request.params).await,
         "runDeleteAll" => run_delete_all(request.params).await,
@@ -1643,6 +1650,7 @@ async fn start_upload(params: Value) -> SidecarResult {
 
 async fn download_object_ranged(
     client: &Client,
+    validator: Option<String>,
     bucket_name: &str,
     key: &str,
     target: &Path,
@@ -1666,6 +1674,7 @@ async fn download_object_ranged(
         let start = index * chunk_bytes;
         let end = (start + chunk_bytes - 1).min(object_size.saturating_sub(1));
         let client = client.clone();
+        let validator = validator.clone();
         let bucket_name = bucket_name.to_string();
         let key = key.to_string();
         let target = target.to_path_buf();
@@ -1681,9 +1690,13 @@ async fn download_object_ranged(
                 .bucket(&bucket_name)
                 .key(&key)
                 .range(format!("bytes={start}-{end}"))
+                .set_if_match(validator)
                 .send()
                 .await
                 .map_err(map_sdk_error)?;
+            if output.content_range() != Some(format!("bytes {start}-{end}/{object_size}").as_str()) {
+                return Err(SidecarError::new("object_conflict", "Download range mismatch; partial file discarded."));
+            }
             let mut file = tokio::fs::OpenOptions::new()
                 .write(true)
                 .open(&target)
@@ -1699,6 +1712,7 @@ async fn download_object_ranged(
                 .await
                 .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?
             {
+                if range_bytes + chunk.len() as u64 > end-start+1 { return Err(SidecarError::new("object_conflict", "Oversized range body.")); }
                 file.write_all(&chunk)
                     .await
                     .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
@@ -1782,6 +1796,7 @@ async fn start_download(params: Value) -> SidecarResult {
     let mut parts_total = 0_u64;
     let mut uses_multipart = false;
     let mut object_sizes = BTreeMap::new();
+    let mut validators = BTreeMap::new();
     for key in &keys {
         let head = client
             .head_object()
@@ -1792,6 +1807,7 @@ async fn start_download(params: Value) -> SidecarResult {
             .map_err(map_sdk_error)?;
         let size = head.content_length().unwrap_or_default() as u64;
         object_sizes.insert(key.clone(), size);
+        validators.insert(key.clone(), head.e_tag().map(str::to_owned));
         total_bytes += size;
         if size >= multipart_threshold_bytes {
             uses_multipart = true;
@@ -1834,7 +1850,9 @@ async fn start_download(params: Value) -> SidecarResult {
     });
     progress.emit("queued", keys.first().cloned());
     for key in &keys {
-        let target = destination.join(Path::new(key).file_name().unwrap_or_default());
+        let staged = StagedDownload::new(&destination)
+            .map_err(|e| SidecarError::new("invalid_config", e.to_string()))?;
+        let target = staged.0.clone();
         let object_size = *object_sizes.get(key).unwrap_or(&0);
         {
             let mut state = progress.state.lock().unwrap();
@@ -1846,6 +1864,7 @@ async fn start_download(params: Value) -> SidecarResult {
         if object_size >= multipart_threshold_bytes {
             download_object_ranged(
                 &client,
+                validators.get(key).cloned().flatten(),
                 &bucket_name,
                 key,
                 &target,
@@ -1860,6 +1879,7 @@ async fn start_download(params: Value) -> SidecarResult {
                 .get_object()
                 .bucket(&bucket_name)
                 .key(key)
+                .set_if_match(validators.get(key).cloned().flatten())
                 .send()
                 .await
                 .map_err(map_sdk_error)?;
@@ -1878,6 +1898,12 @@ async fn start_download(params: Value) -> SidecarResult {
                     .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
                 object_bytes += chunk.len() as u64;
             }
+            if object_bytes != object_size {
+                return Err(SidecarError::new(
+                    "object_conflict",
+                    "Download size mismatch; partial file discarded.",
+                ));
+            }
             file.flush()
                 .await
                 .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
@@ -1887,8 +1913,18 @@ async fn start_download(params: Value) -> SidecarResult {
             }
             progress.emit("running", Some(key.clone()));
         }
+        let final_path = staged
+            .publish(
+                &destination,
+                key,
+                params["conflictPolicy"].as_str().unwrap_or("keepBoth"),
+            )
+            .map_err(|e| SidecarError::new("invalid_config", e.to_string()))?;
         {
             let mut state = progress.state.lock().unwrap();
+            state
+                .output_lines
+                .push(format!("Saved {key} to {}.", final_path.display()));
             state.items_completed += 1;
             state
                 .output_lines
@@ -4619,189 +4655,6 @@ async fn run_benchmark_operation(state: &mut Value, client: &Client) -> Result<(
         );
     }
     Ok(())
-}
-
-fn benchmark_summary(processed_count: usize, workload_type: &str) -> Value {
-    let operations = benchmark_operations(processed_count, workload_type);
-    let throughput_series = benchmark_throughput_series(&operations);
-    let average_ops = throughput_series
-        .iter()
-        .filter_map(|item| item["opsPerSecond"].as_f64())
-        .sum::<f64>()
-        / throughput_series.len().max(1) as f64;
-    let peak_ops = throughput_series
-        .iter()
-        .filter_map(|item| item["opsPerSecond"].as_u64())
-        .max()
-        .unwrap_or(0);
-    let average_bytes = throughput_series
-        .iter()
-        .filter_map(|item| item["bytesPerSecond"].as_f64())
-        .sum::<f64>()
-        / throughput_series.len().max(1) as f64;
-    let peak_bytes = throughput_series
-        .iter()
-        .filter_map(|item| item["bytesPerSecond"].as_u64())
-        .max()
-        .unwrap_or(0);
-    let latency_percentiles = json!({
-        "p50": 18.4,
-        "p75": 27.8,
-        "p90": 35.6,
-        "p95": 41.2,
-        "p99": 63.8,
-        "p999": 81.4,
-    });
-    let latency_by_operation = benchmark_latency_by_operation();
-    json!({
-        "totalOperations": processed_count,
-        "operationsByType": operations,
-        "latencyPercentilesMs": latency_percentiles,
-        "latencyPercentilesByOperationMs": latency_by_operation,
-        "throughputSeries": throughput_series,
-        "sizeLatencyBuckets": benchmark_size_latency_buckets(),
-        "checksumStats": {
-            "validated_success": processed_count,
-            "validated_failure": 0,
-            "not_used": 0
-        },
-        "detailMetrics": {
-            "sampleCount": 24,
-            "sampleWindowSeconds": 1,
-            "averageOpsPerSecond": average_ops,
-            "peakOpsPerSecond": peak_ops,
-            "averageBytesPerSecond": average_bytes,
-            "peakBytesPerSecond": peak_bytes,
-            "averageObjectSizeBytes": 29442048,
-            "checksumValidated": processed_count,
-            "errorCount": 0,
-            "retryCount": (processed_count / 180).max(1),
-        },
-        "operationDetails": benchmark_operation_details(&operations),
-    })
-}
-
-fn benchmark_operations(
-    processed_count: usize,
-    workload_type: &str,
-) -> serde_json::Map<String, Value> {
-    let ratios = match workload_type {
-        "write-heavy" => [("PUT", 60usize), ("GET", 30usize), ("DELETE", 10usize)],
-        "read-heavy" => [("PUT", 25usize), ("GET", 65usize), ("DELETE", 10usize)],
-        "delete" => [("PUT", 0usize), ("GET", 0usize), ("DELETE", 100usize)],
-        _ => [("PUT", 34usize), ("GET", 33usize), ("DELETE", 33usize)],
-    };
-    let mut assigned = 0usize;
-    let mut operations = serde_json::Map::new();
-    for (index, (name, ratio)) in ratios.iter().enumerate() {
-        let value = if index == ratios.len() - 1 {
-            processed_count.saturating_sub(assigned)
-        } else {
-            (processed_count * *ratio) / 100
-        };
-        assigned += value;
-        operations.insert((*name).to_string(), Value::from(value as i64));
-    }
-    operations
-}
-
-fn benchmark_throughput_series(operations: &serde_json::Map<String, Value>) -> Vec<Value> {
-    let total_ratio = operations
-        .values()
-        .filter_map(Value::as_f64)
-        .sum::<f64>()
-        .max(1.0);
-    (0..24)
-        .map(|index| {
-            let second = index + 1;
-            let progress = index as f64 / 23.0;
-            let swing = ((index % 6) as f64 - 2.5) * 0.022;
-            let ops_per_second = (1900.0 * (0.88 + (progress * 0.24) + swing)).round();
-            let average_latency_ms = 21.0 + (progress * 15.0) + (((index % 5) as f64) * 0.6);
-            let mut per_operation = serde_json::Map::new();
-            let mut per_operation_latency = serde_json::Map::new();
-            for (operation, count) in operations {
-                let ratio = count.as_f64().unwrap_or(0.0) / total_ratio;
-                let op_count = (ops_per_second * ratio).round() as u64;
-                per_operation.insert(operation.clone(), json!(op_count));
-                per_operation_latency.insert(
-                    operation.clone(),
-                    json!(round1(
-                        average_latency_ms * operation_latency_factor(operation)
-                    )),
-                );
-            }
-            json!({
-                "second": second,
-                "label": format!("{}s", second),
-                "opsPerSecond": ops_per_second as u64,
-                "bytesPerSecond": (ops_per_second as u64) * 65536,
-                "averageLatencyMs": round1(average_latency_ms),
-                "p95LatencyMs": round1(average_latency_ms * 1.44),
-                "operations": per_operation,
-                "latencyByOperationMs": per_operation_latency,
-            })
-        })
-        .collect()
-}
-
-fn benchmark_size_latency_buckets() -> Vec<Value> {
-    vec![
-        json!({"sizeBytes": 4096, "avgLatencyMs": 8.2, "p50LatencyMs": 6.7, "p95LatencyMs": 9.7, "p99LatencyMs": 11.6, "count": 140}),
-        json!({"sizeBytes": 65536, "avgLatencyMs": 17.6, "p50LatencyMs": 14.4, "p95LatencyMs": 20.8, "p99LatencyMs": 24.9, "count": 140}),
-        json!({"sizeBytes": 1048576, "avgLatencyMs": 42.4, "p50LatencyMs": 34.8, "p95LatencyMs": 50.0, "p99LatencyMs": 60.2, "count": 120}),
-        json!({"sizeBytes": 104857600, "avgLatencyMs": 286.2, "p50LatencyMs": 234.7, "p95LatencyMs": 337.7, "p99LatencyMs": 406.4, "count": 60}),
-        json!({"sizeBytes": 1073741824, "avgLatencyMs": 1924.5, "p50LatencyMs": 1578.1, "p95LatencyMs": 2270.9, "p99LatencyMs": 2732.8, "count": 20}),
-    ]
-}
-
-fn benchmark_latency_by_operation() -> Value {
-    json!({
-        "PUT": {"p50": 21.7, "p75": 32.8, "p90": 42.0, "p95": 48.6, "p99": 75.3, "p999": 96.1},
-        "GET": {"p50": 16.9, "p75": 25.6, "p90": 32.8, "p95": 37.9, "p99": 58.7, "p999": 74.9},
-        "DELETE": {"p50": 15.8, "p75": 23.9, "p90": 30.6, "p95": 35.4, "p99": 54.9, "p999": 70.0},
-        "POST": {"p50": 19.5, "p75": 29.5, "p90": 37.7, "p95": 43.7, "p99": 67.6, "p999": 86.3},
-        "HEAD": {"p50": 13.6, "p75": 20.6, "p90": 26.3, "p95": 30.5, "p99": 47.2, "p999": 60.3},
-    })
-}
-
-fn benchmark_operation_details(operations: &serde_json::Map<String, Value>) -> Vec<Value> {
-    let total = operations
-        .values()
-        .filter_map(Value::as_f64)
-        .sum::<f64>()
-        .max(1.0);
-    let latency_by_operation = benchmark_latency_by_operation();
-    operations
-        .iter()
-        .map(|(operation, count)| {
-            let latency = &latency_by_operation[operation];
-            let share_pct = (count.as_f64().unwrap_or(0.0) / total) * 100.0;
-            let avg_ops = 2250.0 * (count.as_f64().unwrap_or(0.0) / total);
-            json!({
-                "operation": operation,
-                "count": count,
-                "sharePct": round1(share_pct),
-                "avgOpsPerSecond": round1(avg_ops),
-                "peakOpsPerSecond": round1(avg_ops * 1.22),
-                "avgLatencyMs": latency["p75"],
-                "p50LatencyMs": latency["p50"],
-                "p95LatencyMs": latency["p95"],
-                "p99LatencyMs": latency["p99"],
-            })
-        })
-        .collect()
-}
-
-fn operation_latency_factor(operation: &str) -> f64 {
-    match operation.to_uppercase().as_str() {
-        "PUT" => 1.18,
-        "GET" => 0.92,
-        "DELETE" => 0.86,
-        "POST" => 1.06,
-        "HEAD" => 0.74,
-        _ => 1.0,
-    }
 }
 
 fn append_log(state: &mut Value, line: &str) {
