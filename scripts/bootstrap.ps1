@@ -204,7 +204,17 @@ function Ensure-Flutter {
             }
         }
     }
-    $InstalledVersion = ((& $FlutterBat --version --machine) | ConvertFrom-Json).frameworkVersion
+    # A fresh SDK prints tool/pub initialization messages even with --machine.
+    # Finish initialization first so the following command emits only JSON.
+    & $FlutterBat --version
+    if ($LASTEXITCODE -ne 0) {
+        throw "Flutter SDK initialization failed."
+    }
+    $VersionJson = (& $FlutterBat --version --machine | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to read the installed Flutter version."
+    }
+    $InstalledVersion = ($VersionJson | ConvertFrom-Json).frameworkVersion
     if ($InstalledVersion -ne $FlutterVersion) {
         throw "Flutter cache is $InstalledVersion; expected $FlutterVersion. Move $Dir aside and rerun bootstrap."
     }
