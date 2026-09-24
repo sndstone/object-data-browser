@@ -50,9 +50,18 @@ void main() {
             await tester.pumpAndSettle();
             expect(tester.takeException(), isNull, reason: section);
             if (section == 'Connections') {
-              final connection = find.ancestor(
+              // Phones list rows first; wider layouts show the open
+              // profile's editor card in place of its row.
+              final row = find.ancestor(
                   of: find.byIcon(Icons.chevron_right),
                   matching: find.byType(ListTile));
+              final connection = row.evaluate().isNotEmpty
+                  ? row
+                  : find
+                      .descendant(
+                          of: find.byType(ExpansionTile),
+                          matching: find.text('A'))
+                      .first;
               await tester.ensureVisible(connection);
               await tester.pumpAndSettle();
               await tester.tap(connection);

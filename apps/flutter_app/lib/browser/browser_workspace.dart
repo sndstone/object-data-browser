@@ -22,6 +22,7 @@ import '../theme/app_theme.dart';
 import '../theme/breakpoints.dart';
 import '../widgets/app_select_field.dart';
 import '../widgets/compact_selector.dart';
+import '../widgets/underline_tabs.dart';
 import '../widgets/source_code_preview.dart';
 import 'object_panel.dart';
 import '../theme/app_motion.dart';
@@ -97,6 +98,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   AppSettings get _settings => controller.settings;
+
+  static const double _rightInspectorMinWidth = 1180;
 
   bool _desktopCompact(BuildContext context) {
     return AppTheme.isDesktopPlatform(Theme.of(context).platform);
@@ -402,18 +405,18 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         final desktopCompact = _desktopCompact(context);
         final sizeClass = Breakpoints.sizeClass(width);
         if (sizeClass == WindowSizeClass.phone) {
-          return _mobileBrowserShell(context);
+          return _responsiveLayout(context,
+              phone: true, child: _mobileBrowserShell(context));
         }
 
         // Tablet range (and a desktop window resized into it): keep buckets
         // and objects side by side, with inspector access through the info
         // button used by compact object controls.
         final tablet = sizeClass == WindowSizeClass.tablet;
-        final smallDesktop = sizeClass == WindowSizeClass.smallDesktop;
-        final compactRightInspector = desktopCompact && smallDesktop;
+        // Wide windows are short on height, not width, so the inspector
+        // docks beside the list once the object panel keeps enough room.
         final inspectorOnRight = !tablet &&
-            !smallDesktop &&
-            !compactRightInspector &&
+            width >= _rightInspectorMinWidth &&
             _settings.browserInspectorLayout == BrowserInspectorLayout.right;
         final showDockedInspector =
             !tablet && controller.settings.browserInspectorVisible;
@@ -455,25 +458,28 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           );
         }
 
-        return AnimatedPadding(
-          duration: AppMotion.duration(context,
-              enabled: controller.settings.enableAnimations, milliseconds: 220),
-          curve: Curves.easeOutCubic,
-          padding: EdgeInsets.all(outerPadding),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              SizedBox(
-                width: bucketPanelWidth,
-                child: _bucketPanel(context, compact: false),
+        return _responsiveLayout(context,
+            phone: false,
+            child: AnimatedPadding(
+              duration: AppMotion.duration(context,
+                  enabled: controller.settings.enableAnimations,
+                  milliseconds: 220),
+              curve: Curves.easeOutCubic,
+              padding: EdgeInsets.all(outerPadding),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  SizedBox(
+                    width: bucketPanelWidth,
+                    child: _bucketPanel(context, compact: false),
+                  ),
+                  const SizedBox(width: panelGap),
+                  Expanded(
+                    child: objectAndInspector,
+                  ),
+                ],
               ),
-              const SizedBox(width: panelGap),
-              Expanded(
-                child: objectAndInspector,
-              ),
-            ],
-          ),
-        );
+            ));
       },
     );
 
@@ -506,6 +512,15 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       ]),
     );
   }
+
+  Widget _responsiveLayout(BuildContext context,
+          {required bool phone, required Widget child}) =>
+      ResponsiveLayoutTransition(
+        layoutKey: phone,
+        duration: AppMotion.duration(context,
+            enabled: controller.settings.enableAnimations, milliseconds: 240),
+        child: child,
+      );
 
   Future<void> _showCreatePrefixDialog(BuildContext context) async {
     final value = await showDialog<String>(
@@ -618,6 +633,18 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         return;
       case 'inspect':
         await controller.setSelectedObject(object, openFolderOnSelect: false);
+        if (!mounted || !context.mounted) return;
+        // Use the workspace width, which can be narrower than the window
+        // because of the navigation rail or UI scaling.
+        final width = context.size?.width ?? MediaQuery.sizeOf(context).width;
+        if (Breakpoints.isPhone(width)) {
+          setState(() => _mobileSection = _MobileBrowserSection.inspector);
+        } else if (width < Breakpoints.smallDesktop) {
+          await _showInspectorDialog(context);
+        } else {
+          await controller.updateSettings(
+              controller.settings.copyWith(browserInspectorVisible: true));
+        }
         return;
       case 'download':
         await controller.startSampleDownload();
@@ -645,7 +672,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             maxWidth: math.min(MediaQuery.sizeOf(context).width - 48, 920),
             maxHeight: MediaQuery.sizeOf(context).height * 0.88,
           ),
-          child: _inspectorPanel(context, compact: false),
+          child: AnimatedBuilder(
+            animation: controller,
+            builder: (context, _) => _inspectorPanel(context, compact: false),
+          ),
         ),
       ),
     );
@@ -874,6 +904,20 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     final tab = availableTabs.contains(controller.inspectorTab)
         ? controller.inspectorTab
         : availableTabs.first;
+    // Tabs for the current context sit in the row; bucket and diagnostic
+    // views stay one click away in the overflow menu.
+    final primaryTabs = controller.selectedObject == null
+        ? const [
+            BrowserInspectorTab.bucketInfo,
+            BrowserInspectorTab.bucketAdmin,
+            BrowserInspectorTab.versions,
+          ]
+        : const [
+            BrowserInspectorTab.objectDetails,
+            BrowserInspectorTab.objectPreview,
+            BrowserInspectorTab.versions,
+            BrowserInspectorTab.presign,
+          ];
     final desktopCompact = _desktopCompact(context);
     final panelBody = DirectionalSwitcher(
       position: tab.index,
@@ -935,45 +979,21 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                   },
                   icon: const Icon(Icons.close)),
             ]),
-            const SizedBox(height: 12),
-            CompactSelector<InspectorGroup>(
-                expand: true,
-                selected: tab.group,
-                dense: true,
-                options: [
-                  for (final group in InspectorGroup.values)
-                    if (availableTabs.any((t) => t.group == group))
-                      CompactSelectorOption(
-                          value: group,
-                          label: switch (group) {
-                            InspectorGroup.object => 'Object',
-                            InspectorGroup.bucket => 'Bucket',
-                            InspectorGroup.diagnostics => 'Diagnostics'
-                          })
-                ],
-                onChanged: (group) {
-                  final tabs =
-                      availableTabs.where((t) => t.group == group).toList();
-                  final remembered = controller.inspectorGroupTabs[group];
-                  controller.setInspectorTab(
-                      tabs.contains(remembered) ? remembered! : tabs.first);
-                }),
-            const SizedBox(height: 6),
-            CompactSelector<BrowserInspectorTab>(
+            const SizedBox(height: 8),
+            UnderlineTabs<BrowserInspectorTab>(
               selected: tab,
-              wrap: false,
-              dense: true,
               onChanged: controller.setInspectorTab,
-              options: availableTabs
-                  .where((t) => t.group == tab.group)
-                  .map(
-                    (entry) => CompactSelectorOption(
-                      value: entry,
-                      icon: _inspectorIcon(entry),
-                      label: _inspectorLabel(entry),
-                    ),
-                  )
-                  .toList(),
+              overflowTooltip: 'More inspector views',
+              tabs: [
+                for (final entry in availableTabs)
+                  if (primaryTabs.contains(entry))
+                    UnderlineTab(value: entry, label: _inspectorLabel(entry)),
+              ],
+              overflow: [
+                for (final entry in availableTabs)
+                  if (!primaryTabs.contains(entry))
+                    UnderlineTab(value: entry, label: _inspectorLabel(entry)),
+              ],
             ),
             const SizedBox(height: 12),
             Expanded(child: panelBody),
@@ -983,27 +1003,16 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     );
   }
 
-  IconData _inspectorIcon(BrowserInspectorTab entry) {
-    return switch (entry) {
-      BrowserInspectorTab.bucketAdmin => Icons.admin_panel_settings_outlined,
-      BrowserInspectorTab.bucketInfo => Icons.info_outline,
-      BrowserInspectorTab.objectDetails => Icons.article_outlined,
-      BrowserInspectorTab.objectPreview => Icons.preview_outlined,
-      BrowserInspectorTab.versions => Icons.history,
-      BrowserInspectorTab.presign => Icons.link,
-      BrowserInspectorTab.tools => Icons.build_circle_outlined,
-      BrowserInspectorTab.eventsAndDebug => Icons.bug_report_outlined,
-    };
-  }
-
   String _inspectorLabel(BrowserInspectorTab entry) {
     return switch (entry) {
       BrowserInspectorTab.bucketAdmin => 'Bucket config',
       BrowserInspectorTab.bucketInfo => 'Bucket info',
-      BrowserInspectorTab.objectDetails => 'Object',
+      BrowserInspectorTab.objectDetails => 'Details',
       BrowserInspectorTab.objectPreview => 'Preview',
-      BrowserInspectorTab.versions => 'Versions',
-      BrowserInspectorTab.presign => 'Share link',
+      BrowserInspectorTab.versions => controller.versions.isEmpty
+          ? 'Versions'
+          : 'Versions · ${controller.versions.length}',
+      BrowserInspectorTab.presign => 'Share',
       BrowserInspectorTab.tools => 'Tools',
       BrowserInspectorTab.eventsAndDebug => 'Events & Debug',
     };
@@ -1217,9 +1226,12 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       key: const ValueKey('object-details'),
       children: [
         _inlineStat('Key', object.key),
-        _inlineStat('Storage class', object.storageClass),
-        _inlineStat('Last modified', formatDateTime(object.modifiedAt)),
         _inlineStat('Size', formatBytes(object.size)),
+        _inlineStat('Last modified', formatDateTime(object.modifiedAt)),
+        _inlineStat('Content type', controller.objectContentType(object)),
+        _inlineStat('Storage class', object.storageClass),
+        if (object.etag != null && object.etag!.isNotEmpty)
+          _inlineStat('ETag', object.etag!),
         const Divider(height: 16),
         Text('Metadata', style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 8),
@@ -2090,31 +2102,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   Widget _inlineStat(String label, String value) {
-    final theme = Theme.of(context);
     if (['Key', 'ETag', 'Bucket', 'Bucket name'].contains(label)) {
       return CopyableValue(label: label, value: value, controller: controller);
     }
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
-      child: RichText(
-        text: TextSpan(
-          style: theme.textTheme.bodyMedium?.copyWith(
-            height: 1.35,
-            color: theme.colorScheme.onSurface,
-          ),
-          children: [
-            TextSpan(
-              text: '$label: ',
-              style: TextStyle(
-                fontWeight: FontWeight.w700,
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
-            TextSpan(text: value),
-          ],
-        ),
-      ),
-    );
+    return LabeledValue(label: label, child: SelectableText(value));
   }
 
   Widget _pill(String label, bool enabled) {
@@ -2747,88 +2738,119 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
             (bucket) => Builder(
               builder: (context) {
                 final selected = controller.selectedBucket?.name == bucket.name;
-                return Padding(
-                  padding: const EdgeInsets.only(bottom: 3),
-                  child: Material(
-                    color: selected
-                        ? Theme.of(context)
-                            .colorScheme
-                            .primaryContainer
-                            .withValues(alpha: 0.72)
-                        : Colors.transparent,
-                    borderRadius: BorderRadius.circular(8),
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onSecondaryTapDown: (details) => _showBucketMenu(
-                        context,
-                        bucket,
-                        details.globalPosition,
-                      ),
-                      child: InkWell(
-                        borderRadius: BorderRadius.circular(8),
-                        child: ListTile(
-                          dense: desktopCompact,
-                          leading: Icon(
-                            Icons.folder_rounded,
+                return _BucketRowHover(
+                    builder: (hovered) => Padding(
+                          padding: const EdgeInsets.only(bottom: 3),
+                          child: Material(
                             color: selected
-                                ? Theme.of(context).colorScheme.primary
-                                : Theme.of(context)
+                                ? Theme.of(context)
                                     .colorScheme
-                                    .onSurfaceVariant,
-                            size: 20,
-                          ),
-                          shape: RoundedRectangleBorder(
+                                    .primaryContainer
+                                    .withValues(alpha: 0.72)
+                                : Colors.transparent,
                             borderRadius: BorderRadius.circular(8),
-                          ),
-                          selected: selected,
-                          title: Text(
-                            bucket.name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.titleMedium,
-                          ),
-                          subtitle: Text(
-                            '${bucket.region}  -  ${bucket.objectCountHint} objects',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                          trailing: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              if (bucket.versioningEnabled)
-                                const Padding(
-                                  padding: EdgeInsets.only(right: 4),
-                                  child: Icon(Icons.history_toggle_off_rounded),
-                                ),
-                              IconButton(
-                                tooltip: 'Bucket actions',
-                                onPressed: () async {
-                                  final box =
-                                      context.findRenderObject() as RenderBox?;
-                                  if (box == null) {
-                                    return;
-                                  }
-                                  await _showBucketMenu(
-                                    context,
-                                    bucket,
-                                    box.localToGlobal(
-                                      Offset(
-                                        box.size.width - 24,
-                                        box.size.height / 2,
+                            child: GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onSecondaryTapDown: (details) => _showBucketMenu(
+                                context,
+                                bucket,
+                                details.globalPosition,
+                              ),
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(8),
+                                child: ListTile(
+                                  dense: desktopCompact,
+                                  contentPadding: const EdgeInsets.symmetric(
+                                      horizontal: 10),
+                                  minLeadingWidth: 20,
+                                  horizontalTitleGap: 10,
+                                  minVerticalPadding: 8,
+                                  leading: Icon(
+                                    Icons.folder_rounded,
+                                    color: selected
+                                        ? Theme.of(context).colorScheme.primary
+                                        : Theme.of(context)
+                                            .colorScheme
+                                            .onSurfaceVariant,
+                                    size: 20,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  selected: selected,
+                                  title: Row(children: [
+                                    Flexible(
+                                      child: Tooltip(
+                                        message: bucket.name,
+                                        waitDuration:
+                                            const Duration(milliseconds: 600),
+                                        child: Text(
+                                          bucket.name,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: Theme.of(context)
+                                              .textTheme
+                                              .bodyMedium
+                                              ?.copyWith(
+                                                  fontWeight: FontWeight.w600),
+                                        ),
                                       ),
                                     ),
-                                  );
-                                },
-                                icon: const Icon(Icons.more_horiz),
+                                    if (bucket.versioningEnabled) ...[
+                                      const SizedBox(width: 6),
+                                      const _StatusBadge(
+                                        label: 'Versioned',
+                                        tooltip:
+                                            'Versioning is enabled for this bucket',
+                                      ),
+                                    ],
+                                  ]),
+                                  subtitle: Text(
+                                    '${bucket.region} · ${formatCount(bucket.objectCountHint)} objects',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodySmall
+                                        ?.copyWith(
+                                            color: Theme.of(context)
+                                                .colorScheme
+                                                .onSurfaceVariant),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  // Actions appear on hover, focus and touch so
+                                  // bucket names keep the row's full width.
+                                  // Right-click opens the same menu.
+                                  trailing: hovered || AppPlatform.isMobile
+                                      ? IconButton(
+                                          tooltip: 'Bucket actions',
+                                          visualDensity: VisualDensity.compact,
+                                          onPressed: () async {
+                                            final box =
+                                                context.findRenderObject()
+                                                    as RenderBox?;
+                                            if (box == null) {
+                                              return;
+                                            }
+                                            await _showBucketMenu(
+                                              context,
+                                              bucket,
+                                              box.localToGlobal(
+                                                Offset(
+                                                  box.size.width - 24,
+                                                  box.size.height / 2,
+                                                ),
+                                              ),
+                                            );
+                                          },
+                                          icon: const Icon(Icons.more_horiz),
+                                        )
+                                      : null,
+                                  onTap: () => widget.onOpenBucket(bucket),
+                                ),
                               ),
-                            ],
+                            ),
                           ),
-                          onTap: () => widget.onOpenBucket(bucket),
-                        ),
-                      ),
-                    ),
-                  ),
-                );
+                        ));
               },
             ),
           ),
@@ -2857,11 +2879,22 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: Theme.of(context).textTheme.titleLarge)),
+                Container(
+                  margin: const EdgeInsets.only(left: 6, right: 6),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.primaryContainer,
+                    borderRadius: BorderRadius.circular(5),
+                  ),
+                  child: Text('${buckets.length}',
+                      style: Theme.of(context).textTheme.labelSmall),
+                ),
                 if (isRefreshing)
-                  OutlinedButton.icon(
+                  IconButton(
                     onPressed: () => controller.cancelAction('refresh-buckets'),
                     icon: const Icon(Icons.stop_circle_outlined, size: 18),
-                    label: const Text('Cancel'),
+                    tooltip: 'Cancel bucket listing',
                   )
                 else
                   IconButton(
@@ -2869,6 +2902,16 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
                     onPressed: hasProfile ? controller.refreshBuckets : null,
                     icon: const Icon(Icons.refresh),
                   ),
+                IconButton(
+                  key: _bucketActionBarKey,
+                  tooltip: isCreatingBucket ? 'Creating bucket…' : 'New bucket',
+                  onPressed: hasProfile && !isCreatingBucket
+                      ? widget.onCreateBucket
+                      : null,
+                  icon: isCreatingBucket
+                      ? widget.inlineSpinnerBuilder()
+                      : const Icon(Icons.add),
+                ),
               ],
             ),
             const SizedBox(height: 12),
@@ -2885,23 +2928,6 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
                 });
               },
             ),
-            const SizedBox(height: 12),
-            Wrap(
-              key: _bucketActionBarKey,
-              spacing: desktopCompact ? 10 : 12,
-              runSpacing: desktopCompact ? 10 : 12,
-              children: [
-                FilledButton.icon(
-                  onPressed: hasProfile && !isCreatingBucket
-                      ? widget.onCreateBucket
-                      : null,
-                  icon: isCreatingBucket
-                      ? widget.inlineSpinnerBuilder()
-                      : const Icon(Icons.add_circle_outline),
-                  label: Text(isCreatingBucket ? 'Creating...' : 'New bucket'),
-                ),
-              ],
-            ),
             if (!hasProfile)
               const Padding(
                 padding: EdgeInsets.only(top: 8),
@@ -2914,6 +2940,50 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
               child: bucketListViewport,
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _BucketRowHover extends StatefulWidget {
+  const _BucketRowHover({required this.builder});
+  final Widget Function(bool active) builder;
+  @override
+  State<_BucketRowHover> createState() => _BucketRowHoverState();
+}
+
+class _BucketRowHoverState extends State<_BucketRowHover> {
+  bool _hover = false, _focus = false;
+  @override
+  Widget build(BuildContext context) => MouseRegion(
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: Focus(
+          canRequestFocus: false,
+          skipTraversal: true,
+          onFocusChange: (v) => setState(() => _focus = v),
+          child: widget.builder(_hover || _focus)));
+}
+
+class _StatusBadge extends StatelessWidget {
+  const _StatusBadge({required this.label, required this.tooltip});
+  final String label, tooltip;
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: tooltip,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+        decoration: BoxDecoration(
+          color: scheme.tertiaryContainer,
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Text(
+          label,
+          style: Theme.of(context).textTheme.labelSmall?.copyWith(
+              color: scheme.onTertiaryContainer, fontWeight: FontWeight.w700),
         ),
       ),
     );

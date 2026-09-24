@@ -5,8 +5,9 @@ import 'package:flutter/services.dart';
 import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
 import '../theme/app_motion.dart';
-import '../widgets/compact_selector.dart';
 import 'object_table.dart';
+import 'empty_bucket_state.dart';
+import '../utils/format.dart';
 
 class ObjectPanel extends StatefulWidget {
   const ObjectPanel(
@@ -114,7 +115,6 @@ class _ObjectPanelState extends State<ObjectPanel> {
   Widget build(BuildContext context) {
     final c = controller;
     final hasBucket = c.selectedBucket != null;
-    final selectedCount = c.objectSelection.keys.length;
     final objects = c.pagedVisibleObjects;
     final busy = c.isBusy('refresh-objects');
     return CallbackShortcuts(
@@ -134,120 +134,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
                 child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      Row(children: [
-                        Expanded(
-                            child: Text(c.selectedBucket?.name ?? 'Objects',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: Theme.of(context).textTheme.titleLarge)),
-                        IconButton(
-                            tooltip: 'Inspector',
-                            onPressed: onInspector,
-                            icon: const Icon(Icons.info_outline))
-                      ]),
-                      SingleChildScrollView(
-                          scrollDirection: Axis.horizontal,
-                          child: Row(children: [
-                            TextButton(
-                                onPressed: hasBucket
-                                    ? () => c.refreshObjects(prefix: '')
-                                    : null,
-                                child: const Text('Root')),
-                            ..._breadcrumbs(c),
-                          ])),
-                      LayoutBuilder(builder: (context, constraints) {
-                        final narrow = constraints.maxWidth < 450;
-                        final search = TextFormField(
-                            key: const ValueKey('object-search'),
-                            controller: _search,
-                            focusNode: _searchFocus,
-                            onChanged: (value) {
-                              _debounce?.cancel();
-                              if (c.objectFilterMode !=
-                                  BrowserFilterMode.prefix) {
-                                _debounce = Timer(
-                                    const Duration(milliseconds: 250),
-                                    () => _apply(value));
-                              }
-                            },
-                            enabled: hasBucket,
-                            decoration: InputDecoration(
-                                labelText: c.objectFilterMode ==
-                                        BrowserFilterMode.prefix
-                                    ? 'Navigate to prefix'
-                                    : 'Search loaded objects',
-                                hintText: c.objectFilterMode ==
-                                        BrowserFilterMode.regex
-                                    ? 'Regular expression'
-                                    : null,
-                                errorText: c.objectFilterError,
-                                prefixIcon: const Icon(Icons.search)),
-                            onFieldSubmitted: _apply);
-                        final mode = CompactSelector<BrowserFilterMode>(
-                            selected: c.objectFilterMode,
-                            dense: true,
-                            options: const [
-                              CompactSelectorOption(
-                                  value: BrowserFilterMode.prefix,
-                                  label: 'Prefix'),
-                              CompactSelectorOption(
-                                  value: BrowserFilterMode.text, label: 'Text'),
-                              CompactSelectorOption(
-                                  value: BrowserFilterMode.regex,
-                                  label: 'Regex')
-                            ],
-                            onChanged: (v) {
-                              if (!hasBucket) return;
-                              _debounce?.cancel();
-                              c.setObjectFilterMode(v);
-                            });
-                        return narrow
-                            ? Column(
-                                crossAxisAlignment: CrossAxisAlignment.stretch,
-                                children: [
-                                    mode,
-                                    const SizedBox(height: 8),
-                                    search
-                                  ])
-                            : Row(children: [
-                                mode,
-                                const SizedBox(width: 8),
-                                Expanded(child: search)
-                              ]);
-                      }),
-                      const SizedBox(height: 10),
-                      Wrap(
-                          spacing: 8,
-                          runSpacing: 6,
-                          crossAxisAlignment: WrapCrossAlignment.center,
-                          children: [
-                            FilledButton.icon(
-                                onPressed: hasBucket && !c.isBusy('upload')
-                                    ? onUpload
-                                    : null,
-                                icon: const Icon(Icons.upload_file),
-                                label: const Text('Upload')),
-                            OutlinedButton.icon(
-                              onPressed: () => setState(
-                                  () => _viewExpanded = !_viewExpanded),
-                              icon: Icon(_viewExpanded
-                                  ? Icons.expand_less
-                                  : Icons.tune),
-                              label: const Text('View tools'),
-                            ),
-                            IconButton(
-                                tooltip: busy
-                                    ? 'Cancel listing'
-                                    : 'Refresh object list',
-                                onPressed: busy
-                                    ? () => c.cancelAction('refresh-objects')
-                                    : hasBucket
-                                        ? c.refreshObjects
-                                        : null,
-                                icon: Icon(busy
-                                    ? Icons.stop_circle_outlined
-                                    : Icons.refresh)),
-                          ]),
+                      _toolbar(context, hasBucket: hasBucket, busy: busy),
                       ClipRect(
                           child: MotionSize(
                         alignment: Alignment.topCenter,
@@ -308,104 +195,77 @@ class _ObjectPanelState extends State<ObjectPanel> {
                                 ),
                               ),
                       )),
-                      MotionSize(
-                          duration: AppMotion.duration(context,
-                              enabled: c.settings.enableAnimations),
-                          curve: Curves.easeOutCubic,
-                          alignment: Alignment.topCenter,
-                          child: selectedCount > 0 || c.selectedObject != null
-                              ? Padding(
-                                  padding:
-                                      const EdgeInsets.symmetric(vertical: 8),
-                                  child: Wrap(
-                                      spacing: 8,
-                                      crossAxisAlignment:
-                                          WrapCrossAlignment.center,
-                                      children: [
-                                        Text(
-                                            selectedCount > 0
-                                                ? '$selectedCount selected'
-                                                : c.selectedObject!.name,
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis),
-                                        OutlinedButton.icon(
-                                            onPressed: c.isBusy('download')
-                                                ? null
-                                                : c.startSampleDownload,
-                                            icon: const Icon(Icons.download),
-                                            label: const Text('Download')),
-                                        TextButton.icon(
-                                            onPressed: c.isBusy('delete-object')
-                                                ? null
-                                                : onDelete,
-                                            icon: const Icon(
-                                                Icons.delete_outline),
-                                            label: const Text('Delete')),
-                                        if (selectedCount > 0)
-                                          IconButton(
-                                              tooltip: 'Clear selection',
-                                              onPressed: c.clearObjectSelection,
-                                              icon: const Icon(Icons.close)),
-                                      ]))
-                              : const SizedBox.shrink()),
                       if (busy || c.filteringObjects)
                         const LinearProgressIndicator(minHeight: 2),
                       Expanded(
-                          child: objects.isEmpty
-                              ? EmptyState(
-                                  icon: Icons.folder_open_outlined,
-                                  title: c.selectedProfile == null
-                                      ? 'No connection configured'
-                                      : !hasBucket
-                                          ? 'No bucket open'
-                                          : c.objects.isEmpty
-                                              ? 'No objects in this prefix'
-                                              : 'No matching objects',
-                                  message: c.selectedProfile == null
-                                      ? 'Create an endpoint profile to connect to your storage.'
-                                      : !hasBucket
-                                          ? 'Pick a bucket or refresh the list for this endpoint.'
-                                          : c.objects.isEmpty
-                                              ? 'Upload files to get started.'
-                                              : 'Change the filter or load more keys.',
-                                  action: TextButton(
-                                      onPressed: c.selectedProfile == null
-                                          ? () =>
-                                              c.selectTab(WorkspaceTab.settings)
+                          child: objects.isEmpty &&
+                                  hasBucket &&
+                                  c.objects.isEmpty &&
+                                  !busy &&
+                                  c.objectFilterError == null
+                              ? EmptyBucketState(
+                                  destination:
+                                      '${c.selectedBucket!.name}/${c.currentPrefix}',
+                                  isRoot: c.currentPrefix.isEmpty,
+                                  onUpload:
+                                      c.isBusy('upload') ? null : onUpload,
+                                )
+                              : objects.isEmpty
+                                  ? EmptyState(
+                                      icon: Icons.folder_open_outlined,
+                                      title: c.selectedProfile == null
+                                          ? 'No connection configured'
                                           : !hasBucket
-                                              ? c.refreshBuckets
+                                              ? 'No bucket open'
                                               : c.objects.isEmpty
-                                                  ? onUpload
-                                                  : () => _apply(''),
-                                      child: Text(c.selectedProfile == null
-                                          ? 'Create profile'
+                                                  ? 'No objects in this prefix'
+                                                  : 'No matching objects',
+                                      message: c.selectedProfile == null
+                                          ? 'Create an endpoint profile to connect to your storage.'
                                           : !hasBucket
-                                              ? 'Refresh buckets'
+                                              ? 'Pick a bucket or refresh the list for this endpoint.'
                                               : c.objects.isEmpty
-                                                  ? 'Upload files'
-                                                  : 'Clear filter')))
-                              : ObjectTable(
-                                  objects: objects,
-                                  selectedKey: c.selectedObject?.key,
-                                  selectedKeys: c.objectSelection.keys,
-                                  compactRows: c.settings.compactRows,
-                                  sortField: c.objectSortField,
-                                  descending: c.objectSortDescending,
-                                  onSort: (field) {
-                                    if (field == c.objectSortField) {
-                                      c.toggleObjectSortDirection();
-                                    } else {
-                                      if (c.objectSortDescending) {
-                                        c.toggleObjectSortDirection();
-                                      }
-                                      c.setObjectSortField(field);
-                                    }
-                                  },
-                                  onToggle: (o, range) =>
-                                      c.toggleObjectSelection(o, range: range),
-                                  contentTypeFor: c.objectContentType,
-                                  onSelect: c.setSelectedObject,
-                                  onShowContextMenu: widget.onContextMenu)),
+                                                  ? 'Upload files to get started.'
+                                                  : 'Change the filter or load more keys.',
+                                      action: TextButton(
+                                          onPressed: c.selectedProfile == null
+                                              ? () => c.selectTab(
+                                                  WorkspaceTab.settings)
+                                              : !hasBucket
+                                                  ? c.refreshBuckets
+                                                  : c.objects.isEmpty
+                                                      ? onUpload
+                                                      : () => _apply(''),
+                                          child: Text(c.selectedProfile == null
+                                              ? 'Create profile'
+                                              : !hasBucket
+                                                  ? 'Refresh buckets'
+                                                  : c.objects.isEmpty
+                                                      ? 'Upload files'
+                                                      : 'Clear filter')))
+                                  : ObjectTable(
+                                      objects: objects,
+                                      selectedKey: c.selectedObject?.key,
+                                      selectedKeys: c.objectSelection.keys,
+                                      compactRows: c.settings.compactRows,
+                                      sortField: c.objectSortField,
+                                      descending: c.objectSortDescending,
+                                      onSort: (field) {
+                                        if (field == c.objectSortField) {
+                                          c.toggleObjectSortDirection();
+                                        } else {
+                                          if (c.objectSortDescending) {
+                                            c.toggleObjectSortDirection();
+                                          }
+                                          c.setObjectSortField(field);
+                                        }
+                                      },
+                                      onToggle: (o, range) =>
+                                          c.toggleObjectSelection(o,
+                                              range: range),
+                                      contentTypeFor: c.objectContentType,
+                                      onSelect: c.setSelectedObject,
+                                      onShowContextMenu: widget.onContextMenu)),
                       const Divider(height: 1),
                       Wrap(
                           spacing: 8,
@@ -458,15 +318,359 @@ class _ObjectPanelState extends State<ObjectPanel> {
             label: Text(label),
           ));
 
-  List<Widget> _breadcrumbs(AppController c) {
-    final parts = c.currentPrefix.split('/');
-    return [
-      for (var i = 0; i < parts.length; i++)
-        if (parts[i].isNotEmpty)
-          TextButton(
-              onPressed: () =>
-                  c.refreshObjects(prefix: '${parts.take(i + 1).join('/')}/'),
-              child: Text('${parts[i]} /'))
-    ];
+  /// One toolbar row: location, filter and actions. When objects are
+  /// selected the action cluster swaps in place for selection actions, so
+  /// the list below never moves.
+  Widget _toolbar(BuildContext context,
+      {required bool hasBucket, required bool busy}) {
+    final c = controller;
+    return LayoutBuilder(builder: (context, constraints) {
+      final wide = constraints.maxWidth >= 900;
+      Widget actionsFor(double available) => SizedBox(
+          height: 48,
+          child: AnimatedSwitcher(
+              duration: AppMotion.duration(context,
+                  enabled: c.settings.enableAnimations, milliseconds: 160),
+              layoutBuilder: (current, previous) => Stack(
+                  alignment: Alignment.centerRight,
+                  children: [...previous, if (current != null) current]),
+              child:
+                  c.objectSelection.keys.isNotEmpty || c.selectedObject != null
+                      ? KeyedSubtree(
+                          key: const ValueKey('selection-actions'),
+                          child: _selectionActions(context,
+                              labeled: available >=
+                                  MediaQuery.textScalerOf(context).scale(600)))
+                      : KeyedSubtree(
+                          key: const ValueKey('browse-actions'),
+                          child: _browseActions(context,
+                              hasBucket: hasBucket, busy: busy))));
+      final inspector = IconButton(
+          tooltip: 'Inspector',
+          onPressed: onInspector,
+          icon: const Icon(Icons.view_sidebar_outlined));
+      if (wide) {
+        // The search keeps a fixed width so swapping the action cluster
+        // never resizes it; the action area scrolls if it runs out of room.
+        final searchWidth =
+            (constraints.maxWidth * .34).clamp(220.0, 460.0).toDouble();
+        return Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Row(children: [
+              ConstrainedBox(
+                  constraints:
+                      BoxConstraints(maxWidth: constraints.maxWidth * .25),
+                  child: _breadcrumbBar(context, hasBucket: hasBucket)),
+              const SizedBox(width: 8),
+              SizedBox(
+                  width: searchWidth,
+                  child: _searchField(context, hasBucket: hasBucket)),
+              const SizedBox(width: 8),
+              Expanded(
+                  child: LayoutBuilder(
+                      builder: (context, area) => Align(
+                          alignment: Alignment.centerRight,
+                          child: SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              reverse: true,
+                              child: actionsFor(area.maxWidth))))),
+              inspector,
+            ]));
+      }
+      // Narrower panels: location and actions share the first row, the
+      // filter spans the second. Both rows keep a fixed height.
+      if (constraints.maxWidth < 560) {
+        // Phones: location, filter, then a full-width action row.
+        return Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(children: [
+                    Expanded(
+                        child: _breadcrumbBar(context, hasBucket: hasBucket)),
+                    inspector,
+                  ]),
+                  _searchField(context, hasBucket: hasBucket),
+                  const SizedBox(height: 6),
+                  Align(
+                      alignment: Alignment.centerLeft,
+                      child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: actionsFor(constraints.maxWidth))),
+                ]));
+      }
+      return Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Row(children: [
+              ConstrainedBox(
+                  constraints:
+                      BoxConstraints(maxWidth: constraints.maxWidth * .4),
+                  child: _breadcrumbBar(context, hasBucket: hasBucket)),
+              Expanded(
+                  child: LayoutBuilder(
+                      builder: (context, area) => Align(
+                          alignment: Alignment.centerRight,
+                          child: SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              reverse: true,
+                              child: actionsFor(area.maxWidth))))),
+              inspector,
+            ]),
+            const SizedBox(height: 6),
+            _searchField(context, hasBucket: hasBucket),
+          ]));
+    });
+  }
+
+  Widget _browseActions(BuildContext context,
+      {required bool hasBucket, required bool busy}) {
+    final c = controller;
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      FilledButton.icon(
+          onPressed: hasBucket && !c.isBusy('upload') ? onUpload : null,
+          icon: const Icon(Icons.upload_file),
+          label: const Text('Upload')),
+      const SizedBox(width: 8),
+      OutlinedButton.icon(
+        onPressed: () => setState(() => _viewExpanded = !_viewExpanded),
+        icon: Icon(_viewExpanded ? Icons.expand_less : Icons.tune),
+        label: const Text('View tools'),
+      ),
+      IconButton(
+          tooltip: busy ? 'Cancel listing' : 'Refresh object list',
+          onPressed: busy
+              ? () => c.cancelAction('refresh-objects')
+              : hasBucket
+                  ? c.refreshObjects
+                  : null,
+          icon: Icon(busy ? Icons.stop_circle_outlined : Icons.refresh)),
+    ]);
+  }
+
+  /// Selection actions; without room for labels the same actions render as
+  /// icon buttons with tooltips.
+  Widget _selectionActions(BuildContext context, {required bool labeled}) {
+    final c = controller;
+    final theme = Theme.of(context);
+    final keys = c.objectSelection.keys;
+    final object = c.selectedObject;
+    final String label;
+    if (keys.isNotEmpty) {
+      final bytes = c.objects
+          .where((o) => keys.contains(o.key))
+          .fold<int>(0, (sum, o) => sum + o.size);
+      label = '${keys.length} selected · ${formatBytes(bytes)}';
+    } else {
+      label = object!.name;
+    }
+    final single = keys.isEmpty && object != null && !object.isFolder;
+    final canDownload = keys.isNotEmpty || single;
+    final canShare = single &&
+        c.selectedProfile?.endpointType != EndpointProfileType.azureBlob;
+    return DecoratedBox(
+        decoration: BoxDecoration(
+            color: theme.colorScheme.primaryContainer.withValues(alpha: .55),
+            borderRadius: BorderRadius.circular(10)),
+        child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              IconButton(
+                  tooltip: keys.isNotEmpty ? 'Clear selection' : 'Deselect',
+                  onPressed: keys.isNotEmpty
+                      ? c.clearObjectSelection
+                      : c.clearSelectedObject,
+                  icon: const Icon(Icons.close)),
+              ConstrainedBox(
+                  constraints: BoxConstraints(maxWidth: labeled ? 220 : 160),
+                  child: Text(label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.labelLarge?.copyWith(
+                          color: theme.colorScheme.onPrimaryContainer,
+                          fontWeight: FontWeight.w700))),
+              const SizedBox(width: 10),
+              if (labeled) ...[
+                OutlinedButton.icon(
+                    onPressed: canDownload && !c.isBusy('download')
+                        ? c.startSampleDownload
+                        : null,
+                    icon: const Icon(Icons.download),
+                    label: const Text('Download')),
+                if (canShare) ...[
+                  const SizedBox(width: 6),
+                  OutlinedButton.icon(
+                      onPressed: c.isBusy('presign')
+                          ? null
+                          : c.generateSelectedPresignedUrl,
+                      icon: const Icon(Icons.link),
+                      label: const Text('Share link')),
+                ],
+                const SizedBox(width: 2),
+                TextButton.icon(
+                    style: TextButton.styleFrom(
+                        foregroundColor: theme.colorScheme.error),
+                    onPressed: c.isBusy('delete-object') ? null : onDelete,
+                    icon: const Icon(Icons.delete_outline),
+                    label: const Text('Delete')),
+              ] else ...[
+                IconButton(
+                    tooltip: 'Download',
+                    onPressed: canDownload && !c.isBusy('download')
+                        ? c.startSampleDownload
+                        : null,
+                    icon: const Icon(Icons.download)),
+                if (canShare)
+                  IconButton(
+                      tooltip: 'Share link',
+                      onPressed: c.isBusy('presign')
+                          ? null
+                          : c.generateSelectedPresignedUrl,
+                      icon: const Icon(Icons.link)),
+                IconButton(
+                    tooltip: 'Delete',
+                    color: theme.colorScheme.error,
+                    onPressed: c.isBusy('delete-object') ? null : onDelete,
+                    icon: const Icon(Icons.delete_outline)),
+              ],
+            ])));
+  }
+
+  /// Bucket name is the breadcrumb root, so the panel needs no separate
+  /// title row.
+  Widget _breadcrumbBar(BuildContext context, {required bool hasBucket}) {
+    final c = controller;
+    final theme = Theme.of(context);
+    final parts =
+        c.currentPrefix.split('/').where((p) => p.isNotEmpty).toList();
+    final separator = Text('/',
+        style: theme.textTheme.titleSmall
+            ?.copyWith(color: theme.colorScheme.onSurfaceVariant));
+    // Loose alignment keeps short paths left-aligned; long paths scroll
+    // with the current folder in view.
+    return Align(
+        alignment: Alignment.centerLeft,
+        child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            reverse: true,
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              Tooltip(
+                  message: 'Go to bucket root',
+                  child: TextButton(
+                      style: TextButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 6)),
+                      onPressed: hasBucket && parts.isNotEmpty
+                          ? () => c.refreshObjects(prefix: '')
+                          : null,
+                      child: Text(c.selectedBucket?.name ?? 'Objects',
+                          style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w700,
+                              color: parts.isEmpty
+                                  ? theme.colorScheme.onSurface
+                                  : null)))),
+              for (var i = 0; i < parts.length; i++) ...[
+                separator,
+                TextButton(
+                    style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 6)),
+                    onPressed: i == parts.length - 1
+                        ? null
+                        : () => c.refreshObjects(
+                            prefix: '${parts.take(i + 1).join('/')}/'),
+                    child: Text(parts[i],
+                        style: i == parts.length - 1
+                            ? theme.textTheme.titleSmall?.copyWith(
+                                color: theme.colorScheme.onSurface,
+                                fontWeight: FontWeight.w700)
+                            : null)),
+              ],
+              if (parts.isNotEmpty) separator,
+            ])));
+  }
+
+  Widget _searchField(BuildContext context, {required bool hasBucket}) {
+    final c = controller;
+    return TextFormField(
+        key: const ValueKey('object-search'),
+        controller: _search,
+        focusNode: _searchFocus,
+        onChanged: (value) {
+          _debounce?.cancel();
+          if (c.objectFilterMode != BrowserFilterMode.prefix) {
+            _debounce =
+                Timer(const Duration(milliseconds: 250), () => _apply(value));
+          }
+        },
+        enabled: hasBucket,
+        decoration: InputDecoration(
+            hintText: switch (c.objectFilterMode) {
+              BrowserFilterMode.prefix => 'Navigate to prefix',
+              BrowserFilterMode.text => 'Search loaded objects',
+              BrowserFilterMode.regex => 'Regular expression',
+            },
+            errorText: c.objectFilterError,
+            suffixIcon: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Center(
+                widthFactor: 1,
+                heightFactor: 1,
+                child: Text(
+                  Theme.of(context).platform == TargetPlatform.macOS
+                      ? '⌘K'
+                      : 'Ctrl K',
+                  style: Theme.of(context).textTheme.labelSmall,
+                ),
+              ),
+            ),
+            prefixIconConstraints: const BoxConstraints(minHeight: 48),
+            prefixIcon: Padding(
+              padding: const EdgeInsets.only(left: 4, right: 10),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  PopupMenuButton<BrowserFilterMode>(
+                    key: const ValueKey('object-search-mode'),
+                    tooltip: 'Search mode',
+                    enabled: hasBucket,
+                    initialValue: c.objectFilterMode,
+                    onSelected: (mode) {
+                      _debounce?.cancel();
+                      c.setObjectFilterMode(mode);
+                    },
+                    itemBuilder: (_) => const [
+                      PopupMenuItem(
+                          value: BrowserFilterMode.prefix,
+                          child: Text('Prefix')),
+                      PopupMenuItem(
+                          value: BrowserFilterMode.text, child: Text('Text')),
+                      PopupMenuItem(
+                          value: BrowserFilterMode.regex, child: Text('Regex')),
+                    ],
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 12),
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        Text(
+                            switch (c.objectFilterMode) {
+                              BrowserFilterMode.prefix => 'Prefix',
+                              BrowserFilterMode.text => 'Text',
+                              BrowserFilterMode.regex => 'Regex',
+                            },
+                            style: Theme.of(context).textTheme.labelLarge),
+                        const SizedBox(width: 4),
+                        const Icon(Icons.expand_more, size: 16),
+                      ]),
+                    ),
+                  ),
+                  Container(
+                      width: 1,
+                      height: 22,
+                      color: Theme.of(context).colorScheme.outlineVariant),
+                ],
+              ),
+            )),
+        onFieldSubmitted: _apply);
   }
 }

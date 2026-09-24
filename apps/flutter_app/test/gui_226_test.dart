@@ -1,11 +1,16 @@
 import 'package:flutter/material.dart';
-import 'dart:ui' show Tristate, ImageByteFormat;
+import 'package:flutter/foundation.dart'
+    show debugDefaultTargetPlatformOverride;
+import 'dart:ui' show Tristate, ImageByteFormat, PointerDeviceKind;
+import 'package:flutter/gestures.dart' show kSecondaryButton;
 import 'dart:io';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:s3_browser_crossplat/app/s3_browser_app.dart';
 import 'package:s3_browser_crossplat/browser/json_editor_dialog.dart';
+import 'package:s3_browser_crossplat/browser/object_panel.dart';
+import 'package:s3_browser_crossplat/browser/object_table.dart';
 import 'package:s3_browser_crossplat/browser/tag_editor_dialog.dart';
 import 'package:s3_browser_crossplat/controllers/app_controller.dart';
 import 'package:s3_browser_crossplat/models/domain_models.dart';
@@ -286,6 +291,116 @@ void main() {
     expect(c.objectFilterValue, initialPrefix);
     await closeFrame(tester);
   });
+  testWidgets(
+      'inline search mode changes filter and keeps actions clear of search',
+      (tester) async {
+    final c = await frame(tester);
+    final search = find.byKey(const ValueKey('object-search'));
+    final panel = find.byType(ObjectPanel);
+    final upload = find.descendant(
+        of: panel, matching: find.widgetWithText(FilledButton, 'Upload'));
+    // Actions share the toolbar with the search (same row when wide, the row
+    // above when narrow) and never overlap it.
+    expect(tester.getRect(upload).overlaps(tester.getRect(search).deflate(0.5)),
+        isFalse);
+    await tester.tap(find.byKey(const ValueKey('object-search-mode')));
+    await tester.pumpAndSettle();
+    await tester
+        .tap(find.widgetWithText(PopupMenuItem<BrowserFilterMode>, 'Text'));
+    await tester.pumpAndSettle();
+    expect(c.objectFilterMode, BrowserFilterMode.text);
+    await tester.enterText(search, 'no-object-matches-this-query');
+    await tester.pumpAndSettle(const Duration(milliseconds: 300));
+    expect(find.text('No matching objects'), findsOneWidget);
+    expect(find.text('Drop your files here'), findsNothing);
+    await closeFrame(tester);
+  });
+  testWidgets(
+      'hover actions yield to explicit download and delete on selection',
+      (tester) async {
+    final c = await frame(tester);
+    c.selectedObject = null;
+    c.clearObjectSelection();
+    c.clearBanner();
+    await tester.pumpAndSettle();
+    final object = c.pagedVisibleObjects.firstWhere((o) => !o.isFolder);
+    final row = find.descendant(
+        of: find.byType(ObjectTable), matching: find.text(object.name));
+    await tester.ensureVisible(row);
+    await tester.pumpAndSettle();
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.addPointer(location: Offset.zero);
+    await mouse.moveTo(tester.getCenter(row));
+    await tester.pumpAndSettle();
+    final actions = find.byTooltip('Object actions for ${object.name}');
+    final visibility =
+        find.ancestor(of: actions, matching: find.byType(Visibility)).first;
+    expect(tester.widget<Visibility>(visibility).visible, isTrue);
+    await tester.tap(row);
+    await tester.pumpAndSettle();
+    final panel = find.byType(ObjectPanel);
+    // Selection actions are labeled when there is room and icon buttons with
+    // the same names otherwise.
+    Finder action(String name) => find.descendant(
+        of: panel,
+        matching: find.byWidgetPredicate((widget) =>
+            (widget is Tooltip && widget.message == name) ||
+            (widget is Text && widget.data == name)));
+    expect(action('Download'), findsWidgets);
+    expect(action('Delete'), findsWidgets);
+    expect(tester.widget<Visibility>(visibility).visible, isFalse);
+    await mouse.removePointer();
+    await closeFrame(tester);
+  });
+  for (final (width, initiallyVisible) in [
+    (390.0, false),
+    (900.0, false),
+    (1050.0, false),
+    (1500.0, false),
+    (1500.0, true),
+  ]) {
+    testWidgets(
+        'Inspect object opens inspector at $width visible=$initiallyVisible',
+        (tester) async {
+      final c = await frame(tester, width: width);
+      c.settings =
+          c.settings.copyWith(browserInspectorVisible: initiallyVisible);
+      c.clearBanner();
+      c.changed();
+      await tester.pumpAndSettle();
+      if (width < 700) {
+        await tester.tap(find.text('Objects').first);
+        await tester.pumpAndSettle();
+      }
+      final object = c.pagedVisibleObjects.firstWhere((o) => !o.isFolder);
+      final row = find.descendant(
+          of: find.byType(ObjectTable), matching: find.text(object.name));
+      await tester.ensureVisible(row);
+      await tester.pumpAndSettle();
+      await tester.tap(row, buttons: kSecondaryButton);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Inspect object'));
+      await tester.pumpAndSettle();
+      expect(c.selectedObject?.key, object.key);
+      expect(c.selectedObjectDetails, isNotNull);
+      expect(c.inspectorTab, BrowserInspectorTab.objectDetails);
+      expect(find.byTooltip('Hide inspector').hitTestable(), findsOneWidget);
+      if (width < 700) {
+        expect(find.byType(ObjectTable), findsNothing);
+        expect(find.byType(Dialog), findsNothing);
+      } else if (width < 1100) {
+        // The 1050px shell leaves a tablet-width workspace beside its rail.
+        expect(find.byType(Dialog), findsOneWidget);
+        c.setInspectorTab(BrowserInspectorTab.objectPreview);
+        await tester.pumpAndSettle();
+        expect(find.byKey(const ValueKey('object-preview')), findsOneWidget);
+      } else {
+        expect(c.settings.browserInspectorVisible, isTrue);
+        expect(find.byType(Dialog), findsNothing);
+      }
+      await closeFrame(tester);
+    });
+  }
   testWidgets('number field commits on blur and rejects out of range',
       (tester) async {
     var saved = 8;
@@ -445,7 +560,9 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('Inspect'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Diagnostics'));
+    await tester.tap(find.byTooltip('More inspector views'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Tools').last);
     await tester.pumpAndSettle();
     final run = find.text('Run delete all');
     await tester.scrollUntilVisible(run, 300,
@@ -479,6 +596,8 @@ void main() {
     await closeFrame(tester);
   });
   testWidgets('capture GUI review images', (tester) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
     final icons = FontLoader('MaterialIcons')
       ..addFont(rootBundle.load('fonts/MaterialIcons-Regular.otf'));
     await icons.load();
@@ -495,13 +614,20 @@ void main() {
     for (final (name, width, dark) in [
       ('desktop-light', 1500.0, false),
       ('desktop-dark', 1500.0, true),
+      ('tablet-light', 900.0, false),
+      ('tablet-scaled', 1854.0, false),
       ('phone', 390.0, false)
     ]) {
       tester.view.physicalSize = Size(width, width < 700 ? 844 : 1100);
       await tester.binding
           .setSurfaceSize(Size(width, width < 700 ? 844 : 1100));
-      c.settings = c.settings
-          .copyWith(darkMode: dark, uiScalePercent: width < 700 ? 150 : 100);
+      c.settings = c.settings.copyWith(
+          darkMode: dark,
+          uiScalePercent: name == 'tablet-scaled'
+              ? 200
+              : width < 700
+                  ? 150
+                  : 100);
       c.clearBanner();
       c.changed();
       await tester.pumpAndSettle();
@@ -517,6 +643,7 @@ void main() {
       });
     }
     await closeFrame(tester);
+    debugDefaultTargetPlatformOverride = null;
   }, skip: Platform.environment['GUI_CAPTURE'] != '1');
   for (final width in [700.0, 1000.0, 1360.0, 1500.0]) {
     for (final dark in [false, true]) {

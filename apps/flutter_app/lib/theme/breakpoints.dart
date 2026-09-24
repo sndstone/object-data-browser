@@ -10,7 +10,7 @@
 ///   bucket panel + object list with the inspector available on demand.
 /// * `smallDesktop <= width < desktop` — compact desktop layout: a narrow
 ///   navigation rail and a bottom-docked inspector.
-/// * `width >= desktop` — desktop layout: full navigation rail, header search,
+/// * `width >= desktop` — desktop layout: full navigation rail, connection controls,
 ///   resizable inspector (right or bottom), full detail columns.
 abstract final class Breakpoints {
   /// Below this the app behaves like a phone.
@@ -20,7 +20,7 @@ abstract final class Breakpoints {
   static const double smallDesktop = 1000;
 
   /// At and above this the app uses the full desktop layout (wide rail,
-  /// header search, side-by-side inspector).
+  /// connection controls, side-by-side inspector).
   static const double desktop = 1360;
 
   /// Extra-wide desktop: the object table adds detail columns

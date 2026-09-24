@@ -38,11 +38,15 @@ class ObjectTable extends StatelessWidget {
       LayoutBuilder(builder: (context, constraints) {
         final narrow = constraints.maxWidth < 520;
         final height = math.max(
-            AppPlatform.isMobile || !compactRows ? 52.0 : 38.0,
+            AppPlatform.isMobile
+                ? 52.0
+                : compactRows
+                    ? 38.0
+                    : 44.0,
             MediaQuery.textScalerOf(context).scale(16) + 22);
         return Column(children: [
           Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               child: narrow
                   ? Wrap(spacing: 4, children: [
                       _sortHeader('Name', BrowserObjectSortField.name),
@@ -50,23 +54,29 @@ class ObjectTable extends StatelessWidget {
                           'Modified', BrowserObjectSortField.lastModified),
                       _sortHeader('Size', BrowserObjectSortField.size),
                     ])
+                  // Header cells share the row's fixed leading slots and
+                  // column widths so labels sit directly over their values.
                   : Row(children: [
-                      const SizedBox(width: 48),
+                      const SizedBox(width: _checkSlot + _iconSlot),
                       Expanded(
                           child: Align(
                               alignment: Alignment.centerLeft,
                               child: _sortHeader(
                                   'Name', BrowserObjectSortField.name))),
-                      if (!narrow)
-                        SizedBox(
-                            width: 165,
-                            child: _sortHeader('Modified',
-                                BrowserObjectSortField.lastModified)),
                       SizedBox(
-                          width: 96,
-                          child:
-                              _sortHeader('Size', BrowserObjectSortField.size)),
-                      const SizedBox(width: 48)
+                          width: _modifiedWidth,
+                          child: Align(
+                              alignment: Alignment.centerLeft,
+                              child: _sortHeader('Modified',
+                                  BrowserObjectSortField.lastModified))),
+                      SizedBox(
+                          width: _sizeWidth,
+                          child: Align(
+                              alignment: Alignment.centerRight,
+                              child: _sortHeader(
+                                  'Size', BrowserObjectSortField.size,
+                                  trailingAligned: true))),
+                      const SizedBox(width: _actionSlot)
                     ])),
           const Divider(height: 1),
           Expanded(
@@ -78,6 +88,8 @@ class ObjectTable extends StatelessWidget {
                     final object = objects[index];
                     final inspected = object.key == selectedKey;
                     final checked = selectedKeys.contains(object.key);
+                    final showActions =
+                        selectedKeys.isEmpty && selectedKey == null;
                     final theme = Theme.of(context);
                     void toggle() => onToggle(
                         object, HardwareKeyboard.instance.isShiftPressed);
@@ -90,7 +102,9 @@ class ObjectTable extends StatelessWidget {
                             child: Material(
                                 color: checked || inspected
                                     ? theme.colorScheme.primaryContainer
-                                    : Colors.transparent,
+                                    : active
+                                        ? theme.colorScheme.surfaceContainerLow
+                                        : Colors.transparent,
                                 child: Builder(builder: (rowContext) {
                                   void actions() {
                                     final box = rowContext.findRenderObject()
@@ -130,28 +144,35 @@ class ObjectTable extends StatelessWidget {
                                                   const EdgeInsets.symmetric(
                                                       horizontal: 8),
                                               child: Row(children: [
+                                                // Fixed checkbox and icon slots keep
+                                                // folder and file names aligned.
                                                 SizedBox(
-                                                    width: 48,
+                                                    width: _checkSlot,
                                                     child: object.isFolder
-                                                        ? const Icon(Icons
-                                                            .folder_outlined)
+                                                        ? null
                                                         : Checkbox(
                                                             value: checked,
                                                             semanticLabel:
                                                                 'Select ${object.name}',
                                                             onChanged: (_) =>
                                                                 toggle())),
-                                                if (!object.isFolder)
-                                                  Padding(
-                                                      padding:
-                                                          const EdgeInsets.only(
-                                                              right: 8),
-                                                      child: Icon(
-                                                          objectTypeIcon(
-                                                              object.key,
-                                                              contentTypeFor(
-                                                                  object)),
-                                                          size: 18)),
+                                                SizedBox(
+                                                    width: _iconSlot,
+                                                    child: Align(
+                                                        alignment: Alignment
+                                                            .centerLeft,
+                                                        child: Icon(
+                                                            object.isFolder
+                                                                ? Icons
+                                                                    .folder_outlined
+                                                                : objectTypeIcon(
+                                                                    object.key,
+                                                                    contentTypeFor(
+                                                                        object)),
+                                                            size: 18,
+                                                            color: theme
+                                                                .colorScheme
+                                                                .onSurfaceVariant))),
                                                 Expanded(
                                                     child: Tooltip(
                                                         message: object.key,
@@ -162,7 +183,7 @@ class ObjectTable extends StatelessWidget {
                                                                     .ellipsis))),
                                                 if (!narrow)
                                                   SizedBox(
-                                                      width: 165,
+                                                      width: _modifiedWidth,
                                                       child: Tooltip(
                                                           message:
                                                               '${object.modifiedAt.toIso8601String()} · ${formatRelative(object.modifiedAt)}',
@@ -173,7 +194,9 @@ class ObjectTable extends StatelessWidget {
                                                                   .textTheme
                                                                   .bodySmall))),
                                                 SizedBox(
-                                                    width: 96,
+                                                    width: narrow
+                                                        ? 72
+                                                        : _sizeWidth,
                                                     child: Text(
                                                         object.isFolder
                                                             ? '—'
@@ -189,15 +212,16 @@ class ObjectTable extends StatelessWidget {
                                                                   .tabularFigures()
                                                             ]))),
                                                 SizedBox(
-                                                    width: 48,
-                                                    child: Opacity(
-                                                        opacity: AppPlatform
+                                                    width: _actionSlot,
+                                                    child: Visibility(
+                                                        visible: (AppPlatform
                                                                     .isMobile ||
-                                                                active ||
-                                                                checked ||
-                                                                inspected
-                                                            ? 1
-                                                            : 0,
+                                                                narrow ||
+                                                                active) &&
+                                                            showActions,
+                                                        maintainState: true,
+                                                        maintainAnimation: true,
+                                                        maintainSize: true,
                                                         child: IconButton(
                                                             tooltip:
                                                                 'Object actions for ${object.name}',
@@ -211,8 +235,21 @@ class ObjectTable extends StatelessWidget {
                   })),
         ]);
       });
-  Widget _sortHeader(String label, BrowserObjectSortField field) {
+  static const double _checkSlot = 48;
+  static const double _iconSlot = 26;
+  static const double _modifiedWidth = 165;
+  static const double _sizeWidth = 96;
+  static const double _actionSlot = 48;
+
+  Widget _sortHeader(String label, BrowserObjectSortField field,
+      {bool trailingAligned = false}) {
     final active = sortField == field;
+    final icon = Icon(
+        active
+            ? (descending ? Icons.arrow_downward : Icons.arrow_upward)
+            : Icons.unfold_more,
+        size: 16);
+    final text = Flexible(child: Text(label, overflow: TextOverflow.ellipsis));
     return Semantics(
         sortKey: OrdinalSortKey(field.index.toDouble()),
         button: true,
@@ -223,19 +260,14 @@ class ObjectTable extends StatelessWidget {
             child: TextButton(
                 onPressed: () => onSort(field),
                 style: TextButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 4),
-                    minimumSize: const Size(48, 48)),
-                child: Row(mainAxisSize: MainAxisSize.min, children: [
-                  Flexible(child: Text(label, overflow: TextOverflow.ellipsis)),
-                  const SizedBox(width: 4),
-                  Icon(
-                      active
-                          ? (descending
-                              ? Icons.arrow_downward
-                              : Icons.arrow_upward)
-                          : Icons.unfold_more,
-                      size: 16),
-                ]))));
+                    padding: EdgeInsets.zero, minimumSize: const Size(48, 40)),
+                // Numeric columns are right-aligned, so their sort icon leads
+                // and the label's last character sits over the values.
+                child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: trailingAligned
+                        ? [icon, const SizedBox(width: 4), text]
+                        : [text, const SizedBox(width: 4), icon]))));
   }
 
   static IconData objectTypeIcon(String key, String contentType) {

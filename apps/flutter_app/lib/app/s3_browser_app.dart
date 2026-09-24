@@ -177,6 +177,13 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
                       duration: AppMotion.duration(context,
                           enabled: controller.settings.enableAnimations,
                           milliseconds: 220),
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeOutCubic,
+                      transitionBuilder: (child, animation) => SizeTransition(
+                        sizeFactor: animation,
+                        alignment: Alignment.bottomCenter,
+                        child: FadeTransition(opacity: animation, child: child),
+                      ),
                       child: phone
                           ? KeyedSubtree(
                               key: const ValueKey('phone-navigation'),
@@ -276,10 +283,11 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
                                 ),
                               ],
                             ),
+                            // Bottom-right on desktop keeps messages clear of
+                            // the endpoint and engine switchers in the header.
                             Positioned(
-                              top: phone ? null : 76,
-                              bottom: phone ? 12 : null,
-                              right: 12,
+                              bottom: phone ? 12 : 16,
+                              right: phone ? 12 : 16,
                               left: phone ? 12 : null,
                               child: _BannerOverlay(controller: controller),
                             ),
@@ -511,18 +519,19 @@ class _AppHeader extends StatelessWidget {
     final desktopCompact = AppTheme.isDesktopPlatform(theme.platform);
     final desktopWide = !phone && !compact;
     final margin = EdgeInsets.fromLTRB(
-      phone ? 12 : (desktopCompact ? 10 : 12),
       phone ? 8 : (desktopCompact ? 10 : 12),
-      phone ? 12 : (desktopCompact ? 10 : 12),
-      phone ? 8 : (desktopCompact ? 8 : 10),
+      phone ? 6 : (desktopCompact ? 10 : 12),
+      phone ? 8 : (desktopCompact ? 10 : 12),
+      phone ? 4 : (desktopCompact ? 8 : 10),
     );
     final padding = EdgeInsets.fromLTRB(
-      desktopCompact && !phone ? 12 : (phone ? 18 : 12),
-      phone ? 14 : (desktopCompact ? 8 : (compact ? 10 : 12)),
-      desktopCompact && !phone ? 12 : (phone ? 18 : 12),
-      desktopCompact && !phone ? 8 : (phone ? 14 : 10),
+      desktopCompact && !phone ? 12 : (phone ? 14 : 12),
+      phone ? 6 : (desktopCompact ? 8 : (compact ? 10 : 12)),
+      desktopCompact && !phone ? 12 : (phone ? 6 : 12),
+      desktopCompact && !phone ? 8 : (phone ? 6 : 10),
     );
     return Container(
+      width: double.infinity,
       margin: margin,
       padding: padding,
       decoration: BoxDecoration(
@@ -534,30 +543,21 @@ class _AppHeader extends StatelessWidget {
           color: theme.colorScheme.outlineVariant,
         ),
       ),
-      child: TweenAnimationBuilder<double>(
-        tween: Tween(begin: 0, end: 1),
+      child: ResponsiveLayoutTransition(
+        layoutKey: phone
+            ? 'phone'
+            : desktopWide
+                ? 'desktop'
+                : 'tablet',
+        animateSize: true,
         duration: AppMotion.duration(context,
-            enabled: controller.settings.enableAnimations, milliseconds: 220),
-        curve: Curves.easeOutCubic,
-        builder: (context, value, child) {
-          return Transform.translate(
-            offset: Offset(0, 8 * (1 - value)),
-            child: Opacity(opacity: value, child: child),
-          );
-        },
+            enabled: controller.settings.enableAnimations, milliseconds: 240),
         child: desktopWide
             ? Row(
                 children: [
-                  SizedBox(
-                    width: desktopCompact ? 260 : 300,
-                    child: _DesktopHeaderMark(
-                        compact: desktopCompact, controller: controller),
+                  Expanded(
+                    child: _DesktopHeaderMark(controller: controller),
                   ),
-                  SizedBox(width: desktopCompact ? 12 : 16),
-                  if (controller.activeTab == WorkspaceTab.browser)
-                    Expanded(child: _HeaderSearchField(controller: controller))
-                  else
-                    const Spacer(),
                   SizedBox(width: desktopCompact ? 12 : 16),
                   ConstrainedBox(
                     constraints: BoxConstraints(
@@ -566,125 +566,194 @@ class _AppHeader extends StatelessWidget {
                     child: _HeaderControlStrip(
                       controller: controller,
                       embedded: true,
-                      desktopPinned: true,
                     ),
                   ),
                   const SizedBox(width: 12),
                   _HeaderThemeToggle(controller: controller),
                 ],
               )
-            : _HeaderControlStrip(
-                controller: controller,
-                embedded: true,
-                desktopPinned: !phone,
-              ),
+            : phone
+                // One compact bar: where you are, plus a chip that opens the
+                // endpoint and engine switcher.
+                ? Row(children: [
+                    Expanded(
+                      child: Text(
+                        _phoneTitle(controller),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.titleMedium
+                            ?.copyWith(fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Flexible(
+                      child: _HeaderControlStrip(
+                          controller: controller, embedded: true),
+                    ),
+                  ])
+                : Row(children: [
+                    Expanded(
+                      flex: 5,
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: _HeaderControlStrip(
+                          controller: controller,
+                          embedded: true,
+                          outlined: false,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    _HeaderThemeToggle(controller: controller),
+                  ]),
       ),
     );
   }
 }
 
-class _DesktopHeaderMark extends StatelessWidget {
-  const _DesktopHeaderMark({required this.compact, required this.controller});
-  final AppController controller;
+String _shortEngineLabel(AppController controller) {
+  final engine = controller.engines
+      .where((engine) => engine.id == controller.activeEngineId)
+      .firstOrNull;
+  return (engine?.label ?? controller.activeEngineId)
+      .replaceFirst(RegExp(r'\s+Engine$'), '');
+}
 
-  final bool compact;
+String _phoneTitle(AppController controller) => switch (controller.activeTab) {
+      WorkspaceTab.browser => controller.selectedBucket?.name ?? 'Buckets',
+      WorkspaceTab.tasks => 'Jobs',
+      WorkspaceTab.eventLog => 'Event Log',
+      WorkspaceTab.settings => 'Settings',
+      WorkspaceTab.benchmark => 'Benchmark',
+    };
+
+class _DesktopHeaderMark extends StatelessWidget {
+  const _DesktopHeaderMark({required this.controller});
+  final AppController controller;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: compact ? 40 : 48,
-            height: compact ? 40 : 48,
-            decoration: BoxDecoration(
-              color: theme.colorScheme.primaryContainer.withValues(alpha: 0.95),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(
-                color: theme.colorScheme.outlineVariant.withValues(alpha: 0.85),
-              ),
-            ),
-            child: Icon(
-              Icons.storage_rounded,
-              size: compact ? 20 : 24,
-              color: theme.colorScheme.primary,
-            ),
-          ),
-          SizedBox(width: compact ? 10 : 12),
-          Flexible(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Object Data Browser',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: theme.textTheme.titleLarge,
+        ),
+        const SizedBox(height: 8),
+        if (controller.activeTab == WorkspaceTab.browser)
+          LayoutBuilder(builder: (context, constraints) {
+            return Wrap(
+              spacing: 8,
+              runSpacing: 6,
               children: [
-                Text(
-                  'Object Data Browser',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.titleLarge,
+                _HeaderContextChip(
+                  label: 'Endpoint',
+                  value: controller.selectedProfile?.name ?? 'No connection',
+                  maxWidth: constraints.maxWidth,
                 ),
-                const SizedBox(height: 3),
-                if (controller.activeTab == WorkspaceTab.browser)
-                  SingleChildScrollView(
-                      scrollDirection: Axis.horizontal,
-                      child: Row(children: [
-                        Text(
-                            controller.selectedProfile?.name ?? 'No connection',
-                            style: theme.textTheme.bodySmall),
-                        if (controller.selectedBucket != null)
-                          TextButton(
-                              onPressed: () =>
-                                  controller.refreshObjects(prefix: ''),
-                              child: Text(
-                                  ' › ${controller.selectedBucket!.name}')),
-                        ..._prefixButtons(),
-                      ]))
-                else
-                  Text(
-                      controller.activeTab == WorkspaceTab.tasks
-                          ? 'Jobs · ${controller.tasksForView(BrowserTaskView.running).length} running, ${controller.tasksForView(BrowserTaskView.failed).length} failed'
-                          : controller.activeTab == WorkspaceTab.settings
-                              ? 'Settings · ${controller.settingsSectionName}'
-                              : controller.activeTab == WorkspaceTab.eventLog
-                                  ? 'Event Log · ${controller.eventLog.length} events'
-                                  : 'Benchmark',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.bodySmall),
+                if (controller.selectedBucket != null)
+                  _HeaderContextChip(
+                    label: 'Bucket',
+                    value: controller.selectedBucket!.name,
+                    maxWidth: constraints.maxWidth,
+                    onTap: () => controller.refreshObjects(prefix: ''),
+                    highlighted: true,
+                  ),
               ],
-            ),
+            );
+          })
+        else
+          Text(
+            controller.activeTab == WorkspaceTab.tasks
+                ? 'Jobs · ${controller.tasksForView(BrowserTaskView.running).length} running, ${controller.tasksForView(BrowserTaskView.failed).length} failed'
+                : controller.activeTab == WorkspaceTab.settings
+                    ? 'Settings · ${controller.settingsSectionName}'
+                    : controller.activeTab == WorkspaceTab.eventLog
+                        ? 'Event Log · ${controller.eventLog.length} events'
+                        : 'Benchmark',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodySmall,
           ),
-        ],
-      ),
+      ],
     );
-  }
-
-  List<Widget> _prefixButtons() {
-    final parts =
-        controller.currentPrefix.split('/').where((p) => p.isNotEmpty).toList();
-    return [
-      for (var i = 0; i < parts.length; i++)
-        if (parts.length <= 4 || i == 0 || i >= parts.length - 2)
-          TextButton(
-              onPressed: () => controller.refreshObjects(
-                  prefix: '${parts.take(i + 1).join('/')}/'),
-              child: Text(' › ${parts[i]}'))
-        else if (i == 1)
-          const Text(' › …')
-    ];
   }
 }
 
-class _HeaderSearchField extends StatelessWidget {
-  const _HeaderSearchField({required this.controller});
-  final AppController controller;
+class _HeaderContextChip extends StatelessWidget {
+  const _HeaderContextChip({
+    required this.label,
+    required this.value,
+    required this.maxWidth,
+    this.highlighted = false,
+    this.onTap,
+  });
+
+  final String label;
+  final String value;
+  final double maxWidth;
+  final bool highlighted;
+  final VoidCallback? onTap;
+
   @override
-  Widget build(BuildContext context) => OutlinedButton.icon(
-      onPressed: controller.requestObjectSearchFocus,
-      icon: const Icon(Icons.search),
-      label: Text(
-          'Search  ${Theme.of(context).platform == TargetPlatform.macOS ? '⌘K' : 'Ctrl K'}'));
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    final borderRadius = BorderRadius.circular(6);
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxWidth: maxWidth),
+      child: Tooltip(
+        message: onTap == null ? '$label: $value' : 'Open bucket root: $value',
+        child: Material(
+          color: highlighted ? colors.primaryContainer : colors.surface,
+          shape: RoundedRectangleBorder(
+            borderRadius: borderRadius,
+            side: BorderSide(
+              color: highlighted ? Colors.transparent : colors.outlineVariant,
+            ),
+          ),
+          child: InkWell(
+            onTap: onTap,
+            borderRadius: borderRadius,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    label,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: highlighted
+                          ? colors.onPrimaryContainer
+                          : colors.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Flexible(
+                    child: Text(
+                      value,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        fontWeight: FontWeight.w600,
+                        color: highlighted
+                            ? colors.onPrimaryContainer
+                            : colors.onSurface,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _HeaderThemeToggle extends StatelessWidget {
@@ -713,12 +782,12 @@ class _HeaderControlStrip extends StatelessWidget {
   const _HeaderControlStrip({
     required this.controller,
     this.embedded = false,
-    this.desktopPinned = false,
+    this.outlined = true,
   });
 
   final AppController controller;
   final bool embedded;
-  final bool desktopPinned;
+  final bool outlined;
 
   @override
   Widget build(BuildContext context) {
@@ -749,12 +818,21 @@ class _HeaderControlStrip extends StatelessWidget {
                   0,
                 ),
       child: phone
-          ? SizedBox(
-              width: double.infinity,
+          ? Align(
+              alignment: Alignment.centerRight,
               child: TextButton.icon(
-                  icon: const Icon(Icons.cloud_outlined),
+                  style: TextButton.styleFrom(
+                    backgroundColor:
+                        Theme.of(context).colorScheme.primaryContainer,
+                    foregroundColor:
+                        Theme.of(context).colorScheme.onPrimaryContainer,
+                    shape: const StadiumBorder(),
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  icon: const Icon(Icons.cloud_outlined, size: 18),
                   label: Text(
-                      '${controller.selectedProfile?.name ?? 'Choose connection'} · ${controller.activeEngineId}',
+                      '${controller.selectedProfile?.name ?? 'Choose connection'} · ${_shortEngineLabel(controller)}',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis),
                   onPressed: () => showModalBottomSheet<void>(
@@ -791,71 +869,93 @@ class _HeaderControlStrip extends StatelessWidget {
                                                 Navigator.pop(context),
                                             child: const Text('Done')),
                                       ])))))))
-          : Align(
-              alignment: desktopPinned ? Alignment.topRight : Alignment.topLeft,
-              child: desktopPinned
-                  ? Row(
-                      mainAxisAlignment: MainAxisAlignment.end,
-                      children: [
-                        SizedBox(
-                          width: compactWidth(context, embedded, true),
-                          child:
-                              _profileDropdown(context, profiles, phone: false),
-                        ),
-                        const SizedBox(width: 10),
-                        SizedBox(
-                          width: compactWidth(context, embedded, false),
-                          child:
-                              _engineDropdown(context, engines, phone: false),
-                        ),
-                      ],
+          : Container(
+              constraints: const BoxConstraints(maxWidth: 460),
+              padding: outlined
+                  ? const EdgeInsets.symmetric(horizontal: 10, vertical: 6)
+                  : EdgeInsets.zero,
+              decoration: outlined
+                  ? BoxDecoration(
+                      color: Theme.of(context).colorScheme.surfaceContainerLow,
+                      borderRadius: BorderRadius.circular(9),
+                      border: Border.all(
+                          color: Theme.of(context).colorScheme.outlineVariant),
                     )
-                  : Wrap(
-                      spacing: desktopCompact ? 10 : 12,
-                      runSpacing: desktopCompact ? 10 : 12,
-                      children: [
-                        SizedBox(
-                          width: compactWidth(context, embedded, true),
-                          child: _profileDropdown(
-                            context,
-                            profiles,
-                            phone: false,
-                          ),
-                        ),
-                        SizedBox(
-                          width: compactWidth(context, embedded, false),
-                          child: _engineDropdown(
-                            context,
-                            engines,
-                            phone: false,
-                          ),
-                        ),
-                      ],
+                  : null,
+              child: Row(
+                children: [
+                  Expanded(
+                    flex: 11,
+                    child: _connectionControl(
+                      context,
+                      label: 'Endpoint profile',
+                      icon: Icons.cloud_outlined,
+                      child: _profileDropdown(context, profiles,
+                          phone: false, inline: true),
                     ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    flex: 10,
+                    child: _connectionControl(
+                      context,
+                      label: 'Backend engine',
+                      icon: Icons.memory_outlined,
+                      child: _engineDropdown(context, engines,
+                          phone: false, inline: true),
+                    ),
+                  ),
+                ],
+              ),
             ),
     );
   }
 
-  double compactWidth(BuildContext context, bool embedded, bool profile) {
-    final desktopCompact =
-        AppTheme.isDesktopPlatform(Theme.of(context).platform);
-    if (desktopPinned) {
-      return embedded
-          ? (profile
-              ? (desktopCompact ? 180 : 210)
-              : (desktopCompact ? 160 : 190))
-          : (profile
-              ? (desktopCompact ? 180 : 210)
-              : (desktopCompact ? 160 : 190));
-    }
-    return profile
-        ? (embedded
-            ? (desktopCompact ? 292 : 320)
-            : (desktopCompact ? 252 : 280))
-        : (embedded
-            ? (desktopCompact ? 212 : 240)
-            : (desktopCompact ? 196 : 220));
+  Widget _connectionControl(
+    BuildContext context, {
+    required String label,
+    required IconData icon,
+    required Widget child,
+  }) {
+    final theme = Theme.of(context);
+    return Row(children: [
+      Container(
+        width: 38,
+        height: 44,
+        decoration: BoxDecoration(
+          color: theme.colorScheme.primaryContainer,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child:
+            Icon(icon, size: 18, color: theme.colorScheme.onPrimaryContainer),
+      ),
+      const SizedBox(width: 8),
+      Expanded(
+          child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label,
+              style: theme.textTheme.labelSmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
+          child,
+        ],
+      )),
+    ]);
   }
+
+  InputDecoration _inlineDecoration({String? hintText}) => InputDecoration(
+        hintText: hintText,
+        isDense: true,
+        filled: false,
+        constraints: const BoxConstraints(minHeight: 28),
+        contentPadding: EdgeInsets.zero,
+        border: InputBorder.none,
+        enabledBorder: InputBorder.none,
+        focusedBorder: InputBorder.none,
+        disabledBorder: InputBorder.none,
+        suffixIconConstraints:
+            const BoxConstraints(minWidth: 20, minHeight: 28),
+      );
 
   Widget _labeledPhoneField(
     BuildContext context, {
@@ -886,6 +986,7 @@ class _HeaderControlStrip extends StatelessWidget {
     BuildContext context,
     List<EndpointProfile> profiles, {
     required bool phone,
+    bool inline = false,
   }) {
     final onSurface = phone ? Theme.of(context).colorScheme.onSurface : null;
     final selectedId = controller.selectedProfile?.id;
@@ -897,14 +998,19 @@ class _HeaderControlStrip extends StatelessWidget {
       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
             color: onSurface,
           ),
-      decoration: InputDecoration(
-        labelText: phone ? null : 'Endpoint profile',
-        hintText: profiles.isEmpty ? 'Create a profile in Settings' : null,
-        isDense: phone,
-        constraints: phone ? const BoxConstraints(minHeight: 48) : null,
-        contentPadding:
-            phone ? const EdgeInsets.fromLTRB(12, 12, 12, 10) : null,
-      ),
+      decoration: inline
+          ? _inlineDecoration(
+              hintText:
+                  profiles.isEmpty ? 'Create a profile in Settings' : null)
+          : InputDecoration(
+              labelText: phone ? null : 'Endpoint profile',
+              hintText:
+                  profiles.isEmpty ? 'Create a profile in Settings' : null,
+              isDense: phone,
+              constraints: phone ? const BoxConstraints(minHeight: 48) : null,
+              contentPadding:
+                  phone ? const EdgeInsets.fromLTRB(12, 12, 12, 10) : null,
+            ),
       items: profiles
           .map(
             (profile) => AppSelectItem(
@@ -927,6 +1033,7 @@ class _HeaderControlStrip extends StatelessWidget {
     BuildContext context,
     List<EngineDescriptor> engines, {
     required bool phone,
+    bool inline = false,
   }) {
     final activeId = controller.activeEngineId;
     final validEngineValue =
@@ -934,13 +1041,15 @@ class _HeaderControlStrip extends StatelessWidget {
     return AppSelectField<String>(
       value: validEngineValue,
       isExpanded: true,
-      decoration: InputDecoration(
-        labelText: phone ? null : 'Backend engine',
-        isDense: phone,
-        constraints: phone ? const BoxConstraints(minHeight: 48) : null,
-        contentPadding:
-            phone ? const EdgeInsets.fromLTRB(12, 12, 12, 10) : null,
-      ),
+      decoration: inline
+          ? _inlineDecoration()
+          : InputDecoration(
+              labelText: phone ? null : 'Backend engine',
+              isDense: phone,
+              constraints: phone ? const BoxConstraints(minHeight: 48) : null,
+              contentPadding:
+                  phone ? const EdgeInsets.fromLTRB(12, 12, 12, 10) : null,
+            ),
       items: engines
           .map(
             (engine) => AppSelectItem(
@@ -1038,7 +1147,7 @@ class _BannerOverlayState extends State<_BannerOverlay> {
           ? const SizedBox.shrink(key: ValueKey('banner-empty'))
           : Align(
               key: ValueKey('banner-${c.bannerTaskId ?? 'message'}'),
-              alignment: Alignment.topRight,
+              alignment: Alignment.bottomRight,
               child: Semantics(
                   liveRegion: true,
                   child: Material(

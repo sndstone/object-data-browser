@@ -568,8 +568,17 @@ class AppController extends ChangeNotifier {
 
   void selectTab(WorkspaceTab tab) {
     activeTab = tab;
+    // Opening Jobs on an empty filter hides existing history; fall back to
+    // the most useful non-empty view. A chosen view that has jobs is kept.
+    if (tab == WorkspaceTab.tasks && tasksForView(taskView).isEmpty) {
+      taskView = tasksForView(BrowserTaskView.running).isNotEmpty
+          ? BrowserTaskView.running
+          : tasksForView(BrowserTaskView.failed).isNotEmpty
+              ? BrowserTaskView.failed
+              : BrowserTaskView.all;
+    }
     _addEvent(
-      level: 'INFO',
+      level: 'DEBUG',
       category: 'Navigation',
       message: 'Switched workspace to ${tab.name}.',
       source: 'navigation',
@@ -1684,7 +1693,7 @@ class AppController extends ChangeNotifier {
         source: 'task-tray',
       );
       notifyListeners();
-    }, trackTask: false);
+    }, trackTask: false, doneMessage: 'Transfer paused.');
   }
 
   Future<void> resumeTransfer(String jobId) async {
@@ -1709,7 +1718,7 @@ class AppController extends ChangeNotifier {
       );
       _trackTransferJob(job);
       notifyListeners();
-    }, trackTask: false);
+    }, trackTask: false, doneMessage: 'Transfer resumed.');
   }
 
   Future<void> cancelTransfer(String jobId) async {
@@ -1860,7 +1869,7 @@ class AppController extends ChangeNotifier {
           source: 'presign',
         );
       });
-    });
+    }, doneMessage: 'Share link ready.');
   }
 
   Future<void> refreshSelectedObjectPreview() async {
@@ -2384,7 +2393,8 @@ class AppController extends ChangeNotifier {
 
   bool supportsProfile(EndpointProfile profile) =>
       profile.endpointType != EndpointProfileType.azureBlob ||
-      (!AppPlatform.isMobile && const {'python', 'go'}.contains(activeEngineId));
+      (!AppPlatform.isMobile &&
+          const {'python', 'go'}.contains(activeEngineId));
 
   Future<void> testProfileDraft(EndpointProfile draft) async {
     final profile = normalizeEndpointProfile(draft);
@@ -2404,7 +2414,7 @@ class AppController extends ChangeNotifier {
             'Connection test succeeded: ${found.length} bucket(s). Draft was not saved or activated.';
         bannerSeverity = BannerSeverity.success;
       });
-    });
+    }, doneMessage: 'Connection to ${profile.name} succeeded.');
   }
 
   Future<bool> saveProfile(EndpointProfile profile) async {
@@ -3497,9 +3507,13 @@ class AppController extends ChangeNotifier {
     }
   }
 
+  /// Runs [operation] as a tracked busy action. When the operation does not
+  /// replace the busy banner with its own result, [doneMessage] is shown; with
+  /// no [doneMessage] the banner is dismissed quietly, because navigation and
+  /// loading already show their result in place.
   Future<void> _runBusy(
       String actionKey, String busyMessage, Future<void> Function() operation,
-      {bool trackTask = true}) async {
+      {bool trackTask = true, String? doneMessage}) async {
     // Guard against the same action running twice concurrently. There is no
     // handle to await the in-flight run, so short-circuiting is the safe UX:
     // it avoids double execution and never clobbers the shared busy
@@ -3597,10 +3611,13 @@ class AppController extends ChangeNotifier {
       if (!failed &&
           bannerSeverity == BannerSeverity.info &&
           !(bannerTask?.isRunningLike ?? false)) {
-        if (bannerMessage == busyMessage) {
-          bannerMessage = 'Operation completed.';
+        if (bannerMessage == busyMessage && doneMessage == null) {
+          bannerMessage = null;
+          bannerTaskId = null;
+        } else {
+          if (bannerMessage == busyMessage) bannerMessage = doneMessage;
+          bannerSeverity = BannerSeverity.success;
         }
-        bannerSeverity = BannerSeverity.success;
       }
       // Any pending coalesced progress notification is superseded by the
       // notify below; cancelling keeps tests free of stray timers.
@@ -3934,7 +3951,7 @@ class AppController extends ChangeNotifier {
         );
         notifyListeners();
       });
-    });
+    }, doneMessage: 'Updated bucket versioning.');
   }
 
   Future<void> saveBucketPolicy(String policyJson) async {

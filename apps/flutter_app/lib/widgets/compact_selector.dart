@@ -1,3 +1,4 @@
+import 'edge_fade_scroll.dart';
 import 'navigation_item.dart';
 import 'package:flutter/material.dart';
 
@@ -63,12 +64,7 @@ class CompactSelector<T> extends StatelessWidget {
       ),
       child: Padding(
         padding: const EdgeInsets.all(3),
-        child: wrap || expand
-            ? content
-            : SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: content,
-              ),
+        child: wrap || expand ? content : EdgeFadeScroll(child: content),
       ),
     );
   }

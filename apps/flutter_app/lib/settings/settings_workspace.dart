@@ -55,9 +55,14 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
       engines: controller.engines,
     );
 
+    final openProfileId = _editingProfileId ??
+        (phone || controller.profiles.isEmpty
+            ? null
+            : controller.profiles.first.id);
+
     return LayoutBuilder(builder: (context, constraints) {
       final navigationWidth =
-          220 * MediaQuery.textScalerOf(context).scale(14) / 14;
+          236 * MediaQuery.textScalerOf(context).scale(14) / 14;
       final wide = constraints.maxWidth >= navigationWidth + 650;
       final rawSections = <_SettingsSection>[
         _SettingsSection(
@@ -125,10 +130,12 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                   title: 'Connections',
                   children: () => [
                     Wrap(
-                      spacing: 8,
+                      spacing: 4,
                       runSpacing: 8,
+                      alignment: WrapAlignment.end,
+                      crossAxisAlignment: WrapCrossAlignment.center,
                       children: [
-                        FilledButton.icon(
+                        TextButton.icon(
                           onPressed: controller.profiles.isEmpty
                               ? null
                               : () async {
@@ -163,7 +170,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                           icon: const Icon(Icons.upload_file_outlined),
                           label: const Text('Export profiles'),
                         ),
-                        OutlinedButton.icon(
+                        TextButton.icon(
                           onPressed: () async {
                             final picked = await FilePicker.platform.pickFiles(
                               type: profileImportPickerType(
@@ -193,12 +200,26 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                           icon: const Icon(Icons.download_outlined),
                           label: const Text('Import profiles'),
                         ),
+                        const SizedBox(width: 4),
+                        FilledButton.icon(
+                          onPressed: () async {
+                            await controller.addSampleProfile();
+                            if (mounted) {
+                              setState(() => _editingProfileId =
+                                  controller.profiles.last.id);
+                            }
+                          },
+                          icon: const Icon(Icons.add),
+                          label: const Text('Create profile'),
+                        ),
                       ],
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      'App-generated profile exports contain endpoint settings only, never credentials. When an imported JSON file contains access and secret keys, they are moved into secure storage.',
-                      style: Theme.of(context).textTheme.bodySmall,
+                      'Exports contain endpoint settings only, never credentials. Keys in an imported file move into secure storage.',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color:
+                              Theme.of(context).colorScheme.onSurfaceVariant),
                     ),
                     const SizedBox(height: 12),
                     if (controller.profiles.isEmpty)
@@ -210,63 +231,42 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                         ),
                       )
                     else ...[
-                      if (!phone || _editingProfileId == null)
-                        for (final profile in controller.profiles)
-                          ListTile(
-                              selected: _editingProfileId == profile.id,
-                              title: Text(profile.name),
-                              subtitle: Text(profile.endpointUrl),
-                              trailing: const Icon(Icons.chevron_right),
-                              onTap: () => setState(
-                                  () => _editingProfileId = profile.id)),
                       if (phone && _editingProfileId != null)
                         TextButton.icon(
                             onPressed: () =>
                                 setState(() => _editingProfileId = null),
                             icon: const Icon(Icons.arrow_back),
                             label: const Text('All connections')),
-                      ...controller.profiles
-                          .where((profile) =>
-                              profile.id ==
-                              (_editingProfileId ??
-                                  (phone
-                                      ? null
-                                      : controller.profiles.first.id)))
-                          .map(
-                            (profile) => Padding(
-                              padding: const EdgeInsets.only(bottom: 12),
-                              child: _ProfileEditorCard(
-                                key: ValueKey(profile.id),
-                                controller: controller,
-                                profile: profile,
-                                openEditor:
-                                    phone || _editingProfileId == profile.id,
-                                initialDraft: _profileDrafts[profile.id],
-                                onDraftChanged: (draft) {
-                                  if (draft == null) {
-                                    _profileDrafts.remove(profile.id);
-                                  } else {
-                                    _profileDrafts[profile.id] = draft;
-                                  }
-                                },
-                              ),
+                      // The open profile's editor replaces its list row, so a
+                      // profile never appears twice.
+                      for (final profile in controller.profiles)
+                        if (profile.id == openProfileId)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 12),
+                            child: _ProfileEditorCard(
+                              key: ValueKey(profile.id),
+                              controller: controller,
+                              profile: profile,
+                              openEditor:
+                                  phone || _editingProfileId == profile.id,
+                              initialDraft: _profileDrafts[profile.id],
+                              onDraftChanged: (draft) {
+                                if (draft == null) {
+                                  _profileDrafts.remove(profile.id);
+                                } else {
+                                  _profileDrafts[profile.id] = draft;
+                                }
+                              },
                             ),
-                          ),
+                          )
+                        else if (!phone || _editingProfileId == null)
+                          ListTile(
+                              title: Text(profile.name),
+                              subtitle: Text(profile.endpointUrl),
+                              trailing: const Icon(Icons.chevron_right),
+                              onTap: () => setState(
+                                  () => _editingProfileId = profile.id)),
                     ],
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: OutlinedButton.icon(
-                        onPressed: () async {
-                          await controller.addSampleProfile();
-                          if (mounted) {
-                            setState(() => _editingProfileId =
-                                controller.profiles.last.id);
-                          }
-                        },
-                        icon: const Icon(Icons.add),
-                        label: const Text('Create profile'),
-                      ),
-                    ),
                   ],
                 )),
         _SettingsSection(
@@ -815,8 +815,14 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                                 borderRadius: BorderRadius.circular(8)),
                             selectedTileColor:
                                 Theme.of(context).colorScheme.primaryContainer,
+                            minLeadingWidth: 18,
+                            horizontalTitleGap: 10,
                             leading: Icon(section.icon, size: 18),
-                            title: Text(section.title),
+                            title: Text(section.title,
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .bodyMedium
+                                    ?.copyWith(fontWeight: FontWeight.w600)),
                             onTap: () =>
                                 controller.setSettingsSection(section.title)))),
             ])),
@@ -855,8 +861,11 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(title, style: theme.textTheme.titleLarge),
-                      const SizedBox(height: 8),
+                      // The page intro already names the active section.
+                      if (title != _sectionName) ...[
+                        Text(title, style: theme.textTheme.titleLarge),
+                        const SizedBox(height: 8),
+                      ],
                       ...children(),
                     ],
                   ),

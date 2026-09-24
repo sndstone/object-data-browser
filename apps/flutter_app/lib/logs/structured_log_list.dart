@@ -12,12 +12,17 @@ class StructuredLogList extends StatefulWidget {
     required this.textScalePercent,
     required this.emptyMessage,
     this.embedded = false,
+    this.profileNames = const {},
   });
 
   final List<EventLogEntry> entries;
   final int textScalePercent;
   final String emptyMessage;
   final bool embedded;
+
+  /// Profile display names by ID, so context lines name the connection the
+  /// user recognizes instead of its internal identifier.
+  final Map<String, String> profileNames;
 
   @override
   State<StructuredLogList> createState() => _StructuredLogListState();
@@ -58,16 +63,17 @@ class _StructuredLogListState extends State<StructuredLogList> {
                   ? const NeverScrollableScrollPhysics()
                   : const AlwaysScrollableScrollPhysics(),
               itemCount: items.length,
-              separatorBuilder: (_, __) => const SizedBox(height: 10),
+              separatorBuilder: (_, __) => const Divider(height: 1),
               itemBuilder: (context, index) {
                 final item = items[index];
-                if (item.upload != null) {
-                  return _UploadBatchCard(entries: item.upload!);
-                }
-                if (item.group != null) {
-                  return _ApiTraceCard(group: item.group!);
-                }
-                return _EventEntryCard(entry: item.entry!);
+                return _ProfileNames(
+                  names: widget.profileNames,
+                  child: item.upload != null
+                      ? _UploadBatchCard(entries: item.upload!)
+                      : item.group != null
+                          ? _ApiTraceCard(group: item.group!)
+                          : _EventEntryCard(entry: item.entry!),
+                );
               },
             ),
     );
@@ -219,75 +225,42 @@ class _ApiTraceCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final entry = group.displayEntry;
-    final summaryParts = <String>[
-      formatDateTime(entry.timestamp),
-      if ((entry.engineId ?? '').isNotEmpty) entry.engineId!,
-      if ((entry.responseStatus ?? '').isNotEmpty)
-        'Status ${entry.responseStatus}',
+    final detail = <String>[
+      if ((entry.responseStatus ?? '').isNotEmpty) entry.responseStatus!,
       if (entry.latencyMs != null) '${entry.latencyMs} ms',
-    ];
-    final contextParts = <String>[
-      if ((entry.profileId ?? '').isNotEmpty) 'Profile ${entry.profileId}',
-      if ((entry.bucketName ?? '').isNotEmpty) 'Bucket ${entry.bucketName}',
-      if ((entry.objectKey ?? '').isNotEmpty) 'Object ${entry.objectKey}',
+      if ((entry.engineId ?? '').isNotEmpty) entry.engineId!,
+      if ((entry.tracePhase ?? '').isNotEmpty &&
+          group.response == null &&
+          group.send == null)
+        entry.tracePhase!,
     ];
 
-    return Card(
-      clipBehavior: Clip.antiAlias,
-      child: ExpansionTile(
-        tilePadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-        title: Text(
-          entry.method ?? entry.category,
-          style: theme.textTheme.titleMedium,
+    return _ExpandableLogRow(
+      entry: entry,
+      category: entry.category,
+      title: entry.method ?? entry.category,
+      detail: detail.join(' · '),
+      children: [
+        _TracePayloadSection(
+          title: 'Send',
+          entry: group.send,
+          emptyLabel: 'No request payload recorded.',
         ),
-        subtitle: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const SizedBox(height: 6),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                Chip(label: Text(entry.category)),
-                if ((entry.tracePhase ?? '').isNotEmpty &&
-                    group.response == null &&
-                    group.send == null)
-                  Chip(label: Text(entry.tracePhase!)),
-                ...summaryParts.map((part) => Chip(label: Text(part))),
-              ],
-            ),
-            if (contextParts.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Text(
-                contextParts.join(' - '),
-                style: theme.textTheme.bodySmall,
-              ),
-            ],
-          ],
+        const SizedBox(height: 12),
+        _TracePayloadSection(
+          title: 'Response',
+          entry: group.response,
+          emptyLabel: 'No response payload recorded.',
         ),
-        children: [
-          _TracePayloadSection(
-            title: 'Send',
-            entry: group.send,
-            emptyLabel: 'No request payload recorded.',
-          ),
-          const SizedBox(height: 12),
-          _TracePayloadSection(
-            title: 'Response',
-            entry: group.response,
-            emptyLabel: 'No response payload recorded.',
-          ),
-          const SizedBox(height: 12),
-          Text('Raw event text', style: theme.textTheme.titleSmall),
-          const SizedBox(height: 8),
-          _CodeBlock(
-            value: group.orderedRawEntries
-                .map((entry) => '[${entry.level}] ${entry.message}')
-                .join('\n\n'),
-          ),
-        ],
-      ),
+        const SizedBox(height: 12),
+        Text('Raw event text', style: theme.textTheme.titleSmall),
+        const SizedBox(height: 8),
+        _CodeBlock(
+          value: group.orderedRawEntries
+              .map((entry) => '[${entry.level}] ${entry.message}')
+              .join('\n\n'),
+        ),
+      ],
     );
   }
 }
@@ -351,47 +324,12 @@ class _EventEntryCard extends StatelessWidget {
         parsed: parsedApi,
       );
     }
-
-    final theme = Theme.of(context);
-    final contextParts = <String>[
-      if ((entry.profileId ?? '').isNotEmpty) 'Profile ${entry.profileId}',
-      if ((entry.bucketName ?? '').isNotEmpty) 'Bucket ${entry.bucketName}',
-      if ((entry.objectKey ?? '').isNotEmpty) 'Object ${entry.objectKey}',
-    ];
-
-    return Card(
-      clipBehavior: Clip.antiAlias,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              children: [
-                Text(
-                  '[${entry.level}] ${entry.category}',
-                  style: theme.textTheme.titleSmall,
-                ),
-                Chip(label: Text(formatDateTime(entry.timestamp))),
-              ],
-            ),
-            if (contextParts.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Text(
-                contextParts.join(' - '),
-                style: theme.textTheme.bodySmall,
-              ),
-            ],
-            const SizedBox(height: 8),
-            SelectableText(entry.message,
-                key: PageStorageKey(
-                    'event-text-${entry.requestId}-${entry.timestamp.microsecondsSinceEpoch}-${entry.message.hashCode}')),
-          ],
-        ),
-      ),
+    return _LogRow(
+      entry: entry,
+      category: entry.category,
+      message: SelectableText(entry.message,
+          key: PageStorageKey(
+              'event-text-${entry.requestId}-${entry.timestamp.microsecondsSinceEpoch}-${entry.message.hashCode}')),
     );
   }
 }
@@ -408,73 +346,258 @@ class _ParsedApiEntryCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final contextParts = <String>[
-      if ((entry.profileId ?? '').isNotEmpty) 'Profile ${entry.profileId}',
-      if ((entry.bucketName ?? '').isNotEmpty) 'Bucket ${entry.bucketName}',
-      if ((entry.objectKey ?? '').isNotEmpty) 'Object ${entry.objectKey}',
-    ];
-    final summaryParts = <String>[
-      formatDateTime(entry.timestamp),
-      if (parsed.status != null && parsed.status!.isNotEmpty)
-        'Status ${parsed.status}',
-      if (parsed.method != null && parsed.method!.isNotEmpty) parsed.method!,
+    final detail = <String>[
+      parsed.phaseLabel,
+      if (parsed.status != null && parsed.status!.isNotEmpty) parsed.status!,
+      if (parsed.method != null &&
+          parsed.method!.isNotEmpty &&
+          parsed.method != parsed.title)
+        parsed.method!,
       if (entry.latencyMs != null) '${entry.latencyMs} ms',
     ];
 
-    return Card(
-      clipBehavior: Clip.antiAlias,
-      child: ExpansionTile(
-        tilePadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-        title: Text(
-          parsed.title,
-          style: theme.textTheme.titleMedium,
+    return _ExpandableLogRow(
+      entry: entry,
+      category: entry.category,
+      title: parsed.title,
+      detail: detail.join(' · '),
+      extraContext: parsed.url,
+      children: [
+        if (parsed.headers != null) ...[
+          Text('Headers', style: theme.textTheme.titleSmall),
+          const SizedBox(height: 8),
+          _CodeBlock(value: _prettyJson(parsed.headers)),
+          const SizedBox(height: 12),
+        ],
+        Text('Body', style: theme.textTheme.titleSmall),
+        const SizedBox(height: 8),
+        _CodeBlock(value: _prettyJson(parsed.body)),
+        const SizedBox(height: 12),
+        Text('Raw event text', style: theme.textTheme.titleSmall),
+        const SizedBox(height: 8),
+        _CodeBlock(value: entry.message),
+      ],
+    );
+  }
+}
+
+/// Supplies profile display names to log rows below it.
+class _ProfileNames extends InheritedWidget {
+  const _ProfileNames({required this.names, required super.child});
+  final Map<String, String> names;
+
+  static Map<String, String> of(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<_ProfileNames>()?.names ??
+      const {};
+
+  @override
+  bool updateShouldNotify(_ProfileNames oldWidget) => oldWidget.names != names;
+}
+
+String _contextLine(BuildContext context, EventLogEntry entry) {
+  final profileId = entry.profileId ?? '';
+  return [
+    if (profileId.isNotEmpty) _ProfileNames.of(context)[profileId] ?? profileId,
+    if ((entry.bucketName ?? '').isNotEmpty) entry.bucketName!,
+    if ((entry.objectKey ?? '').isNotEmpty) entry.objectKey!,
+  ].join(' · ');
+}
+
+String _clockTime(DateTime value) => [value.hour, value.minute, value.second]
+    .map((part) => part.toString().padLeft(2, '0'))
+    .join(':');
+
+/// Severity colors separate from the accent so errors read at a glance.
+(Color, Color) _levelColors(ColorScheme scheme, String level) =>
+    switch (level.toUpperCase()) {
+      'ERROR' => (scheme.errorContainer, scheme.onErrorContainer),
+      'WARN' || 'WARNING' => (
+          scheme.tertiaryContainer,
+          scheme.onTertiaryContainer
         ),
-        subtitle: Column(
+      'API' => (scheme.primaryContainer, scheme.onPrimaryContainer),
+      'DEBUG' => (scheme.surfaceContainerHighest, scheme.onSurfaceVariant),
+      _ => (scheme.secondaryContainer, scheme.onSecondaryContainer),
+    };
+
+class _LevelPill extends StatelessWidget {
+  const _LevelPill({required this.level});
+  final String level;
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final (background, foreground) = _levelColors(theme.colorScheme, level);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+          color: background, borderRadius: BorderRadius.circular(4)),
+      child: Text(level.toUpperCase(),
+          maxLines: 1,
+          style: theme.textTheme.labelSmall?.copyWith(
+              color: foreground,
+              fontWeight: FontWeight.w800,
+              letterSpacing: .3)),
+    );
+  }
+}
+
+/// One dense log line: time, level, category, then the message with its
+/// profile/bucket/object context underneath.
+class _LogRow extends StatelessWidget {
+  const _LogRow({
+    required this.entry,
+    required this.category,
+    required this.message,
+    this.extraContext,
+  });
+
+  final EventLogEntry entry;
+  final String category;
+  final Widget message;
+  final String? extraContext;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final muted = theme.textTheme.bodySmall
+        ?.copyWith(color: theme.colorScheme.onSurfaceVariant);
+    final contextLine = _contextLine(context, entry);
+    final isError = entry.level.toUpperCase() == 'ERROR';
+    return Container(
+      color: isError
+          ? theme.colorScheme.errorContainer.withValues(alpha: .28)
+          : null,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: LayoutBuilder(builder: (context, constraints) {
+        final narrow = constraints.maxWidth < 520;
+        final meta = [
+          Tooltip(
+            message: formatDateTime(entry.timestamp),
+            child: SizedBox(
+              width: 68,
+              child: Text(_clockTime(entry.timestamp),
+                  style: muted?.copyWith(
+                      fontFeatures: const [FontFeature.tabularFigures()])),
+            ),
+          ),
+          SizedBox(
+              width: 64,
+              child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: _LevelPill(level: entry.level))),
+          SizedBox(
+            width: narrow ? null : 110,
+            child: Text(category,
+                maxLines: 1, overflow: TextOverflow.ellipsis, style: muted),
+          ),
+        ];
+        final body = Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const SizedBox(height: 6),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                Chip(label: Text(entry.category)),
-                Chip(label: Text(parsed.phaseLabel)),
-                ...summaryParts.map((part) => Chip(label: Text(part))),
-              ],
+            DefaultTextStyle.merge(
+                style: theme.textTheme.bodyMedium, child: message),
+            if (contextLine.isNotEmpty)
+              Text(contextLine,
+                  maxLines: 1, overflow: TextOverflow.ellipsis, style: muted),
+            if ((extraContext ?? '').isNotEmpty)
+              Text(extraContext!,
+                  maxLines: 1, overflow: TextOverflow.ellipsis, style: muted),
+          ],
+        );
+        if (narrow) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(children: meta),
+              const SizedBox(height: 4),
+              body,
+            ],
+          );
+        }
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ...meta.map((m) => Padding(
+                padding: const EdgeInsets.only(right: 8, top: 1), child: m)),
+            Expanded(child: body),
+          ],
+        );
+      }),
+    );
+  }
+}
+
+/// A [_LogRow] that expands to show trace payloads.
+class _ExpandableLogRow extends StatefulWidget {
+  const _ExpandableLogRow({
+    required this.entry,
+    required this.category,
+    required this.title,
+    required this.children,
+    this.detail = '',
+    this.extraContext,
+  });
+
+  final EventLogEntry entry;
+  final String category;
+  final String title;
+  final String detail;
+  final String? extraContext;
+  final List<Widget> children;
+
+  @override
+  State<_ExpandableLogRow> createState() => _ExpandableLogRowState();
+}
+
+class _ExpandableLogRowState extends State<_ExpandableLogRow> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        InkWell(
+          onTap: () => setState(() => _expanded = !_expanded),
+          child: Row(children: [
+            Expanded(
+              child: _LogRow(
+                entry: widget.entry,
+                category: widget.category,
+                extraContext: widget.extraContext,
+                message: Wrap(
+                  spacing: 8,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    Text(widget.title,
+                        style: theme.textTheme.bodyMedium
+                            ?.copyWith(fontWeight: FontWeight.w600)),
+                    if (widget.detail.isNotEmpty)
+                      Text(widget.detail,
+                          style: theme.textTheme.bodySmall?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant)),
+                  ],
+                ),
+              ),
             ),
-            if (contextParts.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Text(
-                contextParts.join(' - '),
-                style: theme.textTheme.bodySmall,
-              ),
-            ],
-            if (parsed.url != null && parsed.url!.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Text(
-                parsed.url!,
-                style: theme.textTheme.bodySmall,
-              ),
-            ],
-          ],
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Icon(_expanded ? Icons.expand_less : Icons.expand_more,
+                  semanticLabel: _expanded ? 'Hide details' : 'Show details',
+                  color: theme.colorScheme.onSurfaceVariant),
+            ),
+          ]),
         ),
-        children: [
-          if (parsed.headers != null) ...[
-            Text('Headers', style: theme.textTheme.titleSmall),
-            const SizedBox(height: 8),
-            _CodeBlock(value: _prettyJson(parsed.headers)),
-            const SizedBox(height: 12),
-          ],
-          Text('Body', style: theme.textTheme.titleSmall),
-          const SizedBox(height: 8),
-          _CodeBlock(value: _prettyJson(parsed.body)),
-          const SizedBox(height: 12),
-          Text('Raw event text', style: theme.textTheme.titleSmall),
-          const SizedBox(height: 8),
-          _CodeBlock(value: entry.message),
-        ],
-      ),
+        if (_expanded)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: widget.children,
+            ),
+          ),
+      ],
     );
   }
 }

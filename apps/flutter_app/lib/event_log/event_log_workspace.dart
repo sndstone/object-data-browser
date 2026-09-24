@@ -59,6 +59,11 @@ class _EventLogWorkspaceState extends State<EventLogWorkspace> {
     controller.clearEventLog();
   }
 
+  int _count(List<EventLogEntry> entries, String level) => entries
+      .where((e) =>
+          e.level.toUpperCase() == level || e.source?.toUpperCase() == level)
+      .length;
+
   @override
   Widget build(BuildContext context) {
     final entries = controller.eventLog;
@@ -89,40 +94,63 @@ class _EventLogWorkspaceState extends State<EventLogWorkspace> {
                 child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      Wrap(
-                          spacing: 8,
-                          crossAxisAlignment: WrapCrossAlignment.center,
-                          children: [
-                            Text('Event Log',
-                                style: Theme.of(context).textTheme.titleLarge),
-                            const Tooltip(
-                                message:
-                                    'Profile, listing, transfer and benchmark activity. Enable API and debug logging in Settings for engine traces.',
-                                child: Icon(Icons.info_outline)),
-                            FilledButton.icon(
-                                onPressed: controller.isBusy('export-event-log')
-                                    ? null
-                                    : controller.exportEventLog,
-                                icon: const Icon(Icons.download_outlined),
-                                label: const Text('Export')),
-                            OutlinedButton(
-                                onPressed: _clear, child: const Text('Clear')),
-                          ]),
-                      const SizedBox(height: 12),
-                      CompactSelector<String>(
-                          selected: _level,
-                          onChanged: (v) => setState(() => _level = v),
-                          options: [
-                            for (final level in [
-                              'All',
-                              'ERROR',
-                              'WARN',
-                              'INFO',
-                              'API',
-                              'DEBUG'
-                            ])
-                              CompactSelectorOption(value: level, label: level)
-                          ]),
+                      // The shell header names the workspace; this row holds
+                      // the level filter (with counts) and log actions.
+                      LayoutBuilder(builder: (context, constraints) {
+                        final levels = CompactSelector<String>(
+                            selected: _level,
+                            onChanged: (v) => setState(() => _level = v),
+                            options: [
+                              for (final level in [
+                                'All',
+                                'ERROR',
+                                'WARN',
+                                'INFO',
+                                'API',
+                                'DEBUG'
+                              ])
+                                CompactSelectorOption(
+                                    value: level,
+                                    label: level == 'All'
+                                        ? 'All ${entries.length}'
+                                        : '$level ${_count(entries, level)}')
+                            ]);
+                        final actions =
+                            Row(mainAxisSize: MainAxisSize.min, children: [
+                          const Tooltip(
+                              message:
+                                  'Profile, listing, transfer and benchmark activity. Enable API and debug logging in Settings for engine traces.',
+                              child: Icon(Icons.info_outline, size: 20)),
+                          const SizedBox(width: 4),
+                          TextButton.icon(
+                              onPressed: controller.isBusy('export-event-log')
+                                  ? null
+                                  : controller.exportEventLog,
+                              icon: const Icon(Icons.download_outlined),
+                              label: const Text('Export')),
+                          TextButton(
+                              onPressed: _clear, child: const Text('Clear')),
+                        ]);
+                        // Phones give the level filter its own row.
+                        if (constraints.maxWidth < 560) {
+                          return Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                levels,
+                                Align(
+                                    alignment: Alignment.centerRight,
+                                    child: actions),
+                              ]);
+                        }
+                        return Row(children: [
+                          Expanded(
+                              child: Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: levels)),
+                          const SizedBox(width: 8),
+                          actions,
+                        ]);
+                      }),
                       const SizedBox(height: 8),
                       Row(children: [
                         SizedBox(
@@ -148,7 +176,8 @@ class _EventLogWorkspaceState extends State<EventLogWorkspace> {
                       ]),
                       const SizedBox(height: 8),
                       Text(
-                          'Showing ${_filtered.length} of ${entries.length} · newest first'),
+                          'Showing ${_filtered.length} of ${entries.length} · newest first',
+                          style: Theme.of(context).textTheme.bodySmall),
                       const SizedBox(height: 8),
                       Expanded(
                           child: entries.isEmpty
@@ -165,6 +194,10 @@ class _EventLogWorkspaceState extends State<EventLogWorkspace> {
                                   entries: _filtered,
                                   textScalePercent:
                                       controller.settings.logTextScalePercent,
+                                  profileNames: {
+                                    for (final profile in controller.profiles)
+                                      profile.id: profile.name
+                                  },
                                   emptyMessage:
                                       'No events match these filters.')),
                     ]))));

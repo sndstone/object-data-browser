@@ -23,6 +23,39 @@ class AppMotion {
               child: child));
 }
 
+/// Fade between responsive layouts without laying out the outgoing wide
+/// layout in a newly narrow viewport. Keep state across resizes within a mode.
+class ResponsiveLayoutTransition extends StatelessWidget {
+  const ResponsiveLayoutTransition({
+    super.key,
+    required this.layoutKey,
+    required this.duration,
+    required this.child,
+    this.animateSize = false,
+  });
+  final Object layoutKey;
+  final Duration duration;
+  final Widget child;
+  final bool animateSize;
+
+  @override
+  Widget build(BuildContext context) {
+    final transition = AnimatedSwitcher(
+      duration: duration,
+      switchInCurve: Curves.easeOutCubic,
+      layoutBuilder: (current, previous) => current ?? const SizedBox.shrink(),
+      child: KeyedSubtree(key: ValueKey(layoutKey), child: child),
+    );
+    return animateSize
+        ? MotionSize(
+            duration: duration,
+            alignment: Alignment.topCenter,
+            curve: Curves.easeOutCubic,
+            child: transition)
+        : transition;
+  }
+}
+
 /// Ordered destinations enter from the direction being navigated toward;
 /// the old panel leaves through the opposite edge. Reversing navigation
 /// reverses both motions, including when the previous animation is in flight.

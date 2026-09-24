@@ -17,66 +17,45 @@ class TasksWorkspace extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     final view = controller.taskView;
     return Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(18),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8),
-              color: theme.colorScheme.surface,
-              border: Border.all(
-                color: theme.colorScheme.outlineVariant,
+          // The shell header already names the workspace and its counts,
+          // so filters and the bulk action share one compact row.
+          Wrap(
+            spacing: 12,
+            runSpacing: 8,
+            alignment: WrapAlignment.spaceBetween,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              CompactSelector<BrowserTaskView>(
+                selected: view,
+                onChanged: controller.setTaskView,
+                options: [
+                  CompactSelectorOption(
+                    value: BrowserTaskView.running,
+                    label:
+                        'Running · ${controller.tasksForView(BrowserTaskView.running).length}',
+                  ),
+                  CompactSelectorOption(
+                    value: BrowserTaskView.failed,
+                    label:
+                        'Failed · ${controller.tasksForView(BrowserTaskView.failed).length}',
+                  ),
+                  CompactSelectorOption(
+                    value: BrowserTaskView.all,
+                    label:
+                        'All · ${controller.tasksForView(BrowserTaskView.all).length}',
+                  ),
+                ],
               ),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Wrap(
-                    spacing: 12,
-                    crossAxisAlignment: WrapCrossAlignment.center,
-                    children: [
-                      Text('Jobs', style: theme.textTheme.headlineSmall),
-                      OutlinedButton(
-                          onPressed: controller.clearFinishedTasks,
-                          child: const Text('Clear finished'))
-                    ]),
-                const SizedBox(height: 8),
-                Text(
-                  'Track running work, review failures, and open completed jobs.',
-                  style: theme.textTheme.bodyLarge,
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 16),
-          CompactSelector<BrowserTaskView>(
-            selected: view,
-            onChanged: controller.setTaskView,
-            options: [
-              CompactSelectorOption(
-                value: BrowserTaskView.running,
-                icon: Icons.play_circle_outline,
-                label:
-                    'Running · ${controller.tasksForView(BrowserTaskView.running).length}',
-              ),
-              CompactSelectorOption(
-                value: BrowserTaskView.failed,
-                icon: Icons.error_outline,
-                label:
-                    'Failed · ${controller.tasksForView(BrowserTaskView.failed).length}',
-              ),
-              CompactSelectorOption(
-                value: BrowserTaskView.all,
-                icon: Icons.view_list_outlined,
-                label:
-                    'All · ${controller.tasksForView(BrowserTaskView.all).length}',
-              ),
+              TextButton.icon(
+                  onPressed: controller.clearFinishedTasks,
+                  icon: const Icon(Icons.clear_all),
+                  label: const Text('Clear finished')),
             ],
           ),
           const SizedBox(height: 16),
@@ -286,8 +265,12 @@ class _TaskCardState extends State<_TaskCard> {
                   icon: const Icon(Icons.stop_circle_outlined),
                   label: const Text('Cancel'),
                 ),
-              if (task.kind == BrowserTaskKind.transfer && task.isRunningLike && !task.canCancel && task.status != 'cancelling')
-                const Text('This engine cannot interrupt the active file. Cancelling a batch stops its remaining files.'),
+              if (task.kind == BrowserTaskKind.transfer &&
+                  task.isRunningLike &&
+                  !task.canCancel &&
+                  task.status != 'cancelling')
+                const Text(
+                    'This engine cannot interrupt the active file. Cancelling a batch stops its remaining files.'),
               if (task.kind == BrowserTaskKind.transfer)
                 OutlinedButton(
                   onPressed: task.canPause

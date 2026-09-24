@@ -274,7 +274,11 @@ void main() {
     await tester.pumpAndSettle();
     expect(controller.objectSortDescending, true);
     expect(find.text('Bucket config'), findsOneWidget);
-    await tester.tap(find.text('Diagnostics'));
+    // Diagnostic views live in the inspector's overflow menu.
+    await tester.tap(find.byTooltip('More inspector views'));
+    await tester.pumpAndSettle();
+    expect(find.text('Events & Debug'), findsOneWidget);
+    await tester.tap(find.text('Events & Debug'));
     await tester.pumpAndSettle();
     expect(find.text('Events & Debug'), findsOneWidget);
     expect(find.byTooltip('Advanced inspector tools'), findsNothing);
@@ -479,7 +483,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    final createButton = find.widgetWithText(FilledButton, 'New bucket');
+    final createButton = find.byTooltip('New bucket');
     final firstBucket = find.text('bucket-0');
 
     expect(firstBucket, findsOneWidget);
@@ -583,7 +587,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(find.widgetWithText(FilledButton, 'New bucket'), findsOneWidget);
+    expect(find.byTooltip('New bucket'), findsOneWidget);
     expect(find.widgetWithText(OutlinedButton, 'Create prefix'), findsNothing);
 
     await tester.tap(find.text('bucket-1'));
@@ -1553,9 +1557,22 @@ void main() {
     });
     final controller = await _buildController();
 
-    await tester.binding.setSurfaceSize(const Size(900, 900));
+    await tester.binding.setSurfaceSize(const Size(680, 900));
     await tester.pumpWidget(S3BrowserApp(controller: controller));
     await tester.pumpAndSettle();
+    expect(find.byType(NavigationBar), findsOneWidget);
+    final selectedProfile = controller.selectedProfile?.id;
+    final selectedBucket = controller.selectedBucket?.name;
+    // Reverse the resize before the previous transition finishes.
+    for (final width in [720.0, 680.0, 740.0, 900.0]) {
+      await tester.binding.setSurfaceSize(Size(width, 900));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 60));
+      expect(tester.takeException(), isNull);
+    }
+    await tester.pumpAndSettle();
+    expect(controller.selectedProfile?.id, selectedProfile);
+    expect(controller.selectedBucket?.name, selectedBucket);
     expect(find.byType(NavigationBar), findsNothing);
     final tabletTabs = find.byKey(const ValueKey('workspace-top-tabs'));
     expect(tabletTabs, findsOneWidget);

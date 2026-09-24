@@ -1553,6 +1553,7 @@ class AppSettings {
       'benchmarkDebugMode': benchmarkDebugMode,
       'benchmarkLogPath': benchmarkLogPath,
       'browserInspectorLayout': browserInspectorLayout.name,
+      'browserInspectorLayoutRevision': _inspectorLayoutRevision,
       'browserInspectorSize': browserInspectorSize,
       'relistObjectsAfterMutation': relistObjectsAfterMutation,
       'uiScalePercent': uiScalePercent,
@@ -1597,9 +1598,7 @@ class AppSettings {
           (json['benchmarkDataCacheMb'] as num?)?.toInt() ?? 0,
       benchmarkDebugMode: json['benchmarkDebugMode'] as bool? ?? false,
       benchmarkLogPath: (json['benchmarkLogPath'] as String?) ?? '',
-      browserInspectorLayout: BrowserInspectorLayout.values.byName(
-        (json['browserInspectorLayout'] as String?) ?? 'bottom',
-      ),
+      browserInspectorLayout: _inspectorLayoutFromJson(json),
       browserInspectorSize:
           (json['browserInspectorSize'] as num?)?.toInt() ?? 360,
       relistObjectsAfterMutation:
@@ -1609,6 +1608,23 @@ class AppSettings {
       browserInspectorVisible: json['browserInspectorVisible'] as bool? ?? true,
       logTextScalePercent: (json['logTextScalePercent'] as num?)?.toInt() ?? 80,
     );
+  }
+
+  /// Revision 1 made the right-docked inspector the default. Settings saved
+  /// before it carried the old implicit `bottom` default, so they move to the
+  /// new default once; later explicit choices are kept.
+  static const int _inspectorLayoutRevision = 1;
+
+  static BrowserInspectorLayout _inspectorLayoutFromJson(
+      Map<String, Object?> json) {
+    final raw = json['browserInspectorLayout'] as String?;
+    final revision =
+        (json['browserInspectorLayoutRevision'] as num?)?.toInt() ?? 0;
+    if (raw == null ||
+        (revision < _inspectorLayoutRevision && raw == 'bottom')) {
+      return BrowserInspectorLayout.right;
+    }
+    return BrowserInspectorLayout.values.byName(raw);
   }
 
   AppSettings copyWith({
