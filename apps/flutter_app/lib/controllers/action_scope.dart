@@ -4,8 +4,8 @@ import '../services/listing_cancellation.dart';
 /// An action owns its cancellation across nested async requests. Zone values
 /// keep simultaneous actions separate without adding mutable global selection.
 class ActionScope extends ListingCancellation {
-  ActionScope({this.engineId}) {
-    final parent = current;
+  ActionScope({this.engineId, bool inheritParent = true}) {
+    final parent = inheritParent ? current : null;
     if (parent != null) {
       parent.whenCancelled.then((_) => cancel());
       if (parent.isCancelled) cancel();

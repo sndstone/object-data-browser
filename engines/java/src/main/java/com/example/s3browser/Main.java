@@ -16,14 +16,12 @@ import software.amazon.awssdk.http.apache.ApacheHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
-import software.amazon.awssdk.services.s3.model.AbortIncompleteMultipartUpload;
 import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.Bucket;
 import software.amazon.awssdk.services.s3.model.BucketLocationConstraint;
 import software.amazon.awssdk.services.s3.model.BucketVersioningStatus;
 import software.amazon.awssdk.services.s3.model.CORSConfiguration;
 import software.amazon.awssdk.services.s3.model.CORSRule;
-import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
 import software.amazon.awssdk.services.s3.model.CreateBucketConfiguration;
 import software.amazon.awssdk.services.s3.model.CreateBucketRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
@@ -52,13 +50,10 @@ import software.amazon.awssdk.services.s3.model.GetObjectLockConfigurationReques
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectTaggingRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
-import software.amazon.awssdk.services.s3.model.LifecycleExpiration;
 import software.amazon.awssdk.services.s3.model.LifecycleRule;
-import software.amazon.awssdk.services.s3.model.LifecycleRuleFilter;
 import software.amazon.awssdk.services.s3.model.ListBucketsRequest;
 import software.amazon.awssdk.services.s3.model.ListObjectVersionsRequest;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
-import software.amazon.awssdk.services.s3.model.NoncurrentVersionExpiration;
 import software.amazon.awssdk.services.s3.model.NoncurrentVersionTransition;
 import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 import software.amazon.awssdk.services.s3.model.ObjectLockConfiguration;
@@ -120,7 +115,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class Main {
-    private static final String ENGINE_VERSION = "2.2.8";
+    private static final String ENGINE_VERSION = "2.3.0";
     private static final int REQUEST_POOL_SIZE = 8;
     private static final int DELETE_BATCH_LIMIT = 1000;
     private static final Object STDOUT_LOCK = new Object();
@@ -199,8 +194,16 @@ public final class Main {
                 "source", source
             )));
         } catch (IOException ignored) {
-            System.err.println("S3_BROWSER_LOG {\"level\":\"" + level + "\",\"category\":\"" + category
-                + "\",\"message\":\"" + message.replace("\"", "\\\"") + "\",\"source\":\"" + source + "\"}");
+            System.err.println(
+                    "S3_BROWSER_LOG {\"level\":\""
+                            + level
+                            + "\",\"category\":\""
+                            + category
+                            + "\",\"message\":\""
+                            + message.replace("\"", "\\\"")
+                            + "\",\"source\":\""
+                            + source
+                            + "\"}");
         }
     }
 
@@ -353,24 +356,38 @@ public final class Main {
     }
 
     private static Map<String, Object> getCapabilities() {
-        List<Map<String, Object>> items = List.of(
-            capability("bucket.lifecycle", "Lifecycle policy CRUD", "supported", null),
-            capability("bucket.policy", "Bucket policy CRUD", "supported", null),
-            capability("bucket.cors", "Bucket CORS CRUD", "supported", null),
-            capability("bucket.encryption", "Bucket encryption", "supported", null),
-            capability("bucket.tagging", "Bucket tagging", "supported", null),
-            capability("bucket.versioning", "Bucket versioning", "supported", null),
-            capability("object.copy_move", "Copy, move, rename", "supported", null),
-            capability("object.resumable", "Resumable transfer jobs", "unknown", "Desktop host currently uses one request per sidecar process."),
-            capability("tools.bulk-delete", "Delete-all maintenance tool", "supported", null),
-            capability("benchmark", "Integrated benchmark mode", "supported", null)
-        );
+        List<Map<String, Object>> items =
+                List.of(
+                        capability("bucket.lifecycle", "Lifecycle policy CRUD", "supported", null),
+                        capability("bucket.policy", "Bucket policy CRUD", "supported", null),
+                        capability("bucket.cors", "Bucket CORS CRUD", "supported", null),
+                        capability("bucket.encryption", "Bucket encryption", "supported", null),
+                        capability("bucket.tagging", "Bucket tagging", "supported", null),
+                        capability("bucket.versioning", "Bucket versioning", "supported", null),
+                        capability("object.copy_move", "Copy, move, rename", "supported", null),
+                        capability(
+                                "object.resumable",
+                                "Resumable transfer jobs",
+                                "unknown",
+                                "Desktop host currently uses one request per sidecar process."),
+                        capability(
+                                "tools.bulk-delete",
+                                "Delete-all maintenance tool",
+                                "supported",
+                                null),
+                        capability("benchmark", "Integrated benchmark mode", "supported", null));
         return orderedMap("items", items);
     }
 
     private static Map<String, Object> testProfile(JsonNode profileNode) {
         Profile profile = parseProfile(profileNode);
         try (S3Client client = buildClient(profile)) {
+            String known = profileNode.path("knownBucket").asText("").trim();
+            if (!known.isEmpty()) {
+                client.listObjectsV2(
+                        ListObjectsV2Request.builder().bucket(known).maxKeys(1).build());
+                return orderedMap("ok", true, "bucketCount", 1, "endpoint", profile.endpointUrl);
+            }
             var output = client.listBuckets(ListBucketsRequest.builder().build());
             String endpoint = URI.create(profile.endpointUrl).getHost();
             if (endpoint == null || endpoint.isBlank()) {
@@ -387,16 +404,50 @@ public final class Main {
     private static Map<String, Object> listBuckets(JsonNode profileNode) {
         Profile profile = parseProfile(profileNode);
         try (S3Client client = buildClient(profile)) {
+            String known = profileNode.path("knownBucket").asText("").trim();
+            if (!known.isEmpty())
+                return orderedMap(
+                        "items",
+                        List.of(
+                                orderedMap(
+                                        "name",
+                                        known,
+                                        "region",
+                                        profile.region,
+                                        "objectCountHint",
+                                        0,
+                                        "versioningEnabled",
+                                        false,
+                                        "createdAt",
+                                        nowIso())));
             List<Map<String, Object>> items = new ArrayList<>();
-            for (Bucket bucket : client.listBuckets(ListBucketsRequest.builder().build()).buckets()) {
-                items.add(orderedMap(
-                    "name", bucket.name(),
-                    "region", profile.region,
-                    "objectCountHint", 0,
-                    "versioningEnabled", false,
-                    "createdAt", serializeTime(bucket.creationDate())
-                ));
-            }
+            String token = null;
+            java.util.Set<String> seen = new java.util.HashSet<>();
+            do {
+                var page =
+                        client.listBuckets(
+                                ListBucketsRequest.builder()
+                                        .maxBuckets(1000)
+                                        .continuationToken(token)
+                                        .build());
+                for (Bucket bucket : page.buckets())
+                    items.add(
+                            orderedMap(
+                                    "name",
+                                    bucket.name(),
+                                    "region",
+                                    profile.region,
+                                    "objectCountHint",
+                                    0,
+                                    "versioningEnabled",
+                                    false,
+                                    "createdAt",
+                                    serializeTime(bucket.creationDate())));
+                token = blankToNull(page.continuationToken());
+                if (token != null && !seen.add(token))
+                    throw new SidecarException(
+                            "invalid_response", "Bucket listing repeated a continuation token.");
+            } while (token != null);
             return orderedMap("items", items);
         }
     }
@@ -459,14 +510,39 @@ public final class Main {
 
     private static Map<String, Object> putBucketLifecycle(JsonNode params) throws IOException {
         BucketContext context = bucketContext(params);
-        String lifecycleJson = requiredText(params, "lifecycleJson", "Bucket name and lifecycle JSON are required.");
+        String lifecycleJson =
+                requiredText(
+                        params, "lifecycleJson", "Bucket name and lifecycle JSON are required.");
+        JsonNode configuration = MAPPER.readTree(lifecycleJson);
+        configuration
+                .fieldNames()
+                .forEachRemaining(
+                        field -> {
+                            if (!List.of("Rules", "TransitionDefaultMinimumObjectSize")
+                                    .contains(field))
+                                throw new SidecarException(
+                                        "unsupported_feature",
+                                        "Unsupported lifecycle configuration field "
+                                                + field
+                                                + "; configuration was not changed.");
+                        });
         try (S3Client client = context.client()) {
-            client.putBucketLifecycleConfiguration(PutBucketLifecycleConfigurationRequest.builder()
-                .bucket(context.bucketName())
-                .lifecycleConfiguration(software.amazon.awssdk.services.s3.model.BucketLifecycleConfiguration.builder()
-                    .rules(parseLifecycleRules(MAPPER.readTree(lifecycleJson).path("Rules")))
-                    .build())
-                .build());
+            client.putBucketLifecycleConfiguration(
+                    PutBucketLifecycleConfigurationRequest.builder()
+                            .transitionDefaultMinimumObjectSize(
+                                    MAPPER.readTree(lifecycleJson)
+                                            .path("TransitionDefaultMinimumObjectSize")
+                                            .asText(null))
+                            .bucket(context.bucketName())
+                            .lifecycleConfiguration(
+                                    software.amazon.awssdk.services.s3.model
+                                            .BucketLifecycleConfiguration.builder()
+                                            .rules(
+                                                    parseLifecycleRules(
+                                                            MAPPER.readTree(lifecycleJson)
+                                                                    .path("Rules")))
+                                            .build())
+                            .build());
         }
         return getBucketAdminState(params);
     }
@@ -481,7 +557,8 @@ public final class Main {
 
     private static Map<String, Object> putBucketPolicy(JsonNode params) {
         BucketContext context = bucketContext(params);
-        String policyJson = requiredText(params, "policyJson", "Bucket name and policy JSON are required.");
+        String policyJson =
+                requiredText(params, "policyJson", "Bucket name and policy JSON are required.");
         try (S3Client client = context.client()) {
             client.putBucketPolicy(PutBucketPolicyRequest.builder()
                 .bucket(context.bucketName())
@@ -501,7 +578,8 @@ public final class Main {
 
     private static Map<String, Object> putBucketCors(JsonNode params) throws IOException {
         BucketContext context = bucketContext(params);
-        String corsJson = requiredText(params, "corsJson", "Bucket name and CORS JSON are required.");
+        String corsJson =
+                requiredText(params, "corsJson", "Bucket name and CORS JSON are required.");
         try (S3Client client = context.client()) {
             client.putBucketCors(PutBucketCorsRequest.builder()
                 .bucket(context.bucketName())
@@ -523,7 +601,9 @@ public final class Main {
 
     private static Map<String, Object> putBucketEncryption(JsonNode params) throws IOException {
         BucketContext context = bucketContext(params);
-        String encryptionJson = requiredText(params, "encryptionJson", "Bucket name and encryption JSON are required.");
+        String encryptionJson =
+                requiredText(
+                        params, "encryptionJson", "Bucket name and encryption JSON are required.");
         try (S3Client client = context.client()) {
             client.putBucketEncryption(PutBucketEncryptionRequest.builder()
                 .bucket(context.bucketName())
@@ -548,7 +628,14 @@ public final class Main {
             throw new SidecarException("invalid_config", "Bucket name and tags are required.");
         }
         List<Tag> tagSet = new ArrayList<>();
-        tagsNode.fields().forEachRemaining(entry -> tagSet.add(Tag.builder().key(entry.getKey()).value(entry.getValue().asText("")).build()));
+        tagsNode.fields()
+                .forEachRemaining(
+                        entry ->
+                                tagSet.add(
+                                        Tag.builder()
+                                                .key(entry.getKey())
+                                                .value(entry.getValue().asText(""))
+                                                .build()));
         try (S3Client client = context.client()) {
             client.putBucketTagging(PutBucketTaggingRequest.builder()
                 .bucket(context.bucketName())
@@ -615,14 +702,16 @@ public final class Main {
                     "metadataCount", 0
                 ));
             });
-            items.sort((left, right) -> {
-                boolean leftFolder = Boolean.TRUE.equals(left.get("isFolder"));
-                boolean rightFolder = Boolean.TRUE.equals(right.get("isFolder"));
-                if (leftFolder != rightFolder) {
-                    return leftFolder ? -1 : 1;
-                }
-                return String.valueOf(left.get("key")).compareToIgnoreCase(String.valueOf(right.get("key")));
-            });
+            items.sort(
+                    (left, right) -> {
+                        boolean leftFolder = Boolean.TRUE.equals(left.get("isFolder"));
+                        boolean rightFolder = Boolean.TRUE.equals(right.get("isFolder"));
+                        if (leftFolder != rightFolder) {
+                            return leftFolder ? -1 : 1;
+                        }
+                        return String.valueOf(left.get("key"))
+                                .compareToIgnoreCase(String.valueOf(right.get("key")));
+                    });
             return orderedMap(
                 "items", items,
                 "nextCursor", orderedMap(
@@ -637,9 +726,15 @@ public final class Main {
         BucketContext context = bucketContext(params);
         List<Map<String, Object>> apiCalls = new ArrayList<>();
         try (S3Client client = context.client()) {
-            var versioning = recordApi(apiCalls, "GetBucketVersioning", () ->
-                client.getBucketVersioning(GetBucketVersioningRequest.builder().bucket(context.bucketName()).build())
-            );
+            var versioning =
+                    optionalBucketApi(
+                            apiCalls,
+                            "GetBucketVersioning",
+                            () ->
+                                    client.getBucketVersioning(
+                                            GetBucketVersioningRequest.builder()
+                                                    .bucket(context.bucketName())
+                                                    .build()));
             var encryption = optionalBucketApi(apiCalls, "GetBucketEncryption", () ->
                 client.getBucketEncryption(GetBucketEncryptionRequest.builder().bucket(context.bucketName()).build())
             );
@@ -663,7 +758,15 @@ public final class Main {
             String lifecycleJson = "{\n  \"Rules\": []\n}";
             if (lifecycle != null) {
                 lifecycle.rules().forEach(rule -> lifecycleRules.add(lifecycleRuleSummary(rule)));
-                lifecycleJson = writeJson(orderedMap("Rules", lifecycle.rules().stream().map(Main::lifecycleRuleRaw).toList()));
+                lifecycleJson =
+                        writeJson(
+                                orderedMap(
+                                        "Rules",
+                                        lifecycle.rules().stream()
+                                                .map(Main::lifecycleRuleRaw)
+                                                .toList(),
+                                        "TransitionDefaultMinimumObjectSize",
+                                        lifecycle.transitionDefaultMinimumObjectSizeAsString()));
             }
 
             String encryptionSummary = "Not configured";
@@ -674,9 +777,14 @@ public final class Main {
                 encryptionJson = writeJson(encryptionRaw(encryption.serverSideEncryptionConfiguration()));
                 if (encryptionEnabled) {
                     var applyDefault = encryption.serverSideEncryptionConfiguration().rules().getFirst().applyServerSideEncryptionByDefault();
-                    encryptionSummary = applyDefault.kmsMasterKeyID() == null || applyDefault.kmsMasterKeyID().isBlank()
-                        ? applyDefault.sseAlgorithmAsString()
-                        : applyDefault.sseAlgorithmAsString() + " (" + applyDefault.kmsMasterKeyID() + ")";
+                    encryptionSummary =
+                            applyDefault.kmsMasterKeyID() == null
+                                            || applyDefault.kmsMasterKeyID().isBlank()
+                                    ? applyDefault.sseAlgorithmAsString()
+                                    : applyDefault.sseAlgorithmAsString()
+                                            + " ("
+                                            + applyDefault.kmsMasterKeyID()
+                                            + ")";
                 }
             }
 
@@ -688,10 +796,15 @@ public final class Main {
             String policyJson = policy == null || policy.policy() == null || policy.policy().isBlank()
                 ? "{}"
                 : policy.policy();
-            String corsJson = cors == null ? "[]" : writeJson(cors.corsRules().stream().map(Main::corsRuleRaw).toList());
+            String corsJson =
+                    cors == null
+                            ? "[]"
+                            : writeJson(cors.corsRules().stream().map(Main::corsRuleRaw).toList());
 
             String objectLockMode = null;
             Integer objectLockRetentionDays = null;
+            Integer objectLockRetentionValue = null;
+            String objectLockRetentionUnit = null;
             boolean objectLockEnabled = false;
             if (objectLock != null && objectLock.objectLockConfiguration() != null) {
                 objectLockEnabled = true;
@@ -701,32 +814,51 @@ public final class Main {
                     objectLockMode = retention.modeAsString();
                     if (retention.days() != null) {
                         objectLockRetentionDays = retention.days();
+                        objectLockRetentionValue = retention.days();
+                        objectLockRetentionUnit = "days";
                     } else if (retention.years() != null) {
-                        objectLockRetentionDays = retention.years();
+                        objectLockRetentionValue = retention.years();
+                        objectLockRetentionUnit = "years";
                     }
                 }
             }
 
             return orderedMap(
-                "bucketName", context.bucketName(),
-                "versioningEnabled", versioning.status() == BucketVersioningStatus.ENABLED,
-                "versioningStatus", versioning.statusAsString(),
-                "objectLockEnabled", objectLockEnabled,
-                "lifecycleEnabled", !lifecycleRules.isEmpty(),
-                "policyAttached", policy != null && policy.policy() != null && !policy.policy().isBlank(),
-                "corsEnabled", cors != null && !cors.corsRules().isEmpty(),
-                "encryptionEnabled", encryptionEnabled,
-                "encryptionSummary", encryptionSummary,
-                "objectLockMode", objectLockMode,
-                "objectLockRetentionDays", objectLockRetentionDays,
-                "tags", tags,
-                "lifecycleRules", lifecycleRules,
-                "lifecycleJson", lifecycleJson,
-                "policyJson", policyJson,
-                "corsJson", corsJson,
-                "encryptionJson", encryptionJson,
-                "apiCalls", apiCalls
-            );
+                    "bucketName", context.bucketName(),
+                    "versioningEnabled",
+                            versioning != null
+                                    && versioning.status() == BucketVersioningStatus.ENABLED,
+                    "versioningStatus",
+                            versioning == null
+                                    ? "unknown"
+                                    : blankToDefault(versioning.statusAsString(), "never-enabled"),
+                    "objectLockEnabled", objectLockEnabled,
+                    "lifecycleEnabled", !lifecycleRules.isEmpty(),
+                    "policyAttached",
+                            policy != null && policy.policy() != null && !policy.policy().isBlank(),
+                    "corsEnabled", cors != null && !cors.corsRules().isEmpty(),
+                    "encryptionEnabled", encryptionEnabled,
+                    "encryptionSummary", encryptionSummary,
+                    "objectLockMode", objectLockMode,
+                    "objectLockRetentionDays", objectLockRetentionDays,
+                    "objectLockRetentionYears",
+                            "years".equals(objectLockRetentionUnit)
+                                    ? objectLockRetentionValue
+                                    : null,
+                    "objectLockRetentionValue", objectLockRetentionValue,
+                    "objectLockRetentionUnit", objectLockRetentionUnit,
+                    "tags", tags,
+                    "lifecycleRules", lifecycleRules,
+                    "lifecycleJson", lifecycleJson,
+                    "policyJson", policyJson,
+                    "corsJson", corsJson,
+                    "encryptionJson", encryptionJson,
+                    "sections", sectionStatuses(apiCalls),
+                    "versioningState",
+                            versioning == null
+                                    ? "unknown"
+                                    : blankToDefault(versioning.statusAsString(), "never-enabled"),
+                    "apiCalls", apiCalls);
         }
     }
 
@@ -735,9 +867,8 @@ public final class Main {
         String key = params.path("key").asText("");
         String filterValue = params.path("options").path("filterValue").asText("");
         String filterMode = params.path("options").path("filterMode").asText("prefix");
-        String effectivePrefix = key.isBlank()
-            ? ("prefix".equals(filterMode) ? filterValue : "")
-            : key;
+        String effectivePrefix =
+                key.isEmpty() ? ("prefix".equals(filterMode) ? filterValue : "") : key;
         // Decode the incoming cursor. listObjectVersions paginates on two markers (key + versionId),
         // so the opaque cursor value carries both encoded as JSON. Mirrors listObjects' cursor shape
         // of {value, hasMore}, but the value is a compound token rather than a single string.
@@ -768,7 +899,7 @@ public final class Main {
             var output = client.listObjectVersions(request.build());
             List<Map<String, Object>> items = new ArrayList<>();
             for (ObjectVersion version : output.versions()) {
-                if (!key.isBlank() && !Objects.equals(version.key(), key)) {
+                if (!key.isEmpty() && !Objects.equals(version.key(), key)) {
                     continue;
                 }
                 items.add(orderedMap(
@@ -782,7 +913,7 @@ public final class Main {
                 ));
             }
             for (DeleteMarkerEntry marker : output.deleteMarkers()) {
-                if (!key.isBlank() && !Objects.equals(marker.key(), key)) {
+                if (!key.isEmpty() && !Objects.equals(marker.key(), key)) {
                     continue;
                 }
                 items.add(orderedMap(
@@ -795,8 +926,14 @@ public final class Main {
                     "storageClass", "DELETE_MARKER"
                 ));
             }
-            items.sort((left, right) -> String.valueOf(right.get("modifiedAt")).compareTo(String.valueOf(left.get("modifiedAt"))));
-            long deleteMarkerCount = items.stream().filter(item -> Boolean.TRUE.equals(item.get("deleteMarker"))).count();
+            items.sort(
+                    (left, right) ->
+                            String.valueOf(right.get("modifiedAt"))
+                                    .compareTo(String.valueOf(left.get("modifiedAt"))));
+            long deleteMarkerCount =
+                    items.stream()
+                            .filter(item -> Boolean.TRUE.equals(item.get("deleteMarker")))
+                            .count();
             String nextCursorValue = null;
             if (output.isTruncated()) {
                 nextCursorValue = MAPPER.writeValueAsString(orderedMap(
@@ -816,7 +953,11 @@ public final class Main {
 
     private static Map<String, Object> getObjectDetails(JsonNode params) {
         BucketContext context = bucketContext(params);
-        String key = requiredText(params, "key", "Bucket name and object key are required for object inspection.");
+        String key =
+                requiredText(
+                        params,
+                        "key",
+                        "Bucket name and object key are required for object inspection.");
         List<Map<String, Object>> apiCalls = new ArrayList<>();
         List<Map<String, Object>> debugEvents = new ArrayList<>();
         debugEvents.add(orderedMap(
@@ -825,12 +966,30 @@ public final class Main {
             "message", "Fetching object diagnostics for " + context.bucketName() + "/" + key + "."
         ));
         try (S3Client client = context.client()) {
-            var head = recordApi(apiCalls, "HeadObject", () ->
-                client.headObject(HeadObjectRequest.builder().bucket(context.bucketName()).key(key).build())
-            );
-            var tagging = optionalBucketApi(apiCalls, "GetObjectTagging", () ->
-                client.getObjectTagging(GetObjectTaggingRequest.builder().bucket(context.bucketName()).key(key).build())
-            );
+            var head =
+                    recordApi(
+                            apiCalls,
+                            "HeadObject",
+                            () ->
+                                    client.headObject(
+                                            HeadObjectRequest.builder()
+                                                    .bucket(context.bucketName())
+                                                    .key(key)
+                                                    .versionId(
+                                                            params.path("versionId").asText(null))
+                                                    .build()));
+            var tagging =
+                    optionalBucketApi(
+                            apiCalls,
+                            "GetObjectTagging",
+                            () ->
+                                    client.getObjectTagging(
+                                            GetObjectTaggingRequest.builder()
+                                                    .bucket(context.bucketName())
+                                                    .key(key)
+                                                    .versionId(
+                                                            params.path("versionId").asText(null))
+                                                    .build()));
 
             Map<String, String> metadata = new LinkedHashMap<>(head.metadata());
             Map<String, String> headers = new LinkedHashMap<>();
@@ -853,27 +1012,31 @@ public final class Main {
             ));
 
             return orderedMap(
-                "key", key,
-                "metadata", metadata,
-                "headers", headers,
-                "tags", tags,
-                "debugEvents", debugEvents,
-                "apiCalls", apiCalls,
-                "debugLogExcerpt", List.of(
-                    "Resolved endpoint " + context.profile().endpointUrl + ".",
-                    "Completed HEAD and tagging diagnostics for " + context.bucketName() + "/" + key + "."
-                ),
-                "rawDiagnostics", orderedMap(
-                    "bucketName", context.bucketName(),
-                    "engineState", "healthy"
-                )
-            );
+                    "key", key,
+                    "metadata", metadata,
+                    "headers", headers,
+                    "tags", tags,
+                    "debugEvents", debugEvents,
+                    "sections", sectionStatuses(apiCalls),
+                    "apiCalls", apiCalls,
+                    "debugLogExcerpt",
+                            List.of(
+                                    "Resolved endpoint " + context.profile().endpointUrl + ".",
+                                    "Completed HEAD and tagging diagnostics for "
+                                            + context.bucketName()
+                                            + "/"
+                                            + key
+                                            + "."),
+                    "rawDiagnostics",
+                            orderedMap(
+                                    "bucketName", context.bucketName(), "engineState", "healthy"));
         }
     }
 
     private static Map<String, Object> createFolder(JsonNode params) {
         BucketContext context = bucketContext(params);
-        String key = requiredText(params, "key", "Bucket name and key are required to create a folder.");
+        String key =
+                requiredText(params, "key", "Bucket name and key are required to create a folder.");
         if (!key.endsWith("/")) {
             key += "/";
         }
@@ -889,28 +1052,42 @@ public final class Main {
 
     private static Map<String, Object> copyObject(JsonNode params) {
         Profile profile = parseProfile(params.path("profile"));
-        String sourceBucket = requiredText(params, "sourceBucketName", "Copy source and destination are required.");
-        String sourceKey = requiredText(params, "sourceKey", "Copy source and destination are required.");
-        String destinationBucket = requiredText(params, "destinationBucketName", "Copy source and destination are required.");
-        String destinationKey = requiredText(params, "destinationKey", "Copy source and destination are required.");
         try (S3Client client = buildClient(profile)) {
-            client.copyObject(CopyObjectRequest.builder()
-                .copySource(urlEncode(sourceBucket + "/" + sourceKey))
-                .bucket(destinationBucket)
-                .key(destinationKey)
-                .build());
+            return ServerCopy.run(client, params, transferPoolSize(profile));
         }
-        return orderedMap("successCount", 1, "failureCount", 0, "failures", List.of());
     }
 
     private static Map<String, Object> moveObject(JsonNode params) {
+        if (params.path("sourceBucketName").equals(params.path("destinationBucketName"))
+                && params.path("sourceKey").equals(params.path("destinationKey")))
+            throw new SidecarException(
+                    "invalid_config",
+                    "A move requires different source and destination keys or buckets.");
         Map<String, Object> result = copyObject(params);
-        Profile profile = parseProfile(params.path("profile"));
-        try (S3Client client = buildClient(profile)) {
-            client.deleteObject(DeleteObjectRequest.builder()
-                .bucket(requiredText(params, "sourceBucketName", "Copy source and destination are required."))
-                .key(requiredText(params, "sourceKey", "Copy source and destination are required."))
-                .build());
+        String version = (String) result.get("sourceVersionId");
+        if (version == null
+                && !"awsS3".equals(params.path("profile").path("endpointType").asText())) {
+            result.put("successCount", 0);
+            result.put("failureCount", 1);
+            result.put("copyCompleted", true);
+            result.put("sourceRetained", true);
+            result.put(
+                    "failures",
+                    List.of(
+                            "Copy completed. Source retained because this compatible endpoint has"
+                                + " no verified conditional-delete capability."));
+            return result;
+        }
+        try (S3Client client = buildClient(parseProfile(params.path("profile")))) {
+            client.deleteObject(
+                    DeleteObjectRequest.builder()
+                            .bucket(
+                                    requiredText(
+                                            params, "sourceBucketName", "Source bucket required."))
+                            .key(requiredText(params, "sourceKey", "Source key required."))
+                            .versionId(version)
+                            .ifMatch((String) result.get("sourceETag"))
+                            .build());
         }
         return result;
     }
@@ -1026,7 +1203,8 @@ public final class Main {
         List<String> filePaths = stringArray(params.path("filePaths"));
         Map<String, String> objectKeyByPath = stringMap(params.path("objectKeyByPath"));
         if (filePaths.isEmpty()) {
-            throw new SidecarException("invalid_config", "Bucket name and file paths are required.");
+            throw new SidecarException(
+                    "invalid_config", "Bucket name and file paths are required.");
         }
         String prefix = params.path("prefix").asText("");
         int multipartThresholdMiB = Math.max(params.path("multipartThresholdMiB").asInt(32), 1);
@@ -1109,7 +1287,14 @@ public final class Main {
                 ).replace('\\', '/').replaceFirst("^/+", "");
                 String key = prefix.isBlank() ? targetName : prefix + targetName;
                 synchronized (progressLock) {
-                    outputLines.add("Uploading " + path.getFileName() + " (" + fileSize + " bytes) to " + key + ".");
+                    outputLines.add(
+                            "Uploading "
+                                    + path.getFileName()
+                                    + " ("
+                                    + fileSize
+                                    + " bytes) to "
+                                    + key
+                                    + ".");
                 }
                 if (fileSize >= multipartThresholdBytes) {
                     String uploadId = client.createMultipartUpload(CreateMultipartUploadRequest.builder()
@@ -1123,60 +1308,88 @@ public final class Main {
                             final int partNumber = index + 1;
                             final long partOffset = (long) index * multipartChunkBytes;
                             final long partLength = Math.min(multipartChunkBytes, fileSize - partOffset);
-                            futures.add(executor.submit(() -> {
-                                if (!control.awaitRunnable()) {
-                                    throw new TransferCancelledException();
-                                }
-                                var partResult = client.uploadPart(
-                                    UploadPartRequest.builder()
-                                        .bucket(context.bucketName())
-                                        .key(key)
-                                        .uploadId(uploadId)
-                                        .partNumber(partNumber)
-                                        .build(),
-                                    RequestBody.fromContentProvider(() -> {
-                                        try {
-                                            return new FilePartStream(path, partOffset, partLength, () -> {
-                                                if (!control.awaitRunnable()) throw new TransferCancelledException();
-                                            });
-                                        } catch (IOException error) { throw new java.io.UncheckedIOException(error); }
-                                    }, partLength, "application/octet-stream")
-                                );
-                                long transferredNow = bytesTransferred.addAndGet(partLength);
-                                int partsCompletedNow = partsCompleted.incrementAndGet();
-                                List<String> linesSnapshot;
-                                int itemsCompletedNow;
-                                synchronized (progressLock) {
-                                    addPartOutputLine(outputLines, partOutputLineCount,
-                                        "Uploaded part " + partNumber + " for " + path.getFileName() + ".");
-                                    linesSnapshot = List.copyOf(outputLines);
-                                    itemsCompletedNow = itemsCompleted.get();
-                                }
-                                emitTransferEvent(transferJob(
-                                    jobId,
-                                    label,
-                                    "upload",
-                                    progressFraction(transferredNow, totalBytes),
-                                    "running",
-                                    transferredNow,
-                                    totalBytes,
-                                    strategyLabel,
-                                    path.getFileName().toString(),
-                                    filePaths.size(),
-                                    itemsCompletedNow,
-                                    partSizeBytes,
-                                    partsCompletedNow,
-                                    partCount,
-                                    true,
-                                    false,
-                                    true,
-                                    linesSnapshot
-                                ));
-                                return CompletedPart.builder()
-                                    .eTag(partResult.eTag())
-                                    .partNumber(partNumber)
-                                    .build();
-                            }));
+                            futures.add(
+                                    executor.submit(
+                                            () -> {
+                                                if (!control.awaitRunnable()) {
+                                                    throw new TransferCancelledException();
+                                                }
+                                                var partResult =
+                                                        client.uploadPart(
+                                                                UploadPartRequest.builder()
+                                                                        .bucket(
+                                                                                context
+                                                                                        .bucketName())
+                                                                        .key(key)
+                                                                        .uploadId(uploadId)
+                                                                        .partNumber(partNumber)
+                                                                        .build(),
+                                                                RequestBody.fromContentProvider(
+                                                                        () -> {
+                                                                            try {
+                                                                                return new FilePartStream(
+                                                                                        path,
+                                                                                        partOffset,
+                                                                                        partLength,
+                                                                                        () -> {
+                                                                                            if (!control
+                                                                                                    .awaitRunnable())
+                                                                                                throw new TransferCancelledException();
+                                                                                        });
+                                                                            } catch (
+                                                                                    IOException
+                                                                                            error) {
+                                                                                throw new java.io
+                                                                                        .UncheckedIOException(
+                                                                                        error);
+                                                                            }
+                                                                        },
+                                                                        partLength,
+                                                                        "application/octet-stream"));
+                                                long transferredNow =
+                                                        bytesTransferred.addAndGet(partLength);
+                                                int partsCompletedNow =
+                                                        partsCompleted.incrementAndGet();
+                                                List<String> linesSnapshot;
+                                                int itemsCompletedNow;
+                                                synchronized (progressLock) {
+                                                    addPartOutputLine(
+                                                            outputLines,
+                                                            partOutputLineCount,
+                                                            "Uploaded part "
+                                                                    + partNumber
+                                                                    + " for "
+                                                                    + path.getFileName()
+                                                                    + ".");
+                                                    linesSnapshot = List.copyOf(outputLines);
+                                                    itemsCompletedNow = itemsCompleted.get();
+                                                }
+                                                emitTransferEvent(
+                                                        transferJob(
+                                                                jobId,
+                                                                label,
+                                                                "upload",
+                                                                progressFraction(
+                                                                        transferredNow, totalBytes),
+                                                                "running",
+                                                                transferredNow,
+                                                                totalBytes,
+                                                                strategyLabel,
+                                                                path.getFileName().toString(),
+                                                                filePaths.size(),
+                                                                itemsCompletedNow,
+                                                                partSizeBytes,
+                                                                partsCompletedNow,
+                                                                partCount,
+                                                                true,
+                                                                false,
+                                                                true,
+                                                                linesSnapshot));
+                                                return CompletedPart.builder()
+                                                        .eTag(partResult.eTag())
+                                                        .partNumber(partNumber)
+                                                        .build();
+                                            }));
                         }
                         List<CompletedPart> completedParts = new ArrayList<>(filePartCount);
                         try {
@@ -1279,7 +1492,8 @@ public final class Main {
                 outputLines
             );
         }
-        outputLines.add("Uploaded " + filePaths.size() + " file(s) into " + context.bucketName() + ".");
+        outputLines.add(
+                "Uploaded " + filePaths.size() + " file(s) into " + context.bucketName() + ".");
         return transferJob(
             jobId,
             label,
@@ -1330,9 +1544,14 @@ public final class Main {
     private static Map<String, Object> startDownload(JsonNode params) throws IOException {
         BucketContext context = bucketContext(params);
         List<String> keys = stringArray(params.path("keys"));
-        String destinationPath = requiredText(params, "destinationPath", "Bucket, keys, and destination path are required.");
+        String destinationPath =
+                requiredText(
+                        params,
+                        "destinationPath",
+                        "Bucket, keys, and destination path are required.");
         if (keys.isEmpty()) {
-            throw new SidecarException("invalid_config", "Bucket, keys, and destination path are required.");
+            throw new SidecarException(
+                    "invalid_config", "Bucket, keys, and destination path are required.");
         }
         Path destination = Path.of(destinationPath);
         Files.createDirectories(destination);
@@ -1358,12 +1577,13 @@ public final class Main {
             Map<String, String> validators = new LinkedHashMap<>();
             long totalBytesTally = 0L;
             for (String key : keys) {
-                var head = client.headObject(
-                    HeadObjectRequest.builder()
-                        .bucket(context.bucketName())
-                        .key(key)
-                        .build()
-                );
+                var head =
+                        client.headObject(
+                                HeadObjectRequest.builder()
+                                        .bucket(context.bucketName())
+                                        .key(key)
+                                        .versionId(params.path("versionId").asText(null))
+                                        .build());
                 long size = head.contentLength();
                 validators.put(key, head.eTag());
                 sizes.put(key, size);
@@ -1411,7 +1631,8 @@ public final class Main {
                 try (DownloadDestination staged = new DownloadDestination(destination)) {
                 Path target = staged.path;
                 synchronized (progressLock) {
-                    outputLines.add("Downloading " + key + " (" + size + " bytes) to " + target + ".");
+                        outputLines.add(
+                                "Downloading " + key + " (" + size + " bytes) to " + target + ".");
                 }
                 if (size >= multipartThresholdBytes) {
                     try (RandomAccessFile file = new RandomAccessFile(target.toFile(), "rw")) {
@@ -1421,61 +1642,114 @@ public final class Main {
                         for (long start = 0; start < size; start += multipartChunkBytes) {
                             final long rangeStart = start;
                             final long rangeEnd = Math.min(start + multipartChunkBytes - 1L, size - 1L);
-                            futures.add(executor.submit(() -> {
-                                if (!control.awaitRunnable()) {
-                                    throw new TransferCancelledException();
-                                }
-                                long rangeBytes = 0;
-                                try (ResponseInputStream<software.amazon.awssdk.services.s3.model.GetObjectResponse> stream = client.getObject(GetObjectRequest.builder()
-                                    .bucket(context.bucketName()).key(key).ifMatch(validators.get(key))
-                                    .range("bytes=" + rangeStart + "-" + rangeEnd).build())) {
-                                    if (!("bytes " + rangeStart + "-" + rangeEnd + "/" + size).equals(stream.response().contentRange())) {
-                                        throw new IOException("Download range mismatch.");
-                                    }
-                                    byte[] bytes = new byte[1024 * 1024];
-                                    int read;
-                                    while ((read = stream.read(bytes)) != -1) {
-                                        if (!control.awaitRunnable()) throw new TransferCancelledException();
-                                        if (rangeBytes + read > rangeEnd - rangeStart + 1) throw new IOException("Oversized range body.");
-                                        ByteBuffer buffer = ByteBuffer.wrap(bytes, 0, read);
-                                        long position = rangeStart + rangeBytes;
-                                        while (buffer.hasRemaining()) position += channel.write(buffer, position);
-                                        rangeBytes += read;
-                                    }
-                                }
-                                if (rangeBytes != rangeEnd - rangeStart + 1) throw new IOException("Incomplete range body.");
-                                long transferredNow = bytesTransferred.addAndGet(rangeBytes);
-                                int partsCompletedNow = partsCompleted.incrementAndGet();
-                                List<String> linesSnapshot;
-                                int itemsCompletedNow;
-                                synchronized (progressLock) {
-                                    addPartOutputLine(outputLines, partOutputLineCount,
-                                        "Downloaded byte range " + rangeStart + "-" + rangeEnd + " for " + key + ".");
-                                    linesSnapshot = List.copyOf(outputLines);
-                                    itemsCompletedNow = itemsCompleted.get();
-                                }
-                                emitTransferEvent(transferJob(
-                                    jobId,
-                                    label,
-                                    "download",
-                                    progressFraction(transferredNow, totalBytes),
-                                    "running",
-                                    transferredNow,
-                                    totalBytes,
-                                    strategyLabel,
-                                    key,
-                                    keys.size(),
-                                    itemsCompletedNow,
-                                    partSizeBytes,
-                                    partsCompletedNow,
-                                    partCount,
-                                    true,
-                                    false,
-                                    true,
-                                    linesSnapshot
-                                ));
-                                return null;
-                            }));
+                                futures.add(
+                                        executor.submit(
+                                                () -> {
+                                                    if (!control.awaitRunnable()) {
+                                                        throw new TransferCancelledException();
+                                                    }
+                                                    long rangeBytes = 0;
+                                                    try (ResponseInputStream<
+                                                                    software.amazon.awssdk.services
+                                                                            .s3.model
+                                                                            .GetObjectResponse>
+                                                            stream =
+                                                                    client.getObject(
+                                                                            GetObjectRequest
+                                                                                    .builder()
+                                                                                    .bucket(
+                                                                                            context
+                                                                                                    .bucketName())
+                                                                                    .key(key)
+                                                                                    .versionId(params.path("versionId").asText(null))
+                                                                                    .ifMatch(
+                                                                                            validators
+                                                                                                    .get(
+                                                                                                            key))
+                                                                                    .range(
+                                                                                            "bytes="
+                                                                                                    + rangeStart
+                                                                                                    + "-"
+                                                                                                    + rangeEnd)
+                                                                                    .build())) {
+                                                        if (!("bytes "
+                                                                        + rangeStart
+                                                                        + "-"
+                                                                        + rangeEnd
+                                                                        + "/"
+                                                                        + size)
+                                                                .equals(
+                                                                        stream.response()
+                                                                                .contentRange())) {
+                                                            throw new IOException(
+                                                                    "Download range mismatch.");
+                                                        }
+                                                        byte[] bytes = new byte[1024 * 1024];
+                                                        int read;
+                                                        while ((read = stream.read(bytes)) != -1) {
+                                                            if (!control.awaitRunnable())
+                                                                throw new TransferCancelledException();
+                                                            if (rangeBytes + read
+                                                                    > rangeEnd - rangeStart + 1)
+                                                                throw new IOException(
+                                                                        "Oversized range body.");
+                                                            ByteBuffer buffer =
+                                                                    ByteBuffer.wrap(bytes, 0, read);
+                                                            long position = rangeStart + rangeBytes;
+                                                            while (buffer.hasRemaining())
+                                                                position +=
+                                                                        channel.write(
+                                                                                buffer, position);
+                                                            rangeBytes += read;
+                                                        }
+                                                    }
+                                                    if (rangeBytes != rangeEnd - rangeStart + 1)
+                                                        throw new IOException(
+                                                                "Incomplete range body.");
+                                                    long transferredNow =
+                                                            bytesTransferred.addAndGet(rangeBytes);
+                                                    int partsCompletedNow =
+                                                            partsCompleted.incrementAndGet();
+                                                    List<String> linesSnapshot;
+                                                    int itemsCompletedNow;
+                                                    synchronized (progressLock) {
+                                                        addPartOutputLine(
+                                                                outputLines,
+                                                                partOutputLineCount,
+                                                                "Downloaded byte range "
+                                                                        + rangeStart
+                                                                        + "-"
+                                                                        + rangeEnd
+                                                                        + " for "
+                                                                        + key
+                                                                        + ".");
+                                                        linesSnapshot = List.copyOf(outputLines);
+                                                        itemsCompletedNow = itemsCompleted.get();
+                                                    }
+                                                    emitTransferEvent(
+                                                            transferJob(
+                                                                    jobId,
+                                                                    label,
+                                                                    "download",
+                                                                    progressFraction(
+                                                                            transferredNow,
+                                                                            totalBytes),
+                                                                    "running",
+                                                                    transferredNow,
+                                                                    totalBytes,
+                                                                    strategyLabel,
+                                                                    key,
+                                                                    keys.size(),
+                                                                    itemsCompletedNow,
+                                                                    partSizeBytes,
+                                                                    partsCompletedNow,
+                                                                    partCount,
+                                                                    true,
+                                                                    false,
+                                                                    true,
+                                                                    linesSnapshot));
+                                                    return null;
+                                                }));
                         }
                         try {
                             for (Future<?> future : futures) {
@@ -1495,12 +1769,17 @@ public final class Main {
                         }
                     }
                 } else {
-                    try (OutputStream outputStream = Files.newOutputStream(target);
-                         ResponseInputStream<?> stream = client.getObject(GetObjectRequest.builder()
-                             .bucket(context.bucketName())
-                             .key(key)
-                             .ifMatch(validators.get(key))
-                             .build())) {
+                        try (OutputStream outputStream = Files.newOutputStream(target);
+                                ResponseInputStream<?> stream =
+                                        client.getObject(
+                                                GetObjectRequest.builder()
+                                                        .bucket(context.bucketName())
+                                                        .key(key)
+                                                        .versionId(
+                                                                params.path("versionId")
+                                                                        .asText(null))
+                                                        .ifMatch(validators.get(key))
+                                                        .build())) {
                         byte[] buffer = new byte[(int) Math.min(multipartChunkBytes, 1024 * 1024)];
                         int read;
                         while ((read = stream.read(buffer)) != -1) {
@@ -1539,8 +1818,17 @@ public final class Main {
                     cancelled = true;
                     break;
                 }
-                if (bytesTransferred.get() - beforeObject != size) { throw new IOException("Download size mismatch; partial file discarded."); }
-                Path finalPath = staged.publish(destination, key, params.path("conflictPolicy").asText("keepBoth"));
+                if (bytesTransferred.get() - beforeObject != size) {
+                        throw new IOException("Download size mismatch; partial file discarded.");
+                    }
+                    try (FileChannel durable = FileChannel.open(target, StandardOpenOption.WRITE)) {
+                        durable.force(true);
+                    }
+                    Path finalPath =
+                            staged.publish(
+                                    destination,
+                                    key,
+                                    params.path("conflictPolicy").asText("keepBoth"));
                 outputLines.add("Saved " + key + " to " + finalPath + ".");
                 itemsCompleted.incrementAndGet();
                 synchronized (progressLock) {
@@ -1572,7 +1860,8 @@ public final class Main {
                     outputLines
                 );
             }
-            outputLines.add("Downloaded " + keys.size() + " object(s) into " + destinationPath + ".");
+            outputLines.add(
+                    "Downloaded " + keys.size() + " object(s) into " + destinationPath + ".");
             return transferJob(
                 jobId,
                 label,
@@ -1608,15 +1897,18 @@ public final class Main {
         if (control == null) {
             // The transfer has already finished or was never registered; do not fabricate success.
             throw new SidecarException(
-                "invalid_config",
-                "Transfer " + jobId + " is not active; it may have already completed or been cancelled."
-            );
+                    "invalid_config",
+                    "Transfer "
+                            + jobId
+                            + " is not active; it may have already completed or been cancelled.");
         }
         switch (action) {
             case "paused" -> control.pause();
             case "running" -> control.resume();
             case "cancelled" -> control.cancel();
-            default -> throw new SidecarException("invalid_config", "Unknown transfer action: " + action + ".");
+            default ->
+                    throw new SidecarException(
+                            "invalid_config", "Unknown transfer action: " + action + ".");
         }
         String status = control.status();
         boolean cancelled = "cancelled".equals(status);
@@ -1645,8 +1937,16 @@ public final class Main {
 
     private static Map<String, Object> generatePresignedUrl(JsonNode params) {
         Profile profile = parseProfile(params.path("profile"));
-        String bucketName = requiredText(params, "bucketName", "Bucket name and object key are required to generate a presigned URL.");
-        String key = requiredText(params, "key", "Bucket name and object key are required to generate a presigned URL.");
+        String bucketName =
+                requiredText(
+                        params,
+                        "bucketName",
+                        "Bucket name and object key are required to generate a presigned URL.");
+        String key =
+                requiredText(
+                        params,
+                        "key",
+                        "Bucket name and object key are required to generate a presigned URL.");
         int expirationSeconds = Math.max(params.path("expirationSeconds").asInt(3600), 1);
         AwsCredentialsProvider credentialsProvider = credentialsProvider(profile);
         S3Configuration serviceConfiguration = S3Configuration.builder().pathStyleAccessEnabled(profile.pathStyle).build();
@@ -1656,10 +1956,24 @@ public final class Main {
             .endpointOverride(URI.create(profile.endpointUrl))
             .serviceConfiguration(serviceConfiguration);
         try (S3Presigner presigner = builder.build()) {
-            var request = GetObjectPresignRequest.builder()
-                .signatureDuration(Duration.ofSeconds(expirationSeconds))
-                .getObjectRequest(requestBuilder -> requestBuilder.bucket(bucketName).key(key))
-                .build();
+            var request =
+                    GetObjectPresignRequest.builder()
+                            .signatureDuration(Duration.ofSeconds(expirationSeconds))
+                            .getObjectRequest(
+                                    requestBuilder ->
+                                            requestBuilder
+                                                    .bucket(bucketName)
+                                                    .key(key)
+                                                    .versionId(
+                                                            params.path("versionId").asText(null))
+                                                    .requestPayer(
+                                                            profile.requesterPays
+                                                                    ? "requester"
+                                                                    : null)
+                                                    .expectedBucketOwner(
+                                                            blankToNull(
+                                                                    profile.expectedBucketOwner)))
+                            .build();
             return orderedMap("url", presigner.presignGetObject(request).url().toString());
         }
     }
@@ -1667,9 +1981,11 @@ public final class Main {
     private static Map<String, Object> runPutTestData(JsonNode params) {
         Profile profile = parseProfile(params.path("profile"));
         JsonNode config = params.path("config");
-        String bucketName = requiredText(config, "bucketName", "Bucket name is required for put-testdata.");
+        String bucketName =
+                requiredText(config, "bucketName", "Bucket name is required for put-testdata.");
         String rawPrefix = text(config, "prefix").trim();
-        String prefix = rawPrefix.isBlank() || rawPrefix.endsWith("/") ? rawPrefix : rawPrefix + "/";
+        String prefix =
+                rawPrefix.isBlank() || rawPrefix.endsWith("/") ? rawPrefix : rawPrefix + "/";
         int objectCount = Math.max(config.path("objectCount").asInt(1), 0);
         int objectSizeBytes = Math.max(config.path("objectSizeBytes").asInt(1024), 0);
         int versions = Math.max(config.path("versions").asInt(1), 1);
@@ -1740,7 +2056,10 @@ public final class Main {
             outputLines.addAll(failures);
         }
         if (failed && failedObjects.get() > failures.size()) {
-            outputLines.add("... plus " + (failedObjects.get() - failures.size()) + " more failed object(s).");
+            outputLines.add(
+                    "... plus "
+                            + (failedObjects.get() - failures.size())
+                            + " more failed object(s).");
         }
         return orderedMap(
             "label", "put-testdata",
@@ -1757,208 +2076,78 @@ public final class Main {
     }
 
     private static Map<String, Object> runDeleteAll(JsonNode params) {
-        Profile profile = parseProfile(params.path("profile"));
-        JsonNode config = params.path("config");
-        String bucketName = requiredText(config, "bucketName", "Bucket name is required for delete-all.");
-        String prefix = text(config, "prefix").trim();
-        int listMaxKeys = Math.min(Math.max(config.path("listMaxKeys").asInt(1000), 1), 1000);
-        int batchSize = Math.min(Math.max(config.path("batchSize").asInt(1000), 1), 1000);
-        int maxWorkers = Math.min(Math.max(config.path("maxWorkers").asInt(4), 1), 16);
-        long deletionDelayMs = Math.max(config.path("deletionDelayMs").asLong(0), 0L);
-        long started = System.nanoTime();
-        AtomicLong deletedCount = new AtomicLong();
-        AtomicLong errorCount = new AtomicLong();
-        List<String> failures = Collections.synchronizedList(new ArrayList<>());
-        boolean versionListingSupported = true;
-        boolean versionListingSucceeded = false;
-        long listedTotal = 0;
-        int pageCount = 0;
-        ExecutorService executor = Executors.newFixedThreadPool(maxWorkers);
-        try (S3Client client = buildClient(profile)) {
-            while (true) {
-                List<ObjectIdentifier> identifiers = new ArrayList<>();
-                if (versionListingSupported) {
-                    try {
-                        var output = client.listObjectVersions(ListObjectVersionsRequest.builder()
-                            .bucket(bucketName)
-                            .prefix(prefix)
-                            .maxKeys(listMaxKeys)
-                            .build());
-                        output.versions().forEach(version -> identifiers.add(ObjectIdentifier.builder()
-                            .key(version.key())
-                            .versionId(version.versionId())
-                            .build()));
-                        output.deleteMarkers().forEach(marker -> identifiers.add(ObjectIdentifier.builder()
-                            .key(marker.key())
-                            .versionId(marker.versionId())
-                            .build()));
-                        versionListingSucceeded = true;
-                    } catch (S3Exception | SdkClientException error) {
-                        if (versionListingSucceeded) {
-                            // Version listing worked before, so this is a transient failure rather than a
-                            // capability gap. Falling back to listObjectsV2 here would delete without
-                            // VersionId and report success while versions remain; fail the run instead.
-                            errorCount.incrementAndGet();
-                            failures.add("Version listing failed mid-run: " + mapException(error).message);
-                            break;
-                        }
-                        versionListingSupported = false;
-                    }
-                }
-                if (!versionListingSupported) {
-                    var output = client.listObjectsV2(ListObjectsV2Request.builder()
-                        .bucket(bucketName)
-                        .prefix(prefix)
-                        .maxKeys(listMaxKeys)
-                        .build());
-                    output.contents().forEach(object -> identifiers.add(ObjectIdentifier.builder()
-                        .key(object.key())
-                        .build()));
-                }
-                if (identifiers.isEmpty()) {
-                    break;
-                }
-                listedTotal += identifiers.size();
-                pageCount += 1;
-                long deletedBefore = deletedCount.get();
-                List<Future<?>> futures = new ArrayList<>();
-                for (int offset = 0; offset < identifiers.size(); offset += batchSize) {
-                    if (offset > 0 && deletionDelayMs > 0) {
-                        Thread.sleep(deletionDelayMs);
-                    }
-                    final List<ObjectIdentifier> batch = List.copyOf(
-                        identifiers.subList(offset, Math.min(offset + batchSize, identifiers.size()))
-                    );
-                    futures.add(executor.submit(() -> {
-                        try {
-                            var response = client.deleteObjects(DeleteObjectsRequest.builder()
-                                .bucket(bucketName)
-                                .delete(Delete.builder().objects(batch).quiet(true).build())
-                                .build());
-                            int errors = response.errors().size();
-                            deletedCount.addAndGet(batch.size() - errors);
-                            if (errors > 0) {
-                                errorCount.addAndGet(errors);
-                                response.errors().stream().limit(3).forEach(deleteError -> {
-                                    if (failures.size() < 10) {
-                                        failures.add("Failed " + deleteError.key() + ": "
-                                            + blankToDefault(deleteError.message(),
-                                                blankToDefault(deleteError.code(), "delete error")));
-                                    }
-                                });
-                            }
-                        } catch (Exception error) {
-                            errorCount.addAndGet(batch.size());
-                            if (failures.size() < 10) {
-                                failures.add("Batch delete failed: " + mapException(error).message);
-                            }
-                        }
-                    }));
-                }
-                for (Future<?> future : futures) {
-                    future.get();
-                }
-                if (deletedCount.get() == deletedBefore) {
-                    failures.add("No progress on the last pass; aborting to avoid an endless loop.");
-                    break;
-                }
-                if (deletionDelayMs > 0) {
-                    Thread.sleep(deletionDelayMs);
-                }
-            }
-        } catch (InterruptedException error) {
-            Thread.currentThread().interrupt();
-            errorCount.incrementAndGet();
-            failures.add("Interrupted while deleting objects.");
-        } catch (ExecutionException error) {
-            errorCount.incrementAndGet();
-            failures.add("Worker failed: " + (error.getCause() instanceof Exception cause
-                ? mapException(cause).message
-                : String.valueOf(error.getCause())));
-        } finally {
-            executor.shutdownNow();
+        var profileNode = params.path("profile").deepCopy();
+        ((com.fasterxml.jackson.databind.node.ObjectNode) profileNode).put("maxAttempts", 1);
+        try (S3Client client = buildClient(parseProfile(profileNode))) {
+            return DeleteAll.run(client, params);
         }
-        double durationSeconds = (System.nanoTime() - started) / 1_000_000_000.0;
-        boolean failed = errorCount.get() > 0 || !failures.isEmpty();
-        List<String> outputLines = new ArrayList<>(List.of(
-            "Bucket: " + bucketName,
-            "Prefix: " + (prefix.isBlank() ? "(entire bucket)" : prefix),
-            "Listing mode: " + (versionListingSupported ? "object versions" : "objects (versions unsupported)"),
-            "Page size: " + listMaxKeys + ", batch size: " + batchSize + ", workers: " + maxWorkers
-                + ", delay: " + deletionDelayMs + "ms.",
-            "Deleted " + deletedCount.get() + " of " + listedTotal + " listed entrie(s) across "
-                + pageCount + " page(s).",
-            String.format(java.util.Locale.US, "Duration: %.2fs.", durationSeconds)
-        ));
-        synchronized (failures) {
-            outputLines.addAll(failures);
-        }
-        return orderedMap(
-            "label", "delete-all",
-            "running", false,
-            "lastStatus", failed
-                ? "delete-all completed with " + errorCount.get() + " failure(s)."
-                : "Deleted " + deletedCount.get() + " entrie(s) from " + bucketName + ".",
-            "jobId", "tool-" + UUID.randomUUID().toString().substring(0, 8),
-            "cancellable", false,
-            "outputLines", outputLines,
-            "exitCode", failed ? 1 : 0
-        );
     }
 
     private static Map<String, Object> cancelToolExecution(JsonNode params) {
-        String jobId = text(params, "jobId");
-        // The maintenance tools (put-testdata, delete-all) run synchronously within a single request
-        // and only return their jobId once finished, so the host never holds a live handle to cancel
-        // mid-run. There is genuinely nothing addressable to cancel here; report that honestly rather
-        // than fabricating a successful cancellation.
-        return orderedMap(
-            "label", blankToDefault(jobId, "tool"),
-            "running", false,
-            "lastStatus", "Tool executions run synchronously and cannot be cancelled once started.",
-            "jobId", jobId,
-            "cancellable", false,
-            "outputLines", List.of(
-                "No cancellable tool execution is registered for " + blankToDefault(jobId, "(none)") + "."
-            ),
-            "exitCode", 0
-        );
+        return DeleteAll.cancel(params);
     }
 
-    private static Map<String, Object> startBenchmark(JsonNode params) throws IOException {
+    private static synchronized Map<String, Object> startBenchmark(JsonNode params) throws IOException {
         if (!params.hasNonNull("profile")) {
-            throw new SidecarException("invalid_config", "Profile configuration is required for benchmark runs.");
+            throw new SidecarException(
+                    "invalid_config", "Profile configuration is required for benchmark runs.");
         }
         JsonNode config = params.path("config");
+        validateBenchmarkConfig(config);
+        if (LIVE_BENCHMARKS.size() >= 4)
+            throw new SidecarException("invalid_config", "Stop an existing benchmark before starting another (maximum four live runs).");
         String runId = "bench-" + UUID.randomUUID().toString().substring(0, 8);
         Map<String, Object> benchmarkConfig = benchmarkConfigWithRunDir(
             MAPPER.convertValue(config, new TypeReference<Map<String, Object>>() {}),
             runId
         );
-        Map<String, Object> state = orderedMap(
-            "id", runId,
-            "profile", MAPPER.convertValue(params.path("profile"), new TypeReference<Map<String, Object>>() {}),
-            "config", benchmarkConfig,
-            "status", "running",
-            "processedCount", 0,
-            "startedAt", nowIso(),
-            "lastUpdatedAt", nowIso(),
-            "activeElapsedSeconds", 0.0,
-            "completedAt", null,
-            "averageLatencyMs", 0,
-            "throughputOpsPerSecond", 0,
-            "liveLog", List.of("Benchmark scheduled."),
-            "resultSummary", null,
-            "history", List.of(),
-            "activeObjects", List.of(),
-            "nextObjectIndex", 0,
-            "nextActiveIndex", 0,
-            "nextSizeIndex", 0,
-            "benchmarkPrefix", benchmarkBasePrefix(
-                MAPPER.convertValue(config, new TypeReference<Map<String, Object>>() {}),
-                runId
-            )
-        );
+        Map<String, Object> state =
+                orderedMap(
+                        "id",
+                        runId,
+                        "profile",
+                        MAPPER.convertValue(
+                                params.path("profile"),
+                                new TypeReference<Map<String, Object>>() {}),
+                        "profileId",
+                        params.path("profile").path("id").asText(null),
+                        "config",
+                        benchmarkConfig,
+                        "status",
+                        "running",
+                        "processedCount",
+                        0,
+                        "startedAt",
+                        nowIso(),
+                        "lastUpdatedAt",
+                        nowIso(),
+                        "activeElapsedSeconds",
+                        0.0,
+                        "completedAt",
+                        null,
+                        "averageLatencyMs",
+                        0,
+                        "throughputOpsPerSecond",
+                        0,
+                        "liveLog",
+                        List.of("Benchmark scheduled."),
+                        "resultSummary",
+                        null,
+                        "history",
+                        List.of(),
+                        "activeObjects",
+                        List.of(),
+                        "nextObjectIndex",
+                        0,
+                        "nextActiveIndex",
+                        0,
+                        "nextSizeIndex",
+                        0,
+                        "benchmarkPrefix",
+                        benchmarkBasePrefix(
+                                MAPPER.convertValue(
+                                        config, new TypeReference<Map<String, Object>>() {}),
+                                runId));
         @SuppressWarnings("unchecked")
         Map<String, Object> configMap = (Map<String, Object>) state.get("config");
         @SuppressWarnings("unchecked")
@@ -1971,43 +2160,161 @@ public final class Main {
                 + String.valueOf(profileMap.getOrDefault("endpointUrl", ""))
                 + "."
         );
+        parseProfile(params.path("profile"));
+        String generation = UUID.randomUUID().toString();
+        state.put("workerGeneration", generation);
         writeBenchmarkState(state);
-        return materializeBenchmarkState(state);
+        LIVE_BENCHMARKS.put(runId, state);
+        synchronized (state) {
+            spawnBenchmarkWorker(state, generation);
+            return publicBenchmarkState(state);
+        }
+    }
+
+    private static final Map<String, Map<String, Object>> LIVE_BENCHMARKS =
+            new ConcurrentHashMap<>();
+
+    private static Map<String, Object> publicBenchmarkState(Map<String, Object> state) {
+        Map<String, Object> clean = new LinkedHashMap<>(state);
+        clean.remove("profile");
+        clean.remove("workerGeneration");
+        return MAPPER.convertValue(clean, new TypeReference<Map<String, Object>>() {});
+    }
+
+    private static Map<String, Object> liveBenchmark(JsonNode params) throws IOException {
+        String id = requiredText(params, "runId", "Benchmark run ID is required.");
+        Map<String, Object> live = LIVE_BENCHMARKS.get(id);
+        if (live != null) return live;
+        var state = readBenchmarkState(id);
+        if ("running".equals(state.get("status"))) {
+            state.put("status", "paused");
+            appendBenchmarkLog(
+                    state, "Engine restarted; resume with the owning endpoint credentials.");
+        }
+        if (!"paused".equals(state.get("status"))) return state;
+        if (LIVE_BENCHMARKS.size() >= 4) throw new SidecarException("invalid_config", "Maximum four live benchmark runs.");
+        var existing = LIVE_BENCHMARKS.putIfAbsent(id, state);
+        return existing == null ? state : existing;
+    }
+
+    private static void spawnBenchmarkWorker(Map<String, Object> state, String generation) {
+        Profile ownerProfile = benchmarkProfile(state);
+        var ownerConfig = new LinkedHashMap<>((Map<String, Object>) state.get("config"));
+        Thread worker =
+                new Thread(
+                        () -> {
+                            try (BenchmarkRuntime resources = new BenchmarkRuntime(ownerConfig);
+                                 S3Client client = createClient(ownerProfile)) {
+                            while (true) {
+                                synchronized (state) {
+                                    if (!"running".equals(state.get("status"))
+                                            || !generation.equals(state.get("workerGeneration")))
+                                        return;
+                                    try {
+                                        materializeBenchmarkState(state, resources, client);
+                                    } catch (Exception error) {
+                                        state.put("status", "failed");
+                                        appendBenchmarkLog(
+                                                state,
+                                                "Benchmark failed: " + mapException(error).message);
+                                        try {
+                                            writeBenchmarkState(state);
+                                        } catch (IOException ignored) {
+                                        }
+                                    }
+                                    if (!"running".equals(state.get("status"))) return;
+                                }
+                                try {
+                                    Thread.sleep(1);
+                                } catch (InterruptedException error) {
+                                    Thread.currentThread().interrupt();
+                                    return;
+                                }
+                            }
+                            } catch (Exception error) {
+                                synchronized (state) {
+                                    state.put("status", "failed");
+                                    state.put("completedAt", nowIso());
+                                    state.put("errorCount", asLong(state.get("errorCount")) + 1);
+                                    appendBenchmarkLog(state, "Benchmark failed: " + mapException(error).message);
+                                    state.put("resultSummary", benchmarkSummaryFromState(state));
+                                    try { writeBenchmarkState(state); persistBenchmarkOutputs(state); } catch (IOException ignored) {}
+                                }
+                            } finally {
+                                synchronized (state) {
+                                    if (!"running".equals(state.get("status"))) {
+                                        state.remove("profile");
+                                        LIVE_BENCHMARKS.remove(String.valueOf(state.get("id")), state);
+                                    }
+                                }
+                            }
+                        },
+                        "s3-benchmark-" + state.get("id"));
+        worker.setDaemon(true);
+        worker.start();
     }
 
     private static Map<String, Object> getBenchmarkStatus(JsonNode params) throws IOException {
-        return materializeBenchmarkState(readBenchmarkState(requiredText(params, "runId", "Benchmark run ID is required.")));
+        var state = liveBenchmark(params);
+        synchronized (state) {
+            return publicBenchmarkState(state);
+        }
     }
 
     private static Map<String, Object> pauseBenchmark(JsonNode params) throws IOException {
-        Map<String, Object> state = readBenchmarkState(requiredText(params, "runId", "Benchmark run ID is required."));
-        refreshBenchmarkSnapshot(state);
-        state.put("status", "paused");
-        appendBenchmarkLog(state, "Benchmark paused by user.");
-        writeBenchmarkState(state);
-        persistBenchmarkOutputs(state);
-        return state;
+        var state = liveBenchmark(params);
+        synchronized (state) {
+            if ("running".equals(state.get("status"))) {
+                refreshBenchmarkSnapshot(state);
+                state.put("status", "paused");
+                state.remove("workerGeneration");
+                state.remove("profile");
+                appendBenchmarkLog(state, "Benchmark paused by user.");
+                writeBenchmarkState(state);
+                persistBenchmarkOutputs(state);
+            }
+            return publicBenchmarkState(state);
+        }
     }
 
     private static Map<String, Object> resumeBenchmark(JsonNode params) throws IOException {
-        Map<String, Object> state = readBenchmarkState(requiredText(params, "runId", "Benchmark run ID is required."));
-        state.put("status", "running");
-        state.put("lastUpdatedAt", nowIso());
-        appendBenchmarkLog(state, "Benchmark resumed by user.");
-        writeBenchmarkState(state);
-        return materializeBenchmarkState(state);
+        var state = liveBenchmark(params);
+        String generation = UUID.randomUUID().toString();
+        synchronized (state) {
+            if (!"paused".equals(state.get("status"))) return publicBenchmarkState(state);
+            parseProfile(params.path("profile"));
+            if (state.get("profileId") != null
+                    && !state.get("profileId").equals(params.path("profile").path("id").asText()))
+                throw new SidecarException(
+                        "invalid_config", "Resume requires the original endpoint profile.");
+            state.put(
+                    "profile",
+                    MAPPER.convertValue(
+                            params.path("profile"), new TypeReference<Map<String, Object>>() {}));
+            state.put("status", "running");
+            state.put("lastUpdatedAt", nowIso());
+            state.put("workerGeneration", generation);
+            appendBenchmarkLog(state, "Benchmark resumed by user.");
+            writeBenchmarkState(state);
+            spawnBenchmarkWorker(state, generation);
+            return publicBenchmarkState(state);
+        }
     }
 
     private static Map<String, Object> stopBenchmark(JsonNode params) throws IOException {
-        Map<String, Object> state = readBenchmarkState(requiredText(params, "runId", "Benchmark run ID is required."));
-        refreshBenchmarkSnapshot(state);
-        state.put("status", "stopped");
-        state.put("completedAt", nowIso());
-        state.put("resultSummary", benchmarkSummaryFromState(state));
-        appendBenchmarkLog(state, "Benchmark stopped by user.");
-        writeBenchmarkState(state);
-        persistBenchmarkOutputs(state);
-        return state;
+        var state = liveBenchmark(params);
+        synchronized (state) {
+            if ("running".equals(state.get("status"))) refreshBenchmarkSnapshot(state);
+            state.put("status", "stopped");
+            state.remove("workerGeneration");
+            state.remove("profile");
+            state.put("completedAt", nowIso());
+            state.put("resultSummary", benchmarkSummaryFromState(state));
+            appendBenchmarkLog(state, "Benchmark stopped by user.");
+            writeBenchmarkState(state);
+            persistBenchmarkOutputs(state);
+            return publicBenchmarkState(state);
+        }
     }
 
     private static Map<String, Object> exportBenchmarkResults(JsonNode params) throws IOException {
@@ -2028,10 +2335,13 @@ public final class Main {
     private static Profile parseProfile(JsonNode payload) {
         if ("azureBlob".equals(payload.path("endpointType").asText("").trim())) {
             throw new SidecarException(
-                "unsupported_feature",
-                "Azure Blob profiles are not supported by the java engine yet. Switch the engine to Go or Python in Settings."
-            );
+                    "unsupported_feature",
+                    "Azure Blob profiles are not supported by the java engine yet. Switch the"
+                        + " engine to Go or Python in Settings.");
         }
+        String authMode = payload.path("authMode").asText("static");
+        if (!List.of("static", "awsProfile", "awsDefault", "assumeRole").contains(authMode))
+            throw new SidecarException("invalid_config", "Unknown authentication mode.");
         String endpointUrl = payload.path("endpointUrl").asText("").trim();
         String accessKey = payload.path("accessKey").asText("").trim();
         String secretKey = payload.path("secretKey").asText("").trim();
@@ -2039,31 +2349,89 @@ public final class Main {
         if (endpointUrl.isBlank()) {
             throw new SidecarException("invalid_config", "Endpoint URL is required.");
         }
-        if (accessKey.isBlank() || secretKey.isBlank()) {
+        if ("static".equals(authMode) && (accessKey.isBlank() || secretKey.isBlank())) {
             throw new SidecarException("invalid_config", "Access key and secret key are required.");
         }
         return new Profile(
-            endpointUrl,
-            region.isBlank() ? "us-east-1" : region,
-            accessKey,
-            secretKey,
-            payload.path("sessionToken").asText("").trim(),
-            payload.path("pathStyle").asBoolean(false),
-            !payload.has("verifyTls") || payload.path("verifyTls").asBoolean(true),
-            Math.max(payload.path("connectTimeoutSeconds").asInt(5), 1),
-            Math.max(payload.path("readTimeoutSeconds").asInt(60), 1),
-            Math.max(payload.path("maxAttempts").asInt(5), 1),
-            Math.max(payload.path("maxConcurrentRequests").asInt(10), 1),
-            payload.path("diagnostics").path("enableApiLogging").asBoolean(false),
-            payload.path("diagnostics").path("enableDebugLogging").asBoolean(false)
-        );
+                authMode,
+                payload.path("awsProfileName").asText(""),
+                payload.path("roleArn").asText(""),
+                payload.path("externalId").asText(""),
+                payload.path("roleSessionName").asText("object-browser"),
+                payload.path("caBundlePath").asText(""),
+                payload.path("requesterPays").asBoolean(false),
+                payload.path("expectedBucketOwner").asText(""),
+                endpointUrl,
+                region.isBlank() ? "us-east-1" : region,
+                accessKey,
+                secretKey,
+                payload.path("sessionToken").asText("").trim(),
+                payload.path("pathStyle").asBoolean(false),
+                !payload.has("verifyTls") || payload.path("verifyTls").asBoolean(true),
+                Math.max(payload.path("connectTimeoutSeconds").asInt(5), 1),
+                Math.max(payload.path("readTimeoutSeconds").asInt(60), 1),
+                Math.max(payload.path("maxAttempts").asInt(5), 1),
+                Math.max(payload.path("maxConcurrentRequests").asInt(10), 1),
+                payload.path("diagnostics").path("enableApiLogging").asBoolean(false),
+                payload.path("diagnostics").path("enableDebugLogging").asBoolean(false));
     }
 
-    private static S3Client buildClient(Profile profile) {
+    private static final Map<Profile, S3Client> CLIENTS = new LinkedHashMap<>();
+
+    private static synchronized S3Client buildClient(Profile profile) {
+        S3Client existing = CLIENTS.get(profile);
+        if (existing != null) return clientLease(existing);
+        S3Client built = createClient(profile);
+        if (CLIENTS.size() >= 16) return built;
+        CLIENTS.put(profile, built);
+        return clientLease(built);
+    }
+
+    private static S3Client clientLease(S3Client client) {
+        return (S3Client)
+                java.lang.reflect.Proxy.newProxyInstance(
+                        S3Client.class.getClassLoader(),
+                        new Class<?>[] {S3Client.class},
+                        (proxy, method, args) -> {
+                            if (method.getName().equals("close")) return null;
+                            try {
+                                return method.invoke(client, args);
+                            } catch (java.lang.reflect.InvocationTargetException error) {
+                                throw error.getCause();
+                            }
+                        });
+    }
+
+    private static TrustManager[] customCa(String path) {
+        try (var input = Files.newInputStream(Path.of(path))) {
+            var certificates =
+                    java.security.cert.CertificateFactory.getInstance("X.509")
+                            .generateCertificates(input);
+            if (certificates.isEmpty())
+                throw new IllegalArgumentException("CA bundle contains no certificates.");
+            var store = java.security.KeyStore.getInstance(java.security.KeyStore.getDefaultType());
+            store.load(null, null);
+            int index = 0;
+            for (var certificate : certificates)
+                store.setCertificateEntry("ca-" + (index++), certificate);
+            var factory =
+                    javax.net.ssl.TrustManagerFactory.getInstance(
+                            javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
+            factory.init(store);
+            return factory.getTrustManagers();
+        } catch (Exception error) {
+            throw new SidecarException(
+                    "invalid_config", "Cannot load custom CA bundle: " + error.getMessage());
+        }
+    }
+
+    private static S3Client createClient(Profile profile) {
         ApacheHttpClient.Builder httpClient = ApacheHttpClient.builder()
             .connectionTimeout(Duration.ofSeconds(profile.connectTimeoutSeconds))
             .socketTimeout(Duration.ofSeconds(profile.readTimeoutSeconds))
             .maxConnections(profile.maxPoolConnections);
+        if (!profile.caBundlePath.isBlank())
+            httpClient.tlsTrustManagersProvider(() -> customCa(profile.caBundlePath));
         if (!profile.verifyTls) {
             httpClient.tlsTrustManagersProvider(() -> TRUST_ALL_MANAGERS);
             emitStructuredLog("WARN", "Security",
@@ -2071,10 +2439,19 @@ public final class Main {
                     + "; server certificates are not validated.",
                 "engine");
         }
-        ClientOverrideConfiguration overrides = ClientOverrideConfiguration.builder()
-            .retryPolicy(RetryPolicy.builder().numRetries(Math.max(profile.maxAttempts - 1, 0)).build())
-            .apiCallAttemptTimeout(Duration.ofSeconds(profile.readTimeoutSeconds))
-            .build();
+        ClientOverrideConfiguration.Builder overrideBuilder = ClientOverrideConfiguration.builder()
+                .addExecutionInterceptor(new BenchmarkRuntime.Metrics());
+        if (profile.requesterPays) overrideBuilder.putHeader("x-amz-request-payer", "requester");
+        if (!profile.expectedBucketOwner.isBlank())
+            overrideBuilder.putHeader("x-amz-expected-bucket-owner", profile.expectedBucketOwner);
+        ClientOverrideConfiguration overrides =
+                overrideBuilder
+                        .retryPolicy(
+                                RetryPolicy.builder()
+                                        .numRetries(Math.max(profile.maxAttempts - 1, 0))
+                                        .build())
+                        .apiCallAttemptTimeout(Duration.ofSeconds(profile.readTimeoutSeconds))
+                        .build();
         return S3Client.builder()
             .endpointOverride(URI.create(profile.endpointUrl))
             .region(Region.of(profile.region))
@@ -2086,6 +2463,40 @@ public final class Main {
     }
 
     private static AwsCredentialsProvider credentialsProvider(Profile profile) {
+        if ("awsProfile".equals(profile.authMode))
+            return software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider.create(
+                    blankToDefault(profile.awsProfileName, "default"));
+        if ("awsDefault".equals(profile.authMode))
+            return software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider.builder()
+                    .build();
+        if ("assumeRole".equals(profile.authMode)) {
+            if (profile.roleArn.isBlank())
+                throw new SidecarException("invalid_config", "Role ARN is required.");
+            var source =
+                    profile.awsProfileName.isBlank()
+                            ? software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider
+                                    .builder()
+                                    .build()
+                            : software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider
+                                    .create(profile.awsProfileName);
+            var sts =
+                    software.amazon.awssdk.services.sts.StsClient.builder()
+                            .region(Region.of(profile.region))
+                            .credentialsProvider(source)
+                            .build();
+            return software.amazon.awssdk.services.sts.auth.StsAssumeRoleCredentialsProvider
+                    .builder()
+                    .stsClient(sts)
+                    .refreshRequest(
+                            r -> {
+                                r.roleArn(profile.roleArn)
+                                        .roleSessionName(
+                                                blankToDefault(
+                                                        profile.roleSessionName, "object-browser"));
+                                if (!profile.externalId.isBlank()) r.externalId(profile.externalId);
+                            })
+                    .build();
+        }
         if (!profile.sessionToken.isBlank()) {
             return StaticCredentialsProvider.create(AwsSessionCredentials.create(
                 profile.accessKey,
@@ -2132,16 +2543,54 @@ public final class Main {
         }
     }
 
-    private static <T> T optionalBucketApi(List<Map<String, Object>> apiCalls, String operation, ThrowingSupplier<T> fn) {
+    private static <T> T optionalBucketApi(
+            List<Map<String, Object>> calls, String operation, ThrowingSupplier<T> fn) {
         try {
-            return recordApi(apiCalls, operation, fn);
+            T result = recordApi(calls, operation, fn);
+            calls.getLast().put("sectionState", "available");
+            return result;
         } catch (RuntimeException error) {
-            Throwable cause = error.getCause() != null ? error.getCause() : error;
-            if (cause instanceof S3Exception s3 && MISSING_BUCKET_CONFIGURATION_CODES.contains(s3.awsErrorDetails().errorCode())) {
-                return null;
-            }
-            throw error;
+            var mapped = mapException(error);
+            String code = String.valueOf(mapped.details.getOrDefault("awsCode", "Unknown"));
+            String state =
+                    List.of(
+                                            "AccessDenied",
+                                            "InvalidAccessKeyId",
+                                            "SignatureDoesNotMatch",
+                                            "AllAccessDisabled")
+                                    .contains(code)
+                            ? "denied"
+                            : List.of("NotImplemented", "XNotImplemented", "MethodNotAllowed")
+                                            .contains(code)
+                                    ? "unsupported"
+                                    : MISSING_BUCKET_CONFIGURATION_CODES.contains(code)
+                                                    && !"NoSuchBucket".equals(code)
+                                            ? "absent"
+                                            : "error";
+            calls.getLast().put("sectionState", state);
+            calls.getLast().put("code", code);
+            calls.getLast().put("reason", mapped.message);
+            return null;
         }
+    }
+
+    private static Map<String, Object> sectionStatuses(List<Map<String, Object>> calls) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        for (var call : calls)
+            result.put(
+                    String.valueOf(call.get("operation")),
+                    orderedMap(
+                            "state",
+                            call.getOrDefault(
+                                    "sectionState",
+                                    "200".equals(call.get("status")) ? "available" : "error"),
+                            "code",
+                            call.get("code"),
+                            "reason",
+                            call.get("reason"),
+                            "message",
+                            call.get("reason")));
+        return result;
     }
 
     private static final List<String> MISSING_BUCKET_CONFIGURATION_CODES = List.of(
@@ -2159,82 +2608,7 @@ public final class Main {
     );
 
     private static List<LifecycleRule> parseLifecycleRules(JsonNode rulesNode) {
-        List<LifecycleRule> rules = new ArrayList<>();
-        if (!rulesNode.isArray()) {
-            return rules;
-        }
-        for (JsonNode rule : rulesNode) {
-            LifecycleRule.Builder builder = LifecycleRule.builder();
-            putIfNotBlank(builder::id, textEither(rule, "ID", "id"));
-            builder.status("Enabled".equalsIgnoreCase(text(rule, "Status"))
-                ? ExpirationStatus.ENABLED
-                : ExpirationStatus.DISABLED);
-            String prefix = text(rule.path("Filter"), "Prefix");
-            if (prefix.isBlank()) {
-                prefix = textEither(rule, "Prefix", "prefix");
-            }
-            if (!prefix.isBlank()) {
-                builder.filter(LifecycleRuleFilter.builder().prefix(prefix).build());
-            }
-
-            JsonNode expirationNode = rule.path("Expiration");
-            if (!expirationNode.isMissingNode() && !expirationNode.isNull()) {
-                LifecycleExpiration.Builder expiration = LifecycleExpiration.builder();
-                if (expirationNode.has("Days")) {
-                    expiration.days(expirationNode.path("Days").asInt());
-                }
-                if (expirationNode.has("ExpiredObjectDeleteMarker")) {
-                    expiration.expiredObjectDeleteMarker(expirationNode.path("ExpiredObjectDeleteMarker").asBoolean(false));
-                }
-                builder.expiration(expiration.build());
-            }
-
-            if (rule.path("Transitions").isArray()) {
-                List<Transition> transitions = new ArrayList<>();
-                for (JsonNode transitionNode : rule.path("Transitions")) {
-                    Transition.Builder transition = Transition.builder();
-                    if (transitionNode.has("Days")) {
-                        transition.days(transitionNode.path("Days").asInt());
-                    }
-                    putIfNotBlank(value ->
-                        transition.storageClass(software.amazon.awssdk.services.s3.model.TransitionStorageClass.fromValue(value))
-                    , text(transitionNode, "StorageClass"));
-                    transitions.add(transition.build());
-                }
-                builder.transitions(transitions);
-            }
-
-            JsonNode nonCurrentExpiration = rule.path("NoncurrentVersionExpiration");
-            if (!nonCurrentExpiration.isMissingNode() && !nonCurrentExpiration.isNull()) {
-                builder.noncurrentVersionExpiration(NoncurrentVersionExpiration.builder()
-                    .noncurrentDays(nonCurrentExpiration.path("NoncurrentDays").asInt())
-                    .build());
-            }
-
-            if (rule.path("NoncurrentVersionTransitions").isArray()) {
-                List<NoncurrentVersionTransition> transitions = new ArrayList<>();
-                for (JsonNode transitionNode : rule.path("NoncurrentVersionTransitions")) {
-                    NoncurrentVersionTransition.Builder transition = NoncurrentVersionTransition.builder();
-                    if (transitionNode.has("NoncurrentDays")) {
-                        transition.noncurrentDays(transitionNode.path("NoncurrentDays").asInt());
-                    }
-                    putIfNotBlank(value ->
-                        transition.storageClass(software.amazon.awssdk.services.s3.model.TransitionStorageClass.fromValue(value))
-                    , text(transitionNode, "StorageClass"));
-                    transitions.add(transition.build());
-                }
-                builder.noncurrentVersionTransitions(transitions);
-            }
-
-            JsonNode abortNode = rule.path("AbortIncompleteMultipartUpload");
-            if (!abortNode.isMissingNode() && !abortNode.isNull() && abortNode.has("DaysAfterInitiation")) {
-                builder.abortIncompleteMultipartUpload(AbortIncompleteMultipartUpload.builder()
-                    .daysAfterInitiation(abortNode.path("DaysAfterInitiation").asInt())
-                    .build());
-            }
-            rules.add(builder.build());
-        }
-        return rules;
+        return LifecycleJson.parse(rulesNode);
     }
 
     private static List<CORSRule> parseCorsRules(JsonNode rulesNode) {
@@ -2287,47 +2661,37 @@ public final class Main {
             ? null
             : rule.noncurrentVersionTransitions().getFirst();
         return orderedMap(
-            "id", blankToDefault(rule.id(), "rule"),
-            "enabled", rule.status() == ExpirationStatus.ENABLED,
-            "prefix", rule.filter() != null ? blankToDefault(rule.filter().prefix(), "") : "",
-            "expirationDays", rule.expiration() != null ? rule.expiration().days() : null,
-            "deleteExpiredObjectDeleteMarkers", rule.expiration() != null && Boolean.TRUE.equals(rule.expiration().expiredObjectDeleteMarker()),
-            "transitionStorageClass", transition == null ? null : transition.storageClassAsString(),
-            "transitionDays", transition == null ? null : transition.days(),
-            "nonCurrentExpirationDays", rule.noncurrentVersionExpiration() == null ? null : rule.noncurrentVersionExpiration().noncurrentDays(),
-            "nonCurrentTransitionStorageClass", noncurrent == null ? null : noncurrent.storageClassAsString(),
-            "nonCurrentTransitionDays", noncurrent == null ? null : noncurrent.noncurrentDays(),
-            "abortIncompleteMultipartUploadDays",
-            rule.abortIncompleteMultipartUpload() == null ? null : rule.abortIncompleteMultipartUpload().daysAfterInitiation()
-        );
+                "id",
+                blankToDefault(rule.id(), "rule"),
+                "enabled",
+                rule.status() == ExpirationStatus.ENABLED,
+                "prefix",
+                rule.filter() != null ? blankToDefault(rule.filter().prefix(), "") : "",
+                "expirationDays",
+                rule.expiration() != null ? rule.expiration().days() : null,
+                "deleteExpiredObjectDeleteMarkers",
+                rule.expiration() != null
+                        && Boolean.TRUE.equals(rule.expiration().expiredObjectDeleteMarker()),
+                "transitionStorageClass",
+                transition == null ? null : transition.storageClassAsString(),
+                "transitionDays",
+                transition == null ? null : transition.days(),
+                "nonCurrentExpirationDays",
+                rule.noncurrentVersionExpiration() == null
+                        ? null
+                        : rule.noncurrentVersionExpiration().noncurrentDays(),
+                "nonCurrentTransitionStorageClass",
+                noncurrent == null ? null : noncurrent.storageClassAsString(),
+                "nonCurrentTransitionDays",
+                noncurrent == null ? null : noncurrent.noncurrentDays(),
+                "abortIncompleteMultipartUploadDays",
+                rule.abortIncompleteMultipartUpload() == null
+                        ? null
+                        : rule.abortIncompleteMultipartUpload().daysAfterInitiation());
     }
 
     private static Map<String, Object> lifecycleRuleRaw(LifecycleRule rule) {
-        List<Map<String, Object>> transitions = rule.transitions().stream().map(transition -> orderedMap(
-            "Days", transition.days(),
-            "StorageClass", transition.storageClassAsString()
-        )).toList();
-        List<Map<String, Object>> nonCurrentTransitions = rule.noncurrentVersionTransitions().stream().map(transition -> orderedMap(
-            "NoncurrentDays", transition.noncurrentDays(),
-            "StorageClass", transition.storageClassAsString()
-        )).toList();
-        return orderedMap(
-            "ID", blankToNull(rule.id()),
-            "Status", rule.statusAsString(),
-            "Filter", orderedMap("Prefix", rule.filter() == null ? "" : blankToDefault(rule.filter().prefix(), "")),
-            "Expiration", rule.expiration() == null ? null : orderedMap(
-                "Days", rule.expiration().days(),
-                "ExpiredObjectDeleteMarker", rule.expiration().expiredObjectDeleteMarker()
-            ),
-            "Transitions", transitions,
-            "NoncurrentVersionExpiration", rule.noncurrentVersionExpiration() == null ? null : orderedMap(
-                "NoncurrentDays", rule.noncurrentVersionExpiration().noncurrentDays()
-            ),
-            "NoncurrentVersionTransitions", nonCurrentTransitions,
-            "AbortIncompleteMultipartUpload", rule.abortIncompleteMultipartUpload() == null ? null : orderedMap(
-                "DaysAfterInitiation", rule.abortIncompleteMultipartUpload().daysAfterInitiation()
-            )
-        );
+        return LifecycleJson.raw(rule);
     }
 
     private static Map<String, Object> corsRuleRaw(CORSRule rule) {
@@ -2343,17 +2707,24 @@ public final class Main {
 
     private static Map<String, Object> encryptionRaw(ServerSideEncryptionConfiguration configuration) {
         return orderedMap(
-            "Rules", configuration.rules().stream().map(rule -> orderedMap(
-                "ApplyServerSideEncryptionByDefault",
-                rule.applyServerSideEncryptionByDefault() == null
-                    ? null
-                    : orderedMap(
-                        "SSEAlgorithm", rule.applyServerSideEncryptionByDefault().sseAlgorithmAsString(),
-                        "KMSMasterKeyID", rule.applyServerSideEncryptionByDefault().kmsMasterKeyID()
-                    ),
-                "BucketKeyEnabled", rule.bucketKeyEnabled()
-            )).toList()
-        );
+                "Rules",
+                configuration.rules().stream()
+                        .map(
+                                rule ->
+                                        orderedMap(
+                                                "ApplyServerSideEncryptionByDefault",
+                                                rule.applyServerSideEncryptionByDefault() == null
+                                                        ? null
+                                                        : orderedMap(
+                                                                "SSEAlgorithm",
+                                                                        rule.applyServerSideEncryptionByDefault()
+                                                                                .sseAlgorithmAsString(),
+                                                                "KMSMasterKeyID",
+                                                                        rule.applyServerSideEncryptionByDefault()
+                                                                                .kmsMasterKeyID()),
+                                                "BucketKeyEnabled",
+                                                rule.bucketKeyEnabled()))
+                        .toList());
     }
 
     private static Map<String, Object> transferJob(
@@ -2420,7 +2791,8 @@ public final class Main {
     }
 
     private static Path runtimeDir() throws IOException {
-        Path path = Path.of(System.getProperty("java.io.tmpdir"), "object-data-browser-java-engine");
+        Path path =
+                Path.of(System.getProperty("java.io.tmpdir"), "object-data-browser-java-engine");
         Files.createDirectories(path);
         return path;
     }
@@ -2432,23 +2804,33 @@ public final class Main {
     private static Map<String, Object> readBenchmarkState(String runId) throws IOException {
         Path path = benchmarkStatePath(runId);
         if (!Files.exists(path)) {
-            throw new SidecarException("invalid_config", "Benchmark run " + runId + " was not found.");
+            throw new SidecarException(
+                    "invalid_config", "Benchmark run " + runId + " was not found.");
         }
-        return MAPPER.readValue(Files.readString(path), new TypeReference<>() {});
+        Map<String, Object> state =
+                MAPPER.readValue(Files.readString(path), new TypeReference<>() {});
+        var clean = publicBenchmarkState(state);
+        if (!clean.equals(state)) writeBenchmarkState(clean);
+        return clean;
     }
 
     private static void writeBenchmarkState(Map<String, Object> state) throws IOException {
-        Files.writeString(benchmarkStatePath(String.valueOf(state.get("id"))), MAPPER.writeValueAsString(state));
+        Files.writeString(
+                benchmarkStatePath(String.valueOf(state.get("id"))),
+                MAPPER.writeValueAsString(publicBenchmarkState(state)));
     }
 
-    private static Map<String, Object> materializeBenchmarkState(Map<String, Object> state) throws IOException {
+    private static Map<String, Object> materializeBenchmarkState(Map<String, Object> state, BenchmarkRuntime resources, S3Client client) throws IOException {
         String status = String.valueOf(state.get("status"));
         if (List.of("paused", "completed", "stopped", "failed").contains(status)) {
             return state;
         }
         @SuppressWarnings("unchecked")
         Map<String, Object> config = (Map<String, Object>) state.get("config");
-        Instant lastUpdated = Instant.parse(String.valueOf(state.getOrDefault("lastUpdatedAt", state.get("startedAt"))));
+        Instant lastUpdated =
+                Instant.parse(
+                        String.valueOf(
+                                state.getOrDefault("lastUpdatedAt", state.get("startedAt"))));
         Instant now = Instant.now();
         double activeElapsed = asDouble(state.get("activeElapsedSeconds"))
             + (double) Duration.between(lastUpdated, now).toMillis() / 1000.0;
@@ -2466,30 +2848,31 @@ public final class Main {
         if (durationComplete) {
             state.put("activeElapsedSeconds", effectiveElapsed);
         }
-        int targetProcessed = (int) (effectiveElapsed * concurrentThreads * 8);
-        if (processed == 0 && targetProcessed == 0 && !durationComplete && !operationComplete) {
-            targetProcessed = 1;
+        if (!state.containsKey("totalRecordCount")) {
+            state.put("processedCount", 0);
+            for (var record : mapList(state.get("history"))) accumulateBenchmarkRecord(state, record);
         }
-        if ("operation-count".equals(String.valueOf(config.get("testMode")))) {
-            targetProcessed = Math.min(targetProcessed, operationCount);
-        }
-        int batchSize = Math.max(targetProcessed - processed, 0);
-        if (durationComplete || operationComplete) {
-            batchSize = 0;
-        }
-        batchSize = Math.min(batchSize, Math.max(concurrentThreads * 8, 32));
-        if (batchSize == 0 && processed == 0 && !durationComplete && !operationComplete) {
-            batchSize = 1;
-        }
-        if (batchSize > 0) {
-            Profile profile = benchmarkProfile(state);
-            try (S3Client client = buildClient(profile)) {
-                for (int index = 0; index < batchSize; index += 1) {
+        long batchStarted = System.nanoTime();
+        if (!durationComplete && !operationComplete) {
+            resources.sliceStarted = batchStarted;
+            resources.baseElapsed = activeElapsed;
+            try {
+                while ((System.nanoTime() - batchStarted) / 1_000_000_000.0 < 0.25) {
                     if ("operation-count".equals(String.valueOf(config.get("testMode")))
                         && asInt(state.get("processedCount")) >= operationCount) {
                         break;
                     }
-                    runBenchmarkOperation(state, client);
+                    if (!"operation-count".equals(String.valueOf(config.get("testMode")))
+                            && activeElapsed + (System.nanoTime() - batchStarted) / 1_000_000_000.0
+                                    >= durationSeconds) break;
+                    runBenchmarkBatch(
+                            state,
+                            client,
+                            resources,
+                            concurrentThreads,
+                            "operation-count".equals(String.valueOf(config.get("testMode")))
+                                    ? operationCount - asInt(state.get("processedCount"))
+                                    : Integer.MAX_VALUE);
                 }
             } catch (Exception error) {
                 SidecarException mapped = mapException(error);
@@ -2498,25 +2881,26 @@ public final class Main {
                 appendBenchmarkLog(state, "Benchmark failed: " + mapped.message);
             }
         }
+        state.put(
+                "activeElapsedSeconds",
+                activeElapsed + (System.nanoTime() - batchStarted) / 1_000_000_000.0);
+        state.put("lastUpdatedAt", nowIso());
         if (Boolean.TRUE.equals(config.get("debugMode"))) {
             emitStructuredLog(
-                "DEBUG",
-                "BenchmarkTrace",
-                "Benchmark status=" + state.get("status")
-                    + " processed=" + state.get("processedCount")
-                    + " elapsedSeconds=" + String.format("%.2f", asDouble(state.get("activeElapsedSeconds"))),
-                "benchmark"
-            );
+                    "DEBUG",
+                    "BenchmarkTrace",
+                    "Benchmark status="
+                            + state.get("status")
+                            + " processed="
+                            + state.get("processedCount")
+                            + " elapsedSeconds="
+                            + String.format("%.2f", asDouble(state.get("activeElapsedSeconds"))),
+                    "benchmark");
         }
         state.put("resultSummary", benchmarkSummaryFromState(state));
         state.put("averageLatencyMs", averageBenchmarkLatency(state));
-        @SuppressWarnings("unchecked")
-        List<Map<String, Object>> throughputSeries = (List<Map<String, Object>>) ((Map<String, Object>) state.get("resultSummary"))
-            .getOrDefault("throughputSeries", List.of());
-        state.put(
-            "throughputOpsPerSecond",
-            throughputSeries.isEmpty() ? 0 : asInt(throughputSeries.get(throughputSeries.size() - 1).get("opsPerSecond"))
-        );
+        state.put("throughputOpsPerSecond", round1(asDouble(state.get("processedCount"))
+                / Math.max(asDouble(state.get("activeElapsedSeconds")), 0.000001)));
         if ("running".equals(String.valueOf(state.get("status")))) {
             boolean completed = "operation-count".equals(String.valueOf(config.get("testMode")))
                 ? asInt(state.get("processedCount")) >= operationCount
@@ -2524,18 +2908,29 @@ public final class Main {
             if (completed) {
                 state.put("status", "completed");
                 state.put("completedAt", nowIso());
-                appendBenchmarkLog(state, "Benchmark completed after " + state.get("processedCount") + " request(s).");
+                appendBenchmarkLog(
+                        state,
+                        "Benchmark completed after "
+                                + state.get("processedCount")
+                                + " request(s).");
             }
         }
-        persistBenchmarkOutputs(state);
-        writeBenchmarkState(state);
+        resources.flushRecords();
+        if (!"running".equals(state.get("status")) || System.nanoTime() - resources.lastPersistNanos >= 1_000_000_000L) {
+            persistBenchmarkOutputs(state);
+            writeBenchmarkState(state);
+            resources.lastPersistNanos = System.nanoTime();
+        }
         return state;
     }
 
     private static void refreshBenchmarkSnapshot(Map<String, Object> state) {
         String status = String.valueOf(state.get("status"));
         if (!List.of("completed", "stopped", "failed").contains(status)) {
-            Instant lastUpdated = Instant.parse(String.valueOf(state.getOrDefault("lastUpdatedAt", state.get("startedAt"))));
+            Instant lastUpdated =
+                    Instant.parse(
+                            String.valueOf(
+                                    state.getOrDefault("lastUpdatedAt", state.get("startedAt"))));
             Instant now = Instant.now();
             double activeElapsed = asDouble(state.get("activeElapsedSeconds"))
                 + (double) Duration.between(lastUpdated, now).toMillis() / 1000.0;
@@ -2544,13 +2939,8 @@ public final class Main {
         }
         state.put("resultSummary", benchmarkSummaryFromState(state));
         state.put("averageLatencyMs", averageBenchmarkLatency(state));
-        @SuppressWarnings("unchecked")
-        List<Map<String, Object>> throughputSeries = (List<Map<String, Object>>) ((Map<String, Object>) state.get("resultSummary"))
-            .getOrDefault("throughputSeries", List.of());
-        state.put(
-            "throughputOpsPerSecond",
-            throughputSeries.isEmpty() ? 0 : asInt(throughputSeries.get(throughputSeries.size() - 1).get("opsPerSecond"))
-        );
+        state.put("throughputOpsPerSecond", round1(asDouble(state.get("processedCount"))
+                / Math.max(asDouble(state.get("activeElapsedSeconds")), 0.000001)));
     }
 
     private static void appendBenchmarkLog(Map<String, Object> state, String line) {
@@ -2564,7 +2954,8 @@ public final class Main {
 
     private static Profile benchmarkProfile(Map<String, Object> state) {
         @SuppressWarnings("unchecked")
-        Map<String, Object> merged = new LinkedHashMap<>((Map<String, Object>) state.get("profile"));
+        Map<String, Object> merged =
+                new LinkedHashMap<>((Map<String, Object>) state.get("profile"));
         @SuppressWarnings("unchecked")
         Map<String, Object> config = (Map<String, Object>) state.get("config");
         merged.put("connectTimeoutSeconds", asInt(config.get("connectTimeoutSeconds")));
@@ -2650,7 +3041,7 @@ public final class Main {
         List<Map<String, Object>> result = new ArrayList<>();
         for (Object item : list) {
             if (item instanceof Map<?, ?> map) {
-                result.add(new LinkedHashMap<>(MAPPER.convertValue(map, new TypeReference<Map<String, Object>>() {})));
+                result.add(new LinkedHashMap<>((Map<String, Object>) map));
             }
         }
         return result;
@@ -2672,12 +3063,17 @@ public final class Main {
 
     private static boolean isMissingBenchmarkKey(Exception error) {
         if (error instanceof S3Exception s3) {
-            String code = s3.awsErrorDetails() == null ? "" : blankToDefault(s3.awsErrorDetails().errorCode(), "");
+            String code =
+                    s3.awsErrorDetails() == null
+                            ? ""
+                            : blankToDefault(s3.awsErrorDetails().errorCode(), "");
             if (List.of("NoSuchKey", "NotFound", "404").contains(code)) {
                 return true;
             }
         }
-        return (error.getMessage() == null ? "" : error.getMessage()).toLowerCase().contains("does not exist");
+        return (error.getMessage() == null ? "" : error.getMessage())
+                .toLowerCase()
+                .contains("does not exist");
     }
 
     private static int benchmarkOperationCount(Map<String, Object> record) {
@@ -2695,34 +3091,141 @@ public final class Main {
     }
 
     private static String benchmarkDeleteMode(Map<String, Object> config) {
-        return "multi-object-post".equals(String.valueOf(config.getOrDefault("deleteMode", "single")))
-            ? "multi-object-post"
-            : "single";
+        return "multi-object-post"
+                        .equals(String.valueOf(config.getOrDefault("deleteMode", "single")))
+                ? "multi-object-post"
+                : "single";
     }
 
     private static int benchmarkDeleteBatchSize(Map<String, Object> config, int activeCount) {
         if (!Objects.equals(benchmarkDeleteMode(config), "multi-object-post")) {
             return 1;
         }
-        return Math.max(1, Math.min(Math.min(Math.max(asInt(config.get("concurrentThreads")), 2), 1000), activeCount));
+        return Math.max(
+                1,
+                Math.min(
+                        Math.min(Math.max(asInt(config.get("concurrentThreads")), 2), 1000),
+                        activeCount));
     }
 
-    private static void runBenchmarkOperation(Map<String, Object> state, S3Client client) throws IOException {
+    private static void runBenchmarkBatch(
+            Map<String, Object> state, S3Client client, BenchmarkRuntime resources, int concurrency, int remaining)
+            throws Exception {
+        @SuppressWarnings("unchecked")
+        Map<String, Object> config = (Map<String, Object>) state.get("config");
+        int objectLimit = Math.max(asInt(config.get("objectCount")), 1);
+        int count =
+                Math.min(Math.min(Math.min(Math.max(concurrency, 1), 64), remaining), objectLimit);
+        List<Map<String, Object>> active = mapList(state.get("activeObjects"));
+        List<Map<String, Object>> history = new ArrayList<>((List<Map<String, Object>>) state.get("history"));
+        List<Map<String, Object>> shards = new ArrayList<>();
+        ExecutorService executor = resources.executor;
+        List<Future<?>> futures = new ArrayList<>();
+        try {
+            for (int index = 0; index < count; index++) {
+                Map<String, Object> shard = new LinkedHashMap<>(state);
+                Map<String, Object> localConfig = new LinkedHashMap<>(config);
+                localConfig.put(
+                        "objectCount", objectLimit / count + (index < objectLimit % count ? 1 : 0));
+                // Keep every batch within an operation-count budget, including multi-delete.
+                localConfig.put("concurrentThreads", Math.max(1, remaining / count));
+                shard.put("config", localConfig);
+                shard.put("history", new ArrayList<>());
+                shard.put("liveLog", new ArrayList<>());
+                List<Map<String, Object>> owned = new ArrayList<>();
+                for (int offset = index; offset < active.size(); offset += count)
+                    owned.add(new LinkedHashMap<>(active.get(offset)));
+                shard.put("activeObjects", owned);
+                shard.put("processedCount", asInt(state.get("processedCount")) + index);
+                shard.put("nextObjectIndex", asInt(state.get("nextObjectIndex")) + index);
+                shard.put("nextSizeIndex", asInt(state.get("nextSizeIndex")) + index);
+                shard.put("nextActiveIndex", asInt(state.get("nextActiveIndex")) / count);
+                shards.add(shard);
+                futures.add(
+                        executor.submit(
+                                () -> {
+                                    var counts = new BenchmarkRuntime.Counts();
+                                    BenchmarkRuntime.COUNTS.set(counts);
+                                    try {
+                                        runBenchmarkOperation(shard, client, resources);
+                                        return null;
+                                    } catch (Exception error) {
+                                        if (counts.errors == 0) counts.errors++;
+                                        throw error;
+                                    } finally {
+                                        shard.put("errorCount", counts.errors);
+                                        shard.put("retryCount", counts.retries);
+                                        BenchmarkRuntime.COUNTS.remove();
+                                    }
+                                }));
+            }
+            Exception failure = null;
+            for (var future : futures)
+                try {
+                    future.get();
+                } catch (ExecutionException error) {
+                    if (failure == null)
+                        failure = error.getCause() instanceof Exception e ? e : error;
+                }
+            List<Map<String, Object>> nextActive = new ArrayList<>();
+            List<Map<String, Object>> completedRecords = new ArrayList<>();
+            for (var shard : shards) {
+                nextActive.addAll(mapList(shard.get("activeObjects")));
+                var records = mapList(shard.get("history"));
+                completedRecords.addAll(records);
+                for (var record : records) accumulateBenchmarkRecord(state, record);
+                state.put("errorCount", asLong(state.get("errorCount")) + asLong(shard.get("errorCount")));
+                state.put("retryCount", asLong(state.get("retryCount")) + asLong(shard.get("retryCount")));
+                for (String line : stringList(shard.get("liveLog")))
+                    appendBenchmarkLog(state, line);
+            }
+            state.put("activeObjects", nextActive);
+            completedRecords.sort(java.util.Comparator.comparingDouble(r -> asDouble(r.get("elapsedMs"))));
+            appendBenchmarkCsv(state, completedRecords, resources);
+            history.addAll(completedRecords);
+            if (history.size() > BenchmarkRuntime.HISTORY_LIMIT)
+                history = new ArrayList<>(history.subList(history.size() - BenchmarkRuntime.HISTORY_LIMIT, history.size()));
+            state.put("history", history);
+            state.put("cacheBytes", resources.cacheBytes());
+            state.put("nextObjectIndex", asInt(state.get("nextObjectIndex")) + count);
+            state.put("nextSizeIndex", asInt(state.get("nextSizeIndex")) + count);
+            state.put("nextActiveIndex", asInt(state.get("nextActiveIndex")) + count);
+            if (failure != null) throw failure;
+        } finally {
+            // The owning worker closes its executor after all batches have stopped.
+        }
+    }
+
+    private static String benchmarkOperation(Map<String, Object> config, int index) {
+        String workload = String.valueOf(config.getOrDefault("workloadType", "mixed"));
+        List<Map.Entry<String, Integer>> ratios;
+        if ("custom".equals(workload))
+            ratios =
+                    List.of(
+                            Map.entry("PUT", Math.max(0, asInt(config.get("writePercent")))),
+                            Map.entry("GET", Math.max(0, asInt(config.get("readPercent")))),
+                            Map.entry("DELETE", Math.max(0, asInt(config.get("deletePercent")))));
+        else if ("write-only".equals(workload)) return "PUT";
+        else if ("read-only".equals(workload)) return "GET";
+        else ratios = benchmarkRatios(workload);
+        int total = ratios.stream().mapToInt(Map.Entry::getValue).sum(),
+                slot = index % Math.max(total, 1),
+                cumulative = 0;
+        for (var ratio : ratios) {
+            cumulative += ratio.getValue();
+            if (slot < cumulative) return ratio.getKey();
+        }
+        return "PUT";
+    }
+
+    private static void runBenchmarkOperation(Map<String, Object> state, S3Client client, BenchmarkRuntime resources) throws IOException {
         @SuppressWarnings("unchecked")
         Map<String, Object> config = (Map<String, Object>) state.get("config");
         List<Map<String, Object>> activeObjects = mapList(state.get("activeObjects"));
         List<Map<String, Object>> history = mapList(state.get("history"));
-        int slot = asInt(state.get("processedCount")) % 100;
-        String operation = "PUT";
-        int cumulative = 0;
-        for (Map.Entry<String, Integer> ratio : benchmarkRatios(String.valueOf(config.getOrDefault("workloadType", "mixed")))) {
-            cumulative += ratio.getValue();
-            if (slot < cumulative) {
-                operation = ratio.getKey();
-                break;
-            }
-        }
-        if ((Objects.equals(operation, "GET") || Objects.equals(operation, "DELETE")) && activeObjects.isEmpty()) {
+        String operation = benchmarkOperation(config, asInt(state.get("processedCount")));
+        if ((Objects.equals(operation, "GET") || Objects.equals(operation, "DELETE"))
+                && activeObjects.isEmpty()) {
             operation = "PUT";
         }
         List<Integer> sizes = benchmarkSizes(config);
@@ -2733,6 +3236,8 @@ public final class Main {
         String key;
         int bytesTransferred;
         String checksumState;
+        String actualChecksum = null;
+        String checksumAlgorithm = String.valueOf(config.getOrDefault("checksumAlgorithm", "sha256"));
         double latencyMs;
         int operationCount;
         while (true) {
@@ -2740,7 +3245,11 @@ public final class Main {
             long started = System.nanoTime();
             if (Objects.equals(operation, "PUT")) {
                 if (activeObjects.size() >= objectLimit && !activeObjects.isEmpty()) {
-                    key = String.valueOf(activeObjects.get(nextActiveIndex % activeObjects.size()).get("key"));
+                    key =
+                            String.valueOf(
+                                    activeObjects
+                                            .get(nextActiveIndex % activeObjects.size())
+                                            .get("key"));
                     state.put("nextActiveIndex", nextActiveIndex + 1);
                 } else {
                     int nextObjectIndex = asInt(state.get("nextObjectIndex"));
@@ -2748,16 +3257,11 @@ public final class Main {
                         + String.format("%06d", nextObjectIndex) + "-" + sizeBytes + ".bin";
                     state.put("nextObjectIndex", nextObjectIndex + 1);
                 }
-                byte[] payload = benchmarkPayload(
-                    String.valueOf(state.get("id")),
-                    key,
-                    sizeBytes,
-                    Boolean.TRUE.equals(config.getOrDefault("randomData", Boolean.TRUE))
-                );
-                client.putObject(
-                    PutObjectRequest.builder().bucket(String.valueOf(config.get("bucketName"))).key(key).build(),
-                    software.amazon.awssdk.core.sync.RequestBody.fromBytes(payload)
-                );
+                try (var payload = resources.payload(String.valueOf(state.get("id")), key,
+                        sizeBytes, Boolean.TRUE.equals(config.getOrDefault("randomData", Boolean.TRUE)))) {
+                    client.putObject(PutObjectRequest.builder()
+                            .bucket(String.valueOf(config.get("bucketName"))).key(key).build(), payload.body());
+                }
                 boolean updated = false;
                 for (Map<String, Object> entry : activeObjects) {
                     if (Objects.equals(String.valueOf(entry.get("key")), key)) {
@@ -2768,7 +3272,7 @@ public final class Main {
                 if (!updated) {
                     activeObjects.add(orderedMap("key", key, "sizeBytes", sizeBytes));
                 }
-                bytesTransferred = payload.length;
+                bytesTransferred = sizeBytes;
                 checksumState = "not_used";
                 latencyMs = (System.nanoTime() - started) / 1_000_000.0;
                 operationCount = 1;
@@ -2783,28 +3287,28 @@ public final class Main {
                     .bucket(String.valueOf(config.get("bucketName")))
                     .key(key)
                     .build())) {
-                    byte[] bytes = stream.readAllBytes();
-                    bytesTransferred = bytes.length;
-                    if (Boolean.TRUE.equals(config.getOrDefault("validateChecksum", Boolean.TRUE))) {
-                        byte[] expected = benchmarkPayload(
-                            String.valueOf(state.get("id")),
-                            key,
-                            sizeBytes,
-                            Boolean.TRUE.equals(config.getOrDefault("randomData", Boolean.TRUE))
-                        );
-                        checksumState = java.util.Arrays.equals(bytes, expected) ? "validated_success" : "validated_failure";
-                    } else {
-                        checksumState = "not_used";
-                    }
+                    boolean validate = Boolean.TRUE.equals(config.getOrDefault("validateChecksum", Boolean.TRUE));
+                    var consumed = BenchmarkRuntime.consume(stream, String.valueOf(state.get("id")), key,
+                            sizeBytes, Boolean.TRUE.equals(config.getOrDefault("randomData", Boolean.TRUE)), validate, checksumAlgorithm);
+                    bytesTransferred = Math.toIntExact(consumed.bytes());
+                    actualChecksum = consumed.checksum();
+                    checksumState = validate ? (consumed.valid() ? "validated_success" : "validated_failure") : "not_used";
                     latencyMs = (System.nanoTime() - started) / 1_000_000.0;
                     operationCount = 1;
                     break;
                 } catch (Exception error) {
                     if (isMissingBenchmarkKey(error)) {
                         final String missingKey = key;
-                        activeObjects.removeIf(entry -> Objects.equals(String.valueOf(entry.get("key")), missingKey));
+                        activeObjects.removeIf(
+                                entry ->
+                                        Objects.equals(
+                                                String.valueOf(entry.get("key")), missingKey));
                         state.put("activeObjects", activeObjects);
-                        appendBenchmarkLog(state, "Skipped missing benchmark object " + key + "; rotating to the next object.");
+                        appendBenchmarkLog(
+                                state,
+                                "Skipped missing benchmark object "
+                                        + key
+                                        + "; rotating to the next object.");
                         if (activeObjects.isEmpty()) {
                             operation = "PUT";
                         }
@@ -2822,7 +3326,8 @@ public final class Main {
                 selectedKeys.add(String.valueOf(selected.get("key")));
             }
             state.put("nextActiveIndex", nextActiveIndex + deleteBatchSize);
-            if (Objects.equals(benchmarkDeleteMode(config), "multi-object-post") && selectedKeys.size() > 1) {
+            if (Objects.equals(benchmarkDeleteMode(config), "multi-object-post")
+                    && selectedKeys.size() > 1) {
                 var output = client.deleteObjects(DeleteObjectsRequest.builder()
                     .bucket(String.valueOf(config.get("bucketName")))
                     .delete(Delete.builder()
@@ -2839,28 +3344,36 @@ public final class Main {
                 });
                 LinkedHashSet<String> missingKeys = new LinkedHashSet<>();
                 List<String> fatalErrors = new ArrayList<>();
-                output.errors().forEach(item -> {
-                    String target = blankToDefault(item.key(), "");
-                    String code = blankToDefault(item.code(), "").toLowerCase();
-                    String message = blankToDefault(item.message(), "");
-                    if (List.of("nosuchkey", "notfound", "404").contains(code)
-                        || message.toLowerCase().contains("does not exist")) {
-                        if (!target.isEmpty()) {
-                            missingKeys.add(target);
-                        }
-                        return;
-                    }
-                    fatalErrors.add((target.isEmpty() ? "(unknown)" : target) + ": "
-                        + (message.isEmpty() ? blankToDefault(item.code(), "delete error") : message));
-                });
+                output.errors()
+                        .forEach(
+                                item -> {
+                                    String target = blankToDefault(item.key(), "");
+                                    String code = blankToDefault(item.code(), "").toLowerCase();
+                                    String message = blankToDefault(item.message(), "");
+                                    if (List.of("nosuchkey", "notfound", "404").contains(code)
+                                            || message.toLowerCase().contains("does not exist")) {
+                                        if (!target.isEmpty()) {
+                                            missingKeys.add(target);
+                                        }
+                                        return;
+                                    }
+                                    fatalErrors.add(
+                                            (target.isEmpty() ? "(unknown)" : target)
+                                                    + ": "
+                                                    + (message.isEmpty()
+                                                            ? blankToDefault(
+                                                                    item.code(), "delete error")
+                                                            : message));
+                                });
                 if (!fatalErrors.isEmpty()) {
                     throw new SidecarException("delete_failed", String.join("; ", fatalErrors));
                 }
                 if (!missingKeys.isEmpty()) {
                     appendBenchmarkLog(
-                        state,
-                        "Skipped " + missingKeys.size() + " missing benchmark object(s) during multi-delete POST."
-                    );
+                            state,
+                            "Skipped "
+                                    + missingKeys.size()
+                                    + " missing benchmark object(s) during multi-delete POST.");
                 }
                 activeObjects.removeIf(entry ->
                     deletedKeys.contains(String.valueOf(entry.get("key")))
@@ -2896,7 +3409,8 @@ public final class Main {
                     .key(key)
                     .build());
                 final String deletedKey = key;
-                activeObjects.removeIf(entry -> Objects.equals(String.valueOf(entry.get("key")), deletedKey));
+                activeObjects.removeIf(
+                        entry -> Objects.equals(String.valueOf(entry.get("key")), deletedKey));
                 bytesTransferred = 0;
                 checksumState = "not_used";
                 latencyMs = (System.nanoTime() - started) / 1_000_000.0;
@@ -2905,9 +3419,14 @@ public final class Main {
             } catch (Exception error) {
                 if (isMissingBenchmarkKey(error)) {
                     final String missingKey = key;
-                    activeObjects.removeIf(entry -> Objects.equals(String.valueOf(entry.get("key")), missingKey));
+                    activeObjects.removeIf(
+                            entry -> Objects.equals(String.valueOf(entry.get("key")), missingKey));
                     state.put("activeObjects", activeObjects);
-                    appendBenchmarkLog(state, "Skipped missing benchmark object " + key + "; rotating to the next object.");
+                    appendBenchmarkLog(
+                            state,
+                            "Skipped missing benchmark object "
+                                    + key
+                                    + "; rotating to the next object.");
                     if (activeObjects.isEmpty()) {
                         operation = "PUT";
                     }
@@ -2916,9 +3435,11 @@ public final class Main {
                 throw error;
             }
         }
+        double completedElapsedMs = (resources.baseElapsed + (System.nanoTime() - resources.sliceStarted) / 1_000_000_000.0) * 1000.0;
         history.add(orderedMap(
             "timestamp", nowIso(),
-            "second", ((int) asDouble(state.get("activeElapsedSeconds"))) + 1,
+            "elapsedMs", completedElapsedMs,
+            "second", ((int) (completedElapsedMs / 1000.0)) + 1,
             "operation", operation,
             "key", key,
             "sizeBytes", sizeBytes,
@@ -2926,22 +3447,87 @@ public final class Main {
             "bytesTransferred", bytesTransferred,
             "success", true,
             "checksumState", checksumState,
+            "checksum", actualChecksum,
+            "checksumAlgorithm", checksumAlgorithm,
             "operationCount", operationCount
         ));
         state.put("history", history);
         state.put("activeObjects", activeObjects);
         state.put("processedCount", history.stream().mapToInt(Main::benchmarkOperationCount).sum());
+        if (Boolean.TRUE.equals(config.get("reducedLogging"))) return;
         if (Objects.equals(operation, "DELETE") && operationCount > 1) {
-            appendBenchmarkLog(state, "DELETE POST removed " + operationCount + " object(s) in " + round1(latencyMs) + " ms.");
+            appendBenchmarkLog(
+                    state,
+                    "DELETE POST removed "
+                            + operationCount
+                            + " object(s) in "
+                            + round1(latencyMs)
+                            + " ms.");
         } else {
-            appendBenchmarkLog(state, operation + " " + key + " completed in " + round1(latencyMs) + " ms.");
+            appendBenchmarkLog(
+                    state, operation + " " + key + " completed in " + round1(latencyMs) + " ms.");
+        }
+    }
+
+    private static long asLong(Object value) { return value instanceof Number n ? n.longValue() : 0; }
+
+    private static void validateBenchmarkConfig(JsonNode config) {
+        if (!List.of("sha256", "sha1", "md5", "crc32", "crc32c").contains(config.path("checksumAlgorithm").asText("sha256")))
+            throw new SidecarException("invalid_config", "Benchmark checksum algorithm must be sha256, sha1, md5, crc32 or crc32c.");
+        if (config.path("objectCount").asInt(100) < 1 || config.path("objectCount").asInt(100) > 100_000
+                || config.path("concurrentThreads").asInt(1) < 1 || config.path("concurrentThreads").asInt(1) > 64
+                || config.path("dataCacheMb").asInt(64) < 0 || config.path("dataCacheMb").asInt(64) > 1024)
+            throw new SidecarException("invalid_config", "Benchmark requires 1–100000 objects, 1–64 workers and 0–1024 MiB cache.");
+        for (JsonNode size : config.path("objectSizes"))
+            if (!size.canConvertToInt() || size.asInt() < 1 || size.asInt() > 512 * 1024 * 1024)
+                throw new SidecarException("invalid_config", "Benchmark object sizes must be 1 byte–512 MiB.");
+    }
+
+    private static void accumulateBenchmarkRecord(Map<String, Object> state, Map<String, Object> record) {
+        long count = benchmarkOperationCount(record);
+        state.put("processedCount", asLong(state.get("processedCount")) + count);
+        state.put("totalRecordCount", asLong(state.get("totalRecordCount")) + 1);
+        state.put("totalBytes", asLong(state.get("totalBytes")) + asLong(record.get("bytesTransferred")));
+        state.put("totalLatencyMs", asDouble(state.get("totalLatencyMs")) + asDouble(record.get("latencyMs")));
+        for (var pair : List.of(Map.entry("totalOperationsByType", "operation"), Map.entry("totalChecksumStats", "checksumState"))) {
+            var values = (Map<String, Object>) state.computeIfAbsent(pair.getKey(), ignored -> new LinkedHashMap<>());
+            String key = String.valueOf(record.get(pair.getValue()));
+            values.put(key, asLong(values.get(key)) + count);
+        }
+        var windows = (Map<String, Object>) state.computeIfAbsent("throughputWindows", ignored -> new LinkedHashMap<>());
+        String second = String.valueOf(record.get("second"));
+        var window = (Map<String, Object>) windows.computeIfAbsent(second, ignored -> new LinkedHashMap<>());
+        window.put("operationsCount", asLong(window.get("operationsCount")) + count);
+        window.put("bytes", asLong(window.get("bytes")) + asLong(record.get("bytesTransferred")));
+        window.put("latencyMs", asDouble(window.get("latencyMs")) + asDouble(record.get("latencyMs")));
+        window.put("records", asLong(window.get("records")) + 1);
+        var operations = (Map<String, Object>) window.computeIfAbsent("operations", ignored -> new LinkedHashMap<>());
+        String operation = String.valueOf(record.get("operation"));
+        operations.put(operation, asLong(operations.get(operation)) + count);
+        if (windows.size() > 3600) windows.remove(windows.keySet().stream().min(java.util.Comparator.comparingInt(Integer::parseInt)).orElseThrow());
+        if ("validated_failure".equals(record.get("checksumState")))
+            state.put("errorCount", asLong(state.get("errorCount")) + 1);
+    }
+
+    private static void appendBenchmarkCsv(Map<String, Object> state, List<Map<String, Object>> records, BenchmarkRuntime resources) throws IOException {
+        var config = (Map<String, Object>) state.get("config");
+        Path path = Path.of(String.valueOf(config.get("csvOutputPath")));
+        var output = resources.csv(path);
+        {
+            for (var record : records) {
+                String key = "\"" + String.valueOf(record.get("key")).replace("\"", "\"\"") + "\"";
+                output.write(record.get("second") + "," + record.get("operation") + "," + benchmarkOperationCount(record)
+                        + "," + record.get("latencyMs") + "," + record.get("sizeBytes") + "," + record.get("bytesTransferred")
+                        + ",true," + record.get("checksumState") + "," + key + "," + record.get("elapsedMs") + "\n");
+            }
         }
     }
 
     private static Map<String, Object> benchmarkSummaryFromState(Map<String, Object> state) {
         List<Map<String, Object>> history = mapList(state.get("history"));
         Map<String, Object> operationsByType = new LinkedHashMap<>();
-        Map<String, Object> checksumStats = orderedMap("validated_success", 0, "validated_failure", 0, "not_used", 0);
+        Map<String, Object> checksumStats =
+                orderedMap("validated_success", 0, "validated_failure", 0, "not_used", 0);
         Map<Integer, List<Map<String, Object>>> windows = new java.util.TreeMap<>();
         Map<Integer, List<Double>> sizeLatency = new java.util.TreeMap<>();
         List<Double> latencies = new ArrayList<>();
@@ -2964,19 +3550,30 @@ public final class Main {
         double averageOps = 0;
         double averageBytes = 0;
         int peakOps = 0;
-        int peakBytes = 0;
+        long peakBytes = 0;
+        var exactWindows = (Map<String, Object>) state.getOrDefault("throughputWindows", Map.of());
+        int lastSecond = Math.max(1, (int) Math.ceil(asDouble(state.get("activeElapsedSeconds"))));
+        for (String second : exactWindows.keySet()) lastSecond = Math.max(lastSecond, Integer.parseInt(second));
+        for (int second = Math.max(1, lastSecond - 3599); second <= lastSecond; second++)
+            windows.computeIfAbsent(second, ignored -> new ArrayList<>());
         for (Map.Entry<Integer, List<Map<String, Object>>> entry : windows.entrySet()) {
             Map<String, Object> windowOperations = new LinkedHashMap<>();
             List<Double> windowLatencies = new ArrayList<>();
-            int bytesPerSecond = 0;
+            long bytesPerSecond = 0;
             int opsPerSecond = 0;
             for (Map<String, Object> record : entry.getValue()) {
                 String operation = String.valueOf(record.getOrDefault("operation", ""));
                 int operationCount = benchmarkOperationCount(record);
                 windowOperations.put(operation, asInt(windowOperations.get(operation)) + operationCount);
                 windowLatencies.add(asDouble(record.get("latencyMs")));
-                bytesPerSecond += asInt(record.get("bytesTransferred"));
+                bytesPerSecond += asLong(record.get("bytesTransferred"));
                 opsPerSecond += operationCount;
+            }
+            var exact = (Map<String, Object>) exactWindows.get(String.valueOf(entry.getKey()));
+            if (exact != null) {
+                opsPerSecond = asInt(exact.get("operationsCount"));
+                bytesPerSecond = asLong(exact.get("bytes"));
+                windowOperations = (Map<String, Object>) exact.get("operations");
             }
             averageOps += opsPerSecond;
             averageBytes += bytesPerSecond;
@@ -2987,7 +3584,7 @@ public final class Main {
                 "label", entry.getKey() + "s",
                 "opsPerSecond", opsPerSecond,
                 "bytesPerSecond", bytesPerSecond,
-                "averageLatencyMs", round1(mean(windowLatencies)),
+                "averageLatencyMs", exact == null ? round1(mean(windowLatencies)) : round1(asDouble(exact.get("latencyMs")) / Math.max(asLong(exact.get("records")), 1)),
                 "p95LatencyMs", round1(percentile(windowLatencies, 95)),
                 "operations", windowOperations
             ));
@@ -3000,22 +3597,23 @@ public final class Main {
             int position = secondPositions.getOrDefault(second, 0) + 1;
             secondPositions.put(second, position);
             double elapsedMs = asDouble(record.get("elapsedMs"));
-            if (elapsedMs <= 0) {
-                elapsedMs = ((second - 1) + ((double) position / (windows.get(second).size() + 1))) * 1000.0;
-            }
-            latencyTimeline.add(orderedMap(
-                "sequence", index + 1,
-                "operation", String.valueOf(record.getOrDefault("operation", "")).toUpperCase(),
-                "second", second,
-                "elapsedMs", round1(elapsedMs),
-                "label", benchmarkTimelineLabel(elapsedMs / 1000.0),
-                "latencyMs", round1(asDouble(record.get("latencyMs"))),
-                "sizeBytes", asInt(record.get("sizeBytes")),
-                "bytesTransferred", asInt(record.get("bytesTransferred")),
-                "operationCount", benchmarkOperationCount(record),
-                "success", !record.containsKey("success") || Boolean.TRUE.equals(record.get("success")),
-                "key", String.valueOf(record.getOrDefault("key", ""))
-            ));
+            latencyTimeline.add(
+                    orderedMap(
+                            "sequence", Math.max(0, asLong(state.get("totalRecordCount")) - history.size()) + index + 1,
+                            "operation",
+                                    String.valueOf(record.getOrDefault("operation", ""))
+                                            .toUpperCase(),
+                            "second", second,
+                            "elapsedMs", round1(elapsedMs),
+                            "label", benchmarkTimelineLabel(elapsedMs / 1000.0),
+                            "latencyMs", round1(asDouble(record.get("latencyMs"))),
+                            "sizeBytes", asInt(record.get("sizeBytes")),
+                            "bytesTransferred", asInt(record.get("bytesTransferred")),
+                            "operationCount", benchmarkOperationCount(record),
+                            "success",
+                                    !record.containsKey("success")
+                                            || Boolean.TRUE.equals(record.get("success")),
+                            "key", String.valueOf(record.getOrDefault("key", ""))));
         }
         List<Map<String, Object>> sizeLatencyBuckets = new ArrayList<>();
         for (Map.Entry<Integer, List<Double>> entry : sizeLatency.entrySet()) {
@@ -3029,17 +3627,15 @@ public final class Main {
             ));
         }
         int sampleCount = Math.max(throughputSeries.size(), 1);
-        int averageObjectSize = benchmarkSizes((Map<String, Object>) state.get("config"))
-            .stream()
-            .mapToInt(Integer::intValue)
-            .sum();
+        long averageObjectSize = benchmarkSizes((Map<String, Object>) state.get("config"))
+            .stream().mapToLong(Integer::longValue).sum();
         List<Integer> sizes = benchmarkSizes((Map<String, Object>) state.get("config"));
         if (!sizes.isEmpty()) {
             averageObjectSize /= sizes.size();
         }
         return orderedMap(
-            "totalOperations", history.stream().mapToInt(Main::benchmarkOperationCount).sum(),
-            "operationsByType", operationsByType,
+            "totalOperations", state.getOrDefault("processedCount", 0),
+            "operationsByType", state.getOrDefault("totalOperationsByType", operationsByType),
             "latencyPercentilesMs", orderedMap(
                 "p50", round1(percentile(latencies, 50)),
                 "p75", round1(percentile(latencies, 75)),
@@ -3051,18 +3647,24 @@ public final class Main {
             "throughputSeries", throughputSeries,
             "latencyTimeline", latencyTimeline,
             "sizeLatencyBuckets", sizeLatencyBuckets,
-            "checksumStats", checksumStats,
+            "checksumStats", state.getOrDefault("totalChecksumStats", checksumStats),
             "detailMetrics", orderedMap(
+                "checksumAlgorithm", ((Map<String, Object>) state.get("config")).getOrDefault("checksumAlgorithm", "sha256"),
                 "sampleCount", sampleCount,
                 "sampleWindowSeconds", 1,
-                "averageOpsPerSecond", round1(averageOps / sampleCount),
+                "averageOpsPerSecond", round1(asDouble(state.get("processedCount")) / Math.max(asDouble(state.get("activeElapsedSeconds")), 0.000001)),
                 "peakOpsPerSecond", peakOps,
-                "averageBytesPerSecond", round1(averageBytes / sampleCount),
+                "averageBytesPerSecond", round1(asDouble(state.get("totalBytes")) / Math.max(asDouble(state.get("activeElapsedSeconds")), 0.000001)),
                 "peakBytesPerSecond", peakBytes,
                 "averageObjectSizeBytes", averageObjectSize,
-                "checksumValidated", asInt(checksumStats.get("validated_success")),
-                "errorCount", 0,
-                "retryCount", 0
+                "checksumValidated", ((Map<String, Object>) state.getOrDefault("totalChecksumStats", checksumStats)).getOrDefault("validated_success", 0),
+                "errorCount", state.getOrDefault("errorCount", 0),
+                "retryCount", state.getOrDefault("retryCount", 0),
+                "historyLimit", BenchmarkRuntime.HISTORY_LIMIT,
+                "historyRecordsRetained", history.size(),
+                "historyTruncated", asLong(state.get("totalRecordCount")) > history.size(),
+                "latencyStatisticsScope", "retained-recent-requests",
+                "cacheBytes", state.getOrDefault("cacheBytes", 0)
             )
         );
     }
@@ -3076,9 +3678,10 @@ public final class Main {
         Files.createDirectories(csvPath.getParent());
         Files.createDirectories(jsonPath.getParent());
         Files.createDirectories(logPath.getParent());
-        List<String> csvLines = new ArrayList<>(
-            List.of("second,operation,operationCount,latencyMs,sizeBytes,bytesTransferred,success,checksumState,key")
-        );
+        List<String> csvLines =
+                new ArrayList<>(
+                        List.of(
+                                "second,operation,operationCount,latencyMs,sizeBytes,bytesTransferred,success,checksumState,key"));
         for (Map<String, Object> record : mapList(state.get("history"))) {
             csvLines.add(
                 asInt(record.get("second")) + ","
@@ -3091,16 +3694,13 @@ public final class Main {
                     + record.getOrDefault("key", "")
             );
         }
-        Files.writeString(csvPath, String.join("\n", csvLines) + "\n");
+        if (!Files.exists(csvPath)) Files.writeString(csvPath, String.join("\n", csvLines) + "\n");
         Files.writeString(jsonPath, writeJson(state.get("resultSummary")));
         Files.writeString(logPath, String.join("\n", stringList(state.get("liveLog"))));
     }
 
     private static double averageBenchmarkLatency(Map<String, Object> state) {
-        List<Double> latencies = mapList(state.get("history")).stream()
-            .map(item -> asDouble(item.get("latencyMs")))
-            .toList();
-        return round1(mean(latencies));
+        return round1(asDouble(state.get("totalLatencyMs")) / Math.max(asLong(state.get("totalRecordCount")), 1));
     }
 
     private static double percentile(List<Double> values, double percentile) {
@@ -3138,9 +3738,11 @@ public final class Main {
             ? runtime.getCause()
             : error;
         if (cause instanceof S3Exception s3) {
-            String code = s3.awsErrorDetails() == null ? "Unknown" : s3.awsErrorDetails().errorCode();
+            String code =
+                    s3.awsErrorDetails() == null ? "Unknown" : s3.awsErrorDetails().errorCode();
             String message = s3.awsErrorDetails() == null ? s3.getMessage() : s3.awsErrorDetails().errorMessage();
-            if (List.of("AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch").contains(code)) {
+            if (List.of("AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch")
+                    .contains(code)) {
                 return new SidecarException("auth_failed", message, orderedMap("awsCode", code));
             }
             if ("RequestTimeout".equals(code)) {
@@ -3157,12 +3759,15 @@ public final class Main {
             if (lowered.contains("timed out") || lowered.contains("timeout")) {
                 return new SidecarException("timeout", message);
             }
-            if (lowered.contains("certificate") || lowered.contains("ssl") || lowered.contains("tls")) {
+            if (lowered.contains("certificate")
+                    || lowered.contains("ssl")
+                    || lowered.contains("tls")) {
                 return new SidecarException("tls_error", message);
             }
             return new SidecarException("engine_unavailable", message);
         }
-        return new SidecarException("unknown", error.getMessage() == null ? error.toString() : error.getMessage());
+        return new SidecarException(
+                "unknown", error.getMessage() == null ? error.toString() : error.getMessage());
     }
 
     private static Map<String, Object> capability(String key, String label, String state, String reason) {
@@ -3196,8 +3801,9 @@ public final class Main {
     }
 
     private static String requiredText(JsonNode node, String field, String message) {
-        String value = text(node, field).trim();
-        if (value.isBlank()) {
+        String value = text(node, field);
+        if (!List.of("key", "sourceKey", "destinationKey").contains(field)) value = value.trim();
+        if (value.isEmpty()) {
             throw new SidecarException("invalid_config", message);
         }
         return value;
@@ -3224,12 +3830,13 @@ public final class Main {
         if (node == null || !node.isArray()) {
             return values;
         }
-        node.forEach(item -> {
-            String value = item.asText("").trim();
-            if (!value.isBlank()) {
-                values.add(value);
-            }
-        });
+        node.forEach(
+                item -> {
+                    String value = item.asText("");
+                    if (!value.isEmpty()) {
+                        values.add(value);
+                    }
+                });
         return values;
     }
 
@@ -3324,21 +3931,27 @@ public final class Main {
     }
 
     private record Profile(
-        String endpointUrl,
-        String region,
-        String accessKey,
-        String secretKey,
-        String sessionToken,
-        boolean pathStyle,
-        boolean verifyTls,
-        int connectTimeoutSeconds,
-        int readTimeoutSeconds,
-        int maxAttempts,
-        int maxPoolConnections,
-        boolean enableApiLogging,
-        boolean enableDebugLogging
-    ) {
-    }
+            String authMode,
+            String awsProfileName,
+            String roleArn,
+            String externalId,
+            String roleSessionName,
+            String caBundlePath,
+            boolean requesterPays,
+            String expectedBucketOwner,
+            String endpointUrl,
+            String region,
+            String accessKey,
+            String secretKey,
+            String sessionToken,
+            boolean pathStyle,
+            boolean verifyTls,
+            int connectTimeoutSeconds,
+            int readTimeoutSeconds,
+            int maxAttempts,
+            int maxPoolConnections,
+            boolean enableApiLogging,
+            boolean enableDebugLogging) {}
 
     private record BucketContext(Profile profile, String bucketName, S3Client client) {
     }

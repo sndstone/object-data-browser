@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
 
+import '../widgets/app_menu.dart';
+import '../widgets/app_slider.dart';
+
 class AppTheme {
   static const Color lightCanvas = Color(0xFFF7F8F5);
   static const Color lightPanel = Color(0xFFFFFFFF);
@@ -445,6 +448,27 @@ class AppTheme {
         unselectedLabelStyle: textTheme.labelLarge,
         dividerColor: Colors.transparent,
       ),
+      // Every menu matches the engine selector panel in AppSelectField.
+      popupMenuTheme: PopupMenuThemeData(
+        color: scheme.surface,
+        surfaceTintColor: Colors.transparent,
+        elevation: 6,
+        shadowColor: scheme.shadow,
+        menuPadding: const EdgeInsets.symmetric(
+          vertical: AppMenuStyle.verticalPadding,
+        ),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppMenuStyle.radius),
+          side: BorderSide(
+            color: scheme.outlineVariant.withValues(alpha: 0.9),
+          ),
+        ),
+        textStyle: textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w500),
+        labelTextStyle: WidgetStatePropertyAll(
+          textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w500),
+        ),
+      ),
+      sliderTheme: appSliderTheme(scheme),
       switchTheme: SwitchThemeData(
         trackOutlineColor: WidgetStatePropertyAll(
           scheme.outlineVariant.withValues(alpha: 0.7),

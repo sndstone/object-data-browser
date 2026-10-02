@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 
 class TagEditorDialog extends StatefulWidget {
-  const TagEditorDialog({super.key, required this.initialTags});
+  const TagEditorDialog(
+      {super.key, required this.initialTags, this.title = 'Edit tags'});
   final Map<String, String> initialTags;
+  final String title;
   @override
   State<TagEditorDialog> createState() => _TagEditorDialogState();
 }
@@ -44,7 +46,7 @@ class _TagEditorDialogState extends State<TagEditorDialog> {
 
   @override
   Widget build(BuildContext context) => AlertDialog(
-          title: const Text('Bucket tags'),
+          title: Text(widget.title),
           content: SizedBox(
               width: 560,
               child: SingleChildScrollView(

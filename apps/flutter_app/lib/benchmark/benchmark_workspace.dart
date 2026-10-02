@@ -1,4 +1,5 @@
 import 'benchmark_metrics.dart';
+import 'operation_mix_bar.dart';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -11,6 +12,7 @@ import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_select_field.dart';
+import '../widgets/app_switch.dart';
 import '../widgets/compact_selector.dart';
 
 enum _BenchmarkPreviewSection {
@@ -3144,13 +3146,12 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     required Widget title,
     Widget? subtitle,
   }) {
-    return SwitchListTile(
+    return AppSwitchTile(
       value: value,
       onChanged: onChanged,
       title: title,
       subtitle: subtitle,
       dense: true,
-      contentPadding: EdgeInsets.zero,
       visualDensity: VisualDensity.compact,
     );
   }
@@ -3247,162 +3248,42 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
         .clamp(0, run.config.durationSeconds.toDouble());
   }
 
-  /// Card shown when the workload type is 'custom', with sliders for
-  /// read / write / delete percentages that always sum to 100.
+  /// Card shown when the workload type is 'custom': one split bar for the
+  /// write / read / delete shares, which always sum to 100.
   Widget _customMixCard(BuildContext context, BenchmarkConfig config) {
-    final total =
-        config.readPercent + config.writePercent + config.deletePercent;
-    final balanced = total == 100;
+    final theme = Theme.of(context);
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(14),
-        color: Theme.of(context).colorScheme.surfaceContainerHighest,
-        border: balanced
-            ? null
-            : Border.all(
-                color:
-                    Theme.of(context).colorScheme.error.withValues(alpha: 0.6),
-              ),
+        color: theme.colorScheme.surfaceContainerHighest,
       ),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Row(
-            children: [
-              Expanded(
-                child: Text(
-                  'Custom operation mix',
-                  style: Theme.of(context).textTheme.labelLarge,
-                ),
-              ),
-              Chip(
-                label: Text(
-                  'Total: $total%',
-                  style: TextStyle(
-                    color: balanced
-                        ? Colors.green.shade700
-                        : Theme.of(context).colorScheme.error,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-                padding: EdgeInsets.zero,
-                visualDensity: VisualDensity.compact,
-                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                side: BorderSide.none,
-                backgroundColor: balanced
-                    ? Colors.green.shade50
-                    : Theme.of(context)
-                        .colorScheme
-                        .errorContainer
-                        .withValues(alpha: 0.4),
-              ),
-            ],
+          Text('Custom operation mix', style: theme.textTheme.labelLarge),
+          const SizedBox(height: 2),
+          Text(
+            'Drag the dividers or use a preset. The shares always total 100%.',
+            style: theme.textTheme.bodySmall,
           ),
-          if (!balanced)
-            Padding(
-              padding: const EdgeInsets.only(top: 4, bottom: 4),
-              child: Text(
-                'Percentages must sum to 100. Adjust the sliders below.',
-                style: TextStyle(
-                  color: Theme.of(context).colorScheme.error,
-                  fontSize: 12,
-                ),
+          const SizedBox(height: 12),
+          OperationMixBar(
+            mix: OperationMix(
+              config.writePercent,
+              config.readPercent,
+              config.deletePercent,
+            ),
+            onChanged: (mix) => controller.updateBenchmarkDraft(
+              config.copyWith(
+                writePercent: mix.write,
+                readPercent: mix.read,
+                deletePercent: mix.delete,
               ),
             ),
-          const SizedBox(height: 8),
-          _mixSlider(
-            context,
-            label: 'Write (PUT)',
-            percent: config.writePercent,
-            color: Colors.teal.shade600,
-            onChanged: (value) {
-              // Clamp so write + read ≤ 100, give remainder to delete.
-              final clamped = value.clamp(0, 100 - config.readPercent);
-              controller.updateBenchmarkDraft(config.copyWith(
-                writePercent: clamped,
-                deletePercent: 100 - clamped - config.readPercent,
-              ));
-            },
-          ),
-          _mixSlider(
-            context,
-            label: 'Read (GET)',
-            percent: config.readPercent,
-            color: Colors.blue.shade600,
-            onChanged: (value) {
-              final clamped = value.clamp(0, 100 - config.writePercent);
-              controller.updateBenchmarkDraft(config.copyWith(
-                readPercent: clamped,
-                deletePercent: 100 - config.writePercent - clamped,
-              ));
-            },
-          ),
-          _mixSlider(
-            context,
-            label: 'Delete',
-            percent: config.deletePercent,
-            color: Colors.red.shade600,
-            onChanged: (value) {
-              final clamped = value.clamp(0, 100 - config.writePercent);
-              controller.updateBenchmarkDraft(config.copyWith(
-                deletePercent: clamped,
-                readPercent: 100 - config.writePercent - clamped,
-              ));
-            },
           ),
         ],
       ),
-    );
-  }
-
-  Widget _mixSlider(
-    BuildContext context, {
-    required String label,
-    required int percent,
-    required Color color,
-    required ValueChanged<int> onChanged,
-  }) {
-    return Row(
-      children: [
-        SizedBox(
-          width: 88,
-          child: Text(
-            label,
-            style: const TextStyle(fontSize: 12),
-          ),
-        ),
-        Expanded(
-          child: SliderTheme(
-            data: SliderTheme.of(context).copyWith(
-              activeTrackColor: color,
-              thumbColor: color,
-              overlayColor: color.withValues(alpha: 0.2),
-            ),
-            child: Slider(
-              min: 0,
-              max: 100,
-              divisions: 100,
-              value: percent.toDouble(),
-              label: '$percent%',
-              onChanged: (v) => onChanged(v.round()),
-            ),
-          ),
-        ),
-        SizedBox(
-          width: 36,
-          child: Text(
-            '$percent%',
-            textAlign: TextAlign.right,
-            style: TextStyle(
-              fontWeight: FontWeight.w700,
-              color: color,
-              fontSize: 12,
-            ),
-          ),
-        ),
-      ],
     );
   }
 
@@ -3586,15 +3467,17 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
         .map((entry) => Map<String, Object?>.from(entry))
         .toList();
     timeline.sort((left, right) {
-      final leftSequence = _intMetric(left['sequence']);
-      final rightSequence = _intMetric(right['sequence']);
-      if (leftSequence != rightSequence) {
-        return leftSequence.compareTo(rightSequence);
-      }
+      // Concurrent results can be collected in a different order from their
+      // measured completion times. Draw the time axis chronologically.
       final leftElapsed = _doubleMetric(left['elapsedMs']);
       final rightElapsed = _doubleMetric(right['elapsedMs']);
       if (leftElapsed != rightElapsed) {
         return leftElapsed.compareTo(rightElapsed);
+      }
+      final leftSequence = _intMetric(left['sequence']);
+      final rightSequence = _intMetric(right['sequence']);
+      if (leftSequence != rightSequence) {
+        return leftSequence.compareTo(rightSequence);
       }
       return _intMetric(left['second']).compareTo(_intMetric(right['second']));
     });

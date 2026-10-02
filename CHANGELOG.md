@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 2.3.0 — local development build
+
+- Added bucket-aware access/ACL presets and lifecycle tiering presets, preserving advanced lifecycle fields.
+- Added cross-endpoint bucket copy, resumable version-history copy with version mappings, and reviewed bucket-configuration copy with freshness checks.
+- Added bounded stale-metadata delete recovery for proven non-versioned S3-compatible buckets; versioned and suspended buckets retain normal delete retries.
+- Added object protection, metadata/content headers, archive restore, multipart administration, durable S3/Azure upload and download recovery, Azure account lifecycle/container protection, and ADLS directory administration.
+- Improved benchmark streaming, cache bounds, continuous execution, actual retry/error metrics, and credential-free recovery across engines. Added a shared mobile REST adapter and benchmark runtime.
+- Added repeatable MinIO/Azurite qualification and local S3 performance measurements. This build uses local verification and ad-hoc macOS signing; live-cloud and physical-device qualification are outside this build.
+
+## Earlier unreleased iOS foundation
 
 ### iOS support
 - Added an iOS 13+ Flutter target with a native AWS SDK for Swift engine bridge for S3-compatible and AWS S3 endpoints.
@@ -8,7 +17,7 @@
 - Added local-network privacy/ATS configuration, Keychain sharing entitlements, unsigned compile verification, signed IPA packaging configuration, and an iOS CI lane.
 - Fixed simulator credential persistence guidance after confirming unsigned direct launches fail with Keychain error `-34018`; Keychain failures now retain their platform detail and direct users to an Xcode or provisioned launch instead of showing only a generic session warning.
 - Generalized Android-only mobile UI and engine metadata branches so iOS uses the mobile layouts without desktop drag/drop or unsupported directory picking.
-- Benchmark and bucket-encryption mutations are explicitly capability-gated in the first iOS release.
+- The original native iOS benchmark/encryption gaps are covered by the shared mobile adapter in 2.3.0.
 
 ## 2.2.8
 

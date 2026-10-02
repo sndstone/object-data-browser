@@ -151,13 +151,14 @@ void main() {
     expect(formatRelative(DateTime(2026, 3, 7), now: DateTime(2026, 3, 9)),
         '2 days ago');
   });
-  testWidgets('version delete confirms and cancel cannot dispatch',
+  testWidgets(
+      'current object delete from versions confirms and cancel cannot dispatch',
       (tester) async {
     final c = await frame(tester);
     await c.setSelectedObject(c.objects.firstWhere((o) => !o.isFolder));
     c.setInspectorTab(BrowserInspectorTab.versions);
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Delete selected'));
+    await tester.tap(find.text('Delete current object'));
     await tester.pumpAndSettle();
     expect(c.deletes, 0);
     expect(find.byType(DangerButton), findsOneWidget);
@@ -169,7 +170,7 @@ void main() {
     await tester.tap(find.text('Cancel'));
     await tester.pumpAndSettle();
     expect(c.deletes, 0);
-    await tester.tap(find.text('Delete selected'));
+    await tester.tap(find.text('Delete current object'));
     await tester.pumpAndSettle();
     await tester.tap(find.byType(DangerButton));
     await tester.pumpAndSettle();

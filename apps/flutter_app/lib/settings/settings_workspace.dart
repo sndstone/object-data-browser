@@ -1,6 +1,7 @@
 import 'settings_sections.dart';
 import 'dart:async';
 import '../widgets/setting_fields.dart';
+import '../widgets/connection_options_editor.dart';
 import '../widgets/danger_button.dart';
 import 'dart:io';
 
@@ -13,6 +14,8 @@ import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
 import '../services/app_platform.dart';
 import '../widgets/app_select_field.dart';
+import '../widgets/app_slider.dart';
+import '../widgets/app_switch.dart';
 import 'profile_import_picker.dart';
 import 'version_details_catalog.dart';
 
@@ -312,8 +315,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                       ),
                     ),
                     const SizedBox(height: 12),
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
+                    AppSwitchTile(
                       value: settings.dynamicMultipartSizing,
                       onChanged: (value) => controller.updateSettings(
                         settings.copyWith(dynamicMultipartSizing: value),
@@ -335,7 +337,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                         settings.copyWith(multipartChunkMiB: value),
                       ),
                     ),
-                    SwitchListTile(
+                    AppSwitchTile(
                       value: settings.relistObjectsAfterMutation,
                       onChanged: (value) => controller.updateSettings(
                         settings.copyWith(relistObjectsAfterMutation: value),
@@ -380,15 +382,14 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                   context,
                   title: 'Appearance',
                   children: () => [
-                    SwitchListTile(
+                    AppSwitchTile(
                       value: settings.enableAnimations,
                       onChanged: (value) => controller.updateSettings(
                         settings.copyWith(enableAnimations: value),
                       ),
                       title: const Text('Enable animations'),
                     ),
-                    SwitchListTile.adaptive(
-                      contentPadding: EdgeInsets.zero,
+                    AppSwitchTile(
                       title: const Text('Compact desktop rows'),
                       subtitle: const Text(
                           'Keep text readable while reducing row padding. Touch targets remain comfortable.'),
@@ -396,7 +397,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                       onChanged: (value) => controller.updateSettings(
                           controller.settings.copyWith(compactRows: value)),
                     ),
-                    SwitchListTile(
+                    AppSwitchTile(
                       value: settings.darkMode,
                       onChanged: (value) => controller
                           .updateSettings(settings.copyWith(darkMode: value)),
@@ -430,74 +431,51 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                         );
                       },
                     ),
-                    const SizedBox(height: 16),
-                    ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: Text(
-                        'Inspector panel size: ${settings.browserInspectorSize}px',
-                      ),
-                      subtitle: const Text(
-                        'Applies to the inspector height in stacked mode and width in right-side mode.',
-                      ),
-                    ),
-                    Slider(
+                    const SizedBox(height: 8),
+                    AppSettingSlider(
+                      title: 'Inspector panel size',
+                      subtitle:
+                          'Applies to the inspector height in stacked mode and width in right-side mode.',
+                      style: AppSliderStyle.stepBlocks,
                       min: 240,
                       max: 560,
-                      divisions: 16,
-                      value: settings.browserInspectorSize
-                          .toDouble()
-                          .clamp(240, 560),
-                      label: '${settings.browserInspectorSize}px',
-                      onChanged: (value) {
-                        controller.updateSettings(
-                          settings.copyWith(
-                              browserInspectorSize: value.round()),
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 8),
-                    ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: Text('UI scale: ${settings.uiScalePercent}%'),
-                      subtitle: const Text(
-                        'Text size is independent of row density. Default: 100%. OS accessibility enlargement is always respected.',
+                      step: 20,
+                      unit: 'px',
+                      defaultValue: AppSettings.defaultBrowserInspectorSize,
+                      value: settings.browserInspectorSize,
+                      onChanged: (value) => controller.updateSettings(
+                        settings.copyWith(browserInspectorSize: value),
                       ),
                     ),
-                    Slider(
+                    AppSettingSlider(
+                      title: 'UI scale',
+                      subtitle:
+                          'Text size is independent of row density. OS accessibility enlargement is always respected.',
+                      style: AppSliderStyle.stepBlocks,
                       min: 60,
                       max: 150,
-                      divisions: 18,
-                      value: settings.uiScalePercent.toDouble().clamp(60, 150),
-                      label: '${settings.uiScalePercent}%',
-                      onChanged: (value) {
-                        controller.updateSettings(
-                          settings.copyWith(uiScalePercent: value.round()),
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 8),
-                    ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: Text(
-                        'Log text scale: ${settings.logTextScalePercent}%',
-                      ),
-                      subtitle: const Text(
-                        'Applies only to Event Log and Events & Debug so trace text stays readable at smaller UI scales.',
+                      step: 5,
+                      unit: '%',
+                      defaultValue: AppSettings.defaultUiScalePercent,
+                      value: settings.uiScalePercent,
+                      onChanged: (value) => controller.updateSettings(
+                        settings.copyWith(uiScalePercent: value),
                       ),
                     ),
-                    Slider(
+                    AppSettingSlider(
+                      title: 'Log text scale',
+                      subtitle:
+                          'Applies only to Event Log and Events & Debug so trace text stays readable at smaller UI scales.',
+                      style: AppSliderStyle.stepBlocks,
                       min: 80,
                       max: 130,
-                      divisions: 10,
-                      value: settings.logTextScalePercent
-                          .toDouble()
-                          .clamp(80, 130),
-                      label: '${settings.logTextScalePercent}%',
-                      onChanged: (value) {
-                        controller.updateSettings(
-                          settings.copyWith(logTextScalePercent: value.round()),
-                        );
-                      },
+                      step: 5,
+                      unit: '%',
+                      defaultValue: AppSettings.defaultLogTextScalePercent,
+                      value: settings.logTextScalePercent,
+                      onChanged: (value) => controller.updateSettings(
+                        settings.copyWith(logTextScalePercent: value),
+                      ),
                     ),
                   ],
                 )),
@@ -610,14 +588,14 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                         ),
                       ),
                       const SizedBox(height: 12),
-                      SwitchListTile(
+                      AppSwitchTile(
                         value: settings.benchmarkChartSmoothing,
                         onChanged: (value) => controller.updateSettings(
                           settings.copyWith(benchmarkChartSmoothing: value),
                         ),
                         title: const Text('Smooth result charts'),
                       ),
-                      SwitchListTile(
+                      AppSwitchTile(
                         value: settings.benchmarkDebugMode,
                         onChanged: (value) => controller.updateSettings(
                           settings.copyWith(benchmarkDebugMode: value),
@@ -656,21 +634,21 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                   context,
                   title: 'Diagnostics',
                   children: () => [
-                    SwitchListTile(
+                    AppSwitchTile(
                       value: settings.enableDiagnostics,
                       onChanged: (value) => controller.updateSettings(
                         settings.copyWith(enableDiagnostics: value),
                       ),
                       title: const Text('Diagnostics workspace'),
                     ),
-                    SwitchListTile(
+                    AppSwitchTile(
                       value: settings.enableApiLogging,
                       onChanged: (value) => controller.updateSettings(
                         settings.copyWith(enableApiLogging: value),
                       ),
                       title: const Text('API logging'),
                     ),
-                    SwitchListTile(
+                    AppSwitchTile(
                       value: settings.enableDebugLogging,
                       onChanged: (value) => controller.updateSettings(
                         settings.copyWith(enableDebugLogging: value),
@@ -972,6 +950,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   late final TextEditingController _readTimeoutController;
   late final TextEditingController _notesController;
   late EndpointProfileType _endpointType;
+  late ConnectionOptions _connection;
   late int _connectionLimit;
   late int _maxAttempts;
   late bool _pathStyle;
@@ -1047,6 +1026,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
       _syncText(_readTimeoutController, '${widget.profile.readTimeoutSeconds}');
       _syncText(_notesController, widget.profile.notes ?? '');
       _endpointType = widget.profile.endpointType;
+      _connection = widget.profile.connection;
       _connectionLimit = widget.profile.maxConcurrentRequests;
       _maxAttempts = widget.profile.maxAttempts;
       _pathStyle = widget.profile.pathStyle;
@@ -1076,6 +1056,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
     );
     _notesController = TextEditingController(text: profile.notes ?? '');
     _endpointType = profile.endpointType;
+    _connection = profile.connection;
     _pathStyle = profile.pathStyle;
     _useHttps = endpointUsesHttps(
       profile.endpointUrl,
@@ -1101,6 +1082,16 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   }
 
   void _handleEndpointInputChanged() {
+    if (_endpointType == EndpointProfileType.azureBlob) {
+      final parsed = Uri.tryParse(_endpointController.text.trim());
+      if (parsed?.queryParameters.containsKey('sig') == true) {
+        _connection = _connection.update('authMode', 'azureSas');
+        _sessionTokenController.text = parsed!.query;
+        _endpointController.text =
+            parsed.replace(query: '', fragment: '').toString().split('?').first;
+        return;
+      }
+    }
     if (_endpointType == EndpointProfileType.awsS3) {
       return;
     }
@@ -1130,6 +1121,11 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   void _setEndpointType(EndpointProfileType value) {
     setState(() {
       _endpointType = value;
+      final azureAuth = _connection.authMode.startsWith('azure');
+      if ((value == EndpointProfileType.azureBlob && !azureAuth) ||
+          (value != EndpointProfileType.azureBlob && azureAuth)) {
+        _connection = _connection.update('authMode', 'static');
+      }
       if (_endpointType == EndpointProfileType.awsS3) {
         _useHttps = true;
         _verifyTls = true;
@@ -1199,8 +1195,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
         region: _regionController.text.trim(),
         accessKey: _accessKeyController.text.trim(),
         secretKey: _secretKeyController.text.trim(),
-        sessionToken: (_endpointType == EndpointProfileType.azureBlob ||
-                _sessionTokenController.text.trim().isEmpty)
+        sessionToken: (_sessionTokenController.text.trim().isEmpty)
             ? null
             : _sessionTokenController.text.trim(),
         pathStyle: _endpointType == EndpointProfileType.s3Compatible
@@ -1215,6 +1210,12 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
         readTimeoutSeconds:
             int.tryParse(_readTimeoutController.text.trim()) ?? 60,
         signerOverride: widget.profile.signerOverride,
+        connection: ConnectionOptions.fromJson({
+          for (final entry in _connection.toJson().entries)
+            entry.key: entry.value is String
+                ? (entry.value as String).trim()
+                : entry.value
+        }),
         maxConcurrentRequests: _connectionLimit,
         maxAttempts: _maxAttempts,
         maxRequestsPerSecond: widget.profile.maxRequestsPerSecond,
@@ -1224,12 +1225,20 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   }
 
   bool _looksConfigured(EndpointProfile profile) {
-    return profile.name.trim().isNotEmpty &&
-        profile.accessKey.trim().isNotEmpty &&
-        profile.secretKey.trim().isNotEmpty &&
-        (profile.endpointType == EndpointProfileType.awsS3 ||
-            profile.endpointType == EndpointProfileType.azureBlob ||
-            profile.endpointUrl.trim().isNotEmpty);
+    final hasEndpoint = profile.endpointType == EndpointProfileType.awsS3 ||
+        profile.endpointUrl.trim().isNotEmpty ||
+        (profile.endpointType == EndpointProfileType.azureBlob &&
+            profile.accessKey.trim().isNotEmpty);
+    final credentialsReady = switch (profile.connection.authMode) {
+      'static' => profile.accessKey.trim().isNotEmpty &&
+          profile.secretKey.trim().isNotEmpty,
+      'awsProfile' => profile.connection.awsProfileName.trim().isNotEmpty,
+      'assumeRole' => profile.connection.roleArn.trim().isNotEmpty,
+      'azureSas' => (profile.sessionToken ?? '').trim().isNotEmpty,
+      'awsDefault' || 'azureDefault' => true,
+      _ => false,
+    };
+    return profile.name.trim().isNotEmpty && hasEndpoint && credentialsReady;
   }
 
   @override
@@ -1376,7 +1385,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 ),
               ),
               const SizedBox(height: 12),
-              SwitchListTile(
+              AppSwitchTile(
                 value: _useHttps,
                 onChanged: _setUseHttps,
                 title: const Text('Use HTTPS'),
@@ -1401,7 +1410,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 ),
               ),
               if (_endpointController.text.trim().isNotEmpty)
-                SwitchListTile(
+                AppSwitchTile(
                   value: _useHttps,
                   onChanged: _setUseHttps,
                   title: const Text('Use HTTPS'),
@@ -1452,49 +1461,35 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
               ),
             if (_normalizedEndpointPreview.isNotEmpty)
               const SizedBox(height: 12),
-            phone
-                ? Column(
-                    children: [
-                      TextField(
-                        controller: _accessKeyController,
-                        decoration: InputDecoration(
-                          labelText: _endpointType.accessKeyLabel,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      TextField(
-                        controller: _secretKeyController,
-                        obscureText: !_revealSecret,
-                        style: _revealSecret
-                            ? const TextStyle(fontFamily: 'monospace')
-                            : null,
-                        decoration: InputDecoration(
-                          labelText: _endpointType.secretKeyLabel,
-                          suffixIcon: IconButton(
-                              tooltip: _revealSecret
-                                  ? 'Hide secret'
-                                  : 'Reveal secret',
-                              onPressed: () => _reveal(false),
-                              icon: Icon(_revealSecret
-                                  ? Icons.visibility_off
-                                  : Icons.visibility)),
-                        ),
-                      ),
-                    ],
-                  )
-                : Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
+            ConnectionOptionsEditor(
+              key: ValueKey(
+                  '${widget.profile.id}-${widget.profile.connection.hashCode}'),
+              value: _connection,
+              endpointType: _endpointType,
+              onChanged: (value) => setState(() => _connection = value),
+            ),
+            const SizedBox(height: 12),
+            if (_endpointType == EndpointProfileType.azureBlob &&
+                _connection.authMode != 'static')
+              TextField(
+                controller: _accessKeyController,
+                decoration: const InputDecoration(
+                    labelText: 'Storage account name',
+                    helperText:
+                        'Optional when a custom blob endpoint is configured.'),
+              ),
+            if (_connection.authMode == 'static')
+              phone
+                  ? Column(
+                      children: [
+                        TextField(
                           controller: _accessKeyController,
                           decoration: InputDecoration(
                             labelText: _endpointType.accessKeyLabel,
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: TextField(
+                        const SizedBox(height: 8),
+                        TextField(
                           controller: _secretKeyController,
                           obscureText: !_revealSecret,
                           style: _revealSecret
@@ -1512,11 +1507,45 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                                     : Icons.visibility)),
                           ),
                         ),
-                      ),
-                    ],
-                  ),
+                      ],
+                    )
+                  : Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _accessKeyController,
+                            decoration: InputDecoration(
+                              labelText: _endpointType.accessKeyLabel,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: TextField(
+                            controller: _secretKeyController,
+                            obscureText: !_revealSecret,
+                            style: _revealSecret
+                                ? const TextStyle(fontFamily: 'monospace')
+                                : null,
+                            decoration: InputDecoration(
+                              labelText: _endpointType.secretKeyLabel,
+                              suffixIcon: IconButton(
+                                  tooltip: _revealSecret
+                                      ? 'Hide secret'
+                                      : 'Reveal secret',
+                                  onPressed: () => _reveal(false),
+                                  icon: Icon(_revealSecret
+                                      ? Icons.visibility_off
+                                      : Icons.visibility)),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
             const SizedBox(height: 12),
-            if (_endpointType != EndpointProfileType.azureBlob)
+            if ((_endpointType != EndpointProfileType.azureBlob &&
+                    _connection.authMode == 'static') ||
+                _connection.authMode == 'azureSas')
               TextField(
                 controller: _sessionTokenController,
                 obscureText: !_revealToken,
@@ -1530,15 +1559,18 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                       icon: Icon(_revealToken
                           ? Icons.visibility_off
                           : Icons.visibility)),
-                  labelText: 'Session token (optional)',
+                  labelText: _connection.authMode == 'azureSas'
+                      ? 'SAS token'
+                      : 'Session token (optional)',
+                  helperText: _connection.authMode == 'azureSas'
+                      ? 'Saved securely with your credentials; excluded from profile exports.'
+                      : null,
                 ),
               ),
             ExpansionTile(title: const Text('Advanced transport'), children: [
-              if (!AppPlatform.isMobile &&
-                  _endpointType != EndpointProfileType.azureBlob) ...[
+              if (!AppPlatform.isMobile) ...[
                 SettingNumberField(
-                    label:
-                        'Connection pool limit (S3 part workers capped at 8)',
+                    label: 'Connection pool limit (part workers capped at 8)',
                     value: _connectionLimit,
                     min: 1,
                     max: 256,
@@ -1555,7 +1587,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
               ] else
                 const Text(
                     'This engine manages connection pools and retry limits.'),
-              SwitchListTile(
+              AppSwitchTile(
                 value: _pathStyle,
                 onChanged: _endpointType == EndpointProfileType.s3Compatible
                     ? (value) => setState(() => _pathStyle = value)
@@ -1570,7 +1602,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                     'Useful for MinIO and other S3-compatible endpoints.',
                 }),
               ),
-              SwitchListTile(
+              AppSwitchTile(
                 value: _verifyTls,
                 onChanged:
                     (_endpointType != EndpointProfileType.awsS3 && _useHttps)
@@ -1661,6 +1693,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 OutlinedButton.icon(
                   onPressed: !valid ||
                           !widget.controller.supportsProfile(_buildProfile()) ||
+                          !_looksConfigured(_buildProfile()) ||
                           isTesting
                       ? null
                       : () async {
@@ -1673,6 +1706,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 OutlinedButton.icon(
                   onPressed: !valid ||
                           !widget.controller.supportsProfile(_buildProfile()) ||
+                          !_looksConfigured(_buildProfile()) ||
                           isSelecting
                       ? null
                       : () async {

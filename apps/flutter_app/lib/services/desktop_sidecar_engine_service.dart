@@ -38,6 +38,33 @@ class DesktopSidecarEngineService
   Map<String, _EngineManifestEntry>? _cachedManifest;
   String? _cachedEngineRoot;
   final Map<String, String> _benchmarkEngines = <String, String>{};
+  final Map<String, EndpointProfile> _benchmarkProfiles = {};
+
+  @override
+  Future<Map<String, Object?>> storageAction({
+    required EndpointProfile profile,
+    required String action,
+    Map<String, Object?> arguments = const {},
+    EndpointProfile? destinationProfile,
+  }) async {
+    // Advanced operations use the provider-aware reference adapter explicitly;
+    // never replay an uncertain mutation on a different engine.
+    final entry = await _tryGetEngine('python');
+    if (entry == null) throw _engineUnavailable('python', 'storageAction');
+    return _sendSidecarRequest(entry,
+        method: 'storageAction',
+        onEvent: _handleSidecarEvent,
+        params: {
+          ...arguments,
+          'action': action,
+          'profile': _profileToJson(profile),
+          if (destinationProfile != null) ...{
+            'sourceProfile': _profileToJson(profile),
+            'destinationProfile': _profileToJson(destinationProfile),
+          },
+        });
+  }
+
   final Map<String, String> _jobEngines = <String, String>{};
   int _requestSequence = 0;
   final Set<ListingCancellation> _listingRequests = {};
@@ -58,6 +85,7 @@ class DesktopSidecarEngineService
   @override
   void shutdown() {
     _host.dispose();
+    _benchmarkProfiles.clear();
     _fallback.shutdown();
   }
 
@@ -269,6 +297,7 @@ class DesktopSidecarEngineService
     required EndpointProfile profile,
     required String bucketName,
     required String lifecycleJson,
+    String? transitionDefaultMinimumObjectSize,
   }) {
     return _bucketAdminWrite(
       engineId: engineId,
@@ -277,11 +306,17 @@ class DesktopSidecarEngineService
       bucketName: bucketName,
       payloadKey: 'lifecycleJson',
       payloadValue: lifecycleJson,
+      extraParams: {
+        if (transitionDefaultMinimumObjectSize != null)
+          'transitionDefaultMinimumObjectSize':
+              transitionDefaultMinimumObjectSize
+      },
       onFallback: () => _fallback.putBucketLifecycle(
         engineId: engineId,
         profile: profile,
         bucketName: bucketName,
         lifecycleJson: lifecycleJson,
+        transitionDefaultMinimumObjectSize: transitionDefaultMinimumObjectSize,
       ),
     );
   }
@@ -959,6 +994,15 @@ class DesktopSidecarEngineService
       ),
     );
     _benchmarkEngines[run.id] = run.config.engineId;
+    if (!_isTerminalBenchmarkStatus(run.status)) {
+      _benchmarkProfiles[run.id] = profile;
+    }
+    if (_benchmarkEngines.length > 500) {
+      final expired = _benchmarkEngines.keys
+          .where((id) => !_benchmarkProfiles.containsKey(id))
+          .firstOrNull;
+      if (expired != null) _benchmarkEngines.remove(expired);
+    }
     return run;
   }
 
@@ -975,13 +1019,14 @@ class DesktopSidecarEngineService
     return _sendWithFallback(
       engineId: engineId,
       method: 'getBenchmarkStatus',
-      params: {'runId': runId},
+      params: _benchmarkParams(runId),
       onSuccess: (json) {
         final run = _benchmarkRunFromJson(json);
         // Evict once the run reaches a terminal state so the map cannot grow
         // without bound over a long-lived session.
         if (_isTerminalBenchmarkStatus(run.status)) {
-          _benchmarkEngines.remove(run.id);
+          // Retain engine identity for export, release credentials at terminal.
+          _benchmarkProfiles.remove(run.id);
         } else {
           _benchmarkEngines[run.id] = run.config.engineId;
         }
@@ -1000,11 +1045,18 @@ class DesktopSidecarEngineService
       case 'error':
       case 'cancelled':
       case 'canceled':
+      case 'interrupted':
         return true;
       default:
         return false;
     }
   }
+
+  Map<String, Object?> _benchmarkParams(String runId) => {
+        'runId': runId,
+        if (_benchmarkProfiles[runId] case final profile?)
+          'profile': _profileToJson(profile),
+      };
 
   @override
   Future<void> pauseBenchmark(String runId) {
@@ -1012,7 +1064,7 @@ class DesktopSidecarEngineService
     return _sendWithFallback<void>(
       engineId: engineId,
       method: 'pauseBenchmark',
-      params: {'runId': runId},
+      params: _benchmarkParams(runId),
       onSuccess: (_) {},
       onFallback: () => _fallback.pauseBenchmark(runId),
     );
@@ -1024,7 +1076,7 @@ class DesktopSidecarEngineService
     return _sendWithFallback<void>(
       engineId: engineId,
       method: 'resumeBenchmark',
-      params: {'runId': runId},
+      params: _benchmarkParams(runId),
       onSuccess: (_) {},
       onFallback: () => _fallback.resumeBenchmark(runId),
     );
@@ -1036,7 +1088,7 @@ class DesktopSidecarEngineService
     return _sendWithFallback<void>(
       engineId: engineId,
       method: 'stopBenchmark',
-      params: {'runId': runId},
+      params: _benchmarkParams(runId),
       onSuccess: (_) {},
       onFallback: () => _fallback.stopBenchmark(runId),
     );
@@ -1052,7 +1104,7 @@ class DesktopSidecarEngineService
       engineId: engineId,
       method: 'exportBenchmarkResults',
       params: {
-        'runId': runId,
+        ..._benchmarkParams(runId),
         'format': format,
       },
       onSuccess: _benchmarkExportBundleFromJson,
@@ -1068,9 +1120,11 @@ class DesktopSidecarEngineService
     required String bucketName,
     String? payloadKey,
     Object? payloadValue,
+    Map<String, Object?> extraParams = const {},
     required Future<BucketAdminState> Function() onFallback,
   }) {
     final params = <String, Object?>{
+      ...extraParams,
       'profile': _profileToJson(profile),
       'bucketName': bucketName,
     };
@@ -1141,6 +1195,8 @@ class DesktopSidecarEngineService
     ListingCancellation? cancellation,
   }) async {
     engineId = ActionScope.current?.engineId ?? engineId;
+    final runId = params?['runId']?.toString();
+    if (runId != null) engineId = _benchmarkEngines[runId] ?? engineId;
     final jobId = params?['jobId']?.toString();
     if (jobId != null) engineId = _jobEngines[jobId] ?? engineId;
     final entry = await _tryGetEngine(engineId);
@@ -1244,6 +1300,7 @@ class DesktopSidecarEngineService
     final request = <String, Object?>{
       'requestId': requestId,
       'method': method,
+      'engineVersion': '1.0',
       'params': params ?? const <String, Object?>{},
     };
     // Building sanitized trace bodies + jsonEncode is expensive; only do it
@@ -1564,6 +1621,9 @@ class DesktopSidecarEngineService
 
   Map<String, Object?> _profileToJson(EndpointProfile profile) {
     return {
+      ...profile.connection.toJson(),
+      if (profile.connection.authMode == 'azureSas')
+        'azureSasToken': profile.sessionToken,
       'id': profile.id,
       'name': profile.name,
       'endpointUrl': profile.endpointUrl,
@@ -1762,6 +1822,11 @@ class DesktopSidecarEngineService
       objectLockMode: json['objectLockMode'] as String?,
       objectLockRetentionDays:
           (json['objectLockRetentionDays'] as num?)?.toInt(),
+      objectLockRetentionYears:
+          (json['objectLockRetentionYears'] as num?)?.toInt(),
+      transitionDefaultMinimumObjectSize:
+          json['transitionDefaultMinimumObjectSize'] as String?,
+      sections: Map<String, Object?>.from(json['sections'] as Map? ?? {}),
       tags: tags,
       lifecycleRules: rules,
       policyJson: (json['policyJson'] as String?) ?? '{}',

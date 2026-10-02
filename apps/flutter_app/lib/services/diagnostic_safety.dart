@@ -4,7 +4,7 @@ import 'dart:convert';
 /// One sanitization boundary for display, retained diagnostics and exports.
 class DiagnosticSafety {
   static final _secretKey = RegExp(
-    r'^(access.?key(id)?|secret.?key|secret.?access.?key|session.?token|authorization|proxy.authorization|account.?key|password|sas.?token|sig|signature|x-amz-(signature|credential|security-token))$',
+    r'^(access.?key(id)?|secret.?key|secret.?access.?key|session.?token|authorization|proxy.authorization|account.?key|password|(?:azure)?sas.?token|sig|signature|x-amz-(signature|credential|security-token))$',
     caseSensitive: false,
   );
   static Object? sanitize(Object? value) {
@@ -36,7 +36,7 @@ class DiagnosticSafety {
         },
       ).replaceAllMapped(
         RegExp(
-            r'((?:authorization|secretKey|accessKey|sessionToken|accountKey|password)\s*[=:]\s*)([^\s,;]+)',
+            r'((?:authorization|secretKey|accessKey|sessionToken|azureSasToken|sasToken|accountKey|password|sig)\s*[=:]\s*)([^\s,;]+)',
             caseSensitive: false),
         (m) => '${m[1]}[redacted]',
       );

@@ -12,6 +12,7 @@ import 'package:s3_browser_crossplat/services/mock_engine_service.dart';
 import 'package:s3_browser_crossplat/theme/breakpoints.dart';
 import 'package:s3_browser_crossplat/theme/app_motion.dart';
 import 'package:s3_browser_crossplat/logs/structured_log_list.dart';
+import 'package:s3_browser_crossplat/widgets/app_switch.dart';
 
 class TestAppController extends AppController {
   TestAppController({
@@ -175,7 +176,7 @@ Widget _browserApp(
 
 Finder _debugSwitchFinder() {
   return find.byWidgetPredicate((widget) {
-    if (widget is! SwitchListTile) {
+    if (widget is! AppSwitchTile) {
       return false;
     }
     final title = widget.title;

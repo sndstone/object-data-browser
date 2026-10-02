@@ -236,21 +236,23 @@ function Stage-PythonEngine {
     New-Item -ItemType Directory -Force -Path $EngineDest | Out-Null
     New-Item -ItemType Directory -Force -Path $SitePackagesDir | Out-Null
 
-    Copy-Item -Path (Join-Path $EngineSourceDir "python\src\main.py") -Destination (Join-Path $EngineDest "main.py") -Force
+    Copy-Item -Path (Join-Path $EngineSourceDir "python\src\*.py") -Destination $EngineDest -Force
 
-    foreach ($Package in @(
-        "boto3",
-        "botocore",
-        "s3transfer",
-        "jmespath",
-        "python-dateutil",
-        "urllib3",
-        "six"
-    )) {
-        Install-WheelPackage -PackageName $Package -SitePackagesDir $SitePackagesDir
-    }
-
+    # Bootstrap pip from its universal wheel, then let its resolver include
+    # Azure Identity's transitive and platform-specific dependencies (notably
+    # cryptography). Manually extracting only pure wheels omits those modules.
+    Install-WheelPackage -PackageName "pip" -SitePackagesDir $SitePackagesDir
     Enable-EmbeddedPythonSite -PythonDir $PythonDest
+    $PythonExe = Join-Path $PythonDest "python.exe"
+    $RequirementsPath = Join-Path $EngineSourceDir "python\requirements.txt"
+    & $PythonExe -m pip install --disable-pip-version-check --no-compile --upgrade --target $SitePackagesDir --requirement $RequirementsPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Python engine dependency installation failed with exit code $LASTEXITCODE."
+    }
+    & $PythonExe -c "import boto3, urllib3; from azure.identity import DefaultAzureCredential"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Python engine credential provider dependencies failed their import check."
+    }
 }
 
 function Stage-GoEngine {
@@ -475,7 +477,8 @@ $Manifest = @{
             workingDirectory = "python"
             requiredFiles = @(
                 "python\python.exe",
-                "python\engine\main.py"
+                "python\engine\main.py",
+                "python\engine\advanced_workflows.py"
             )
         },
         @{

@@ -1,3 +1,6 @@
+import 'storage_preset_dialog.dart';
+import 'bucket_copy_dialog.dart';
+import 'storage_admin_dialog.dart';
 import '../widgets/empty_state.dart';
 import 'json_editor_dialog.dart';
 import 'tag_editor_dialog.dart';
@@ -20,7 +23,9 @@ import '../services/app_platform.dart';
 import '../services/source_preview.dart';
 import '../theme/app_theme.dart';
 import '../theme/breakpoints.dart';
+import '../widgets/app_menu.dart';
 import '../widgets/app_select_field.dart';
+import '../widgets/app_switch.dart';
 import '../widgets/compact_selector.dart';
 import '../widgets/underline_tabs.dart';
 import '../widgets/source_code_preview.dart';
@@ -538,7 +543,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   Future<void> _showObjectContextMenu(
     BuildContext context,
     ObjectEntry object,
-    Offset position,
+    Rect anchor,
   ) async {
     controller.clearObjectSelection();
     await controller.setSelectedObject(
@@ -549,65 +554,53 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     if (!context.mounted) {
       return;
     }
-    final selected = await showMenu<String>(
+    final selected = await showAppMenu<String>(
       context: context,
-      position: RelativeRect.fromLTRB(
-        position.dx,
-        position.dy,
-        position.dx,
-        position.dy,
-      ),
+      anchor: anchor,
       items: [
-        PopupMenuItem(
+        appMenuItem(
           value: object.isFolder ? 'open-folder' : 'inspect',
-          child: ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(
+          icon:
               object.isFolder ? Icons.folder_open_outlined : Icons.info_outline,
-            ),
-            title: Text(object.isFolder ? 'Open folder' : 'Inspect object'),
-          ),
+          label: object.isFolder ? 'Open folder' : 'Inspect object',
         ),
         if (!object.isFolder) ...[
-          const PopupMenuItem(
+          appMenuItem(
             value: 'download',
-            child: ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.download_outlined),
-              title: Text('Download'),
-            ),
+            icon: Icons.download_outlined,
+            label: 'Download',
           ),
-          const PopupMenuItem(
+          appMenuItem(
             value: 'presign',
-            child: ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.link),
-              title: Text('Generate presigned URL'),
-            ),
+            icon: Icons.link,
+            label: 'Generate presigned URL',
           ),
         ],
-        const PopupMenuItem(value: 'copy-key', child: Text('Copy key')),
-        const PopupMenuItem(value: 'copy-uri', child: Text('Copy s3:// URI')),
+        appMenuDivider(),
+        appMenuItem(
+          value: 'copy-key',
+          icon: Icons.content_copy_outlined,
+          label: 'Copy key',
+        ),
+        appMenuItem(
+          value: 'copy-uri',
+          icon: Icons.storage_outlined,
+          label: 'Copy s3:// URI',
+        ),
         if (!object.isFolder &&
             controller.selectedProfile?.endpointType !=
                 EndpointProfileType.azureBlob)
-          const PopupMenuItem(
-              value: 'copy-url', child: Text('Copy presigned URL')),
-        const PopupMenuDivider(),
-        PopupMenuItem(
-          value: 'delete',
-          child: ListTile(
-            iconColor: Theme.of(context).colorScheme.error,
-            textColor: Theme.of(context).colorScheme.error,
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(
-              Icons.delete_outline,
-              color: Theme.of(context).colorScheme.error,
-            ),
-            title: Text(
-              object.isFolder ? 'Delete folder marker' : 'Delete object',
-            ),
+          appMenuItem(
+            value: 'copy-url',
+            icon: Icons.add_link,
+            label: 'Copy presigned URL',
           ),
+        appMenuDivider(),
+        appMenuItem(
+          value: 'delete',
+          icon: Icons.delete_outline,
+          destructive: true,
+          label: object.isFolder ? 'Delete folder marker' : 'Delete object',
         ),
       ],
     );
@@ -820,6 +813,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                       child: Column(mainAxisSize: MainAxisSize.min, children: [
                     Text(
                         'Bucket: $bucket\nEngine: $engine\nBatch size: ${config.batchSize}\n\nThis deletes every object. Type the bucket name to confirm.'),
+                    if (controller.selectedProfile?.endpointType ==
+                        EndpointProfileType.s3Compatible)
+                      const Text(
+                          'After normal retries, a confirmed never-versioned bucket may require overwriting a stuck key with an empty object before deleting it. Failed recovery is reported, including any empty object left behind. Versioned and suspended buckets never use this fallback.'),
                     TextField(
                         autofocus: true,
                         decoration: const InputDecoration(
@@ -1018,6 +1015,17 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     };
   }
 
+  List<Widget> _configurationWarnings(BucketAdminState admin) => [
+        for (final entry in admin.sections.entries)
+          if (entry.value is Map &&
+              !{'supported', 'missing', 'absent', 'available'}
+                  .contains((entry.value as Map)['state']))
+            Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(
+                    '${entry.key}: ${(entry.value as Map)['state'] ?? 'unknown'} — ${(entry.value as Map)['message'] ?? 'Configuration could not be read.'}')),
+      ];
+
   Widget _bucketAdminView(BuildContext context) {
     final admin = controller.adminState;
     if (admin == null) {
@@ -1029,7 +1037,25 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       context,
       key: const ValueKey('bucket-admin'),
       children: [
+        ..._configurationWarnings(admin),
         Wrap(spacing: 8, runSpacing: 8, children: [
+          FilledButton.tonal(
+              onPressed: () => showDialog<void>(
+                  context: context,
+                  builder: (_) => StoragePresetDialog(
+                      controller: controller, lifecycle: false)),
+              child: const Text('Access presets')),
+          FilledButton.tonal(
+              onPressed: () => showDialog<void>(
+                  context: context,
+                  builder: (_) => StoragePresetDialog(
+                      controller: controller, lifecycle: true)),
+              child: const Text('Lifecycle presets')),
+          OutlinedButton(
+              onPressed: () => showDialog<void>(
+                  context: context,
+                  builder: (_) => StorageAdminDialog(controller: controller)),
+              child: const Text('Advanced administration')),
           OutlinedButton(
               onPressed: () => _showJsonEditorDialog(context,
                   title: 'Lifecycle JSON',
@@ -1084,6 +1110,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       context,
       key: const ValueKey('bucket-info'),
       children: [
+        if (admin != null) ..._configurationWarnings(admin),
         Text(bucket.name, style: Theme.of(context).textTheme.titleMedium),
         const SizedBox(height: 12),
         if (admin != null)
@@ -1122,7 +1149,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               'Object lock',
               admin.objectLockMode == null
                   ? 'Enabled'
-                  : '${admin.objectLockMode} - ${admin.objectLockRetentionDays ?? 0} day retention',
+                  : '${admin.objectLockMode} - ${admin.objectLockRetentionYears ?? admin.objectLockRetentionDays ?? 0} ${admin.objectLockRetentionYears != null ? 'year' : 'day'} retention',
             ),
           _inlineStat('Encryption', admin.encryptionSummary),
           _inlineStat('Bucket tags', '${admin.tags.length} tags'),
@@ -1225,6 +1252,14 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       context,
       key: const ValueKey('object-details'),
       children: [
+        Align(
+            alignment: Alignment.centerLeft,
+            child: OutlinedButton(
+                onPressed: () => showDialog<void>(
+                    context: context,
+                    builder: (_) => StorageAdminDialog(
+                        controller: controller, objectKey: object.key)),
+                child: const Text('Manage object'))),
         _inlineStat('Key', object.key),
         _inlineStat('Size', formatBytes(object.size)),
         _inlineStat('Last modified', formatDateTime(object.modifiedAt)),
@@ -1635,14 +1670,14 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               onPressed:
                   hasSelectedObject ? controller.startSampleDownload : null,
               icon: const Icon(Icons.download),
-              label: const Text('Download selected'),
+              label: const Text('Download current object'),
             ),
             OutlinedButton.icon(
               onPressed: hasSelectedObject
                   ? () => _confirmDeleteObjects(context)
                   : null,
               icon: const Icon(Icons.delete_outline),
-              label: const Text('Delete selected'),
+              label: const Text('Delete current object'),
             ),
           ],
         ),
@@ -1708,7 +1743,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             ),
           ],
         ),
-        SwitchListTile(
+        AppSwitchTile(
           value: options.showVersions,
           onChanged: (value) {
             controller.updateVersionBrowserOptions(
@@ -1717,7 +1752,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           },
           title: const Text('Show versions'),
         ),
-        SwitchListTile(
+        AppSwitchTile(
           value: options.showDeleteMarkers,
           onChanged: (value) {
             controller.updateVersionBrowserOptions(
@@ -1734,6 +1769,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           ),
         ),
         const Divider(height: 20),
+        const Text('Select a version below to inspect, download, share, restore or delete that exact version.'),
         ...versions.map(
           (version) => ListTile(
             contentPadding: EdgeInsets.zero,
@@ -1751,6 +1787,13 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                   monospace: true,
                   shorten: true),
             ]),
+            onTap: () => showDialog<void>(
+                context: context,
+                builder: (_) => StorageAdminDialog(
+                    controller: controller,
+                    objectKey: version.key,
+                    versionId: version.versionId,
+                    deleteMarker: version.deleteMarker)),
             trailing: Chip(
                 label: Text(version.deleteMarker
                     ? 'Delete marker'
@@ -1762,6 +1805,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                     : null),
           ),
         ),
+        if (controller.versionCursor.hasMore)
+          OutlinedButton(
+              onPressed: controller.loadMoreVersions,
+              child: const Text('Load more versions')),
       ],
     );
   }
@@ -1998,7 +2045,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             ),
           ],
         ),
-        SwitchListTile(
+        AppSwitchTile(
           value: deleteAll.immediateDeletion,
           onChanged: (value) {
             controller.updateDeleteAllConfig(
@@ -2205,15 +2252,13 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                       ),
                     ),
                     const SizedBox(height: 12),
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
+                    AppSwitchTile(
                       value: enableVersioning,
                       onChanged: (value) =>
                           setState(() => enableVersioning = value),
                       title: const Text('Enable versioning'),
                     ),
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
+                    AppSwitchTile(
                       value: enableObjectLock,
                       onChanged: (value) =>
                           setState(() => enableObjectLock = value),
@@ -2222,7 +2267,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                     const Align(
                       alignment: Alignment.centerLeft,
                       child: Text(
-                        'Object lock must be enabled when the bucket is created.',
+                        'Object Lock enables versioning. Existing S3 buckets can also enable it through advanced administration when supported by the endpoint.',
                       ),
                     ),
                   ],
@@ -2297,113 +2342,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     BuildContext context,
     BucketSummary sourceBucket,
   ) async {
-    final destinationController = TextEditingController();
-    var createDestination = false;
-    final initialDestinations = controller.buckets
-        .where((bucket) => bucket.name != sourceBucket.name)
-        .map((bucket) => bucket.name)
-        .toList();
-    String? selectedDestination =
-        initialDestinations.isEmpty ? null : initialDestinations.first;
-    destinationController.text = selectedDestination ?? '';
-
     await showDialog<void>(
-      context: context,
-      builder: (context) {
-        return StatefulBuilder(
-          builder: (context, setState) {
-            final destinations = controller.buckets
-                .where((bucket) => bucket.name != sourceBucket.name)
-                .map((bucket) => bucket.name)
-                .toList();
-            return AlertDialog(
-              title: Text('Copy ${sourceBucket.name}'),
-              content: SizedBox(
-                width: 420,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    AppSelectField<String>(
-                      value: destinations.contains(selectedDestination)
-                          ? selectedDestination
-                          : null,
-                      decoration: const InputDecoration(
-                        labelText: 'Destination bucket',
-                      ),
-                      items: destinations
-                          .map(
-                            (bucketName) => AppSelectItem(
-                              value: bucketName,
-                              label: bucketName,
-                            ),
-                          )
-                          .toList(),
-                      onChanged: (value) {
-                        setState(() {
-                          selectedDestination = value;
-                          destinationController.text = value ?? '';
-                        });
-                      },
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: destinationController,
-                      decoration: const InputDecoration(
-                        labelText: 'Or enter a new destination bucket',
-                      ),
-                      onChanged: (value) {
-                        setState(() {
-                          selectedDestination =
-                              value.trim().isEmpty ? null : value;
-                        });
-                      },
-                    ),
-                    const SizedBox(height: 12),
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
-                      value: createDestination,
-                      onChanged: (value) =>
-                          setState(() => createDestination = value),
-                      title: const Text('Create destination if missing'),
-                    ),
-                    const Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        'Copies bucket contents only. Lifecycle, policy, encryption, and tagging stay independent.',
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(context).pop(),
-                  child: const Text('Cancel'),
-                ),
-                FilledButton(
-                  onPressed: () async {
-                    final destinationBucketName =
-                        destinationController.text.trim();
-                    if (destinationBucketName.isEmpty) {
-                      return;
-                    }
-                    Navigator.of(context).pop();
-                    await controller.copyBucketContents(
-                      sourceBucketName: sourceBucket.name,
-                      destinationBucketName: destinationBucketName,
-                      createDestinationIfMissing: createDestination,
-                    );
-                  },
-                  child: const Text('Copy bucket'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-
-    destinationController.dispose();
+        context: context,
+        builder: (_) => BucketCopyDialog(
+            controller: controller, sourceBucket: sourceBucket));
   }
 
   Future<void> _showJsonEditorDialog(
@@ -2526,110 +2468,72 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
   Future<void> _showBucketMenu(
     BuildContext context,
     BucketSummary bucket,
-    Offset position,
+    Rect anchor,
   ) async {
     // Versioning, lifecycle, policy, encryption, and tagging are S3-only
     // bucket admin features.
     final isAzure = widget.controller.selectedProfile?.endpointType ==
         EndpointProfileType.azureBlob;
-    final selected = await showMenu<String>(
+    final selected = await showAppMenu<String>(
       context: context,
-      position: RelativeRect.fromLTRB(
-        position.dx,
-        position.dy,
-        position.dx,
-        position.dy,
-      ),
+      anchor: anchor,
       items: [
-        const PopupMenuItem(
+        appMenuItem(
           value: 'open',
-          child: ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(Icons.folder_open_outlined),
-            title: Text('Open bucket'),
-          ),
+          icon: Icons.folder_open_outlined,
+          label: 'Open bucket',
+        ),
+        appMenuItem(
+          value: 'copy',
+          icon: Icons.copy_all_outlined,
+          label: 'Copy bucket',
         ),
         if (!isAzure) ...[
-          PopupMenuItem(
+          appMenuDivider(),
+          appMenuItem(
             value: bucket.versioningEnabled
                 ? 'suspend-versioning'
                 : 'enable-versioning',
-            child: ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(
-                bucket.versioningEnabled
-                    ? Icons.pause_circle_outline
-                    : Icons.history_toggle_off_rounded,
-              ),
-              title: Text(
-                bucket.versioningEnabled
-                    ? 'Suspend versioning'
-                    : 'Enable versioning',
-              ),
-            ),
+            icon: bucket.versioningEnabled
+                ? Icons.pause_circle_outline
+                : Icons.history_toggle_off_rounded,
+            label: bucket.versioningEnabled
+                ? 'Suspend versioning'
+                : 'Enable versioning',
           ),
-          const PopupMenuDivider(),
-          const PopupMenuItem(
+          appMenuItem(
             value: 'lifecycle',
-            child: ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.schedule_outlined),
-              title: Text('Lifecycle policy'),
-            ),
+            icon: Icons.schedule_outlined,
+            label: 'Lifecycle policy',
           ),
-          const PopupMenuItem(
+          appMenuItem(
             value: 'policy',
-            child: ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.policy_outlined),
-              title: Text('Bucket policy'),
-            ),
+            icon: Icons.policy_outlined,
+            label: 'Bucket policy',
           ),
-          const PopupMenuItem(
+          appMenuItem(
             value: 'encryption',
-            child: ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.lock_outline),
-              title: Text('Bucket encryption'),
-            ),
+            icon: Icons.lock_outline,
+            label: 'Bucket encryption',
           ),
-          const PopupMenuItem(
+          appMenuItem(
             value: 'tags',
-            child: ListTile(
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(Icons.sell_outlined),
-              title: Text('Bucket tagging'),
-            ),
+            icon: Icons.sell_outlined,
+            label: 'Bucket tagging',
           ),
         ],
-        const PopupMenuItem(
-          value: 'copy',
-          child: ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: Icon(Icons.copy_all_outlined),
-            title: Text('Copy bucket'),
-          ),
-        ),
-        const PopupMenuDivider(),
-        PopupMenuItem(
+        appMenuDivider(),
+        appMenuItem(
           value: 'delete',
-          child: ListTile(
-            iconColor: Theme.of(context).colorScheme.error,
-            textColor: Theme.of(context).colorScheme.error,
-            contentPadding: EdgeInsets.zero,
-            leading: const Icon(Icons.delete_outline),
-            title: const Text('Delete bucket'),
-          ),
+          icon: Icons.delete_outline,
+          destructive: true,
+          label: 'Delete bucket',
         ),
-        PopupMenuItem(
+        appMenuItem(
           value: 'force-delete',
-          child: ListTile(
-            iconColor: Theme.of(context).colorScheme.error,
-            textColor: Theme.of(context).colorScheme.error,
-            contentPadding: EdgeInsets.zero,
-            leading: const Icon(Icons.delete_forever_outlined),
-            title: const Text('Force delete bucket'),
-          ),
+          icon: Icons.delete_forever_outlined,
+          destructive: true,
+          label: 'Force delete bucket',
         ),
       ],
     );
@@ -2754,7 +2658,7 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
                               onSecondaryTapDown: (details) => _showBucketMenu(
                                 context,
                                 bucket,
-                                details.globalPosition,
+                                details.globalPosition & Size.zero,
                               ),
                               child: InkWell(
                                 borderRadius: BorderRadius.circular(8),
@@ -2821,28 +2725,21 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
                                   // bucket names keep the row's full width.
                                   // Right-click opens the same menu.
                                   trailing: hovered || AppPlatform.isMobile
-                                      ? IconButton(
-                                          tooltip: 'Bucket actions',
-                                          visualDensity: VisualDensity.compact,
-                                          onPressed: () async {
-                                            final box =
-                                                context.findRenderObject()
-                                                    as RenderBox?;
-                                            if (box == null) {
-                                              return;
-                                            }
-                                            await _showBucketMenu(
+                                      ? Builder(
+                                          // The menu opens from this
+                                          // button's bounds.
+                                          builder: (buttonContext) =>
+                                              IconButton(
+                                            tooltip: 'Bucket actions',
+                                            visualDensity:
+                                                VisualDensity.compact,
+                                            onPressed: () => _showBucketMenu(
                                               context,
                                               bucket,
-                                              box.localToGlobal(
-                                                Offset(
-                                                  box.size.width - 24,
-                                                  box.size.height / 2,
-                                                ),
-                                              ),
-                                            );
-                                          },
-                                          icon: const Icon(Icons.more_horiz),
+                                              globalRectOf(buttonContext),
+                                            ),
+                                            icon: const Icon(Icons.more_horiz),
+                                          ),
                                         )
                                       : null,
                                   onTap: () => widget.onOpenBucket(bucket),

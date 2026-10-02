@@ -8,6 +8,7 @@ import '../theme/app_motion.dart';
 import 'object_table.dart';
 import 'empty_bucket_state.dart';
 import '../utils/format.dart';
+import '../widgets/app_menu.dart';
 
 class ObjectPanel extends StatefulWidget {
   const ObjectPanel(
@@ -20,7 +21,7 @@ class ObjectPanel extends StatefulWidget {
       required this.onContextMenu});
   final AppController controller;
   final VoidCallback onUpload, onDelete, onCreatePrefix, onInspector;
-  final Future<void> Function(ObjectEntry, Offset) onContextMenu;
+  final Future<void> Function(ObjectEntry, Rect) onContextMenu;
 
   @override
   State<ObjectPanel> createState() => _ObjectPanelState();
@@ -634,19 +635,23 @@ class _ObjectPanelState extends State<ObjectPanel> {
                     key: const ValueKey('object-search-mode'),
                     tooltip: 'Search mode',
                     enabled: hasBucket,
-                    initialValue: c.objectFilterMode,
+                    position: PopupMenuPosition.under,
+                    offset: const Offset(0, AppMenuStyle.anchorGap),
+                    popUpAnimationStyle: AppMenuStyle.animation,
                     onSelected: (mode) {
                       _debounce?.cancel();
                       c.setObjectFilterMode(mode);
                     },
-                    itemBuilder: (_) => const [
-                      PopupMenuItem(
-                          value: BrowserFilterMode.prefix,
-                          child: Text('Prefix')),
-                      PopupMenuItem(
-                          value: BrowserFilterMode.text, child: Text('Text')),
-                      PopupMenuItem(
-                          value: BrowserFilterMode.regex, child: Text('Regex')),
+                    itemBuilder: (_) => [
+                      for (final (mode, label) in const [
+                        (BrowserFilterMode.prefix, 'Prefix'),
+                        (BrowserFilterMode.text, 'Text'),
+                        (BrowserFilterMode.regex, 'Regex'),
+                      ])
+                        appMenuItem(
+                            value: mode,
+                            label: label,
+                            selected: mode == c.objectFilterMode),
                     ],
                     child: Padding(
                       padding: const EdgeInsets.symmetric(

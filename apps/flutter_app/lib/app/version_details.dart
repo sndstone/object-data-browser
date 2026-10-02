@@ -1,9 +1,11 @@
-const String kApplicationVersion = '2.2.8';
-const String kApplicationBuild = '2.2.8+1';
+const String kApplicationVersion = '2.3.0';
+const String kApplicationBuild = '2.3.0+1';
 
 const Map<String, String> kFlutterDependencyVersions = <String, String>{
   'flutter': 'sdk',
-  'cupertino_icons': '1.0.8',
+  'cupertino_icons': '1.0.9',
+  'crypto': '3.0.7',
+  'xml': '6.6.1',
   'desktop_drop': '0.6.1',
   'file_picker': '8.3.7',
   'flutter_secure_storage': '10.3.1',
@@ -12,8 +14,8 @@ const Map<String, String> kFlutterDependencyVersions = <String, String>{
 };
 
 const Map<String, String> kBundledEngineVersions = <String, String>{
-  'Rust engine': '2.2.8',
-  'Go engine': '2.2.8',
-  'Python engine': '2.2.8',
-  'Java engine': '2.2.8',
+  'Rust engine': '2.3.0',
+  'Go engine': '2.3.0',
+  'Python engine': '2.3.0',
+  'Java engine': '2.3.0',
 };

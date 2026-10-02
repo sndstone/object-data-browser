@@ -104,20 +104,17 @@ stage_python_engine() {
     python_exe="$python_dest/bin/python3"
   fi
 
-  cp "$ENGINE_SOURCE_DIR/python/src/main.py" "$python_dest/engine/main.py"
+  cp "$ENGINE_SOURCE_DIR/python/src/"*.py "$python_dest/engine/"
 
   "$python_exe" -m pip install \
     --disable-pip-version-check \
     --no-compile \
     --upgrade \
     --target "$site_packages_dir" \
-    boto3 \
-    botocore \
-    s3transfer \
-    jmespath \
-    python-dateutil \
-    urllib3 \
-    six
+    --requirement "$ENGINE_SOURCE_DIR/python/requirements.txt"
+
+  PYTHONPATH="$site_packages_dir" "$python_exe" -c \
+    'import boto3, urllib3; from azure.identity import DefaultAzureCredential'
 
   cat >"$python_dest/run-python-engine.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -134,6 +131,7 @@ else
   echo "Python 3 is required to run the packaged Python sidecar." >&2
   exit 127
 fi
+export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$SCRIPT_DIR/site-packages${PYTHONPATH:+:$PYTHONPATH}"
 exec "$PYTHON_CMD" "$SCRIPT_DIR/engine/main.py" "$@"
 EOF
@@ -308,6 +306,7 @@ manifest = {
             "requiredFiles": [
                 "python/run-python-engine.sh",
                 "python/engine/main.py",
+                "python/engine/advanced_workflows.py",
             ],
         },
         {

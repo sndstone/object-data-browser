@@ -1,0 +1,7 @@
+# Keep the S3 SDK at the version used for contract verification.
+boto3==1.43.89
+botocore==1.43.89
+urllib3>=2.5,<3
+# Microsoft Entra / Azure CLI / managed identity credential providers.
+azure-identity==1.25.3
+google-crc32c>=1.7.1,<2

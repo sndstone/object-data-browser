@@ -41,6 +41,8 @@ class DesktopEngineHost {
   final Map<String, int> _activeByKey = {};
   final List<_HostWaiter> _waiters = [];
   final Map<String, _EngineProcess> _jobOwners = {};
+  final Map<String, _EngineProcess> _benchmarkOwners = {};
+  final Map<_EngineProcess, String> _benchmarkKeys = {};
   final Map<ListingCancellation, _EngineProcess?> _listings = {};
   int get liveProcessCount => _liveProcesses.length;
   int get queuedRequestCount => _waiters.length;
@@ -68,6 +70,26 @@ class DesktopEngineHost {
     }
     final key = _processKey(executablePath, arguments, workingDirectory);
     final method = request['method']?.toString() ?? '';
+    final runId = (request['params'] as Map?)?['runId']?.toString();
+    final benchmarkOwner = _benchmarkOwners['$key/$runId'];
+    if (runId != null && benchmarkOwner != null) {
+      try {
+        final response = await benchmarkOwner.send(
+            request: request, timeout: timeout ?? requestTimeout);
+        final result = response.payload['result'];
+        if (result is Map && _benchmarkFinished(result['status'])) {
+          if (_unpinBenchmark(benchmarkOwner)) {
+            _releaseProcess(key, benchmarkOwner);
+          }
+        }
+        return response;
+      } catch (_) {
+        _discardProcess(key, benchmarkOwner);
+        rethrow;
+      } finally {
+        _wakeWaiters();
+      }
+    }
     final jobId = (request['params'] as Map?)?['jobId']?.toString();
     if (jobId != null &&
         {
@@ -114,7 +136,8 @@ class DesktopEngineHost {
             'startUpload',
             'startDownload',
             'runPutTestData',
-            'runDeleteAll'
+            'runDeleteAll',
+            'storageAction'
           }.contains(method),
           onEvent: (event) {
             final job = event['job'];
@@ -138,7 +161,19 @@ class DesktopEngineHost {
           : await cancellation.wait(pending);
       if (cancellation?.isCancelled ?? false) throw const ListingCancelled();
       _jobOwners.removeWhere((_, owner) => identical(owner, process));
-      _releaseProcess(key, process);
+      final result = response.payload['result'];
+      if ({'startBenchmark', 'resumeBenchmark'}.contains(method) &&
+          response.payload['ok'] == true &&
+          result is Map &&
+          result['id'] != null &&
+          !_benchmarkFinished(result['status'])) {
+        _benchmarkOwners['$key/${result['id']}'] = process;
+        _benchmarkKeys[process] = key;
+        // Reserve this process and its permit while background work runs.
+        entered = false;
+      } else {
+        _releaseProcess(key, process);
+      }
       return response;
     } catch (_) {
       if (cancellation is ActionScope &&
@@ -160,6 +195,23 @@ class DesktopEngineHost {
       }
       _wakeWaiters();
     }
+  }
+
+  static bool _benchmarkFinished(Object? status) => {
+        'completed',
+        'failed',
+        'cancelled',
+        'stopped',
+        'interrupted'
+      }.contains(status?.toString());
+
+  bool _unpinBenchmark(_EngineProcess process) {
+    final key = _benchmarkKeys.remove(process);
+    if (key == null) return false;
+    _benchmarkOwners.removeWhere((_, owner) => identical(owner, process));
+    _active--;
+    _activeByKey[key] = (_activeByKey[key] ?? 1) - 1;
+    return true;
   }
 
   Future<void> _enter(
@@ -234,6 +286,8 @@ class DesktopEngineHost {
     }
     _waiters.clear();
     _jobOwners.clear();
+    _benchmarkOwners.clear();
+    _benchmarkKeys.clear();
     final processes = List<_EngineProcess>.of(_liveProcesses);
     _liveProcesses.clear();
     _idleProcesses.clear();
@@ -289,9 +343,11 @@ class DesktopEngineHost {
       _starting--;
     }
     process.onDefunct = (defunct) {
+      _unpinBenchmark(defunct);
       _jobOwners.removeWhere((_, owner) => identical(owner, defunct));
       _liveProcesses.remove(defunct);
       _idleProcesses[key]?.remove(defunct);
+      _wakeWaiters();
     };
     _liveProcesses.add(process);
     if (_disposed) {
@@ -316,6 +372,7 @@ class DesktopEngineHost {
   }
 
   void _discardProcess(String key, _EngineProcess process) {
+    _unpinBenchmark(process);
     _jobOwners.removeWhere((_, owner) => identical(owner, process));
     _idleProcesses[key]?.remove(process);
     _liveProcesses.remove(process);

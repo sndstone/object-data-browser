@@ -8,6 +8,17 @@ import 'engine_service.dart';
 class MockEngineService implements EngineService, TransferJobSinkRegistrant {
   MockEngineService();
 
+  @override
+  Future<Map<String, Object?>> storageAction(
+          {required EndpointProfile profile,
+          required String action,
+          Map<String, Object?> arguments = const {},
+          EndpointProfile? destinationProfile}) async =>
+      throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message:
+              'Advanced storage administration requires a desktop storage adapter.');
+
   final Map<String, BenchmarkRun> _runs = {};
   final Map<String, TransferJob> _transfers = {};
   final math.Random _random = math.Random(7);
@@ -236,6 +247,7 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     required EndpointProfile profile,
     required String bucketName,
     required String lifecycleJson,
+    String? transitionDefaultMinimumObjectSize,
   }) async {
     return _bucketAdminState(bucketName).copyWith(
       lifecycleEnabled: true,

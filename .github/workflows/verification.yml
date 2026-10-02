@@ -61,7 +61,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install pytest boto3
+      - run: python -m pip install pytest -r engines/python/requirements.txt
       - uses: actions/setup-go@v5
         if: matrix.engine == 'go'
         with:
@@ -100,5 +100,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install pytest boto3
+      - run: python -m pip install pytest -r engines/python/requirements.txt
       - run: python -m pytest tests/contract/test_download_safety.py -q

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
+import importlib.util
 import hmac
 import io
 import json
@@ -20,17 +22,19 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from types import SimpleNamespace
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import formatdate, parsedate_to_datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, parse_qsl
 
 
-ENGINE_VERSION = "2.2.8"
+ENGINE_VERSION = "2.3.0"
 
 # Serialize every write to stdout so transferProgress events emitted from worker
 # threads never interleave with request/response lines.
@@ -208,6 +212,18 @@ def _run_transfer(fn: Any, params: dict[str, Any]) -> dict[str, Any]:
         _CURRENT_TRANSFER.job_id = None
 
 
+def _run_tool(fn, params):
+    finished = threading.Event()
+    def heartbeat():
+        while not finished.wait(5):
+            _write_stdout_line(json.dumps({'event': 'toolProgress', 'status': 'running'}))
+    threading.Thread(target=heartbeat, daemon=True).start()
+    try:
+        return fn(params)
+    finally:
+        finished.set()
+
+
 class SidecarError(Exception):
     def __init__(self, code: str, message: str, details: dict[str, Any] | None = None):
         super().__init__(message)
@@ -232,6 +248,16 @@ class Profile:
     max_pool_connections: int
     enable_api_logging: bool
     enable_debug_logging: bool
+    auth_mode: str = "static"
+    aws_profile_name: str = ""
+    role_arn: str = ""
+    external_id: str = ""
+    role_session_name: str = "object-browser"
+    known_bucket: str = ""
+    requester_pays: bool = False
+    expected_bucket_owner: str = ""
+    ca_bundle_path: str = ""
+    azure_sas_token: str = ""
 
 
 def _lazy_boto_imports():
@@ -270,9 +296,14 @@ def _parse_profile(payload: dict[str, Any]) -> Profile:
     secret_key = str(payload.get("secretKey", "")).strip()
     region = str(payload.get("region", "")).strip() or "us-east-1"
 
-    if not endpoint_url and endpoint_type != "azureBlob":
+    auth_mode = str(payload.get("authMode") or "static")
+    if auth_mode not in {"static", "awsProfile", "awsDefault", "assumeRole", "azureSas", "azureDefault"}:
+        raise SidecarError("invalid_config", "Unknown authentication mode.")
+    if auth_mode == 'awsProfile' and not str(payload.get('awsProfileName') or '').strip():
+        raise SidecarError('invalid_config', 'Select a named AWS profile for this authentication mode.')
+    if not endpoint_url and endpoint_type not in {"azureBlob", "awsS3"} and auth_mode == "static":
         raise SidecarError("invalid_config", "Endpoint URL is required.")
-    if not access_key or not secret_key:
+    if auth_mode == "static" and (not access_key or not secret_key):
         raise SidecarError("invalid_config", "Access key and secret key are required.")
 
     return Profile(
@@ -297,10 +328,39 @@ def _parse_profile(payload: dict[str, Any]) -> Profile:
         enable_debug_logging=bool(
             (payload.get("diagnostics") or {}).get("enableDebugLogging", False),
         ),
+        auth_mode=auth_mode,
+        aws_profile_name=str(payload.get("awsProfileName") or ""),
+        role_arn=str(payload.get("roleArn") or ""),
+        external_id=str(payload.get("externalId") or ""),
+        role_session_name=str(payload.get("roleSessionName") or "object-browser"),
+        known_bucket=str(payload.get("knownBucket") or ""),
+        requester_pays=bool(payload.get("requesterPays", False)),
+        expected_bucket_owner=str(payload.get("expectedBucketOwner") or ""),
+        ca_bundle_path=str(payload.get("caBundlePath") or ""),
+        azure_sas_token=str(payload.get("azureSasToken") or (payload.get("sessionToken") if auth_mode == "azureSas" else "") or "").lstrip("?"),
     )
 
 
+_CLIENT_CACHE: OrderedDict[Profile, Any] = OrderedDict()
+_CLIENT_CACHE_LOCK = threading.RLock()
+
+
 def _build_client(profile: Profile):
+    with _CLIENT_CACHE_LOCK:
+        cached = _CLIENT_CACHE.get(profile)
+        if cached is not None:
+            _CLIENT_CACHE.move_to_end(profile)
+            return cached
+        client = _new_client(profile)
+        _CLIENT_CACHE[profile] = client
+        # Eviction removes credentials from our cache; do not close a client
+        # which may still be serving another transfer.
+        while len(_CLIENT_CACHE) > 16:
+            _CLIENT_CACHE.popitem(last=False)
+        return client
+
+
+def _new_client(profile: Profile):
     imports = _lazy_boto_imports()
     config = imports["Config"](
         region_name=profile.region,
@@ -310,17 +370,42 @@ def _build_client(profile: Profile):
         max_pool_connections=profile.max_pool_connections,
         s3={"addressing_style": "path" if profile.path_style else "virtual"},
     )
-    session = imports["boto3"].session.Session()
+    session = imports["boto3"].session.Session(
+        profile_name=profile.aws_profile_name or None,
+        region_name=profile.region,
+    )
+    if profile.auth_mode == "assumeRole":
+        if not profile.role_arn:
+            raise SidecarError("invalid_config", "An IAM role ARN is required.")
+        from botocore.credentials import DeferredRefreshableCredentials, AssumeRoleCredentialFetcher
+        from botocore.session import get_session
+        source = session.get_credentials()
+        if profile.access_key and profile.secret_key:
+            from botocore.credentials import Credentials
+            source = Credentials(profile.access_key, profile.secret_key, profile.session_token)
+        extra = {"RoleSessionName": profile.role_session_name}
+        if profile.external_id:
+            extra["ExternalId"] = profile.external_id
+        fetcher = AssumeRoleCredentialFetcher(
+            client_creator=session._session.create_client,
+            source_credentials=source, role_arn=profile.role_arn, extra_args=extra,
+        )
+        core = get_session()
+        core._credentials = DeferredRefreshableCredentials(
+            refresh_using=fetcher.fetch_credentials, method="assume-role",
+        )
+        session = imports["boto3"].session.Session(botocore_session=core)
 
     client_kwargs: dict[str, Any] = {
-        "endpoint_url": profile.endpoint_url,
-        "aws_access_key_id": profile.access_key,
-        "aws_secret_access_key": profile.secret_key,
+        "endpoint_url": profile.endpoint_url or None,
         "region_name": profile.region,
-        "verify": profile.verify_tls,
+        "verify": profile.ca_bundle_path or profile.verify_tls,
         "config": config,
     }
-    if profile.session_token:
+    if profile.auth_mode == "static":
+        client_kwargs["aws_access_key_id"] = profile.access_key
+        client_kwargs["aws_secret_access_key"] = profile.secret_key
+    if profile.session_token and profile.auth_mode == "static":
         client_kwargs["aws_session_token"] = profile.session_token
     if not profile.verify_tls:
         _emit_structured_log(
@@ -330,6 +415,13 @@ def _build_client(profile: Profile):
             "python-engine",
         )
     client = session.client("s3", **client_kwargs)
+    def request_context(params, model, **kwargs):
+        members = model.input_shape.members if model.input_shape else {}
+        if profile.requester_pays and "RequestPayer" in members:
+            params.setdefault("RequestPayer", "requester")
+        if profile.expected_bucket_owner and "ExpectedBucketOwner" in members:
+            params.setdefault("ExpectedBucketOwner", profile.expected_bucket_owner)
+    client.meta.events.register("before-parameter-build.s3", request_context)
     if profile.enable_api_logging or profile.enable_debug_logging:
         events = client.meta.events
         events.register(
@@ -357,7 +449,7 @@ def _serialize_dt(value: Any) -> str:
 
 
 def _json_dumps(value: Any) -> str:
-    return json.dumps(value, indent=2, sort_keys=True)
+    return json.dumps(value, indent=2, sort_keys=True, default=_serialize_dt)
 
 
 def _emit_structured_log(level: str, category: str, message: str, source: str) -> None:
@@ -378,7 +470,7 @@ def _sanitize_headers(headers: Any) -> dict[str, str]:
     sanitized: dict[str, str] = {}
     for key, value in dict(headers or {}).items():
         lower = str(key).lower()
-        if any(token in lower for token in ("authorization", "security-token", "access-key", "secret", "token")):
+        if any(token in lower for token in ("authorization", "security-token", "access-key", "secret", "token")) or (lower in {'x-ms-copy-source', 'x-ms-rename-source'} and '?' in str(value)):
             sanitized[str(key)] = "[redacted]"
             continue
         sanitized[str(key)] = str(value)
@@ -485,6 +577,16 @@ def _maybe_call(api_calls: list[dict[str, Any]], operation: str, fn, default: An
         return _call_api(api_calls, operation, fn)
     except Exception as error:  # noqa: BLE001
         code = _client_error_code(error)
+        state = ("denied" if code in {"AccessDenied", "Forbidden", "Unauthorized"}
+                 else "unsupported" if code in {"MethodNotAllowed", "NotImplemented", "XNotImplemented"}
+                 else "missing" if code.startswith("NoSuch") or "NotFound" in code
+                 else "error")
+        if api_calls:
+            api_calls[-1].update({"state": state, "errorCode": code, "message": str(error)})
+        if state == "denied":
+            return default
+        if state in {"missing", "unsupported"} and code != "NoSuchBucket":
+            return default
         if code in {
             "NoSuchLifecycleConfiguration",
             "NoSuchBucketPolicy",
@@ -549,7 +651,6 @@ def _map_exception(error: Exception) -> SidecarError:
 
 _AZURE_API_VERSION = "2021-12-02"
 _AZURE_PUT_BLOB_LIMIT = 64 * 1024 * 1024
-_AZURE_BLOCK_SIZE = 16 * 1024 * 1024
 
 _AZURE_UNSUPPORTED_METHODS = {
     "setBucketVersioning",
@@ -590,16 +691,25 @@ class _AzureBlobClient:
 
     def __init__(self, profile: Profile):
         self.profile = profile
-        self.account = profile.access_key
+        self.account = profile.access_key or (urlparse(profile.endpoint_url).hostname or "").split(".")[0]
+        self.credential = None
+        if profile.auth_mode == "azureDefault":
+            try:
+                from azure.identity import DefaultAzureCredential
+                self.credential = DefaultAzureCredential()
+            except ImportError as error:
+                raise SidecarError("unsupported_feature", "Azure Default credentials require azure-identity in the engine runtime.") from error
         try:
-            self.key = base64.b64decode(profile.secret_key)
+            self.key = base64.b64decode(profile.secret_key) if profile.auth_mode == 'static' else b''
         except (ValueError, TypeError) as error:
             raise SidecarError(
                 "invalid_config",
                 "Azure account access key must be valid base64.",
             ) from error
-        if not self.key:
+        if not self.key and profile.auth_mode not in {"azureSas", "azureDefault"}:
             raise SidecarError("invalid_config", "Azure account access key must not be empty.")
+        if profile.auth_mode == "azureSas" and not profile.azure_sas_token:
+            raise SidecarError("invalid_config", "An Azure SAS token is required.")
 
         base = profile.endpoint_url.strip().rstrip("/")
         if not base:
@@ -615,7 +725,7 @@ class _AzureBlobClient:
         self.timeout = max(profile.connect_timeout_seconds, profile.read_timeout_seconds)
         self.context: ssl.SSLContext | None = None
         if self.scheme == "https":
-            context = ssl.create_default_context()
+            context = ssl.create_default_context(cafile=profile.ca_bundle_path or None)
             if not profile.verify_tls:
                 context.check_hostname = False
                 context.verify_mode = ssl.CERT_NONE
@@ -626,6 +736,11 @@ class _AzureBlobClient:
                     "python-engine",
                 )
             self.context = context
+        import urllib3
+        self.pool = urllib3.PoolManager(
+            num_pools=4, maxsize=profile.max_pool_connections, block=True,
+            ssl_context=self.context, cert_reqs="CERT_REQUIRED" if profile.verify_tls else "CERT_NONE",
+        )
 
     def blob_path(self, container: str, key: str | None = None) -> str:
         path = f"/{quote(container, safe='')}"
@@ -741,11 +856,16 @@ class _AzureBlobClient:
                 request_headers["Content-Type"] = "application/octet-stream"
 
         full_path = f"{self.base_path}{path}" or "/"
-        string_to_sign = self._string_to_sign(method, full_path, query_params, request_headers)
-        signature = base64.b64encode(
-            hmac.new(self.key, string_to_sign.encode("utf-8"), hashlib.sha256).digest()
-        ).decode("ascii")
-        request_headers["Authorization"] = f"SharedKey {self.account}:{signature}"
+        if self.profile.auth_mode == "azureSas":
+            query_params.update(dict(parse_qsl(self.profile.azure_sas_token, keep_blank_values=True)))
+        elif self.credential is not None:
+            request_headers["Authorization"] = f"Bearer {self.credential.get_token('https://storage.azure.com/.default').token}"
+        else:
+            string_to_sign = self._string_to_sign(method, full_path, query_params, request_headers)
+            signature = base64.b64encode(
+                hmac.new(self.key, string_to_sign.encode("utf-8"), hashlib.sha256).digest()
+            ).decode("ascii")
+            request_headers["Authorization"] = f"SharedKey {self.account}:{signature}"
 
         url = f"{self.scheme}://{self.netloc}{full_path}"
         if query_params:
@@ -758,25 +878,33 @@ class _AzureBlobClient:
             _emit_structured_log(
                 "API",
                 "HttpSend",
-                f"SEND {method.upper()} {url} HEADERS={json.dumps(_sanitize_headers(request_headers), sort_keys=True)} BODY=[{len(body or b'')} byte(s)]",
+                f"SEND {method.upper()} {url.split('?')[0]} HEADERS={json.dumps(_sanitize_headers(request_headers), sort_keys=True)} BODY=[{len(body or b'')} byte(s)]",
                 "api",
             )
 
-        request = urllib.request.Request(
-            url,
-            data=body,
-            method=method.upper(),
-            headers=request_headers,
-        )
         try:
-            response = urllib.request.urlopen(request, timeout=self.timeout, context=self.context)
+            import urllib3
+            safe_retry = method.upper() in {"GET", "HEAD"} or (method.upper() == "PUT" and (query or {}).get("comp") == "block")
+            retry = urllib3.Retry(
+                total=max(0, self.profile.max_attempts - 1) if safe_retry else 0,
+                allowed_methods={method.upper()} if safe_retry else set(),
+                status_forcelist={429, 500, 502, 503, 504}, backoff_factor=0.2,
+                raise_on_status=False,
+            )
+            response = self.pool.request(method.upper(), url, body=body, headers=request_headers,
+                timeout=urllib3.Timeout(connect=self.profile.connect_timeout_seconds, read=self.profile.read_timeout_seconds),
+                pool_timeout=self.profile.read_timeout_seconds, retries=retry, preload_content=False, redirect=False)
+            if response.status >= 400:
+                data = response.read()
+                response.close()
+                raise urllib.error.HTTPError(url.split('?')[0], response.status, "Azure request failed", response.headers, io.BytesIO(data))
         except urllib.error.HTTPError as error:
             mapped = self._map_http_error(error)
             if self.profile.enable_api_logging:
                 _emit_structured_log(
                     "API",
                     "HttpReceive",
-                    f"RECV {method.upper()} {url} STATUS={mapped.details.get('httpStatus')} CODE={mapped.details.get('azureCode')}",
+                    f"RECV {method.upper()} {url.split('?')[0]} STATUS={mapped.details.get('httpStatus')} CODE={mapped.details.get('azureCode')}",
                     "api",
                 )
             raise mapped from error
@@ -792,13 +920,15 @@ class _AzureBlobClient:
                 raise SidecarError("timeout", str(reason)) from error
             raise SidecarError("engine_unavailable", str(reason)) from error
         except (ConnectionError, OSError) as error:
-            raise SidecarError("engine_unavailable", str(error)) from error
+            raise SidecarError("engine_unavailable", "Azure transport failed.") from error
+        except urllib3.exceptions.HTTPError as error:
+            raise SidecarError("engine_unavailable", "Azure transport failed; check connectivity and TLS settings.") from error
 
         if self.profile.enable_api_logging:
             _emit_structured_log(
                 "API",
                 "HttpReceive",
-                f"RECV {method.upper()} {url} STATUS={response.status}",
+                f"RECV {method.upper()} {url.split('?')[0]} STATUS={response.status}",
                 "api",
             )
         return response
@@ -815,6 +945,28 @@ class _AzureBlobClient:
         with response:
             data = response.read()
             return int(response.status), response.headers, data
+
+
+_AZURE_CLIENT_CACHE = OrderedDict()
+
+
+def _build_azure_client(profile):
+    with _CLIENT_CACHE_LOCK:
+        client = _AZURE_CLIENT_CACHE.get(profile)
+        if client is None:
+            client = _AzureBlobClient(profile)
+            _AZURE_CLIENT_CACHE[profile] = client
+            while len(_AZURE_CLIENT_CACHE) > 16:
+                _AZURE_CLIENT_CACHE.popitem(last=False)
+        else:
+            _AZURE_CLIENT_CACHE.move_to_end(profile)
+        return client
+
+
+def _azure_block_size(size):
+    if size > 50000 * 4000 * 1024**2:
+        raise SidecarError("invalid_config", "Blob exceeds Azure's 50,000-block limit.")
+    return max(8 * 1024**2, min(128 * 1024**2, (size + 127) // 128), (size + 49999) // 50000)
 
 
 def _azure_parse_xml(body: bytes) -> ET.Element:
@@ -856,8 +1008,12 @@ def _azure_list_containers_page(
 
 def _azure_test_profile(profile_payload: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(profile_payload)
-    client = _AzureBlobClient(profile)
-    containers, _ = _azure_list_containers_page(client, maxresults=1)
+    client = _build_azure_client(profile)
+    if profile.known_bucket:
+        client.request('HEAD', client.blob_path(profile.known_bucket), query={'restype': 'container'})
+        containers = [{'name': profile.known_bucket}]
+    else:
+        containers, _ = _azure_list_containers_page(client, maxresults=1)
     return {
         "ok": True,
         "bucketCount": len(containers),
@@ -867,7 +1023,10 @@ def _azure_test_profile(profile_payload: dict[str, Any]) -> dict[str, Any]:
 
 def _azure_list_buckets(profile_payload: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(profile_payload)
-    client = _AzureBlobClient(profile)
+    client = _build_azure_client(profile)
+    if profile.known_bucket:
+        return {'items': [{'name': profile.known_bucket, 'region': profile.region, 'objectCountHint': 0,
+                           'versioningEnabled': False, 'createdAt': _serialize_dt(None)}]}
     buckets: list[dict[str, Any]] = []
     marker: str | None = None
     while True:
@@ -892,7 +1051,7 @@ def _azure_create_bucket(params: dict[str, Any]) -> dict[str, Any]:
     bucket_name = str(params.get("bucketName", "")).strip()
     if not bucket_name:
         raise SidecarError("invalid_config", "Bucket name is required.")
-    client = _AzureBlobClient(profile)
+    client = _build_azure_client(profile)
     client.request("PUT", client.blob_path(bucket_name), query={"restype": "container"}, body=b"")
     return {
         "name": bucket_name,
@@ -908,7 +1067,7 @@ def _azure_delete_bucket(params: dict[str, Any]) -> dict[str, Any]:
     bucket_name = str(params.get("bucketName", "")).strip()
     if not bucket_name:
         raise SidecarError("invalid_config", "Bucket name is required.")
-    client = _AzureBlobClient(profile)
+    client = _build_azure_client(profile)
     client.request("DELETE", client.blob_path(bucket_name), query={"restype": "container"})
     return {"deleted": True, "bucketName": bucket_name}
 
@@ -950,7 +1109,7 @@ def _azure_list_objects(params: dict[str, Any]) -> dict[str, Any]:
     cursor = params.get("cursor") or {}
     continuation_token = cursor.get("value") if isinstance(cursor, dict) else None
 
-    client = _AzureBlobClient(profile)
+    client = _build_azure_client(profile)
     root, next_marker = _azure_list_blobs_page(
         client,
         bucket_name,
@@ -958,6 +1117,8 @@ def _azure_list_objects(params: dict[str, Any]) -> dict[str, Any]:
         delimiter=None if flat else "/",
         marker=str(continuation_token) if continuation_token else None,
     )
+    if next_marker and next_marker == continuation_token:
+        raise SidecarError('invalid_response', 'Azure returned a repeated listing continuation marker.')
 
     items: list[dict[str, Any]] = []
     for node in root.iterfind("Blobs/BlobPrefix"):
@@ -1043,11 +1204,11 @@ def _azure_get_bucket_admin_state(params: dict[str, Any]) -> dict[str, Any]:
 def _azure_get_object_details(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     bucket_name = str(params.get("bucketName", "")).strip()
-    key = str(params.get("key", "")).strip()
+    key = str(params.get("key", ""))
     if not bucket_name or not key:
         raise SidecarError("invalid_config", "Bucket name and object key are required for object inspection.")
 
-    client = _AzureBlobClient(profile)
+    client = _build_azure_client(profile)
     api_calls: list[dict[str, Any]] = []
     debug_events: list[dict[str, Any]] = []
 
@@ -1062,7 +1223,7 @@ def _azure_get_object_details(params: dict[str, Any]) -> dict[str, Any]:
     _, head_headers, _ = _call_api(
         api_calls,
         "HeadBlob",
-        lambda: client.request("HEAD", client.blob_path(bucket_name, key)),
+        lambda: client.request("HEAD", client.blob_path(bucket_name, key), query={"versionid": str(params["versionId"])} if params.get("versionId") is not None else {}),
     )
 
     metadata = {
@@ -1078,6 +1239,10 @@ def _azure_get_object_details(params: dict[str, Any]) -> dict[str, Any]:
         "Last-Modified": _serialize_dt(_azure_parse_rfc1123(last_modified)) if last_modified else "",
         "Storage-Class": str(head_headers.get("x-ms-access-tier", "") or "STANDARD"),
         "Cache-Control": str(head_headers.get("Cache-Control", "")),
+        "Content-Disposition": str(head_headers.get("Content-Disposition", "")),
+        "Content-Encoding": str(head_headers.get("Content-Encoding", "")),
+        "Content-Language": str(head_headers.get("Content-Language", "")),
+        "Expires": str(head_headers.get("Expires", "")),
     }
     headers = {name: value for name, value in headers.items() if value}
 
@@ -1091,6 +1256,13 @@ def _azure_get_object_details(params: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "key": key,
+        "etag": str(head_headers.get("ETag", "")).strip('"'),
+        "versionId": head_headers.get('x-ms-version-id') or params.get('versionId'),
+        "storageClass": head_headers.get('x-ms-access-tier'),
+        "leaseStatus": head_headers.get('x-ms-lease-status'),
+        "leaseState": head_headers.get('x-ms-lease-state'),
+        "archiveStatus": head_headers.get('x-ms-archive-status'),
+        "encryption": {'serverEncrypted': head_headers.get('x-ms-server-encrypted') == 'true', 'scope': head_headers.get('x-ms-encryption-scope')},
         "metadata": metadata,
         "headers": headers,
         "tags": {},
@@ -1115,7 +1287,7 @@ def _azure_create_folder(params: dict[str, Any]) -> dict[str, Any]:
         raise SidecarError("invalid_config", "Bucket name and key are required to create a folder.")
     if not key.endswith("/"):
         key = f"{key}/"
-    client = _AzureBlobClient(profile)
+    client = _build_azure_client(profile)
     client.request(
         "PUT",
         client.blob_path(bucket_name, key),
@@ -1153,7 +1325,7 @@ def _azure_copy_object(params: dict[str, Any]) -> dict[str, Any]:
     dest_key = str(params.get("destinationKey", "")).strip()
     if not src_bucket or not src_key or not dest_bucket or not dest_key:
         raise SidecarError("invalid_config", "Copy source and destination are required.")
-    client = _AzureBlobClient(profile)
+    client = _build_azure_client(profile)
     source_url = f"{client.scheme}://{client.netloc}{client.base_path}{client.blob_path(src_bucket, src_key)}"
     dest_path = client.blob_path(dest_bucket, dest_key)
     _, headers, _ = client.request(
@@ -1172,7 +1344,7 @@ def _azure_move_object(params: dict[str, Any]) -> dict[str, Any]:
         raise SidecarError("invalid_config", "Move source and destination must differ.")
     result = _azure_copy_object(params)
     profile = _parse_profile(params.get("profile", {}))
-    client = _AzureBlobClient(profile)
+    client = _build_azure_client(profile)
     client.request(
         "DELETE",
         client.blob_path(
@@ -1199,7 +1371,7 @@ def _azure_delete_objects(params: dict[str, Any]) -> dict[str, Any]:
     keys = [str(item) for item in params.get("keys", []) if str(item).strip()]
     if not bucket_name or not keys:
         raise SidecarError("invalid_config", "Bucket name and keys are required.")
-    client = _AzureBlobClient(profile)
+    client = _build_azure_client(profile)
     success_count = 0
     failures: list[dict[str, Any]] = []
     max_workers = max(1, min(profile.max_pool_connections, 16))
@@ -1230,7 +1402,7 @@ def _azure_delete_objects(params: dict[str, Any]) -> dict[str, Any]:
 def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     bucket_name = str(params.get("bucketName", "")).strip()
-    prefix = str(params.get("prefix", "")).strip()
+    prefix = str(params.get("prefix", ""))
     file_paths = [str(item) for item in params.get("filePaths", []) if str(item).strip()]
     object_key_by_path = {
         str(key): str(value).replace("\\", "/").lstrip("/")
@@ -1239,16 +1411,17 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
     }
     if not bucket_name or not file_paths:
         raise SidecarError("invalid_config", "Bucket name and file paths are required.")
-    client = _AzureBlobClient(profile)
+    client = _build_azure_client(profile)
     paths = [Path(file_path) for file_path in file_paths]
+    block_sizes = {path: _azure_block_size(path.stat().st_size) for path in paths}
     total_bytes = sum(path.stat().st_size for path in paths)
     uses_multipart = any(path.stat().st_size >= _AZURE_PUT_BLOB_LIMIT for path in paths)
     parts_total = sum(
-        max((path.stat().st_size + _AZURE_BLOCK_SIZE - 1) // _AZURE_BLOCK_SIZE, 1)
+        max((path.stat().st_size + block_sizes[path] - 1) // block_sizes[path], 1)
         for path in paths
         if path.stat().st_size >= _AZURE_PUT_BLOB_LIMIT
     )
-    part_size_bytes = _AZURE_BLOCK_SIZE if parts_total > 0 else None
+    part_size_bytes = max(block_sizes.values()) if parts_total > 0 else None
     job_id = f"upload-{uuid.uuid4().hex[:8]}"
     label = f"Upload {len(paths)} file(s) to {bucket_name}"
     strategy_label = _transfer_strategy_label("upload", uses_multipart)
@@ -1297,53 +1470,33 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
         file_size = path.stat().st_size
         output_lines.append(f"Uploading {path.name} ({file_size} bytes) to {target_key}.")
         if file_size >= _AZURE_PUT_BLOB_LIMIT:
-            block_ids: list[str] = []
-            block_index = 0
-            with path.open("rb") as handle:
-                while True:
-                    chunk = handle.read(_AZURE_BLOCK_SIZE)
-                    if not chunk:
-                        break
-                    block_id = base64.b64encode(f"block-{block_index:010d}".encode("ascii")).decode("ascii")
-                    client.request(
-                        "PUT",
-                        blob_path,
-                        query={"comp": "block", "blockid": block_id},
-                        body=chunk,
-                    )
-                    block_ids.append(block_id)
-                    bytes_transferred += len(chunk)
-                    parts_completed += 1
-                    _transfer_checkpoint(
-                        control,
-                        bytes_transferred=bytes_transferred,
-                        items_completed=items_completed,
-                        parts_completed=parts_completed,
-                        current_item_label=path.name,
-                    )
-                    output_lines.append(f"Uploaded part {block_index + 1} for {path.name}.")
-                    _emit_transfer_event(
-                        _build_transfer_job(
-                            job_id=job_id,
-                            label=label,
-                            direction="upload",
-                            progress=bytes_transferred / total_bytes if total_bytes else 1,
-                            status="running",
-                            bytes_transferred=bytes_transferred,
-                            total_bytes=total_bytes,
-                            output_lines=list(output_lines),
-                            strategy_label=strategy_label,
-                            current_item_label=path.name,
-                            item_count=len(paths),
-                            items_completed=items_completed,
-                            part_size_bytes=part_size_bytes,
-                            parts_completed=parts_completed,
-                            parts_total=parts_total,
-                            can_pause=True,
-                            can_cancel=True,
-                        )
-                    )
-                    block_index += 1
+            chunk_size = block_sizes[path]
+            block_count = (file_size + chunk_size - 1) // chunk_size
+            upload_nonce = uuid.uuid4().hex
+            block_ids = [base64.b64encode(f"{upload_nonce}-{index:08d}".encode()).decode() for index in range(block_count)]
+            def upload_block(index):
+                _transfer_gate(control)
+                with path.open("rb") as handle:
+                    length = min(chunk_size, file_size - index * chunk_size)
+                    client.request("PUT", blob_path, query={"comp": "block", "blockid": block_ids[index]},
+                                   body=_FilePart(handle, index * chunk_size, length))
+                return length
+            workers = max(1, min(8, profile.max_pool_connections, (256 * 1024**2) // chunk_size))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(upload_block, index) for index in range(block_count)]
+                try:
+                    for future in as_completed(futures):
+                        bytes_transferred += future.result()
+                        parts_completed += 1
+                        _transfer_checkpoint(control, bytes_transferred=bytes_transferred, items_completed=items_completed, parts_completed=parts_completed, current_item_label=path.name)
+                        _emit_transfer_event(_build_transfer_job(job_id=job_id, label=label, direction="upload", progress=bytes_transferred / total_bytes if total_bytes else 1,
+                            status="running", bytes_transferred=bytes_transferred, total_bytes=total_bytes, output_lines=list(output_lines), strategy_label=strategy_label,
+                            current_item_label=path.name, item_count=len(paths), items_completed=items_completed, part_size_bytes=chunk_size,
+                            parts_completed=parts_completed, parts_total=parts_total, can_pause=True, can_cancel=True))
+                except BaseException:
+                    for pending in futures: pending.cancel()
+                    raise
+            _transfer_gate(control)
             block_list_xml = "".join(f"<Latest>{block_id}</Latest>" for block_id in block_ids)
             block_list_body = (
                 f'<?xml version="1.0" encoding="utf-8"?><BlockList>{block_list_xml}</BlockList>'
@@ -1468,18 +1621,22 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     bucket_name = str(params.get("bucketName", "")).strip()
     keys = [str(item) for item in params.get("keys", []) if str(item).strip()]
+    versions = {str(item["key"]): str(item["versionId"]) for item in params.get("objects", []) if item.get("versionId") is not None}
+    if params.get("objects"): keys = [str(item["key"]) for item in params["objects"]]
+    if params.get("versionId") is not None: versions.update({key: str(params["versionId"]) for key in keys})
+    def version_query(key): return {"versionid": versions[key]} if key in versions else {}
     destination_path = str(params.get("destinationPath", "")).strip()
     if not bucket_name or not keys or not destination_path:
         raise SidecarError("invalid_config", "Bucket, keys, and destination path are required.")
     multipart_threshold_bytes = _int_param(params, "multipartThresholdMiB", 32) * 1024 * 1024
     multipart_chunk_bytes = _int_param(params, "multipartChunkMiB", 8) * 1024 * 1024
-    client = _AzureBlobClient(profile)
+    client = _build_azure_client(profile)
     destination = Path(destination_path)
     destination.mkdir(parents=True, exist_ok=True)
     sizes: dict[str, int] = {}
     validators = {}
     for key in keys:
-        _, head_headers, _ = client.request("HEAD", client.blob_path(bucket_name, key))
+        _, head_headers, _ = client.request("HEAD", client.blob_path(bucket_name, key), query=version_query(key))
         sizes[key] = int(head_headers.get("Content-Length", 0) or 0)
         validators[key] = {"If-Match": head_headers["ETag"]} if head_headers.get("ETag") else {}
     total_bytes = sum(sizes.values())
@@ -1539,51 +1696,45 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
         before_object = bytes_transferred
         with _staged_download(destination, key, params.get("conflictPolicy", "keepBoth"), output_lines) as handle:
             if object_size >= multipart_threshold_bytes:
-                start = 0
-                while start < object_size:
-                    end = min(start + multipart_chunk_bytes - 1, object_size - 1)
-                    _, range_headers, chunk = client.request(
-                        "GET",
-                        blob_path,
-                        headers={"Range": f"bytes={start}-{end}", **validators[key]},
-                    )
-                    _validate_download_range(range_headers.get("Content-Range", ""), start, end, object_size, len(chunk))
-                    handle.write(chunk)
-                    chunk_size = end - start + 1
-                    bytes_transferred += chunk_size
-                    parts_completed += 1
-                    _transfer_checkpoint(
-                        control,
-                        bytes_transferred=bytes_transferred,
-                        items_completed=items_completed,
-                        parts_completed=parts_completed,
-                        current_item_label=key,
-                    )
-                    output_lines.append(f"Downloaded byte range {start}-{end} for {key}.")
-                    _emit_transfer_event(
-                        _build_transfer_job(
-                            job_id=job_id,
-                            label=label,
-                            direction="download",
-                            progress=bytes_transferred / total_bytes if total_bytes else 1,
-                            status="running",
-                            bytes_transferred=bytes_transferred,
-                            total_bytes=total_bytes,
-                            output_lines=list(output_lines),
-                            strategy_label=strategy_label,
-                            current_item_label=key,
-                            item_count=len(keys),
-                            items_completed=items_completed,
-                            part_size_bytes=part_size_bytes,
-                            parts_completed=parts_completed,
-                            parts_total=parts_total,
-                            can_pause=True,
-                            can_cancel=True,
-                        )
-                    )
-                    start = end + 1
+                handle.truncate(object_size)
+                write_lock = threading.Lock()
+                def download_range(start):
+                    _transfer_gate(control)
+                    end = min(start + multipart_chunk_bytes, object_size) - 1
+                    response = client.open("GET", blob_path, query=version_query(key), headers={"Range": f"bytes={start}-{end}", **validators[key]})
+                    try:
+                        expected = end - start + 1
+                        _validate_download_range(response.headers.get('Content-Range', ''), start, end, object_size, expected)
+                        received = 0
+                        while received <= expected:
+                            data = response.read(min(1024 * 1024, expected - received + 1))
+                            if not data: break
+                            _transfer_gate(control)
+                            with write_lock:
+                                handle.seek(start + received)
+                                handle.write(data)
+                            received += len(data)
+                    finally:
+                        response.close()
+                    _validate_download_range(response.headers.get('Content-Range', ''), start, end, object_size, received)
+                    return received
+                workers = max(1, min(8, profile.max_pool_connections, (256 * 1024**2) // multipart_chunk_bytes))
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = _bounded_parallel(pool, download_range, range(0, object_size, multipart_chunk_bytes), workers * 2)
+                    try:
+                        for future in futures:
+                            bytes_transferred += future.result()
+                            parts_completed += 1
+                            _transfer_checkpoint(control, bytes_transferred=bytes_transferred, items_completed=items_completed, parts_completed=parts_completed, current_item_label=key)
+                            _emit_transfer_event(_build_transfer_job(job_id=job_id, label=label, direction="download", progress=bytes_transferred / total_bytes if total_bytes else 1,
+                                status="running", bytes_transferred=bytes_transferred, total_bytes=total_bytes, output_lines=list(output_lines),
+                                strategy_label=strategy_label, current_item_label=key, item_count=len(keys), items_completed=items_completed,
+                                part_size_bytes=part_size_bytes, parts_completed=parts_completed, parts_total=parts_total, can_pause=True, can_cancel=True))
+                    except BaseException:
+                        futures.close()
+                        raise
             else:
-                response = client.open("GET", blob_path, headers=validators[key])
+                response = client.open("GET", blob_path, query=version_query(key), headers=validators[key])
                 with response:
                     while True:
                         chunk = response.read(min(multipart_chunk_bytes, 1024 * 1024))
@@ -1655,7 +1806,7 @@ def _azure_run_put_testdata(params: dict[str, Any]) -> dict[str, Any]:
     size_bytes = max(int(config.get("objectSizeBytes", config.get("sizeBytes", 4096)) or 4096), 0)
     if not bucket_name:
         raise SidecarError("invalid_config", "Bucket name is required.")
-    client = _AzureBlobClient(profile)
+    client = _build_azure_client(profile)
     payload = b"A" * size_bytes
 
     def put_one(index: int) -> None:
@@ -1692,7 +1843,7 @@ def _azure_run_delete_all(params: dict[str, Any]) -> dict[str, Any]:
     max_workers = max(1, min(int(config.get("maxWorkers", 4) or 4), 16))
     if not bucket_name:
         raise SidecarError("invalid_config", "Bucket name is required.")
-    client = _AzureBlobClient(profile)
+    client = _build_azure_client(profile)
 
     deleted_count = 0
     failure_count = 0
@@ -1732,10 +1883,10 @@ class _AzureBenchmarkClient:
     """boto3-shaped facade over the Azure client for benchmark primitives."""
 
     def __init__(self, profile: Profile):
-        self._client = _AzureBlobClient(profile)
+        self._client = _build_azure_client(profile)
 
     def put_object(self, Bucket: str, Key: str, Body: bytes = b"", **_: Any) -> dict[str, Any]:  # noqa: N803
-        body = bytes(Body) if isinstance(Body, (bytes, bytearray)) else bytes(str(Body), "utf-8")
+        body = Body
         self._client.request(
             "PUT",
             self._client.blob_path(Bucket, Key),
@@ -1745,8 +1896,9 @@ class _AzureBenchmarkClient:
         return {}
 
     def get_object(self, Bucket: str, Key: str, **_: Any) -> dict[str, Any]:  # noqa: N803
-        _, _, data = self._client.request("GET", self._client.blob_path(Bucket, Key))
-        return {"Body": io.BytesIO(data), "ContentLength": len(data)}
+        response = self._client.open("GET", self._client.blob_path(Bucket, Key))
+        return {"Body": response, "ContentLength": int(response.headers.get('Content-Length') or 0),
+                "ResponseMetadata": {"RetryAttempts": len(getattr(getattr(response, 'retries', None), 'history', ()) or ())}}
 
     def delete_object(self, Bucket: str, Key: str, **_: Any) -> dict[str, Any]:  # noqa: N803
         self._client.request("DELETE", self._client.blob_path(Bucket, Key))
@@ -1808,7 +1960,7 @@ def _handle_azure_request(method: str, params: dict[str, Any]) -> dict[str, Any]
     if method == "runPutTestData":
         return _azure_run_put_testdata(params)
     if method == "runDeleteAll":
-        return _azure_run_delete_all(params)
+        return _run_tool(_azure_run_delete_all, params)
     return None
 
 
@@ -1829,6 +1981,7 @@ def _health() -> dict[str, Any]:
         "methods": [
             "health",
             "getCapabilities",
+            "storageAction",
             "testProfile",
             "listBuckets",
             "createBucket",
@@ -1873,7 +2026,7 @@ def _health() -> dict[str, Any]:
 
 
 def _get_capabilities(_: dict[str, Any]) -> dict[str, Any]:
-    return {
+    result = {
         "items": [
             {"key": "bucket.lifecycle", "label": "Lifecycle policy CRUD", "state": "supported"},
             {"key": "bucket.policy", "label": "Bucket policy CRUD", "state": "supported"},
@@ -1882,17 +2035,27 @@ def _get_capabilities(_: dict[str, Any]) -> dict[str, Any]:
             {"key": "bucket.tagging", "label": "Bucket tagging", "state": "supported"},
             {"key": "bucket.versioning", "label": "Bucket versioning", "state": "supported"},
             {"key": "object.copy_move", "label": "Copy, move, rename", "state": "supported"},
-            {"key": "object.resumable", "label": "Resumable transfer jobs", "state": "unknown", "reason": "Desktop host currently uses one request per sidecar process."},
+            {"key": "object.resumable", "label": "Resumable transfer jobs", "state": "supported", "reason": "Explicit multipart/block upload and verified range-download checkpoints; credentials are resupplied on resume."},
             {"key": "tools.bulk-delete", "label": "Delete-all maintenance tool", "state": "supported"},
             {"key": "benchmark", "label": "Integrated benchmark mode", "state": "supported"},
+            {"key": "storage.admin", "label": "Advanced storage administration", "state": "supported", "actions": _STORAGE_ACTIONS},
         ]
     }
+    if _is_azure_profile(_.get('profile')):
+        for item in result['items']:
+            if item['key'].startswith('bucket.'):
+                item.update({'state': 'unsupported', 'reason': 'Azure account administration requires provider-specific management APIs.'})
+            elif item['key'] == 'storage.admin':
+                item['actions'] = _storage_action({'profile': _['profile'], 'action': 'providerInfo'})['actions']
+    return result
 
 
 def _test_profile(profile_payload: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(profile_payload)
     client = _build_client(profile)
-    response = client.list_buckets()
+    response = ({"Buckets": [{"Name": profile.known_bucket}]} if profile.known_bucket else client.list_buckets())
+    if profile.known_bucket:
+        client.head_bucket(Bucket=profile.known_bucket)
     buckets = response.get("Buckets", [])
     endpoint_host = urlparse(profile.endpoint_url).netloc or profile.endpoint_url
     return {
@@ -1905,7 +2068,7 @@ def _test_profile(profile_payload: dict[str, Any]) -> dict[str, Any]:
 def _list_buckets(profile_payload: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(profile_payload)
     client = _build_client(profile)
-    response = client.list_buckets()
+    response = ({"Buckets": [{"Name": profile.known_bucket}]} if profile.known_bucket else client.list_buckets())
     buckets = []
     for bucket in response.get("Buckets", []):
         buckets.append(
@@ -2004,6 +2167,8 @@ def _list_objects(params: dict[str, Any]) -> dict[str, Any]:
         request["ContinuationToken"] = continuation_token
 
     response = client.list_objects_v2(**request)
+    if response.get('IsTruncated') and (not response.get('NextContinuationToken') or response.get('NextContinuationToken') == continuation_token):
+        raise SidecarError('invalid_response', 'S3 returned a truncated listing without a progressing continuation token.')
     items: list[dict[str, Any]] = []
 
     for common_prefix in response.get("CommonPrefixes", []):
@@ -2145,7 +2310,7 @@ def _get_bucket_admin_state(params: dict[str, Any]) -> dict[str, Any]:
     return {
         "bucketName": bucket_name,
         "versioningEnabled": versioning.get("Status") == "Enabled",
-        "versioningStatus": versioning.get("Status", "Suspended"),
+        "versioningStatus": versioning.get("Status", "Disabled") if not any(x.get("operation") == "GetBucketVersioning" and x.get("state") for x in api_calls) else "Unknown",
         "objectLockEnabled": bool(object_lock.get("ObjectLockConfiguration")),
         "lifecycleEnabled": bool(rules),
         "policyAttached": bool(policy.get("Policy")),
@@ -2153,16 +2318,20 @@ def _get_bucket_admin_state(params: dict[str, Any]) -> dict[str, Any]:
         "encryptionEnabled": bool(encryption_rules),
         "encryptionSummary": encryption_summary,
         "objectLockMode": retention.get("Mode"),
-        "objectLockRetentionDays": retention.get("Days") or retention.get("Years"),
+        "objectLockRetentionDays": retention.get("Days"),
+        "objectLockRetentionYears": retention.get("Years"),
+        "objectLockRetention": {"value": retention.get("Days", retention.get("Years")), "unit": "years" if "Years" in retention else "days"},
         "tags": tags,
         "lifecycleRules": rules,
         "lifecycleJson": _json_dumps({"Rules": lifecycle.get("Rules", [])}),
+        "transitionDefaultMinimumObjectSize": lifecycle.get("TransitionDefaultMinimumObjectSize"),
         "policyJson": policy.get("Policy", "{}"),
         "corsJson": _json_dumps(cors.get("CORSRules", [])),
         "encryptionJson": _json_dumps(
             encryption.get("ServerSideEncryptionConfiguration", {})
         ),
         "apiCalls": api_calls,
+        "sections": {item["operation"]: {"state": item.get("state", "supported"), "message": item.get("message", "")} for item in api_calls},
     }
 
 
@@ -2174,9 +2343,17 @@ def _put_bucket_lifecycle(params: dict[str, Any]) -> dict[str, Any]:
         raise SidecarError("invalid_config", "Bucket name and lifecycle JSON are required.")
     client = _build_client(profile)
     lifecycle = json.loads(lifecycle_json)
+    options = {}
+    if params.get("transitionDefaultMinimumObjectSize"):
+        options["TransitionDefaultMinimumObjectSize"] = params["transitionDefaultMinimumObjectSize"]
+    if params.get("expectedLifecycleJson") is not None:
+        current = _configuration_or_missing(lambda: client.get_bucket_lifecycle_configuration(Bucket=bucket_name), {"NoSuchLifecycleConfiguration"})
+        if json.loads(_json_dumps({"Rules": current.get("Rules", [])})) != json.loads(params["expectedLifecycleJson"]):
+            raise SidecarError("conflict", "Lifecycle changed since it was loaded. Refresh before applying.")
     client.put_bucket_lifecycle_configuration(
         Bucket=bucket_name,
         LifecycleConfiguration=lifecycle,
+        **options,
     )
     return _get_bucket_admin_state(params)
 
@@ -2284,7 +2461,7 @@ def _delete_bucket_tagging(params: dict[str, Any]) -> dict[str, Any]:
 def _list_object_versions(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     bucket_name = str(params.get("bucketName", "")).strip()
-    key = str(params.get("key", "")).strip()
+    key = str(params.get("key", ""))
     options = params.get("options") or {}
     filter_value = str(options.get("filterValue", "")).strip()
     filter_mode = str(options.get("filterMode", "prefix")).strip()
@@ -2362,6 +2539,8 @@ def _list_object_versions(params: dict[str, Any]) -> dict[str, Any]:
     next_key_marker = str(response.get("NextKeyMarker") or "")
     next_version_id_marker = str(response.get("NextVersionIdMarker") or "")
     if has_more and (next_key_marker or next_version_id_marker):
+        if (next_key_marker, next_version_id_marker) == (key_marker, version_id_marker):
+            raise SidecarError('invalid_response', 'S3 returned repeated version listing markers.')
         next_cursor_value: str | None = json.dumps(
             {
                 "keyMarker": next_key_marker,
@@ -2369,7 +2548,8 @@ def _list_object_versions(params: dict[str, Any]) -> dict[str, Any]:
             }
         )
     else:
-        # No continuation markers means there is nothing more to fetch.
+        if has_more:
+            raise SidecarError('invalid_response', 'S3 returned a truncated version listing without continuation markers.')
         has_more = False
         next_cursor_value = None
 
@@ -2385,7 +2565,7 @@ def _list_object_versions(params: dict[str, Any]) -> dict[str, Any]:
 def _get_object_details(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     bucket_name = str(params.get("bucketName", "")).strip()
-    key = str(params.get("key", "")).strip()
+    key = str(params.get("key", ""))
     if not bucket_name or not key:
         raise SidecarError("invalid_config", "Bucket name and object key are required for object inspection.")
 
@@ -2401,11 +2581,11 @@ def _get_object_details(params: dict[str, Any]) -> dict[str, Any]:
         }
     )
 
-    head = _call_api(api_calls, "HeadObject", lambda: client.head_object(Bucket=bucket_name, Key=key))
+    head = _call_api(api_calls, "HeadObject", lambda: client.head_object(**_object_ref(params)))
     tag_response = _maybe_call(
         api_calls,
         "GetObjectTagging",
-        lambda: client.get_object_tagging(Bucket=bucket_name, Key=key),
+        lambda: client.get_object_tagging(**_object_ref(params)),
         {},
     )
 
@@ -2418,6 +2598,10 @@ def _get_object_details(params: dict[str, Any]) -> dict[str, Any]:
         "Last-Modified": _serialize_dt(head.get("LastModified")),
         "Storage-Class": str(head.get("StorageClass", "STANDARD")),
         "Cache-Control": str(head.get("CacheControl", "")),
+        "Content-Disposition": str(head.get('ContentDisposition', '')),
+        "Content-Encoding": str(head.get('ContentEncoding', '')),
+        "Content-Language": str(head.get('ContentLanguage', '')),
+        "Expires": _serialize_dt(head['Expires']) if head.get('Expires') else '',
     }
     headers = {key: value for key, value in headers.items() if value}
 
@@ -2431,6 +2615,12 @@ def _get_object_details(params: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "key": key,
+        "versionId": head.get('VersionId') or params.get('versionId'),
+        "etag": str(head.get('ETag', '')).strip('"'),
+        "storageClass": head.get('StorageClass', 'STANDARD'),
+        "restore": head.get('Restore'),
+        "archiveStatus": head.get('ArchiveStatus'),
+        "encryption": {field: head[field] for field in ('ServerSideEncryption', 'SSEKMSKeyId', 'BucketKeyEnabled') if field in head},
         "metadata": metadata,
         "headers": headers,
         "tags": tags,
@@ -2450,7 +2640,7 @@ def _get_object_details(params: dict[str, Any]) -> dict[str, Any]:
 def _generate_presigned_url(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     bucket_name = str(params.get("bucketName", "")).strip()
-    key = str(params.get("key", "")).strip()
+    key = str(params.get("key", ""))
     expiration_seconds = max(int(params.get("expirationSeconds", 3600) or 3600), 1)
     if not bucket_name or not key:
         raise SidecarError("invalid_config", "Bucket name and object key are required to generate a presigned URL.")
@@ -2458,7 +2648,7 @@ def _generate_presigned_url(params: dict[str, Any]) -> dict[str, Any]:
     client = _build_client(profile)
     url = client.generate_presigned_url(
         "get_object",
-        Params={"Bucket": bucket_name, "Key": key},
+        Params=_object_ref(params),
         ExpiresIn=expiration_seconds,
     )
     return {"url": url}
@@ -2478,20 +2668,7 @@ def _create_folder(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _copy_object(params: dict[str, Any]) -> dict[str, Any]:
-    profile = _parse_profile(params.get("profile", {}))
-    src_bucket = str(params.get("sourceBucketName", "")).strip()
-    src_key = str(params.get("sourceKey", "")).strip()
-    dest_bucket = str(params.get("destinationBucketName", "")).strip()
-    dest_key = str(params.get("destinationKey", "")).strip()
-    if not src_bucket or not src_key or not dest_bucket or not dest_key:
-        raise SidecarError("invalid_config", "Copy source and destination are required.")
-    client = _build_client(profile)
-    client.copy_object(
-        Bucket=dest_bucket,
-        Key=dest_key,
-        CopySource={"Bucket": src_bucket, "Key": src_key},
-    )
-    return {"successCount": 1, "failureCount": 0, "failures": []}
+    return _storage_copy(params)
 
 
 def _move_object(params: dict[str, Any]) -> dict[str, Any]:
@@ -2512,6 +2689,26 @@ _S3_DELETE_BATCH_LIMIT = 1000
 def _chunked(items: list[Any], size: int):
     for start in range(0, len(items), size):
         yield items[start : start + size]
+
+
+def _bounded_parallel(pool, function, items, pending_limit):
+    iterator = iter(items)
+    pending = set()
+    def refill():
+        while len(pending) < pending_limit:
+            try: item = next(iterator)
+            except StopIteration: return
+            pending.add(pool.submit(function, item))
+    try:
+        refill()
+        while pending:
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                pending.remove(future)
+                yield future
+            refill()
+    finally:
+        for future in pending: future.cancel()
 
 
 def _delete_objects(params: dict[str, Any]) -> dict[str, Any]:
@@ -2683,10 +2880,35 @@ def _transfer_strategy_label(direction: str, uses_multipart: bool) -> str:
     return f'{"Multipart" if uses_multipart else "Single-part"} {direction}'
 
 
+class _FilePart:
+    """Seekable view of one file range; SDK hashing and retries stay bounded."""
+    def __init__(self, handle, start, length):
+        self.handle, self.start, self.length, self.position = handle, start, length, 0
+        self.handle.seek(start)
+
+    def read(self, size=-1):
+        remaining = self.length - self.position
+        amount = remaining if size is None or size < 0 else min(size, remaining)
+        data = self.handle.read(amount)
+        self.position += len(data)
+        return data
+
+    def tell(self): return self.position
+    def seek(self, offset, whence=0):
+        target = offset if whence == 0 else self.position + offset if whence == 1 else self.length + offset
+        if target < 0 or target > self.length: raise ValueError("Seek outside multipart range")
+        self.handle.seek(self.start + target)
+        self.position = target
+        return target
+    def seekable(self): return True
+    def readable(self): return True
+    def __len__(self): return self.length
+
+
 def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     bucket_name = str(params.get("bucketName", "")).strip()
-    prefix = str(params.get("prefix", "")).strip()
+    prefix = str(params.get("prefix", ""))
     file_paths = [str(item) for item in params.get("filePaths", []) if str(item).strip()]
     object_key_by_path = {
         str(key): str(value).replace("\\", "/").lstrip("/")
@@ -2780,8 +3002,8 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
                 offset = (part_number - 1) * multipart_chunk_bytes
                 length = min(multipart_chunk_bytes, file_size - offset)
                 handle = _get_part_handle()
-                handle.seek(offset)
-                chunk = handle.read(length)
+                _transfer_gate(control)
+                chunk = _FilePart(handle, offset, length)
                 part_response = client.upload_part(
                     Bucket=bucket_name,
                     Key=target_key,
@@ -2789,7 +3011,7 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
                     PartNumber=part_number,
                     Body=chunk,
                 )
-                return part_number, part_response.get("ETag"), len(chunk)
+                return part_number, part_response.get("ETag"), length
 
             completed_parts: list[dict[str, Any]] = []
             try:
@@ -2860,12 +3082,18 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
                     except Exception:  # noqa: BLE001
                         pass
             completed_parts.sort(key=lambda part: part["PartNumber"])
-            client.complete_multipart_upload(
-                Bucket=bucket_name,
-                Key=target_key,
-                UploadId=upload_id,
-                MultipartUpload={"Parts": completed_parts},
-            )
+            try:
+                _transfer_gate(control)
+                client.complete_multipart_upload(
+                    Bucket=bucket_name, Key=target_key, UploadId=upload_id,
+                    MultipartUpload={"Parts": completed_parts},
+                )
+            except BaseException:
+                try:
+                    client.abort_multipart_upload(Bucket=bucket_name, Key=target_key, UploadId=upload_id)
+                except Exception:
+                    pass
+                raise
         else:
             with path.open("rb") as handle:
                 client.put_object(Bucket=bucket_name, Key=target_key, Body=handle)
@@ -2924,6 +3152,13 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     bucket_name = str(params.get("bucketName", "")).strip()
     keys = [str(item) for item in params.get("keys", []) if str(item).strip()]
+    versions = {str(item["key"]): str(item["versionId"]) for item in params.get("objects", []) if item.get("versionId") is not None}
+    if params.get("objects"):
+        keys = [str(item["key"]) for item in params["objects"]]
+    if params.get("versionId") is not None:
+        versions.update({key: str(params["versionId"]) for key in keys})
+    def version_kwargs(key):
+        return {"VersionId": versions[key]} if key in versions else {}
     destination_path = str(params.get("destinationPath", "")).strip()
     if not bucket_name or not keys or not destination_path:
         raise SidecarError("invalid_config", "Bucket, keys, and destination path are required.")
@@ -2932,7 +3167,7 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
     client = _build_client(profile)
     destination = Path(destination_path)
     destination.mkdir(parents=True, exist_ok=True)
-    heads = {key: client.head_object(Bucket=bucket_name, Key=key) for key in keys}
+    heads = {key: client.head_object(Bucket=bucket_name, Key=key, **version_kwargs(key)) for key in keys}
     sizes = {key: int(heads[key].get("ContentLength", 0)) for key in keys}
     total_bytes = sum(sizes.values())
     uses_multipart = any(size >= multipart_threshold_bytes for size in sizes.values())
@@ -2992,12 +3227,7 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
             if object_size >= multipart_threshold_bytes:
                 handle.truncate(object_size)
                 write_lock = threading.Lock()
-                ranges: list[tuple[int, int]] = []
-                start = 0
-                while start < object_size:
-                    end = min(start + multipart_chunk_bytes - 1, object_size - 1)
-                    ranges.append((start, end))
-                    start = end + 1
+                ranges = ((start, min(start + multipart_chunk_bytes, object_size) - 1) for start in range(0, object_size, multipart_chunk_bytes))
                 max_workers = min(8, max(profile.max_pool_connections, 1))
 
                 def _download_one_range(
@@ -3011,27 +3241,31 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
                         Bucket=bucket_name,
                         Key=key,
                         Range=f"bytes={start}-{end}",
+                        **version_kwargs(key),
                         **({"IfMatch": heads[key]["ETag"]} if heads[key].get("ETag") else {}),
                     )
                     _transfer_gate(control)
                     try:
-                        data = response["Body"].read(end - start + 2)
+                        expected = end - start + 1
+                        _validate_download_range(response.get('ContentRange', ''), start, end, object_size, expected)
+                        received = 0
+                        while received <= expected:
+                            data = response['Body'].read(min(1024 * 1024, expected - received + 1))
+                            if not data: break
+                            _transfer_gate(control)
+                            with write_lock:
+                                handle.seek(start + received)
+                                handle.write(data)
+                            received += len(data)
                     finally:
                         response["Body"].close()
-                    _validate_download_range(response.get("ContentRange", ""), start, end, object_size, len(data))
-                    _transfer_gate(control)
-                    with write_lock:
-                        handle.seek(start)
-                        handle.write(data)
-                    return start, end, len(data)
+                    _validate_download_range(response.get('ContentRange', ''), start, end, object_size, received)
+                    return start, end, received
 
                 with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                    futures = [
-                        pool.submit(_download_one_range, range_start, range_end)
-                        for range_start, range_end in ranges
-                    ]
+                    futures = _bounded_parallel(pool, lambda span: _download_one_range(*span), ranges, max_workers * 2)
                     try:
-                        for future in as_completed(futures):
+                        for future in futures:
                             range_start, range_end, chunk_size = future.result()
                             bytes_transferred += chunk_size
                             parts_completed += 1
@@ -3067,11 +3301,10 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
                                 )
                             )
                     except BaseException:
-                        for pending in futures:
-                            pending.cancel()
+                        futures.close()
                         raise
             else:
-                response = client.get_object(Bucket=bucket_name, Key=key, **({"IfMatch": heads[key]["ETag"]} if heads[key].get("ETag") else {}))
+                response = client.get_object(Bucket=bucket_name, Key=key, **version_kwargs(key), **({"IfMatch": heads[key]["ETag"]} if heads[key].get("ETag") else {}))
                 try:
                     while True:
                         chunk = response["Body"].read(min(multipart_chunk_bytes, 1024 * 1024))
@@ -3272,6 +3505,86 @@ def _run_put_testdata(params: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
+_DELETE_TRANSIENT_CODES = {'InternalError', 'InternalFailure', 'ServiceUnavailable', 'SlowDown', 'RequestTimeout', 'RequestTimeoutException', '500', '502', '503', '504'}
+_DELETE_STALE_CODES = {'InternalError', 'InternalFailure', 'ServiceUnavailable', '500', '502', '503'}
+
+
+def _delete_error_retryable(error):
+    if isinstance(error, dict): return str(error.get('Code') or '') in _DELETE_TRANSIENT_CODES
+    return _client_error_code(error) in _DELETE_TRANSIENT_CODES or isinstance(error, (TimeoutError, ConnectionError))
+
+
+def _recover_delete_entry(client, bucket, entry, error, eligible, attempts=3):
+    request = {'Bucket': bucket, **{k: v for k, v in entry.items() if k in {'Key', 'VersionId'}}}
+    message = str(error.get('Message') or error.get('Code')) if isinstance(error, dict) else str(error)
+    code = str(error.get('Code') or '') if isinstance(error, dict) else _client_error_code(error)
+    if not _delete_error_retryable(error): return message
+    for attempt in range(attempts):
+        try:
+            client.delete_object(**request)
+            return None
+        except Exception as failed:
+            code, message = _client_error_code(failed), str(failed)
+            if not _delete_error_retryable(failed): return message
+            if attempt + 1 < attempts: time.sleep(min(0.1 * 2**attempt, 1))
+    if not eligible or code not in _DELETE_STALE_CODES:
+        return message
+    # Recheck immediately before the destructive recovery. Suspended, enabled,
+    # failed probes and a real version id all exclude the empty-PUT path.
+    try:
+        versioning = client.get_bucket_versioning(Bucket=bucket)
+        if versioning.get('Status') or entry.get('VersionId') not in {None, 'null'}:
+            return message
+        condition = {'IfMatch': entry['_ETag']} if entry.get('_ETag') else {}
+        client.put_object(Bucket=bucket, Key=entry['Key'], Body=b'', **condition)
+    except Exception as failed:
+        return f'{message}; empty PUT recovery failed: {failed}'
+    for attempt in range(attempts):
+        try:
+            client.delete_object(Bucket=bucket, Key=entry['Key'])
+            return None
+        except Exception as failed:
+            message = str(failed)
+            if not _delete_error_retryable(failed): break
+            if attempt + 1 < attempts: time.sleep(min(0.1 * 2**attempt, 1))
+    return f'overwritten with an empty object; delete failed: {message}'
+
+
+def _delete_batch_with_recovery(client, bucket, batch, eligible, attempts=3):
+    pending = list(batch)
+    failures = []
+    last_errors = {}
+    identity = lambda e: (str(e.get('Key') or ''), str(e.get('VersionId') or ''))
+    for attempt in range(attempts):
+        if not pending: break
+        try:
+            response = client.delete_objects(Bucket=bucket, Delete={'Objects': [{k: v for k, v in item.items() if k in {'Key', 'VersionId'}} for item in pending], 'Quiet': True})
+            errors = response.get('Errors') or []
+            errors_by_id = {identity(e): e for e in errors}
+            retry = []
+            for entry in pending:
+                error = errors_by_id.get(identity(entry))
+                # Some compatible implementations omit VersionId in errors.
+                if error is None: error = next((e for e in errors if e.get('Key') == entry.get('Key') and not e.get('VersionId')), None)
+                if error is None: continue
+                if _delete_error_retryable(error):
+                    retry.append(entry)
+                    last_errors[identity(entry)] = error
+                else: failures.append((entry, str(error.get('Message') or error.get('Code') or 'delete failed')))
+            pending = retry
+        except Exception as error:
+            if not _delete_error_retryable(error):
+                failures.extend((entry, str(error)) for entry in pending)
+                pending = []
+            else:
+                for entry in pending: last_errors[identity(entry)] = error
+        if pending and attempt + 1 < attempts: time.sleep(min(0.1 * 2**attempt, 1))
+    for entry in pending:
+        message = _recover_delete_entry(client, bucket, entry, last_errors[identity(entry)], eligible, attempts)
+        if message: failures.append((entry, message))
+    return failures
+
+
 def _run_delete_all(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     config = params.get("config") or {}
@@ -3285,7 +3598,15 @@ def _run_delete_all(params: dict[str, Any]) -> dict[str, Any]:
         raise SidecarError("invalid_config", "Bucket name is required.")
     client = _build_client(profile)
 
-    used_versions = True
+    try:
+        versioning = client.get_bucket_versioning(Bucket=bucket_name)
+        never_versioned = not versioning.get("Status")
+    except Exception:
+        never_versioned = False
+    hostname = (urlparse(profile.endpoint_url).hostname or "").lower()
+    eligible_recovery = (profile.endpoint_type == "s3Compatible" and never_versioned
+                         and not hostname.endswith(("amazonaws.com", "amazonaws.com.cn")))
+    used_versions = not never_versioned
     abort_message: str | None = None
 
     def _iter_entries():
@@ -3294,13 +3615,11 @@ def _run_delete_all(params: dict[str, Any]) -> dict[str, Any]:
         if prefix:
             base_kwargs["Prefix"] = prefix
         try:
-            page = client.list_object_versions(**dict(base_kwargs))
-        except Exception:  # noqa: BLE001
-            page = None
-            used_versions = False
+            page = None if never_versioned else client.list_object_versions(**dict(base_kwargs))
+        except Exception as error:
+            raise SidecarError("delete_failed", "Version listing failed; refusing to delete without knowing the version history.") from error
         if page is not None:
-            prev_markers: tuple[str, str] | None = None
-            prev_processed: int | None = None
+            seen_markers = set()
             while True:
                 for group in ("Versions", "DeleteMarkers"):
                     for item in page.get(group) or []:
@@ -3315,6 +3634,8 @@ def _run_delete_all(params: dict[str, Any]) -> dict[str, Any]:
                         # omitting it would only stack a delete marker.
                         if version_id:
                             entry["VersionId"] = version_id
+                        else:
+                            raise SidecarError("delete_failed", "Version listing omitted a version ID; refusing an ambiguous deletion.")
                         yield entry
                 if not page.get("IsTruncated"):
                     return
@@ -3323,19 +3644,17 @@ def _run_delete_all(params: dict[str, Any]) -> dict[str, Any]:
                 if not next_key_marker and not next_version_marker:
                     # Truncated page without continuation markers: continuing
                     # would refetch page 1 forever, so stop listing here.
+                    abort_message = "Version listing was truncated without continuation markers. Deletion is incomplete."
                     return
                 markers = (next_key_marker, next_version_marker)
-                with counter_lock:
-                    processed = deleted_count + failure_count
-                if markers == prev_markers and processed == prev_processed:
+                if markers in seen_markers:
                     abort_message = (
                         "Aborting: listing made no progress "
                         f"(markers repeated at key marker '{next_key_marker}' "
                         "with no new deletions or failures)."
                     )
                     return
-                prev_markers = markers
-                prev_processed = processed
+                seen_markers.add(markers)
                 next_kwargs = dict(base_kwargs)
                 if next_key_marker:
                     next_kwargs["KeyMarker"] = next_key_marker
@@ -3344,6 +3663,7 @@ def _run_delete_all(params: dict[str, Any]) -> dict[str, Any]:
                 page = client.list_object_versions(**next_kwargs)
             return
         continuation: str | None = None
+        seen_continuations = set()
         while True:
             v2_kwargs = dict(base_kwargs)
             if continuation:
@@ -3352,14 +3672,16 @@ def _run_delete_all(params: dict[str, Any]) -> dict[str, Any]:
             for item in page.get("Contents") or []:
                 key = str(item.get("Key", ""))
                 if key:
-                    yield {"Key": key}
+                    yield {"Key": key, "_ETag": item.get("ETag")}
             if not page.get("IsTruncated"):
                 return
             continuation = page.get("NextContinuationToken")
-            if not continuation:
+            if not continuation or continuation in seen_continuations:
                 # Truncated page without a continuation token: stop rather
                 # than refetching page 1 forever.
+                abort_message = "Object listing returned a missing or repeated continuation token. Deletion is incomplete."
                 return
+            seen_continuations.add(continuation)
 
     deleted_count = 0
     failure_count = 0
@@ -3369,26 +3691,14 @@ def _run_delete_all(params: dict[str, Any]) -> dict[str, Any]:
 
     def delete_batch(batch: list[dict[str, Any]]) -> None:
         nonlocal deleted_count, failure_count
-        try:
-            response = client.delete_objects(
-                Bucket=bucket_name,
-                Delete={"Objects": batch, "Quiet": True},
-            )
-            batch_errors = response.get("Errors") or []
-            with counter_lock:
-                failure_count += len(batch_errors)
-                deleted_count += len(batch) - len(batch_errors)
-                for item in batch_errors:
-                    if len(errors) >= 5:
-                        break
-                    errors.append(
-                        f"{item.get('Key', '')}: {item.get('Message') or item.get('Code') or 'delete failed'}"
-                    )
-        except Exception as error:  # noqa: BLE001
-            with counter_lock:
-                failure_count += len(batch)
-                if len(errors) < 5:
-                    errors.append(str(error))
+        failed = _delete_batch_with_recovery(client, bucket_name, batch, eligible_recovery,
+                                              attempts=max(1, min(profile.max_attempts, 5)))
+        with counter_lock:
+            deleted_count += len(batch) - len(failed)
+            failure_count += len(failed)
+            for entry, message in failed:
+                if len(errors) < 20:
+                    errors.append(f"{entry['Key']}: {message}")
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = []
@@ -3397,6 +3707,8 @@ def _run_delete_all(params: dict[str, Any]) -> dict[str, Any]:
             batch.append(entry)
             if len(batch) >= batch_size:
                 futures.append(pool.submit(delete_batch, list(batch)))
+                if len(futures) >= max_workers * 2:
+                    futures.pop(0).result()
                 batch.clear()
                 if deletion_delay_ms > 0:
                     time.sleep(deletion_delay_ms / 1000.0)
@@ -3412,6 +3724,7 @@ def _run_delete_all(params: dict[str, Any]) -> dict[str, Any]:
         f"Listing mode: {'versions' if used_versions else 'objects'}",
         f"Batch size: {batch_size}",
         f"Workers: {max_workers}",
+        f"Empty PUT recovery eligible: {eligible_recovery}",
         f"Deleted: {deleted_count}",
         f"Failures: {failure_count}",
         f"Duration: {duration_seconds:.2f}s",
@@ -3457,6 +3770,8 @@ def _runtime_dir() -> Path:
 
 
 def _benchmark_state_path(run_id: str) -> Path:
+    if not re.fullmatch(r"bench-[a-zA-Z0-9_-]+", run_id):
+        raise SidecarError("invalid_config", "Invalid benchmark identifier.")
     return _runtime_dir() / f"benchmark-{run_id}.json"
 
 
@@ -3464,11 +3779,44 @@ def _read_benchmark_state(run_id: str) -> dict[str, Any]:
     path = _benchmark_state_path(run_id)
     if not path.exists():
         raise SidecarError("invalid_config", f"Benchmark run {run_id} was not found.")
-    return json.loads(path.read_text())
+    state = json.loads(path.read_text())
+    if 'historyTotals' in state:
+        _restore_benchmark_history(state)
+    public = _public_benchmark(state)
+    if public != state:
+        _write_benchmark_state(public)
+    return public
 
 
 def _write_benchmark_state(state: dict[str, Any]) -> None:
-    _benchmark_state_path(str(state["id"])).write_text(json.dumps(state))
+    path = _benchmark_state_path(str(state["id"]))
+    temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as output:
+            os.chmod(temporary, 0o600)
+            json.dump(_public_benchmark(state), output)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _scrub_legacy_benchmark_artifacts():
+    for path in _runtime_dir().glob('benchmark-bench-*.json'):
+        try:
+            if path.is_symlink() or not path.is_file(): continue
+            if hasattr(os, 'getuid') and path.stat().st_uid != os.getuid(): continue
+            state = json.loads(path.read_text())
+            if path.name != f"benchmark-{state.get('id')}.json": continue
+            public = _public_benchmark(state)
+            if state == public: continue
+            if public.get('status') in {'running', 'paused'}:
+                public['status'] = 'paused'
+                public['requiresReauthorization'] = True
+            _write_benchmark_state(public)
+        except (OSError, ValueError, TypeError, SidecarError):
+            # Do not inspect foreign or malformed artifacts further, and never
+            # print their contents into diagnostics.
+            continue
 
 
 def _now_iso() -> str:
@@ -3497,6 +3845,8 @@ def _benchmark_operations_from_history(history: list[dict[str, Any]]) -> dict[st
 
 def _benchmark_profile(profile_payload: dict[str, Any], config: dict[str, Any]) -> Profile:
     merged = dict(profile_payload)
+    merged['enableApiLogging'] = bool(config.get('debugMode')) and not bool(config.get('reducedLogging'))
+    merged['enableDebugLogging'] = bool(config.get('debugMode')) and not bool(config.get('reducedLogging'))
     merged["connectTimeoutSeconds"] = int(
         config.get("connectTimeoutSeconds", merged.get("connectTimeoutSeconds", 5)) or 5
     )
@@ -3510,7 +3860,9 @@ def _benchmark_profile(profile_payload: dict[str, Any], config: dict[str, Any]) 
     return _parse_profile(merged)
 
 
-def _append_benchmark_log(state: dict[str, Any], line: str) -> None:
+def _append_benchmark_log(state: dict[str, Any], line: str, routine: bool = False) -> None:
+    if routine and (state.get('config') or {}).get('reducedLogging'):
+        return
     log = [str(item) for item in state.get("liveLog", [])]
     log.append(line)
     state["liveLog"] = log[-60:]
@@ -3583,9 +3935,23 @@ def _benchmark_latency_percentiles(values: list[float]) -> dict[str, float]:
 
 
 def _benchmark_operation_for_index(state: dict[str, Any]) -> str:
-    slot = int(state.get("processedCount", 0) or 0) % 100
+    config = state.get("config") or {}
+    mode = str(config.get("workloadType", "mixed"))
+    if mode == "write-only":
+        return "PUT"
+    if mode == "read-only":
+        return "GET"
+    if mode == "custom":
+        ratios = [(operation, max(0, int(config.get(field) or 0))) for operation, field in
+                  (("PUT", "writePercent"), ("GET", "readPercent"), ("DELETE", "deletePercent"))]
+    else:
+        ratios = _benchmark_ratios(mode)
+    total = sum(weight for _, weight in ratios)
+    if total <= 0:
+        return "PUT"
+    slot = int(state.get("processedCount", 0) or 0) % total
     cumulative = 0
-    for operation, ratio in _benchmark_ratios(str(state.get("config", {}).get("workloadType", "mixed"))):
+    for operation, ratio in ratios:
         cumulative += ratio
         if slot < cumulative:
             return operation
@@ -3611,7 +3977,7 @@ def _benchmark_delete_mode(config: dict[str, Any]) -> str:
 def _benchmark_delete_batch_size(config: dict[str, Any], active_count: int) -> int:
     if _benchmark_delete_mode(config) != "multi-object-post":
         return 1
-    return max(1, min(active_count, max(int(config.get("concurrentThreads", 1) or 1), 2), 1000))
+    return max(1, min(active_count, max(int(config.get("concurrentThreads", 1) or 1), 2), int(config.get("operationBudget") or 1000), 1000))
 
 
 def _benchmark_upsert_active_object(
@@ -3635,7 +4001,10 @@ def _is_missing_benchmark_key(error: Exception) -> bool:
 def _rebuild_benchmark_summary(state: dict[str, Any]) -> dict[str, Any]:
     config = dict(state.get("config") or {})
     history = [dict(item) for item in state.get("history", [])]
-    operations_by_type = _benchmark_operations_from_history(history)
+    elapsed_seconds = max(float(state.get('activeElapsedSeconds') or 0),
+                          max((float(item.get('elapsedMs') or 0) / 1000 for item in history), default=0))
+    totals = state.get('historyTotals')
+    operations_by_type = dict(totals['operationsByType']) if totals else _benchmark_operations_from_history(history)
     latency_values = [float(item.get("latencyMs", 0) or 0) for item in history]
     checksum_stats = {"validated_success": 0, "validated_failure": 0, "not_used": 0}
     for record in history:
@@ -3643,6 +4012,8 @@ def _rebuild_benchmark_summary(state: dict[str, Any]) -> dict[str, Any]:
         if checksum_state not in checksum_stats:
             checksum_stats[checksum_state] = 0
         checksum_stats[checksum_state] += _benchmark_operation_count(record)
+    if totals:
+        checksum_stats = dict(totals['checksumStats'])
 
     windows: dict[int, list[dict[str, Any]]] = {}
     for record in history:
@@ -3681,25 +4052,21 @@ def _rebuild_benchmark_summary(state: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    second_positions: dict[int, int] = {}
     latency_timeline: list[dict[str, Any]] = []
     for sequence, record in enumerate(history, start=1):
         second = max(int(record.get("second", 1) or 1), 1)
-        position = second_positions.get(second, 0) + 1
-        second_positions[second] = position
-        elapsed_ms = float(record.get("elapsedMs", 0) or 0)
-        if elapsed_ms <= 0:
-            elapsed_seconds = (second - 1) + (position / (len(windows.get(second, [])) + 1))
-            elapsed_ms = elapsed_seconds * 1000
-        else:
-            elapsed_seconds = elapsed_ms / 1000
+        measured = record.get('elapsedMs') is not None
+        # Older saved runs have only a one-second bucket. Keep that explicitly
+        # coarse instead of fabricating evenly spaced completion timestamps.
+        elapsed_ms = float(record['elapsedMs']) if measured else (second - 1) * 1000.0
         latency_timeline.append(
             {
-                "sequence": sequence,
+                "sequence": int(record.get('sequence') or sequence),
                 "operation": str(record.get("operation", "")).upper(),
                 "second": second,
-                "elapsedMs": round(elapsed_ms, 1),
-                "label": _benchmark_timeline_label(elapsed_seconds),
+                "elapsedMs": elapsed_ms,
+                "label": _benchmark_timeline_label(elapsed_ms / 1000),
+                "timingPrecision": "measured" if measured else "second",
                 "latencyMs": round(float(record.get("latencyMs", 0) or 0), 1),
                 "sizeBytes": int(record.get("sizeBytes", 0) or 0),
                 "bytesTransferred": int(record.get("bytesTransferred", 0) or 0),
@@ -3739,7 +4106,7 @@ def _rebuild_benchmark_summary(state: dict[str, Any]) -> dict[str, Any]:
 
     latency_percentiles_by_operation: dict[str, dict[str, float]] = {}
     operation_details: list[dict[str, Any]] = []
-    total_operations = sum(_benchmark_operation_count(item) for item in history)
+    total_operations = int(totals['operationCount']) if totals else sum(_benchmark_operation_count(item) for item in history)
     sample_count = len(throughput_series)
     for operation, count in operations_by_type.items():
         op_latencies = [
@@ -3758,7 +4125,7 @@ def _rebuild_benchmark_summary(state: dict[str, Any]) -> dict[str, Any]:
                 "operation": operation,
                 "count": count,
                 "sharePct": round((count / max(total_operations, 1)) * 100, 1),
-                "avgOpsPerSecond": round(sum(per_window) / max(len(per_window), 1), 1),
+                "avgOpsPerSecond": round(count / elapsed_seconds, 1) if elapsed_seconds > 0 else 0.0,
                 "peakOpsPerSecond": max(per_window) if per_window else 0,
                 "p50LatencyMs": latency_percentiles["p50"],
                 "p95LatencyMs": latency_percentiles["p95"],
@@ -3766,25 +4133,17 @@ def _rebuild_benchmark_summary(state: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    average_bytes = (
-        sum(float(item.get("bytesPerSecond", 0) or 0) for item in throughput_series)
-        / max(len(throughput_series), 1)
-        if throughput_series
-        else 0.0
-    )
+    total_bytes = int(totals['bytesTransferred']) if totals else sum(int(item.get('bytesTransferred') or 0) for item in history)
+    average_bytes = (total_bytes
+                     / elapsed_seconds) if elapsed_seconds > 0 else 0.0
     peak_bytes = max(
         [int(item.get("bytesPerSecond", 0) or 0) for item in throughput_series] or [0]
     )
-    average_ops = (
-        sum(float(item.get("opsPerSecond", 0) or 0) for item in throughput_series)
-        / max(len(throughput_series), 1)
-        if throughput_series
-        else 0.0
-    )
+    average_ops = total_operations / elapsed_seconds if elapsed_seconds > 0 else 0.0
     peak_ops = max([int(item.get("opsPerSecond", 0) or 0) for item in throughput_series] or [0])
     size_list = _benchmark_size_list(config)
     average_object_size = int(sum(size_list) / max(len(size_list), 1))
-    failures = len([item for item in history if not bool(item.get("success", True))])
+    failures = int(totals['errorCount']) if totals else len([item for item in history if not bool(item.get("success", True))])
 
     return {
         "totalOperations": total_operations,
@@ -3798,6 +4157,13 @@ def _rebuild_benchmark_summary(state: dict[str, Any]) -> dict[str, Any]:
         "detailMetrics": {
             "sampleCount": sample_count,
             "sampleWindowSeconds": 1,
+            "activeElapsedSeconds": elapsed_seconds,
+            "historyLimit": _BENCHMARK_HISTORY_LIMIT,
+            "historyRecordCount": int(totals['records']) if totals else len(history),
+            "retainedHistoryRecords": len(history),
+            "latencyPercentileScope": 'recent-records' if totals and totals['records'] > len(history) else 'all-records',
+            "peakThroughputScope": 'recent-records' if totals and totals['records'] > len(history) else 'all-records',
+            "totalBytesTransferred": total_bytes,
             "averageOpsPerSecond": round(average_ops, 1),
             "peakOpsPerSecond": peak_ops,
             "averageBytesPerSecond": round(average_bytes, 1),
@@ -3805,7 +4171,10 @@ def _rebuild_benchmark_summary(state: dict[str, Any]) -> dict[str, Any]:
             "averageObjectSizeBytes": average_object_size,
             "checksumValidated": checksum_stats.get("validated_success", 0),
             "errorCount": failures,
-            "retryCount": 0,
+            "retryCount": int(totals['retryCount']) if totals else sum(int(item.get('retryCount') or 0) for item in history),
+            "dataMode": 'memory' if config.get('inMemoryData', True) else 'file',
+            "dataCacheMb": max(0, int(config.get('dataCacheMb') or 0)),
+            "checksumAlgorithm": config.get('checksumAlgorithm') or 'sha256',
             "runMode": config.get("testMode", "duration"),
             "workloadType": config.get("workloadType", "mixed"),
             "bucket": config.get("bucketName", ""),
@@ -3813,6 +4182,112 @@ def _rebuild_benchmark_summary(state: dict[str, Any]) -> dict[str, Any]:
         },
         "operationDetails": operation_details,
     }
+
+
+_BENCHMARK_HISTORY_LIMIT = 10000
+_BENCHMARK_CSV_FIELDS = ('sequence', 'timestamp', 'elapsedMs', 'second', 'operation',
+                         'operationCount', 'latencyMs', 'sizeBytes', 'bytesTransferred',
+                         'success', 'checksumState', 'retryCount', 'errorCode', 'key')
+
+
+def _benchmark_empty_totals():
+    return {'records': 0, 'operationCount': 0, 'operationsByType': {},
+            'bytesTransferred': 0, 'totalLatencyMs': 0.0, 'errorCount': 0, 'retryCount': 0,
+            'checksumStats': {'validated_success': 0, 'validated_failure': 0, 'not_used': 0}}
+
+
+def _benchmark_accumulate(totals, row):
+    count = _benchmark_operation_count(row)
+    totals['records'] += 1
+    totals['operationCount'] += count
+    operation = str(row.get('operation') or '').upper()
+    totals['operationsByType'][operation] = totals['operationsByType'].get(operation, 0) + count
+    totals['bytesTransferred'] += int(row.get('bytesTransferred') or 0)
+    totals['totalLatencyMs'] += float(row.get('latencyMs') or 0)
+    totals['errorCount'] += int(not bool(row.get('success', True)))
+    totals['retryCount'] += int(row.get('retryCount') or 0)
+    checksum = str(row.get('checksumState') or 'not_used')
+    totals['checksumStats'][checksum] = totals['checksumStats'].get(checksum, 0) + count
+
+
+def _benchmark_write_csv_rows(output, rows, header=False):
+    writer = csv.DictWriter(output, fieldnames=_BENCHMARK_CSV_FIELDS, extrasaction='ignore')
+    if header:
+        writer.writeheader()
+    for row in rows:
+        writer.writerow({**row, 'success': 'true' if row.get('success', True) else 'false'})
+
+
+def _prepare_benchmark_history(state):
+    path = Path(state['config']['csvOutputPath'])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if 'historyTotals' in state:
+        if not path.exists():
+            raise SidecarError('invalid_config', 'The benchmark CSV history is missing; start a new run.')
+        return
+    totals = _benchmark_empty_totals()
+    rows = state.get('history') or []
+    for row in rows:
+        _benchmark_accumulate(totals, row)
+        row['sequence'] = totals['records']
+    with path.open('w', encoding='utf-8', newline='') as output:
+        os.chmod(path, 0o600)
+        _benchmark_write_csv_rows(output, rows, header=True)
+    state['historyTotals'] = totals
+    state['history'] = rows[-_BENCHMARK_HISTORY_LIMIT:]
+    state['processedCount'] = totals['operationCount']
+
+
+def _append_benchmark_history(state, rows):
+    if not rows:
+        return
+    totals = state['historyTotals']
+    for row in rows:
+        _benchmark_accumulate(totals, row)
+        row['sequence'] = totals['records']
+    # Append every measured row before a bounded state checkpoint can drop it.
+    # CSV quoting preserves keys containing commas, quotes or line breaks.
+    with Path(state['config']['csvOutputPath']).open('a', encoding='utf-8', newline='') as output:
+        _benchmark_write_csv_rows(output, rows)
+    state['history'].extend(rows)
+    if len(state['history']) > _BENCHMARK_HISTORY_LIMIT:
+        del state['history'][:-_BENCHMARK_HISTORY_LIMIT]
+    state['processedCount'] = totals['operationCount']
+
+
+def _restore_benchmark_history(state):
+    path = Path(state['config']['csvOutputPath'])
+    if not path.exists():
+        raise SidecarError('invalid_config', 'The benchmark CSV history is missing; start a new run.')
+    totals, recent = _benchmark_empty_totals(), deque(maxlen=_BENCHMARK_HISTORY_LIMIT)
+    elapsed_ms = 0.0
+    try:
+        with path.open(encoding='utf-8', newline='') as source:
+            reader = csv.DictReader(source)
+            if tuple(reader.fieldnames or ()) != _BENCHMARK_CSV_FIELDS:
+                raise ValueError('Unexpected benchmark CSV schema')
+            for raw in reader:
+                row = {key: raw[key] for key in ('timestamp', 'operation', 'checksumState', 'errorCode', 'key')}
+                for key in ('sequence', 'second', 'operationCount', 'sizeBytes', 'bytesTransferred', 'retryCount'):
+                    row[key] = int(raw[key] or 0)
+                row['latencyMs'] = float(raw['latencyMs'] or 0)
+                if raw['elapsedMs']:
+                    row['elapsedMs'] = float(raw['elapsedMs'])
+                if raw['success'] not in {'true', 'false'} or row['sequence'] != totals['records'] + 1:
+                    raise ValueError('Incomplete benchmark CSV row')
+                row['success'] = raw['success'] == 'true'
+                _benchmark_accumulate(totals, row)
+                recent.append(row)
+                elapsed_ms = max(elapsed_ms, row.get('elapsedMs', 0))
+    except (ValueError, TypeError, KeyError, csv.Error) as error:
+        raise SidecarError('invalid_config', 'Benchmark CSV history is incomplete; inspect the export before starting a new run.') from error
+    if totals['records'] < int(state['historyTotals'].get('records') or 0):
+        raise SidecarError('invalid_config', 'Benchmark CSV history is shorter than its checkpoint; start a new run.')
+    state['historyTotals'] = totals
+    state['history'] = list(recent)
+    state['processedCount'] = totals['operationCount']
+    state['activeElapsedSeconds'] = max(float(state.get('activeElapsedSeconds') or 0), elapsed_ms / 1000)
+    _refresh_benchmark_snapshot(state)
 
 
 def _persist_benchmark_outputs(state: dict[str, Any]) -> None:
@@ -3823,30 +4298,157 @@ def _persist_benchmark_outputs(state: dict[str, Any]) -> None:
     for path in (csv_path, json_path, log_path):
         path.parent.mkdir(parents=True, exist_ok=True)
 
-    history = [dict(item) for item in state.get("history", [])]
-    csv_lines = ["second,operation,operationCount,latencyMs,sizeBytes,bytesTransferred,success,checksumState,key"]
-    for item in history:
-        csv_lines.append(
-            ",".join(
-                [
-                    str(int(item.get("second", 0) or 0)),
-                    str(item.get("operation", "")),
-                    str(_benchmark_operation_count(item)),
-                    str(round(float(item.get("latencyMs", 0) or 0), 1)),
-                    str(int(item.get("sizeBytes", 0) or 0)),
-                    str(int(item.get("bytesTransferred", 0) or 0)),
-                    "true" if bool(item.get("success", True)) else "false",
-                    str(item.get("checksumState", "not_used")),
-                    str(item.get("key", "")),
-                ]
-            )
-        )
-    csv_path.write_text("\n".join(csv_lines) + "\n")
+    if 'historyTotals' not in state:
+        with csv_path.open('w', encoding='utf-8', newline='') as output:
+            _benchmark_write_csv_rows(output, state.get('history') or [], header=True)
     json_path.write_text(json.dumps(state.get("resultSummary"), indent=2))
     log_path.write_text("\n".join(str(item) for item in state.get("liveLog", [])))
 
 
-def _run_benchmark_operation(state: dict[str, Any], client: Any) -> None:
+class _BenchmarkPayloadStore:
+    """Bounded deterministic payload cache; large/file-mode bodies are streamed."""
+    def __init__(self, config):
+        self.limit = min(1024, max(0, int(config.get('dataCacheMb') or 0))) * 1024**2
+        self.memory = bool(config.get('inMemoryData', True))
+        self.cache = OrderedDict()
+        self.bytes = 0
+        self.lock = threading.RLock()
+
+    @contextmanager
+    def body(self, run_id, key, size, random_data):
+        identity = (run_id if random_data else '', key if random_data else '', size)
+        if self.memory and size <= min(self.limit, 128 * 1024**2):
+            with self.lock:
+                data = self.cache.get(identity)
+                if data is None:
+                    data = _benchmark_payload_bytes(run_id, key, size, random_data)
+                    while self.bytes + size > self.limit and self.cache:
+                        _, old = self.cache.popitem(last=False)
+                        self.bytes -= len(old)
+                    self.cache[identity] = data
+                    self.bytes += size
+                else:
+                    self.cache.move_to_end(identity)
+            yield data
+            return
+        if self.memory and size <= 8 * 1024**2:
+            yield _benchmark_payload_bytes(run_id, key, size, random_data)
+            return
+        # Generate repeated payload blocks without allocating object-size RAM.
+        with tempfile.TemporaryFile('w+b') as temporary:
+            for block in _benchmark_payload_chunks(run_id, key, size, random_data):
+                temporary.write(block)
+            temporary.seek(0)
+            yield _FilePart(temporary, 0, size)
+
+
+def _benchmark_payload_chunks(run_id, key, size, random_data, chunk=1024**2):
+    if not random_data:
+        pattern = b'A'
+    else:
+        seed = f'{run_id}:{key}:{size}'.encode() or b's3-benchmark'
+        length = min(max(len(seed) * 8, 64), 4096)
+        pattern = bytes((seed[index % len(seed)] + index * 17) % 256 for index in range(length))
+    for offset in range(0, size, chunk):
+        length = min(chunk, size - offset)
+        start = offset % len(pattern)
+        yield (pattern * ((start + length + len(pattern) - 1) // len(pattern)))[start:start + length]
+
+
+class _BenchmarkCrc:
+    def __init__(self, castagnoli=False):
+        self.castagnoli = castagnoli
+        self.value = 0
+        if castagnoli:
+            table = []
+            for index in range(256):
+                crc = index
+                for _ in range(8): crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+                table.append(crc)
+            self.table = table
+
+    def update(self, data):
+        if not self.castagnoli:
+            import zlib
+            self.value = zlib.crc32(data, self.value)
+        else:
+            crc = self.value ^ 0xFFFFFFFF
+            for byte in data: crc = self.table[(crc ^ byte) & 255] ^ (crc >> 8)
+            self.value = crc ^ 0xFFFFFFFF
+
+    def digest(self): return self.value.to_bytes(4, 'big')
+
+
+def _benchmark_digest(algorithm):
+    algorithm = str(algorithm or 'sha256').lower().replace('-', '')
+    if algorithm == 'crc32': return _BenchmarkCrc()
+    if algorithm == 'crc32c':
+        try:
+            import google_crc32c
+            return google_crc32c.Checksum()
+        except ImportError:
+            return _BenchmarkCrc(castagnoli=True)
+    if algorithm not in {'sha256', 'sha1', 'md5'}:
+        raise SidecarError('invalid_config', 'Benchmark checksum algorithm must be crc32c, crc32, sha256, sha1 or md5.')
+    return hashlib.new(algorithm)
+
+
+class _BenchmarkMeteredClient:
+    def __init__(self, client, state):
+        self.client, self.state = client, state
+
+    def __getattr__(self, name):
+        target = getattr(self.client, name)
+        def call(**kwargs):
+            self.state['_operationContext'] = {'operation': {'put_object': 'PUT', 'get_object': 'GET', 'delete_object': 'DELETE', 'delete_objects': 'DELETE'}.get(name, name),
+                                                'key': kwargs.get('Key', ''), 'sizeBytes': len(kwargs.get('Body', b''))}
+            try:
+                result = target(**kwargs)
+            except Exception as error:
+                response = getattr(error, 'response', {})
+                self.state['_retryCount'] += int((response.get('ResponseMetadata') or {}).get('RetryAttempts') or 0)
+                raise
+            if isinstance(result, dict):
+                self.state['_retryCount'] += int((result.get('ResponseMetadata') or {}).get('RetryAttempts') or 0)
+            return result
+        return call
+
+
+def _run_benchmark_operation(state, client):
+    state['_retryCount'] = 0
+    started = time.perf_counter()
+    previous = len(state.get('history') or [])
+    try:
+        _run_benchmark_operation_impl(state, _BenchmarkMeteredClient(client, state))
+    except Exception as error:
+        if len(state.get('history') or []) == previous:
+            state.setdefault('history', []).append({
+                **state.get('_operationContext', {'operation': 'UNKNOWN', 'key': '', 'sizeBytes': 0}),
+                'timestamp': _now_iso(), 'second': int(state.get('activeElapsedSeconds') or 0) + 1,
+                'latencyMs': (time.perf_counter() - started) * 1000, 'bytesTransferred': 0,
+                'success': False, 'checksumState': 'not_used', 'operationCount': 1,
+                'retryCount': state['_retryCount'], 'errorCode': _map_exception(error).code})
+        raise
+    finally:
+        # Checksum validation records the completed GET before raising. Meter
+        # that existing failure record too, without adding a second operation.
+        if len(state.get('history') or []) > previous:
+            record = state['history'][-1]
+            record['retryCount'] = state['_retryCount']
+            owner = _BENCHMARKS.get(state.get('id'))
+            if owner:
+                with owner.lock:
+                    completed_elapsed = owner.elapsed()
+            else:
+                completed_elapsed = max(0, float(state.get('activeElapsedSeconds') or 0)) + max(0, time.perf_counter() - started)
+            record['elapsedMs'] = completed_elapsed * 1000
+            record['second'] = int(completed_elapsed) + 1
+            record['timestamp'] = _now_iso()
+        state.pop('_operationContext', None)
+        state.pop('_retryCount', None)
+
+
+def _run_benchmark_operation_impl(state: dict[str, Any], client: Any) -> None:
     config = dict(state.get("config") or {})
     active_objects = [dict(item) for item in state.get("activeObjects", [])]
     history = [dict(item) for item in state.get("history", [])]
@@ -3875,11 +4477,13 @@ def _run_benchmark_operation(state: dict[str, Any], client: Any) -> None:
         else:
             key = f"{state['benchmarkPrefix']}obj-{next_object_index:06d}-{size_bytes}.bin"
             state["nextObjectIndex"] = next_object_index + 1
-        payload = _benchmark_payload_bytes(str(state["id"]), key, size_bytes, bool(config.get("randomData", True)))
-        started_at = time.perf_counter()
-        client.put_object(Bucket=str(config.get("bucketName", "")), Key=key, Body=payload)
-        latency_ms = (time.perf_counter() - started_at) * 1000
-        bytes_transferred = len(payload)
+        owner = _BENCHMARKS.get(state['id'])
+        store = owner.payload_store if owner else _BenchmarkPayloadStore(config)
+        with store.body(str(state['id']), key, size_bytes, bool(config.get('randomData', True))) as payload:
+            started_at = time.perf_counter()
+            client.put_object(Bucket=str(config.get("bucketName", "")), Key=key, Body=payload)
+            latency_ms = (time.perf_counter() - started_at) * 1000
+            bytes_transferred = len(payload)
         _benchmark_upsert_active_object(active_objects, key, size_bytes)
     elif operation == "GET":
         selected = active_objects[active_index % len(active_objects)]
@@ -3899,21 +4503,22 @@ def _run_benchmark_operation(state: dict[str, Any], client: Any) -> None:
                     state,
                     f"Skipped missing benchmark object {key}; rotating to the next object.",
                 )
-                _run_benchmark_operation(state, client)
+                _run_benchmark_operation_impl(state, client)
                 return
             raise
-        body = response["Body"].read()
+        digest = _benchmark_digest(config.get('checksumAlgorithm')) if checksum_enabled else None
+        try:
+            for block in iter(lambda: response['Body'].read(1024**2), b''):
+                bytes_transferred += len(block)
+                if digest is not None: digest.update(block)
+        finally:
+            response['Body'].close()
         latency_ms = (time.perf_counter() - started_at) * 1000
-        bytes_transferred = len(body)
         if checksum_enabled:
-            expected = _benchmark_payload_bytes(
-                str(state["id"]),
-                key,
-                size_bytes,
-                bool(config.get("randomData", True)),
-            )
-            checksum_state = "validated_success" if body == expected else "validated_failure"
-        response["Body"].close()
+            expected = _benchmark_digest(config.get('checksumAlgorithm'))
+            for block in _benchmark_payload_chunks(str(state['id']), key, size_bytes, bool(config.get('randomData', True))):
+                expected.update(block)
+            checksum_state = 'validated_success' if bytes_transferred == size_bytes and digest.digest() == expected.digest() else 'validated_failure'
     else:
         delete_batch_size = _benchmark_delete_batch_size(config, len(active_objects))
         selected_batch = [
@@ -3961,7 +4566,7 @@ def _run_benchmark_operation(state: dict[str, Any], client: Any) -> None:
             operation_count = len(deleted_keys)
             if operation_count == 0:
                 state["activeObjects"] = active_objects
-                _run_benchmark_operation(state, client)
+                _run_benchmark_operation_impl(state, client)
                 return
             first_key = next(iter(deleted_keys))
             key = (
@@ -3986,7 +4591,7 @@ def _run_benchmark_operation(state: dict[str, Any], client: Any) -> None:
                         state,
                         f"Skipped missing benchmark object {key}; rotating to the next object.",
                     )
-                    _run_benchmark_operation(state, client)
+                    _run_benchmark_operation_impl(state, client)
                     return
                 raise
             latency_ms = (time.perf_counter() - started_at) * 1000
@@ -4004,7 +4609,7 @@ def _run_benchmark_operation(state: dict[str, Any], client: Any) -> None:
             "sizeBytes": size_bytes,
             "latencyMs": round(latency_ms, 1),
             "bytesTransferred": bytes_transferred,
-            "success": True,
+            "success": checksum_state != 'validated_failure',
             "checksumState": checksum_state,
             "operationCount": operation_count,
         }
@@ -4016,27 +4621,19 @@ def _run_benchmark_operation(state: dict[str, Any], client: Any) -> None:
         _append_benchmark_log(
             state,
             f"DELETE POST removed {operation_count} object(s) in {round(latency_ms, 1)} ms.",
+            routine=True,
         )
     else:
         _append_benchmark_log(
             state,
             f"{operation} {key} completed in {round(latency_ms, 1)} ms.",
+            routine=True,
         )
+    if checksum_state == 'validated_failure':
+        raise SidecarError('checksum_mismatch', 'Benchmark download checksum validation failed.')
 
 
 def _refresh_benchmark_snapshot(state: dict[str, Any]) -> None:
-    status = str(state.get("status", "") or "")
-    if status not in {"completed", "stopped", "failed"}:
-        now = datetime.now(tz=timezone.utc)
-        last_updated = datetime.fromisoformat(
-            str(state.get("lastUpdatedAt") or state["startedAt"]),
-        )
-        delta_seconds = max((now - last_updated).total_seconds(), 0.0)
-        state["activeElapsedSeconds"] = (
-            float(state.get("activeElapsedSeconds", 0.0) or 0.0) + delta_seconds
-        )
-        state["lastUpdatedAt"] = _serialize_dt(now)
-
     summary = _rebuild_benchmark_summary(state)
     state["resultSummary"] = summary
     history = [dict(item) for item in state.get("history", [])]
@@ -4046,180 +4643,999 @@ def _refresh_benchmark_snapshot(state: dict[str, Any]) -> None:
         if latency_values
         else 0.0
     )
-    throughput_series = list(summary.get("throughputSeries", []))
-    state["throughputOpsPerSecond"] = (
-        float(throughput_series[-1].get("opsPerSecond", 0) or 0)
-        if throughput_series
-        else 0.0
-    )
+    if state.get('historyTotals', {}).get('records'):
+        totals = state['historyTotals']
+        state['averageLatencyMs'] = round(totals['totalLatencyMs'] / totals['records'], 1)
+    state["throughputOpsPerSecond"] = summary['detailMetrics']['averageOpsPerSecond']
 
 
-def _materialize_benchmark_state(state: dict[str, Any]) -> dict[str, Any]:
-    if state["status"] in {"paused", "completed", "stopped", "failed"}:
-        return state
+_BENCHMARKS = {}
+_BENCHMARKS_LOCK = threading.RLock()
+_PROFILE_PUBLIC_FIELDS = {'id', 'name', 'endpointType', 'region', 'pathStyle', 'verifyTls', 'authMode', 'awsProfileName', 'knownBucket', 'requesterPays', 'expectedBucketOwner'}
 
-    config = dict(state.get("config") or {})
-    now = datetime.now(tz=timezone.utc)
-    last_updated = datetime.fromisoformat(str(state.get("lastUpdatedAt") or state["startedAt"]))
-    delta_seconds = max((now - last_updated).total_seconds(), 0.0)
-    active_elapsed = float(state.get("activeElapsedSeconds", 0.0) or 0.0) + delta_seconds
-    state["activeElapsedSeconds"] = active_elapsed
-    state["lastUpdatedAt"] = _serialize_dt(now)
-    if bool(config.get("debugMode", False)):
-        _emit_structured_log(
-            "DEBUG",
-            "BenchmarkTrace",
-            f"Benchmark tick status={state.get('status', 'unknown')} elapsed={active_elapsed:.2f}s processed={int(state.get('processedCount', 0) or 0)}",
-            "debug",
-        )
 
-    concurrent_threads = max(int(config.get("concurrentThreads", 1) or 1), 1)
-    processed_count = int(state.get("processedCount", 0) or 0)
-    test_mode = str(config.get("testMode", "duration"))
-    duration_seconds = max(int(config.get("durationSeconds", 60) or 60), 1)
-    operation_count = max(int(config.get("operationCount", 1000) or 1000), 1)
-    duration_complete = test_mode != "operation-count" and active_elapsed >= duration_seconds
-    operation_complete = test_mode == "operation-count" and processed_count >= operation_count
-    effective_elapsed = min(active_elapsed, float(duration_seconds))
-    if duration_complete:
-        state["activeElapsedSeconds"] = effective_elapsed
-    rate_target = int(effective_elapsed * concurrent_threads * 8)
-    if processed_count == 0 and not duration_complete and not operation_complete:
-        rate_target = max(rate_target, 1)
+def _public_benchmark(state):
+    public = dict(state)
+    public['profile'] = {k: v for k, v in (state.get('profile') or {}).items() if k in _PROFILE_PUBLIC_FIELDS}
+    return json.loads(json.dumps(public, default=_serialize_dt))
 
-    if test_mode == "operation-count":
-        remaining = max(operation_count - processed_count, 0)
-        target_processed = min(operation_count, rate_target)
-    else:
-        remaining = 1 << 30
-        target_processed = rate_target
 
-    deficit = max(target_processed - processed_count, 0)
-    batch_size = min(max(deficit, 0), max(concurrent_threads * 8, 32))
-    if (duration_complete or operation_complete):
-        batch_size = 0
-    if processed_count == 0 and batch_size == 0 and not duration_complete and not operation_complete:
-        batch_size = 1
-    if test_mode == "operation-count":
-        batch_size = min(batch_size, remaining)
+class _BenchmarkRun:
+    def __init__(self, state, profile):
+        self.state = state
+        self.profile = profile
+        self.lock = threading.RLock()
+        self.condition = threading.Condition(self.lock)
+        self.wake = threading.Event()
+        self.wake.set()
+        self.reserved = 0
+        self.last_persisted = 0.0
+        self.threads = []
+        self.payload_store = _BenchmarkPayloadStore(state['config'])
+        # Monotonic anchors are process-local and never enter saved state.
+        self.elapsed_base = max(0, float(state.get('activeElapsedSeconds') or 0))
+        self.elapsed_anchor = time.monotonic() if state['status'] == 'running' else None
 
-    if batch_size > 0:
-        profile = _benchmark_profile(dict(state.get("profile") or {}), config)
-        client = (
-            _AzureBenchmarkClient(profile)
-            if profile.endpoint_type == "azureBlob"
-            else _build_client(profile)
-        )
+    def elapsed(self):
+        return self.elapsed_base + (max(0, time.monotonic() - self.elapsed_anchor)
+                                    if self.elapsed_anchor is not None else 0)
+
+    def update_clock(self):
+        now = time.monotonic()
+        if self.elapsed_anchor is not None:
+            self.elapsed_base += max(0, now - self.elapsed_anchor)
+        # Pausing stops dispatch immediately; in-flight work still counts as
+        # active time until it drains. Idle paused time is excluded on resume.
+        self.elapsed_anchor = now if self.state['status'] == 'running' or self.reserved else None
+        self.state['activeElapsedSeconds'] = self.elapsed_base
+        self.state['lastUpdatedAt'] = _now_iso()
+        return self.elapsed_base
+
+    def start(self):
+        profile = _benchmark_profile(self.profile, self.state['config'])
+        self.client = _AzureBenchmarkClient(profile) if profile.endpoint_type == 'azureBlob' else _build_client(profile)
+        self.profile = {}
+        workers = min(32, max(1, int(self.state['config'].get('concurrentThreads') or 1)))
+        for index in range(workers):
+            worker = threading.Thread(target=self.run, args=(index,), daemon=True)
+            self.threads.append(worker)
+            worker.start()
+
+    def snapshot(self, persist=False):
+        with self.lock:
+            self.update_clock()
+            _refresh_benchmark_snapshot(self.state)
+            public = _public_benchmark(self.state)
+            if persist:
+                _write_benchmark_state(public)
+                _persist_benchmark_outputs(public)
+            return public
+
+    def run(self, index):
+        lane = _public_benchmark(self.state)
+        lane['benchmarkPrefix'] += f'worker-{index}/'
         try:
-            for _ in range(batch_size):
-                if test_mode == "operation-count" and int(state.get("processedCount", 0) or 0) >= operation_count:
-                    break
-                _run_benchmark_operation(state, client)
-        except Exception as error:  # noqa: BLE001
-            mapped = _map_exception(error)
-            state["status"] = "failed"
-            state["completedAt"] = _now_iso()
-            _append_benchmark_log(state, f"Benchmark failed: {mapped.message}")
+            client = self.client
+            while True:
+                self.wake.wait(0.25)
+                with self.lock:
+                    state = self.state
+                    if state['status'] in {'completed', 'stopped', 'failed'}: return
+                    if state['status'] == 'paused': continue
+                    elapsed = self.update_clock()
+                    config = state['config']
+                    operation_mode = config.get('testMode') == 'operation-count'
+                    remaining = max(0, int(config.get('operationCount') or 1000) - state['processedCount'] - self.reserved) if operation_mode else 1000
+                    expired = not operation_mode and elapsed >= max(1, int(config.get('durationSeconds') or 60))
+                    if expired and self.reserved:
+                        self.condition.wait(0.1)
+                        continue
+                    if expired or (remaining == 0 and self.reserved == 0):
+                        state['status'] = 'completed'
+                        state['completedAt'] = _now_iso()
+                        state['activeElapsedSeconds'] = elapsed
+                        self.snapshot(persist=True)
+                        return
+                    if remaining == 0:
+                        self.condition.wait(0.1)
+                        continue
+                    reserve = min(remaining, _benchmark_delete_batch_size(config, len(lane.get('activeObjects', [])))) if _benchmark_operation_for_index(lane) == 'DELETE' else 1
+                    self.reserved += reserve
+                    lane['config']['operationBudget'] = reserve
+                    lane['activeElapsedSeconds'] = elapsed
+                    lane['history'] = []
+                try:
+                    _run_benchmark_operation(lane, client)
+                except BaseException:
+                    with self.lock:
+                        self.reserved -= reserve
+                        self.update_clock()
+                        _append_benchmark_history(state, lane['history'])
+                        self.condition.notify_all()
+                    raise
+                with self.lock:
+                    self.reserved -= reserve
+                    self.update_clock()
+                    self.condition.notify_all()
+                    _append_benchmark_history(state, lane['history'])
+                    lane['processedCount'] = state['processedCount']
+                    if lane.get('liveLog') and not config.get('reducedLogging'): _append_benchmark_log(state, lane['liveLog'][-1])
+                    if time.monotonic() - self.last_persisted >= 0.5:
+                        self.last_persisted = time.monotonic()
+                        self.snapshot(persist=True)
+        except Exception as error:
+            with self.lock:
+                if self.state['status'] != 'stopped': self.state['status'] = 'failed'
+                self.state['completedAt'] = _now_iso()
+                # Do not serialize exception text; authentication errors can embed tokens.
+                _append_benchmark_log(self.state, f'Benchmark failed ({_map_exception(error).code}).')
+                self.snapshot(persist=True)
+        finally:
+            with self.lock:
+                if self.state['status'] in {'completed', 'stopped', 'failed'}:
+                    self.profile = {}
 
-    _refresh_benchmark_snapshot(state)
 
-    if state["status"] == "running":
-        completed = False
-        if test_mode == "operation-count":
-            completed = int(state.get("processedCount", 0) or 0) >= operation_count
+def _materialize_benchmark_state(state):
+    # Status reads never execute workload requests.
+    with _BENCHMARKS_LOCK: run = _BENCHMARKS.get(str(state['id']))
+    if run: return run.snapshot()
+    if state.get('status') in {'running', 'paused'}:
+        state['status'] = 'paused'
+        state['requiresReauthorization'] = True
+        _append_benchmark_log(state, 'Owning engine stopped. Resume explicitly to authorize a new worker.')
+        _write_benchmark_state(state)
+    return _public_benchmark(state)
+
+
+def _start_benchmark(params):
+    profile = dict(params.get('profile') or {})
+    if not profile: raise SidecarError('invalid_config', 'Profile configuration is required for benchmark runs.')
+    _parse_profile(profile)
+    run_id = f'bench-{uuid.uuid4().hex[:8]}'
+    config = _benchmark_config_with_run_dir(dict(params.get('config') or {}), run_id)
+    if not config.get('bucketName'): raise SidecarError('invalid_config', 'A benchmark bucket is required.')
+    if any(size > 5 * 1024**3 for size in _benchmark_size_list(config)):
+        raise SidecarError('invalid_config', 'Single-request benchmark objects cannot exceed 5 GiB.')
+    if config.get('validateChecksum', True): _benchmark_digest(config.get('checksumAlgorithm'))
+    if not 0 <= int(config.get('dataCacheMb') or 0) <= 1024:
+        raise SidecarError('invalid_config', 'Benchmark data cache must be between 0 and 1024 MiB.')
+    state = {'id': run_id, 'profile': {k: v for k, v in profile.items() if k in _PROFILE_PUBLIC_FIELDS},
+             'config': config, 'status': 'running', 'processedCount': 0,
+             'startedAt': _now_iso(), 'completedAt': None, 'lastUpdatedAt': _now_iso(),
+             'activeElapsedSeconds': 0.0, 'averageLatencyMs': 0, 'throughputOpsPerSecond': 0,
+             'liveLog': ['Benchmark started.'], 'resultSummary': None, 'history': [],
+             'activeObjects': [], 'nextObjectIndex': 0, 'nextActiveIndex': 0, 'nextSizeIndex': 0,
+             'benchmarkPrefix': _benchmark_base_prefix(config, run_id)}
+    run = _BenchmarkRun(state, profile)
+    _prepare_benchmark_history(state)
+    with _BENCHMARKS_LOCK: _BENCHMARKS[run_id] = run
+    result = run.snapshot(persist=True)
+    run.start()
+    return result
+
+
+def _get_benchmark_status(params):
+    run_id = str(params.get('runId') or '')
+    with _BENCHMARKS_LOCK: run = _BENCHMARKS.get(run_id)
+    return run.snapshot() if run else _materialize_benchmark_state(_read_benchmark_state(run_id))
+
+
+def _benchmark_control(params, status):
+    run_id = str(params.get('runId') or '')
+    with _BENCHMARKS_LOCK: run = _BENCHMARKS.get(run_id)
+    if run is None:
+        state = _read_benchmark_state(run_id)
+        if status == 'running':
+            profile = dict(params.get('profile') or {})
+            _parse_profile(profile)
+            state['requiresReauthorization'] = False
+            state['status'] = 'running'
+            state['lastUpdatedAt'] = _now_iso()
+            # New namespace prevents accidental overlap with an interrupted worker.
+            state['benchmarkPrefix'] += f'resumed-{uuid.uuid4().hex[:8]}/'
+            run = _BenchmarkRun(state, profile)
+            _prepare_benchmark_history(state)
+            with _BENCHMARKS_LOCK: _BENCHMARKS[run_id] = run
+            run.start()
         else:
-            completed = float(state.get("activeElapsedSeconds", 0.0) or 0.0) >= duration_seconds
-        if completed:
-            state["status"] = "completed"
-            state["completedAt"] = _now_iso()
-            _append_benchmark_log(
-                state,
-                f"Benchmark completed after {int(state.get('processedCount', 0) or 0)} request(s).",
-            )
+            state['status'] = status
+            _write_benchmark_state(state)
+            return _public_benchmark(state)
+    with run.lock:
+        if run.state['status'] in {'completed', 'failed', 'stopped'}: return run.snapshot()
+        run.update_clock()
+        run.state['status'] = status
+        run.state['lastUpdatedAt'] = _now_iso()
+        if status == 'paused': run.wake.clear()
+        else: run.wake.set()
+        if status == 'stopped': run.state['completedAt'] = _now_iso()
+        return run.snapshot(persist=True)
 
+
+def _pause_benchmark(params): return _benchmark_control(params, 'paused')
+def _resume_benchmark(params): return _benchmark_control(params, 'running')
+def _stop_benchmark(params): return _benchmark_control(params, 'stopped')
+
+
+def _export_benchmark_results(params):
+    state = _get_benchmark_status(params)
     _persist_benchmark_outputs(state)
-    _write_benchmark_state(state)
-    return state
+    format_name = str(params.get('format') or 'csv')
+    return {'format': format_name, 'path': state['config'].get('csvOutputPath' if format_name == 'csv' else 'jsonOutputPath'), 'summary': state.get('resultSummary')}
 
 
-def _start_benchmark(params: dict[str, Any]) -> dict[str, Any]:
-    config = dict(params.get("config") or {})
-    profile_payload = dict(params.get("profile") or {})
-    if not profile_payload:
-        raise SidecarError("invalid_config", "Profile configuration is required for benchmark runs.")
-    run_id = f"bench-{uuid.uuid4().hex[:8]}"
-    config = _benchmark_config_with_run_dir(config, run_id)
-    state = {
-        "id": run_id,
-        "profile": profile_payload,
-        "config": config,
-        "status": "running",
-        "processedCount": 0,
-        "startedAt": _now_iso(),
-        "completedAt": None,
-        "lastUpdatedAt": _now_iso(),
-        "activeElapsedSeconds": 0.0,
-        "averageLatencyMs": 0,
-        "throughputOpsPerSecond": 0,
-        "liveLog": ["Benchmark scheduled."],
-        "resultSummary": None,
-        "history": [],
-        "activeObjects": [],
-        "nextObjectIndex": 0,
-        "nextActiveIndex": 0,
-        "nextSizeIndex": 0,
-        "benchmarkPrefix": _benchmark_base_prefix(config, run_id),
-    }
-    _append_benchmark_log(
-        state,
-        f"Benchmark target bucket: {config.get('bucketName', '')} via {profile_payload.get('endpointUrl', '')}.",
-    )
-    _write_benchmark_state(state)
-    return _materialize_benchmark_state(state)
+# Recovery manifests contain object/file identity and multipart checkpoints only.
+# Credentials are re-supplied by the host for every explicit recovery request.
+def _recovery_dir():
+    path = Path(os.environ.get('OBJECT_BROWSER_TRANSFER_DIR') or (Path.home() / '.object-data-browser' / 'transfers'))
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return path
 
 
-def _get_benchmark_status(params: dict[str, Any]) -> dict[str, Any]:
-    return _materialize_benchmark_state(_read_benchmark_state(str(params.get("runId", "")).strip()))
+def _recovery_path(recovery_id):
+    if not re.fullmatch(r'upload-[a-f0-9]{32}', str(recovery_id)):
+        raise SidecarError('invalid_config', 'Invalid transfer recovery identifier.')
+    return _recovery_dir() / f'{recovery_id}.json'
 
 
-def _pause_benchmark(params: dict[str, Any]) -> dict[str, Any]:
-    state = _read_benchmark_state(str(params.get("runId", "")).strip())
-    _refresh_benchmark_snapshot(state)
-    state["status"] = "paused"
-    _append_benchmark_log(state, "Benchmark paused by user.")
-    _write_benchmark_state(state)
-    _persist_benchmark_outputs(state)
-    return state
+def _recovery_write(state):
+    state['updatedAt'] = _now_iso()
+    path = _recovery_path(state['id'])
+    temporary = path.with_suffix(f'.{uuid.uuid4().hex}.tmp')
+    try:
+        with temporary.open('x', encoding='utf-8') as output:
+            os.chmod(temporary, 0o600)
+            json.dump(state, output)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
-def _resume_benchmark(params: dict[str, Any]) -> dict[str, Any]:
-    state = _read_benchmark_state(str(params.get("runId", "")).strip())
-    state["status"] = "running"
-    state["lastUpdatedAt"] = _now_iso()
-    _append_benchmark_log(state, "Benchmark resumed by user.")
-    _write_benchmark_state(state)
-    return _materialize_benchmark_state(state)
+@contextmanager
+def _recovery_lock(recovery_id):
+    path = _recovery_path(recovery_id).with_suffix('.lock')
+    with path.open('a+b') as handle:
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                if handle.tell() == 0:
+                    handle.write(b'0')
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError) as error:
+            raise SidecarError('conflict', 'This recovery upload is already active in another request.') from error
+        try:
+            yield
+        finally:
+            if os.name == 'nt':
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _stop_benchmark(params: dict[str, Any]) -> dict[str, Any]:
-    state = _read_benchmark_state(str(params.get("runId", "")).strip())
-    _refresh_benchmark_snapshot(state)
-    state["status"] = "stopped"
-    state["completedAt"] = _now_iso()
-    state["resultSummary"] = _rebuild_benchmark_summary(state)
-    _append_benchmark_log(state, "Benchmark stopped by user.")
-    _write_benchmark_state(state)
-    _persist_benchmark_outputs(state)
-    return state
+def _file_identity(path):
+    stat = path.stat()
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''): digest.update(block)
+    after = path.stat()
+    if (stat.st_size, stat.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise SidecarError('conflict', 'Source file changed while computing its identity.')
+    return {'size': stat.st_size, 'modifiedNs': stat.st_mtime_ns, 'sha256': digest.hexdigest()}
 
 
-def _export_benchmark_results(params: dict[str, Any]) -> dict[str, Any]:
-    run_id = str(params.get("runId", "")).strip()
-    format_name = str(params.get("format", "csv")).strip().lower()
-    state = _materialize_benchmark_state(_read_benchmark_state(run_id))
-    config = dict(state.get("config") or {})
-    path = str(config.get("csvOutputPath" if format_name == "csv" else "jsonOutputPath", ""))
-    return {"format": format_name, "path": path, "summary": state.get("resultSummary")}
+def _recovery_profile_ref(payload):
+    reference = {k: payload.get(k) for k in ('id', 'endpointUrl', 'endpointType', 'region', 'pathStyle')}
+    endpoint = urlparse(str(reference.get('endpointUrl') or ''))
+    reference['endpointUrl'] = endpoint._replace(netloc=endpoint.netloc.rsplit('@', 1)[-1], query='', fragment='').geturl()
+    return reference
+
+
+def _recovery_public(state):
+    return {k: v for k, v in state.items() if k not in {'options', 'parts'}}
+
+
+def _recovery_verify_completion(state, client):
+    try:
+        head = client.head_object(Bucket=state['bucketName'], Key=state['key'], **({'VersionId': state['versionId']} if state.get('versionId') else {}))
+    except Exception:
+        return False
+    metadata = head.get('Metadata') or {}
+    if int(head.get('ContentLength') or 0) == state['fileSize'] and metadata.get('object-browser-recovery-id') == state['id'] and metadata.get('object-browser-source-sha256') == state['sourceIdentity']['sha256']:
+        state.update({'status': 'completed', 'completedBytes': state['fileSize'], 'requiresVerification': False,
+                      'versionId': head.get('VersionId'), 'ownerPid': None})
+        _recovery_write(state)
+        return True
+    return False
+
+
+def _transfer_recovery_action(params):
+    action = params['action']
+    profile_payload = params.get('profile') or {}
+    profile = _parse_profile(profile_payload)
+    reference = _recovery_profile_ref(profile_payload)
+    if action == 'listTransferRecovery':
+        items = []
+        for path in _recovery_dir().glob('*.json'):
+            try:
+                state = json.loads(path.read_text())
+                if state.get('profileRef') != reference: continue
+                if params.get('bucketName') and state.get('bucketName') != params['bucketName']: continue
+                if state.get('id', '').startswith(('upload-', 'azureupload-', 'download-')):
+                    items.append({k: v for k, v in state.items() if k not in {'options', 'parts', 'blocks', 'ranges'}})
+            except (OSError, ValueError):
+                continue
+        return {'items': sorted(items, key=lambda item: item.get('updatedAt', ''), reverse=True)}
+    if profile.endpoint_type == 'azureBlob':
+        return _advanced_workflow(params)
+    if action == 'startResumableUpload':
+        path = Path(str(params.get('filePath') or '')).expanduser().resolve()
+        if not path.is_file(): raise SidecarError('invalid_config', 'An existing local file is required.')
+        ref = _object_ref(params)
+        identity = _file_identity(path)
+        size = identity['size']
+        chunk = max(5 * 1024**2, int(params.get('multipartChunkMiB') or 8) * 1024**2, (size + 9999) // 10000)
+        if chunk > 5 * 1024**3 or size > 50000 * 1024**3:
+            raise SidecarError('invalid_config', 'File exceeds S3 multipart size limits.')
+        recovery_id = 'upload-' + uuid.uuid4().hex
+        state = {'id': recovery_id, 'recoveryId': recovery_id, 'profileRef': reference, 'bucketName': ref['Bucket'], 'key': ref['Key'],
+                 'filePath': str(path), 'fileSize': size, 'sourceIdentity': identity, 'partSize': chunk, 'parts': [],
+                 'completedBytes': 0, 'status': 'prepared', 'createdAt': _now_iso(), 'ownerPid': None,
+                 'conflictPolicy': params.get('conflictPolicy') or 'replace', 'options': _copy_options({}, params.get('options') or {})}
+        if state['conflictPolicy'] not in {'replace', 'overwrite', 'fail', 'skip'}:
+            raise SidecarError('invalid_config', 'Conflict policy must be replace, fail, or skip.')
+        _recovery_write(state)
+    else:
+        recovery_id = str(params.get('recoveryId') or '')
+        path = _recovery_path(recovery_id)
+        if not path.exists(): raise SidecarError('invalid_config', 'Transfer recovery manifest was not found.')
+        state = json.loads(path.read_text())
+        if state.get('profileRef') != reference:
+            raise SidecarError('conflict', 'The selected profile does not match the upload endpoint and profile ID.')
+    with _recovery_lock(recovery_id):
+        if action != 'startResumableUpload': state = json.loads(_recovery_path(recovery_id).read_text())
+        client = _build_client(profile)
+        if state['status'] == 'completionUnknown':
+            if not _recovery_verify_completion(state, client):
+                state['requiresVerification'] = True
+                state['error'] = 'Completion outcome is unknown. Inspect the destination and multipart upload before any new upload.'
+                _recovery_write(state)
+            return _recovery_public(state)
+        if state['status'] in {'completed', 'skipped', 'aborted'}:
+            return _recovery_public(state)
+        if action == 'abortUpload':
+            if state.get('uploadId'):
+                client.abort_multipart_upload(Bucket=state['bucketName'], Key=state['key'], UploadId=state['uploadId'])
+            state.update({'status': 'aborted', 'ownerPid': None})
+            _recovery_write(state)
+            return _recovery_public(state)
+        if state['status'] in {'cancelled', 'failed'}:
+            return _recovery_public(state)
+        current = _file_identity(Path(state['filePath']))
+        if current != state['sourceIdentity']:
+            raise SidecarError('conflict', 'Source file identity changed. Abort the old multipart upload before starting a new upload.')
+        return _run_transfer(lambda _: _execute_recovery_upload(state, profile, client), params)
+
+
+def _execute_recovery_upload(state, profile, client):
+    ref = {'Bucket': state['bucketName'], 'Key': state['key']}
+    size, chunk = state['fileSize'], state['partSize']
+    count = max(1, (size + chunk - 1) // chunk)
+    control = _register_transfer(TransferControl(job_id=state['id'], label=f"Recoverable upload {state['key']}", direction='upload',
+        total_bytes=size, item_count=1, strategy_label='Recoverable multipart upload', part_size_bytes=chunk, parts_total=count))
+    state.update({'ownerPid': os.getpid(), 'status': 'uploading'})
+    _recovery_write(state)
+    def progress():
+        _emit_transfer_event(_build_transfer_job(job_id=state['id'], label=control.label, direction='upload', progress=state['completedBytes'] / size if size else 0,
+            status='running', bytes_transferred=state['completedBytes'], total_bytes=size, output_lines=[], current_item_label=state['key'],
+            item_count=1, items_completed=0, part_size_bytes=chunk, parts_completed=len(state['parts']), parts_total=count, can_pause=True, can_cancel=True))
+    progress()
+    def heartbeat():
+        while True:
+            time.sleep(5)
+            if _lookup_transfer(state['id']) is not control: return
+            progress()
+    threading.Thread(target=heartbeat, daemon=True).start()
+    try:
+        options = dict(state['options'])
+        options['Metadata'] = {**options.get('Metadata', {}), 'object-browser-recovery-id': state['id'],
+                               'object-browser-source-sha256': state['sourceIdentity']['sha256']}
+        conditional = {'IfNoneMatch': '*'} if state['conflictPolicy'] in {'fail', 'skip'} else {}
+        if not state.get('uploadId') and state['conflictPolicy'] in {'fail', 'skip'}:
+            try:
+                client.head_object(**ref)
+            except Exception as error:
+                if _client_error_code(error) not in {'404', 'NoSuchKey', 'NotFound'}: raise
+            else:
+                if state['conflictPolicy'] == 'skip':
+                    state['status'] = 'skipped'
+                    _recovery_write(state)
+                    return _recovery_public(state)
+                raise SidecarError('conflict', 'Destination already exists.')
+        if size == 0:
+            state['status'] = 'completionUnknown'
+            _recovery_write(state)
+            client.put_object(**ref, Body=b'', **options, **conditional)
+        else:
+            if not state.get('uploadId'):
+                response = client.create_multipart_upload(**ref, **options)
+                state['uploadId'] = response['UploadId']
+                _recovery_write(state)
+            remote = {}
+            marker = None
+            while True:
+                response = client.list_parts(**ref, UploadId=state['uploadId'], **({'PartNumberMarker': marker} if marker else {}))
+                for part in response.get('Parts', []): remote[int(part['PartNumber'])] = part
+                if not response.get('IsTruncated'): break
+                next_marker = response.get('NextPartNumberMarker')
+                if not next_marker or next_marker == marker: raise SidecarError('conflict', 'Multipart part listing did not progress.')
+                marker = next_marker
+            # Only reuse parts checkpointed by this app and independently found
+            # with the same ETag and length at the endpoint.
+            reusable = []
+            for part in state['parts']:
+                number = part['PartNumber']
+                actual = remote.get(number)
+                expected_size = min(chunk, size - (number - 1) * chunk)
+                if actual and actual.get('ETag') == part['ETag'] and int(actual.get('Size') or 0) == expected_size:
+                    reusable.append(part)
+            state['parts'] = reusable
+            state['completedBytes'] = sum(min(chunk, size - (p['PartNumber'] - 1) * chunk) for p in reusable)
+            _recovery_write(state)
+            done = {part['PartNumber'] for part in reusable}
+            def upload(number):
+                _transfer_gate(control)
+                with Path(state['filePath']).open('rb') as source:
+                    length = min(chunk, size - (number - 1) * chunk)
+                    response = client.upload_part(**ref, UploadId=state['uploadId'], PartNumber=number,
+                        Body=_FilePart(source, (number - 1) * chunk, length))
+                return {'PartNumber': number, 'ETag': response['ETag']}, length
+            with ThreadPoolExecutor(max_workers=min(8, profile.max_pool_connections)) as pool:
+                futures = [pool.submit(upload, n) for n in range(1, count + 1) if n not in done]
+                try:
+                    for future in as_completed(futures):
+                        part, length = future.result()
+                        state['parts'].append(part)
+                        state['completedBytes'] += length
+                        _recovery_write(state)
+                        _transfer_checkpoint(control, bytes_transferred=state['completedBytes'], items_completed=0, parts_completed=len(state['parts']), current_item_label=state['key'])
+                        progress()
+                except BaseException:
+                    for pending in futures: pending.cancel()
+                    raise
+            _transfer_gate(control)
+            if _file_identity(Path(state['filePath'])) != state['sourceIdentity']:
+                raise SidecarError('conflict', 'Source file changed during upload.')
+            # Persist uncertainty before dispatch. A killed process can never
+            # mistakenly replay a possibly successful completion on resume.
+            state['status'] = 'completionUnknown'
+            _recovery_write(state)
+            result = client.complete_multipart_upload(**ref, UploadId=state['uploadId'], MultipartUpload={'Parts': sorted(state['parts'], key=lambda p: p['PartNumber'])}, **conditional)
+            state['versionId'] = result.get('VersionId')
+        if not _recovery_verify_completion(state, client):
+            state['requiresVerification'] = True
+            _recovery_write(state)
+        return _recovery_public(state)
+    except BaseException as error:
+        if state['status'] == 'completionUnknown':
+            state['requiresVerification'] = not _recovery_verify_completion(state, client)
+        else:
+            if state.get('uploadId'):
+                try:
+                    client.abort_multipart_upload(**ref, UploadId=state['uploadId'])
+                except Exception:
+                    state['cleanupRequired'] = True
+            state['status'] = 'cancelled' if isinstance(error, _TransferCancelled) else 'failed'
+        state['error'] = 'Upload cancelled.' if isinstance(error, _TransferCancelled) else 'Upload did not finish; inspect its status and cleanup requirement.'
+        _recovery_write(state)
+        if isinstance(error, _TransferCancelled): return _recovery_public(state)
+        if state['status'] == 'completionUnknown': return _recovery_public(state)
+        raise
+    finally:
+        state['ownerPid'] = None
+        _recovery_write(state)
+
+
+# Advanced operations use the same clients and credentials as ordinary browsing.
+_STORAGE_ACTIONS = [
+    'startResumableUpload', 'resumeUpload', 'listTransferRecovery', 'abortUpload',
+    'providerInfo', 'ensureBucket', 'getBucketAdminState', 'getBucketConfiguration', 'putLifecycle', 'getAccess', 'putAccess', 'objectDetails', 'objectTags',
+    'objectProperties', 'getObjectProtection', 'setObjectProtection',
+    'getBucketProtection', 'setBucketProtection', 'restoreObject',
+    'listMultipartUploads', 'listParts', 'abortMultipartUpload', 'copyObject',
+    'listObjects', 'listObjectVersions', 'downloadVersion', 'presignVersion', 'deleteVersion',
+    'planHistoryCopy', 'resumeHistoryCopy', 'inspectHistoryCopy', 'resolveHistoryCopy',
+    'planBucketConfigurationCopy', 'applyBucketConfigurationCopy',
+    'startResumableDownload', 'resumeDownload', 'abortDownload',
+]
+
+_ADVANCED_MODULE = None
+
+
+def _advanced_module():
+    global _ADVANCED_MODULE
+    if _ADVANCED_MODULE is None:
+        spec = importlib.util.spec_from_file_location('object_browser_advanced_workflows', Path(__file__).with_name('advanced_workflows.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _ADVANCED_MODULE = module
+    return _ADVANCED_MODULE
+
+
+def _advanced_workflow(params):
+    return _advanced_module().handle(params, SimpleNamespace(**globals()))
+
+
+def _object_ref(params):
+    ref = {'Bucket': str(params.get('bucketName') or ''), 'Key': str(params.get('key') or '')}
+    if not ref['Bucket'] or not ref['Key']:
+        raise SidecarError('invalid_config', 'Bucket name and exact object key are required.')
+    if params.get('versionId') is not None:
+        ref['VersionId'] = str(params['versionId'])
+    return ref
+
+
+def _clean_sdk(value):
+    if isinstance(value, dict):
+        return {k: _clean_sdk(v) for k, v in value.items() if k != 'ResponseMetadata'}
+    if isinstance(value, list):
+        return [_clean_sdk(v) for v in value]
+    return _serialize_dt(value) if isinstance(value, datetime) else value
+
+
+def _configuration_or_missing(fn, missing_codes):
+    try:
+        return fn()
+    except Exception as error:
+        if _client_error_code(error) in missing_codes: return {}
+        raise
+
+
+def _storage_action(params):
+    action = str(params.get('action') or '')
+    if action in _advanced_module().ACTIONS:
+        return _advanced_workflow(params)
+    if action in {'startResumableUpload', 'resumeUpload', 'listTransferRecovery', 'abortUpload'}:
+        return _transfer_recovery_action(params)
+    if action == 'copyObject':
+        return _storage_copy(params)
+    profile = _parse_profile(params.get('profile') or {})
+    if action == 'getBucketAdminState':
+        return _azure_get_bucket_admin_state(params) if profile.endpoint_type == 'azureBlob' else _get_bucket_admin_state(params)
+    if action == 'deleteVersion':
+        if params.get('versionId') is None or params.get('versionId') == '':
+            raise SidecarError('invalid_config', 'An explicit version ID is required, including the literal null version ID.')
+        ref = _object_ref(params)
+        if profile.endpoint_type == 'azureBlob':
+            client = _build_azure_client(profile)
+            client.request('DELETE', client.blob_path(ref['Bucket'], ref['Key']), query={'versionid': ref['VersionId']})
+        else:
+            _build_client(profile).delete_object(**ref)
+        return {'successCount': 1, 'failureCount': 0, 'failures': [], 'deleted': True}
+    if action == 'ensureBucket':
+        bucket = str(params.get('bucketName') or '')
+        if not bucket: raise SidecarError('invalid_config', 'Destination bucket name is required.')
+        if profile.endpoint_type == 'azureBlob':
+            client = _build_azure_client(profile)
+            try:
+                client.request('HEAD', client.blob_path(bucket), query={'restype': 'container'})
+                return {'exists': True, 'created': False}
+            except SidecarError as error:
+                if error.details.get('httpStatus') != 404: raise
+            _azure_create_bucket(params)
+        else:
+            client = _build_client(profile)
+            try:
+                client.head_bucket(Bucket=bucket)
+                if params.get('versioningEnabled') is True:
+                    client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={'Status': 'Enabled'})
+                return {'exists': True, 'created': False}
+            except Exception as error:
+                if _client_error_code(error) not in {'NoSuchBucket', '404', 'NotFound'}: raise
+            _create_bucket(params)
+            if params.get('versioningEnabled') is True:
+                client.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={'Status': 'Enabled'})
+        return {'exists': True, 'created': True}
+    if action == 'putLifecycle':
+        if profile.endpoint_type == 'azureBlob':
+            raise SidecarError('unsupported_feature', 'Azure lifecycle policies require storage account management access.')
+        return _put_bucket_lifecycle(params)
+    if action == 'providerInfo':
+        azure = profile.endpoint_type == 'azureBlob'
+        return {'provider': profile.endpoint_type, 'actions':
+                (['providerInfo', 'ensureBucket', 'getBucketAdminState', 'objectDetails', 'objectTags', 'objectProperties', 'copyObject', 'listObjects', 'listObjectVersions', 'downloadVersion', 'deleteVersion',
+                  'getObjectProtection', 'setObjectProtection', 'presignVersion', 'startResumableUpload', 'resumeUpload', 'abortUpload', 'listTransferRecovery'] + sorted(_advanced_module().AZURE_ACTIONS)) if azure else _STORAGE_ACTIONS,
+                'requirements': {'accountManagement': 'azureDefault credentials, accountResourceId and management RBAC',
+                                 'adls': 'Confirmed hierarchical namespace and paired public-cloud HTTPS endpoint',
+                                 'presignVersion': 'Shared Key or Azure Default user delegation; cannot attenuate an existing SAS'} if azure else {},
+                'support': 'unknown' if profile.endpoint_type == 's3Compatible' else 'supported',
+                'storageClasses': ['Hot', 'Cool', 'Cold', 'Archive'] if azure else ['STANDARD', 'STANDARD_IA', 'ONEZONE_IA', 'INTELLIGENT_TIERING', 'GLACIER_IR', 'GLACIER', 'DEEP_ARCHIVE']}
+    if action == 'listObjects':
+        return _azure_list_objects(params) if profile.endpoint_type == 'azureBlob' else _list_objects(params)
+    if action == 'downloadVersion':
+        return _run_transfer(_azure_start_download if profile.endpoint_type == 'azureBlob' else _start_download,
+                             {**params, 'keys': [params['key']], 'destinationPath': params.get('destinationPath') or params.get('destinationDirectory') or ''})
+    if profile.endpoint_type == 'azureBlob':
+        return _azure_storage_action(params)
+    client = _build_client(profile)
+    bucket = str(params.get('bucketName') or '')
+    if action == 'getBucketConfiguration':
+        if not bucket: raise SidecarError('invalid_config', 'Bucket name is required.')
+        calls, result = [], {}
+        sections = [
+            ('replication', 'GetBucketReplication', lambda: client.get_bucket_replication(Bucket=bucket)),
+            ('notification', 'GetBucketNotificationConfiguration', lambda: client.get_bucket_notification_configuration(Bucket=bucket)),
+            ('ownershipControls', 'GetBucketOwnershipControls', lambda: client.get_bucket_ownership_controls(Bucket=bucket)),
+            ('publicAccessBlock', 'GetPublicAccessBlock', lambda: client.get_public_access_block(Bucket=bucket)),
+        ]
+        for field, operation, request in sections:
+            try:
+                result[field] = _clean_sdk(_maybe_call(calls, operation, request, {}))
+            except Exception:
+                result[field] = None
+        result['sections'] = {call['operation']: {'state': call.get('state', 'supported'), 'message': call.get('message', '')} for call in calls}
+        result['apiCalls'] = calls
+        return result
+    if action == 'getAccess':
+        calls = []
+        policy = _maybe_call(calls, 'GetBucketPolicy', lambda: client.get_bucket_policy(Bucket=bucket), {})
+        acl = _maybe_call(calls, 'GetBucketAcl', lambda: client.get_bucket_acl(Bucket=bucket), {})
+        ownership = _maybe_call(calls, 'GetBucketOwnershipControls', lambda: client.get_bucket_ownership_controls(Bucket=bucket), {})
+        block = _maybe_call(calls, 'GetPublicAccessBlock', lambda: client.get_public_access_block(Bucket=bucket), {})
+        return {'policyJson': policy.get('Policy', '{}'), 'acl': _clean_sdk(acl),
+                'ownershipControls': ownership.get('OwnershipControls', {}),
+                'publicAccessBlock': block.get('PublicAccessBlockConfiguration', {}), 'sections': calls}
+    if action == 'putAccess':
+        if 'expectedPolicyJson' in params:
+            current = _configuration_or_missing(lambda: client.get_bucket_policy(Bucket=bucket), {'NoSuchBucketPolicy'})
+            if json.loads(current.get('Policy') or '{}') != json.loads(params['expectedPolicyJson'] or '{}'):
+                raise SidecarError('conflict', 'Bucket policy changed. Refresh before applying the preset.')
+        if params.get('policyJson') is not None:
+            policy = json.loads(params['policyJson'])
+            if not policy or policy.get('Statement') == []:
+                client.delete_bucket_policy(Bucket=bucket)
+            else:
+                client.put_bucket_policy(Bucket=bucket, Policy=params['policyJson'])
+        if params.get('acl'):
+            client.put_bucket_acl(Bucket=bucket, ACL=params['acl'])
+        return {'applied': True}
+    if action == 'objectDetails':
+        return _get_object_details(params)
+    if action == 'listObjectVersions':
+        return _list_object_versions(params)
+    if action == 'presignVersion':
+        return _generate_presigned_url(params)
+    if action in {'getBucketProtection', 'setBucketProtection'}:
+        if action.startswith('set'):
+            client.put_object_lock_configuration(Bucket=bucket, ObjectLockConfiguration=params['configuration'])
+        return {'configuration': _clean_sdk(client.get_object_lock_configuration(Bucket=bucket)).get('ObjectLockConfiguration', {})}
+    if action == 'listMultipartUploads':
+        request = {'Bucket': bucket, 'MaxUploads': 1000, 'Prefix': str(params.get('prefix') or '')}
+        cursor = params.get('cursor') or {}
+        for key in ('KeyMarker', 'UploadIdMarker'):
+            if cursor.get(key): request[key] = cursor[key]
+        response = client.list_multipart_uploads(**request)
+        return {'items': _clean_sdk(response.get('Uploads', [])), 'isTruncated': bool(response.get('IsTruncated')),
+                'nextCursor': {'KeyMarker': response.get('NextKeyMarker'), 'UploadIdMarker': response.get('NextUploadIdMarker'), 'hasMore': bool(response.get('IsTruncated'))}}
+    ref = _object_ref(params)
+    if action == 'objectTags':
+        if 'tags' in params:
+            client.put_object_tagging(**ref, Tagging={'TagSet': [{'Key': str(k), 'Value': str(v)} for k, v in params['tags'].items()]})
+        return {'tags': {i['Key']: i['Value'] for i in client.get_object_tagging(**ref).get('TagSet', [])}}
+    if action in {'getObjectProtection', 'setObjectProtection'}:
+        if action.startswith('set'):
+            if params.get('retention') is not None:
+                request = {'Retention': params['retention']}
+                if params.get('bypassGovernanceRetention'): request['BypassGovernanceRetention'] = True
+                client.put_object_retention(**ref, **request)
+            if params.get('legalHold') is not None:
+                hold = params['legalHold']
+                client.put_object_legal_hold(**ref, LegalHold=hold if isinstance(hold, dict) else {'Status': 'ON' if hold else 'OFF'})
+        calls = []
+        retention = _maybe_call(calls, 'GetObjectRetention', lambda: client.get_object_retention(**ref), {})
+        hold = _maybe_call(calls, 'GetObjectLegalHold', lambda: client.get_object_legal_hold(**ref), {})
+        return {'retention': _clean_sdk(retention.get('Retention', {})), 'legalHold': hold.get('LegalHold', {}), 'sections': calls}
+    if action == 'restoreObject':
+        request = {'Days': max(1, int(params.get('days') or 7)), 'GlacierJobParameters': {'Tier': params.get('tier') or 'Standard'}}
+        response = client.restore_object(**ref, RestoreRequest=request)
+        return {'requested': True, 'statusCode': response.get('ResponseMetadata', {}).get('HTTPStatusCode')}
+    if action in {'listParts', 'abortMultipartUpload'}:
+        ref.pop('VersionId', None)
+        ref['UploadId'] = params['uploadId']
+        if action == 'abortMultipartUpload':
+            client.abort_multipart_upload(**ref)
+            return {'aborted': True}
+        marker = (params.get('cursor') or {}).get('PartNumberMarker')
+        if marker: ref['PartNumberMarker'] = int(marker)
+        response = client.list_parts(**ref)
+        return {'items': _clean_sdk(response.get('Parts', [])), 'isTruncated': bool(response.get('IsTruncated')),
+                'nextCursor': {'PartNumberMarker': response.get('NextPartNumberMarker'), 'hasMore': bool(response.get('IsTruncated'))}}
+    if action == 'objectProperties':
+        return _storage_copy({**params, 'sourceProfile': params['profile'], 'destinationProfile': params['profile'],
+                              'sourceBucketName': bucket, 'destinationBucketName': bucket,
+                              'sourceKey': ref['Key'], 'destinationKey': ref['Key'], 'sourceVersionId': params.get('versionId'),
+                              'conflictPolicy': 'replace', 'options': {k: params[k] for k in ('metadata', 'headers', 'storageClass', 'encryption', 'expectedETag') if k in params}})
+    raise SidecarError('unsupported_feature', f'Unknown storage action: {action}')
+
+
+_COPY_HEADERS = {'ContentType': 'Content-Type', 'CacheControl': 'Cache-Control', 'ContentDisposition': 'Content-Disposition',
+                 'ContentEncoding': 'Content-Encoding', 'ContentLanguage': 'Content-Language', 'Expires': 'Expires'}
+
+
+def _copy_options(head, options):
+    result = {'Metadata': dict(options.get('metadata', head.get('Metadata') or {}))}
+    for aws, http in _COPY_HEADERS.items():
+        value = (options.get('headers') or {}).get(http, (options.get('headers') or {}).get(aws, head.get(aws)))
+        if value is not None: result[aws] = value
+    if options.get('storageClass') or head.get('StorageClass'):
+        result['StorageClass'] = options.get('storageClass') or head['StorageClass']
+    encryption = options.get('encryption') or {}
+    if isinstance(encryption, str): encryption = {'ServerSideEncryption': encryption}
+    for field in ('ServerSideEncryption', 'SSEKMSKeyId', 'BucketKeyEnabled'):
+        if field in encryption: result[field] = encryption[field]
+    return result
+
+
+def _check_mutation_result(result, required_field=None):
+    if not isinstance(result, dict) or result.get('Error') or result.get('Errors'):
+        raise SidecarError('invalid_response', 'Storage returned an embedded mutation error; success was not verified.')
+    if required_field and not result.get(required_field):
+        raise SidecarError('invalid_response', f'Storage omitted {required_field}; success was not verified.')
+
+
+def _relay_chunks(body, chunk_size):
+    """Large S3 parts spill to a private temporary file, bounded to one part."""
+    while True:
+        with tempfile.SpooledTemporaryFile(max_size=8 * 1024**2, mode='w+b') as part:
+            received = 0
+            while received < chunk_size:
+                block = body.read(min(1024 * 1024, chunk_size - received))
+                if not block: break
+                part.write(block)
+                received += len(block)
+            if not received: return
+            part.seek(0)
+            yield _FilePart(part, 0, received)
+            if received < chunk_size: return
+
+
+def _storage_copy(params):
+    return _run_transfer(_storage_copy_impl, params)
+
+
+def _storage_copy_impl(params):
+    source_profile = _parse_profile(params.get('sourceProfile') or params.get('profile') or {})
+    dest_profile = _parse_profile(params.get('destinationProfile') or params.get('profile') or {})
+    source = {'Bucket': str(params.get('sourceBucketName') or ''), 'Key': str(params.get('sourceKey') or '')}
+    dest = {'Bucket': str(params.get('destinationBucketName') or ''), 'Key': str(params.get('destinationKey') or '')}
+    if not all((*source.values(), *dest.values())):
+        raise SidecarError('invalid_config', 'Copy source and destination bucket names and keys are required.')
+    if params.get('sourceVersionId') is not None: source['VersionId'] = str(params['sourceVersionId'])
+    src_azure, dst_azure = source_profile.endpoint_type == 'azureBlob', dest_profile.endpoint_type == 'azureBlob'
+    src = _build_azure_client(source_profile) if src_azure else _build_client(source_profile)
+    dst = _build_azure_client(dest_profile) if dst_azure else _build_client(dest_profile)
+    src_query = {'versionid': source['VersionId']} if 'VersionId' in source else {}
+    if src_azure:
+        _, headers, _ = src.request('HEAD', src.blob_path(source['Bucket'], source['Key']), query=src_query)
+        head = {'ContentLength': int(headers.get('Content-Length') or 0), 'ETag': headers.get('ETag'),
+                'Metadata': {k[10:]: v for k, v in headers.items() if k.lower().startswith('x-ms-meta-')}}
+        for aws, http in _COPY_HEADERS.items():
+            if headers.get(http): head[aws] = headers[http]
+    else:
+        head = src.head_object(**source)
+    size = int(head.get('ContentLength') or 0)
+    options = params.get('options') or {}
+    expected = params.get('expectedSourceETag') or options.get('expectedETag') or params.get('expectedETag')
+    if expected and str(expected).strip('"') != str(head.get('ETag') or '').strip('"'):
+        raise SidecarError('conflict', 'Source object changed. Refresh before copying.')
+    policy = params.get('conflictPolicy') or 'replace'
+    if policy not in {'replace', 'overwrite', 'skip', 'fail'}:
+        raise SidecarError('invalid_config', 'Copy conflict policy must be replace, skip, or fail.')
+    if policy in {'skip', 'fail'}:
+        try:
+            if dst_azure: dst.request('HEAD', dst.blob_path(dest['Bucket'], dest['Key']))
+            else: dst.head_object(**dest)
+        except Exception as error:
+            if _client_error_code(error) not in {'404', 'NoSuchKey', 'NotFound'} and not (isinstance(error, SidecarError) and error.details.get('httpStatus') == 404): raise
+        else:
+            if policy == 'fail': raise SidecarError('conflict', 'Destination object already exists.')
+            return {'successCount': 0, 'failureCount': 0, 'failures': [], 'skipped': True, 'bytesCopied': 0}
+    job_id = f"copy-{uuid.uuid4().hex[:8]}"
+    control = _register_transfer(TransferControl(job_id=job_id, label=f"Copy {source['Key']}", direction="copy", total_bytes=size,
+        item_count=1, strategy_label="Object copy", part_size_bytes=None, parts_total=None))
+    def publish_copy(transferred=None, completed=False):
+        if transferred is not None:
+            _transfer_checkpoint(control, bytes_transferred=transferred, items_completed=int(completed), parts_completed=0, current_item_label=source['Key'])
+        _emit_transfer_event(_build_transfer_job(job_id=job_id, label=control.label, direction="copy", progress=control.bytes_transferred / size if size else int(completed),
+            status="completed" if completed else "running", bytes_transferred=control.bytes_transferred, total_bytes=size, output_lines=[], current_item_label=source['Key'],
+            item_count=1, items_completed=int(completed), can_pause=not completed, can_cancel=not completed))
+    publish_copy(0)
+    def heartbeat():
+        while True:
+            time.sleep(5)
+            if _lookup_transfer(job_id) is not control: return
+            publish_copy()
+    threading.Thread(target=heartbeat, daemon=True).start()
+    if source_profile == dest_profile and source['Bucket'] == dest['Bucket'] and source['Key'] == dest['Key'] and 'encryption' not in options:
+        options = {**options, 'encryption': {field: head[field] for field in ('ServerSideEncryption', 'SSEKMSKeyId', 'BucketKeyEnabled') if field in head}}
+    put_options = _copy_options(head, options)
+    source_tags = {}
+    if options.get('preserveTags', True):
+        if src_azure:
+            _, _, tag_xml = src.request('GET', src.blob_path(source['Bucket'], source['Key']), query={**src_query, 'comp': 'tags'})
+            tag_root = _azure_parse_xml(tag_xml)
+            source_tags = {node.findtext('Key'): node.findtext('Value') for node in tag_root.iterfind('TagSet/Tag')}
+        else:
+            source_tags = {tag['Key']: tag['Value'] for tag in src.get_object_tagging(**source).get('TagSet', [])}
+    if options.get('tags') is not None: source_tags = dict(options['tags'])
+    if source_tags and not dst_azure:
+        put_options['Tagging'] = '&'.join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in source_tags.items())
+    # Independent credentials are never guessed to have server-side cross-account access.
+    same_authority = source_profile == dest_profile
+    strategy = 'relay'
+    result = {}
+    if not src_azure and not dst_azure and same_authority and policy not in {'skip', 'fail'}:
+        strategy = 'server-side-copy'
+        copy_source = dict(source)
+        match = {'CopySourceIfMatch': head['ETag']} if head.get('ETag') else {}
+        if size <= 5 * 1024**3:
+            result = dst.copy_object(**dest, CopySource=copy_source, MetadataDirective='REPLACE', TaggingDirective='REPLACE', **put_options, **match)
+            _check_mutation_result(result, 'CopyObjectResult')
+        else:
+            upload = dst.create_multipart_upload(**dest, **put_options)['UploadId']
+            try:
+                chunk = max(64 * 1024**2, (size + 9999) // 10000)
+                if chunk > 5 * 1024**3: raise SidecarError('invalid_config', 'Object exceeds S3 multipart limits.')
+                parts = []
+                def copy_part(index):
+                    _transfer_gate(control)
+                    start = index * chunk
+                    response = dst.upload_part_copy(**dest, UploadId=upload, PartNumber=index + 1,
+                        CopySource=copy_source, CopySourceRange=f'bytes={start}-{min(start + chunk, size) - 1}', **match)
+                    return {'PartNumber': index + 1, 'ETag': response['CopyPartResult']['ETag']}
+                with ThreadPoolExecutor(max_workers=min(8, dest_profile.max_pool_connections)) as pool:
+                    for part in pool.map(copy_part, range((size + chunk - 1) // chunk)):
+                        parts.append(part)
+                        publish_copy(min(size, len(parts) * chunk))
+                _transfer_gate(control)
+                result = dst.complete_multipart_upload(**dest, UploadId=upload, MultipartUpload={'Parts': parts})
+                _check_mutation_result(result)
+            except BaseException:
+                dst.abort_multipart_upload(**dest, UploadId=upload)
+                raise
+    else:
+        # Relay spills one part at a time above 8 MiB; no credentials go to disk.
+        # Source identity is pinned for the entire stream by version/ETag.
+        if src_azure:
+            body = src.open('GET', src.blob_path(source['Bucket'], source['Key']), query=src_query,
+                            headers={'If-Match': head['ETag']} if head.get('ETag') else {})
+        else:
+            body = src.get_object(**source, **({'IfMatch': head['ETag']} if head.get('ETag') else {}))['Body']
+        try:
+            chunk = max(8 * 1024**2, (size + (49999 if dst_azure else 9999)) // (50000 if dst_azure else 10000))
+            if chunk > (4000 * 1024**2 if dst_azure else 5 * 1024**3):
+                raise SidecarError('unsupported_feature', 'Object exceeds the destination multipart size limits.')
+            if dst_azure:
+                path = dst.blob_path(dest['Bucket'], dest['Key'])
+                block_ids = []
+                copied = 0
+                upload_nonce = uuid.uuid4().hex
+                for block in _relay_chunks(body, chunk):
+                    _transfer_gate(control)
+                    block_id = base64.b64encode(f'{upload_nonce}-{len(block_ids):08d}'.encode()).decode()
+                    dst.request('PUT', path, query={'comp': 'block', 'blockid': block_id}, body=block)
+                    block_ids.append(block_id)
+                    copied += len(block)
+                    publish_copy(copied)
+                if copied != size: raise SidecarError('conflict', 'Source size changed while copying.')
+                headers = {'Content-Type': 'application/xml'}
+                headers.update({f'x-ms-meta-{k}': v for k, v in put_options.get('Metadata', {}).items()})
+                if source_tags: headers['x-ms-tags'] = '&'.join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in source_tags.items())
+                for aws, http in _COPY_HEADERS.items():
+                    if aws in put_options: headers['x-ms-blob-' + http.lower()] = str(put_options[aws])
+                if options.get('storageClass'): headers['x-ms-access-tier'] = options['storageClass']
+                if policy in {'skip', 'fail'}: headers['If-None-Match'] = '*'
+                xml = ('<BlockList>' + ''.join(f'<Latest>{v}</Latest>' for v in block_ids) + '</BlockList>').encode()
+                _, final_headers, _ = dst.request('PUT', path, query={'comp': 'blocklist'}, headers=headers, body=xml)
+                result = {'VersionId': final_headers.get('x-ms-version-id')}
+            elif size <= chunk:
+                data = body.read(chunk + 1)
+                if len(data) != size: raise SidecarError('conflict', 'Source size changed while copying.')
+                result = dst.put_object(**dest, Body=data, **put_options, **({'IfNoneMatch': '*'} if policy in {'skip', 'fail'} else {}))
+            else:
+                upload = dst.create_multipart_upload(**dest, **put_options)['UploadId']
+                try:
+                    parts, copied = [], 0
+                    for block in _relay_chunks(body, chunk):
+                        _transfer_gate(control)
+                        number = len(parts) + 1
+                        response = dst.upload_part(**dest, UploadId=upload, PartNumber=number, Body=block)
+                        parts.append({'PartNumber': number, 'ETag': response['ETag']})
+                        copied += len(block)
+                        publish_copy(copied)
+                    if copied != size: raise SidecarError('conflict', 'Source size changed while copying.')
+                    result = dst.complete_multipart_upload(**dest, UploadId=upload, MultipartUpload={'Parts': parts},
+                                                           **({'IfNoneMatch': '*'} if policy in {'skip', 'fail'} else {}))
+                    _check_mutation_result(result)
+                except BaseException:
+                    dst.abort_multipart_upload(**dest, UploadId=upload)
+                    raise
+        finally:
+            body.close()
+    _check_mutation_result(result)
+    verify = {'Bucket': dest['Bucket'], 'Key': dest['Key']}
+    if result.get('VersionId'): verify['VersionId'] = result['VersionId']
+    if dst_azure:
+        _, destination_head, _ = dst.request('HEAD', dst.blob_path(dest['Bucket'], dest['Key']), query={'versionid': result['VersionId']} if result.get('VersionId') else {})
+        dest_size = int(destination_head.get('Content-Length') or 0)
+    else:
+        dest_size = int(dst.head_object(**verify).get('ContentLength') or 0)
+    if dest_size != size: raise SidecarError('conflict', 'Destination size verification failed after copying.')
+    publish_copy(size, completed=True)
+    return {'successCount': 1, 'failureCount': 0, 'failures': [], 'skipped': False, 'bytesCopied': size,
+            'versionId': result.get('VersionId'), 'strategy': strategy}
+
+
+def _azure_storage_action(params):
+    action = params['action']
+    if action in {'presignVersion', 'getObjectProtection', 'setObjectProtection'}:
+        return _advanced_workflow(params)
+    if action not in {'objectDetails', 'listObjectVersions', 'objectTags', 'objectProperties'}:
+        raise SidecarError('unsupported_feature', f'{action} is not available for Azure Blob on this engine.')
+    if action == 'objectDetails': return _azure_get_object_details(params)
+    client = _build_azure_client(_parse_profile(params['profile']))
+    if action == 'listObjectVersions':
+        bucket = str(params.get('bucketName') or '')
+        key = str(params.get('key') or '')
+        query = {'restype': 'container', 'comp': 'list', 'include': 'versions', 'maxresults': '1000',
+                 'prefix': key or str(params.get('prefix') or '')}
+        if (params.get('cursor') or {}).get('value'): query['marker'] = params['cursor']['value']
+        _, _, data = client.request('GET', client.blob_path(bucket), query=query)
+        root = _azure_parse_xml(data)
+        items = []
+        for node in root.iterfind('Blobs/Blob'):
+            name = node.findtext('Name') or ''
+            if key and name != key: continue
+            items.append({'key': name, 'versionId': node.findtext('VersionId') or '',
+                          'modifiedAt': _serialize_dt(_azure_parse_rfc1123(node.findtext('Properties/Last-Modified'))),
+                          'latest': node.findtext('IsCurrentVersion') == 'true', 'deleteMarker': False,
+                          'size': int(node.findtext('Properties/Content-Length') or 0),
+                          'storageClass': node.findtext('Properties/AccessTier') or 'Hot'})
+        marker = root.findtext('NextMarker') or None
+        return {'items': items, 'cursor': {'value': marker, 'hasMore': bool(marker)}, 'totalCount': len(items), 'versionCount': len(items), 'deleteMarkerCount': 0}
+    ref = _object_ref(params)
+    path = client.blob_path(ref['Bucket'], ref['Key'])
+    query = {'versionid': ref['VersionId']} if 'VersionId' in ref else {}
+    if action == 'objectTags':
+        if 'tags' in params:
+            root = ET.Element('Tags')
+            tag_set = ET.SubElement(root, 'TagSet')
+            for k, v in params['tags'].items():
+                node = ET.SubElement(tag_set, 'Tag')
+                ET.SubElement(node, 'Key').text = str(k)
+                ET.SubElement(node, 'Value').text = str(v)
+            client.request('PUT', path, query={**query, 'comp': 'tags'}, headers={'Content-Type': 'application/xml'}, body=ET.tostring(root))
+        _, _, data = client.request('GET', path, query={**query, 'comp': 'tags'})
+        root = _azure_parse_xml(data)
+        return {'tags': {n.findtext('Key'): n.findtext('Value') for n in root.iterfind('TagSet/Tag')}}
+    if action == 'objectProperties':
+        if params.get('encryption'):
+            raise SidecarError('unsupported_feature', 'Azure encryption changes are managed by the storage account; this operation does not change encryption.')
+        condition = {'If-Match': params['expectedETag']} if params.get('expectedETag') else {}
+        if 'metadata' in params:
+            client.request('PUT', path, query={**query, 'comp': 'metadata'}, headers={**condition, **{f'x-ms-meta-{k}': v for k, v in params['metadata'].items()}}, body=b'')
+        if params.get('storageClass'):
+            client.request('PUT', path, query={**query, 'comp': 'tier'}, headers={'x-ms-access-tier': params['storageClass']}, body=b'')
+        if params.get('headers'):
+            client.request('PUT', path, query={**query, 'comp': 'properties'}, headers={**condition, **{'x-ms-blob-' + k.lower(): v for k, v in params['headers'].items()}}, body=b'')
+        return {'applied': True}
+    raise SidecarError('unsupported_feature', f'{action} is not available for Azure Blob on this engine.')
 
 
 def handle_request(payload: dict[str, Any]) -> dict[str, Any]:
@@ -4231,6 +5647,8 @@ def handle_request(payload: dict[str, Any]) -> dict[str, Any]:
         if azure_result is not None:
             return azure_result
 
+    if method == "storageAction":
+        return _storage_action(dict(params))
     if method == "health":
         return _health()
     if method == "getCapabilities":
@@ -4298,7 +5716,7 @@ def handle_request(payload: dict[str, Any]) -> dict[str, Any]:
     if method == "runPutTestData":
         return _run_put_testdata(dict(params))
     if method == "runDeleteAll":
-        return _run_delete_all(dict(params))
+        return _run_tool(_run_delete_all, dict(params))
     if method == "cancelToolExecution":
         return _cancel_tool_execution(dict(params))
     if method == "startBenchmark":
@@ -4366,6 +5784,7 @@ def _is_control_plane_request(line: str) -> bool:
 
 
 def main() -> int:
+    _scrub_legacy_benchmark_artifacts()
     # Read requests on the main thread but handle each on a worker so that
     # control requests (pause/resume/cancel) can be processed while a transfer
     # is still streaming. stdout writes are serialized by _write_stdout_line.

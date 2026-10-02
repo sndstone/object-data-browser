@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'app_menu.dart';
+
 /// A single option shown by [AppSelectField].
 class AppSelectItem<T> {
   const AppSelectItem({
@@ -52,9 +54,9 @@ class AppSelectField<T> extends StatefulWidget {
 
 class _AppSelectFieldState<T> extends State<AppSelectField<T>>
     with SingleTickerProviderStateMixin, WidgetsBindingObserver {
-  static const double _itemHeight = 40;
-  static const double _menuVerticalPadding = 6;
-  static const double _anchorGap = 4;
+  static const double _itemHeight = AppMenuStyle.itemHeight;
+  static const double _menuVerticalPadding = AppMenuStyle.verticalPadding;
+  static const double _anchorGap = AppMenuStyle.anchorGap;
 
   final OverlayPortalController _overlayController = OverlayPortalController();
   final LayerLink _layerLink = LayerLink();
@@ -363,20 +365,11 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
               (item) => DropdownMenuItem<T>(
                 value: item.value,
                 enabled: item.enabled,
-                child: Row(
-                  children: [
-                    if (item.icon != null) ...[
-                      Icon(item.icon, size: 16),
-                      const SizedBox(width: 8),
-                    ],
-                    Expanded(
-                      child: Text(
-                        item.label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                  ],
+                child: AppMenuRow(
+                  label: item.label,
+                  icon: item.icon,
+                  selected: item.value == widget.value,
+                  enabled: item.enabled,
                 ),
               ),
             )
@@ -386,7 +379,17 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
         style: widget.style ?? theme.textTheme.bodyMedium,
         isExpanded: widget.isExpanded,
         menuMaxHeight: widget.menuMaxHeight,
-        borderRadius: BorderRadius.circular(10),
+        dropdownColor: theme.colorScheme.surface,
+        borderRadius: BorderRadius.circular(AppMenuStyle.radius),
+        // The closed field shows only the label; the check belongs to the
+        // open menu.
+        selectedItemBuilder: (context) => widget.items
+            .map((item) => Align(
+                  alignment: AlignmentDirectional.centerStart,
+                  child: Text(item.label,
+                      maxLines: 1, overflow: TextOverflow.ellipsis),
+                ))
+            .toList(growable: false),
       );
     }
 
@@ -482,15 +485,24 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
                 builder: (context, child) {
                   return FadeTransition(
                     opacity: _expandAnimation,
-                    child: ClipRect(
-                      child: Align(
-                        // Grow downward from the field (or upward when the
-                        // menu is anchored above it).
-                        alignment: _openUpward
-                            ? Alignment.bottomCenter
-                            : Alignment.topCenter,
-                        heightFactor: _expandAnimation.value,
-                        child: child,
+                    // The shadow sits outside the clip so it stays visible
+                    // and follows the growing panel, like popup menus.
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        borderRadius:
+                            BorderRadius.circular(AppMenuStyle.radius),
+                        boxShadow: AppMenuStyle.shadows(theme),
+                      ),
+                      child: ClipRect(
+                        child: Align(
+                          // Grow downward from the field (or upward when the
+                          // menu is anchored above it).
+                          alignment: _openUpward
+                              ? Alignment.bottomCenter
+                              : Alignment.topCenter,
+                          heightFactor: _expandAnimation.value,
+                          child: child,
+                        ),
                       ),
                     ),
                   );
@@ -510,13 +522,11 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
       onKeyEvent: (node, event) => _handleKeyEvent(event),
       child: Material(
         color: theme.colorScheme.surface,
-        elevation: 6,
-        shadowColor: theme.colorScheme.shadow,
-        borderRadius: BorderRadius.circular(10),
+        borderRadius: BorderRadius.circular(AppMenuStyle.radius),
         clipBehavior: Clip.antiAlias,
         child: DecoratedBox(
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(10),
+            borderRadius: BorderRadius.circular(AppMenuStyle.radius),
             border: Border.all(
               color: theme.colorScheme.outlineVariant.withValues(alpha: 0.9),
             ),
@@ -543,47 +553,21 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
   Widget _menuItem(ThemeData theme, AppSelectItem<T> item, int index) {
     final isSelected = item.value == widget.value;
     final isHighlighted = index == _highlightedIndex;
-    final foreground = !item.enabled
-        ? theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.5)
-        : isSelected
-            ? theme.colorScheme.onPrimaryContainer
-            : theme.colorScheme.onSurface;
     return Material(
       color: isSelected
-          ? theme.colorScheme.primaryContainer.withValues(alpha: 0.55)
+          ? AppMenuStyle.selectedBackground(theme)
           : isHighlighted
-              ? theme.colorScheme.onSurface.withValues(alpha: 0.08)
+              ? AppMenuStyle.highlightBackground(theme)
               : Colors.transparent,
       child: InkWell(
         onTap: item.enabled ? () => _selectItem(item) : null,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          child: Row(
-            children: [
-              if (item.icon != null) ...[
-                Icon(item.icon, size: 16, color: foreground),
-                const SizedBox(width: 8),
-              ],
-              Expanded(
-                child: Text(
-                  item.label,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    color: foreground,
-                    fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
-                  ),
-                ),
-              ),
-              if (isSelected) ...[
-                const SizedBox(width: 8),
-                Icon(
-                  Icons.check_rounded,
-                  size: 16,
-                  color: theme.colorScheme.primary,
-                ),
-              ],
-            ],
+          padding: AppMenuStyle.itemPadding,
+          child: AppMenuRow(
+            label: item.label,
+            icon: item.icon,
+            selected: isSelected,
+            enabled: item.enabled,
           ),
         ),
       ),

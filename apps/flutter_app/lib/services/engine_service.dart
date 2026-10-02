@@ -65,6 +65,18 @@ abstract interface class TransferJobSinkRegistrant {
 }
 
 abstract class EngineService {
+  /// Extended provider operations. Unsupported platforms fail explicitly.
+  Future<Map<String, Object?>> storageAction({
+    required EndpointProfile profile,
+    required String action,
+    Map<String, Object?> arguments = const {},
+    EndpointProfile? destinationProfile,
+  }) async =>
+      throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message:
+              'Advanced storage administration requires a desktop storage adapter.');
+
   void configureDiagnostics(DiagnosticsOptions options) {}
 
   /// Whether this is the in-process mock service (no real backend wired).
@@ -115,6 +127,7 @@ abstract class EngineService {
     required EndpointProfile profile,
     required String bucketName,
     required String lifecycleJson,
+    String? transitionDefaultMinimumObjectSize,
   });
   Future<BucketAdminState> deleteBucketLifecycle({
     required String engineId,

@@ -1,4 +1,8 @@
+mod benchmark_runtime;
+mod delete_all;
 mod download_destination;
+mod lifecycle;
+mod server_copy;
 use aws_config::{retry::RetryConfig, BehaviorVersion};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::interceptors::{
@@ -9,36 +13,35 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, BucketLocationConstraint,
-    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, CorsConfiguration, CorsRule,
-    CreateBucketConfiguration, Delete, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
-    NoncurrentVersionExpiration, NoncurrentVersionTransition, ObjectIdentifier,
-    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
-    ServerSideEncryptionRule, Tag, Tagging, Transition, TransitionStorageClass,
-    VersioningConfiguration,
+    BucketLifecycleConfiguration, BucketLocationConstraint, BucketVersioningStatus,
+    CompletedMultipartUpload, CompletedPart, CorsConfiguration, CorsRule,
+    CreateBucketConfiguration, Delete, LifecycleRule, ObjectIdentifier, ServerSideEncryption,
+    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+    Tag, Tagging, VersioningConfiguration,
 };
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use chrono::{SecondsFormat, Utc};
 use download_destination::StagedDownload;
+use lifecycle::{lifecycle_rule_raw, parse_lifecycle_rules};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
-use std::io::{self, BufRead, SeekFrom, Write};
+use std::io::{self, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-const ENGINE_VERSION: &str = "2.2.8";
+const ENGINE_VERSION: &str = "2.3.0";
 
 const SUPPORTED_METHODS: &[&str] = &[
     "health",
@@ -104,8 +107,15 @@ struct Response {
     error: Option<Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Profile {
+    auth_mode: String,
+    aws_profile_name: String,
+    role_arn: String,
+    external_id: Option<String>,
+    role_session_name: String,
+    requester_pays: bool,
+    expected_bucket_owner: Option<String>,
     endpoint_url: String,
     region: String,
     access_key: String,
@@ -179,9 +189,11 @@ struct BenchmarkTaskResult {
     size_bytes: usize,
     bytes_transferred: i64,
     checksum_state: String,
+    checksum: Option<String>,
     latency_ms: f64,
     operation_count: i64,
     elapsed_ms: f64,
+    completed_at: String,
     upserted_object: Option<(String, usize)>,
     removed_keys: Vec<String>,
     log_line: Option<String>,
@@ -189,84 +201,34 @@ struct BenchmarkTaskResult {
 
 fn main() {
     let runtime = Runtime::new().expect("tokio runtime");
-    let stdin = io::stdin();
-
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else {
-            continue;
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let response = match serde_json::from_str::<Request>(trimmed) {
-            Ok(request) => {
+    runtime.block_on(async {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        let slots = Arc::new(Semaphore::new(8));
+        let mut tasks = JoinSet::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            let request = match serde_json::from_str::<Request>(line) {
+                Ok(r) => r,
+                Err(_) => { println!("{}", json!({"requestId":null,"ok":false,"error":{"code":"invalid_config","message":"Malformed JSON request."}})); continue; }
+            };
+            let slots = slots.clone();
+            tasks.spawn(async move {
                 let request_id = request.request_id.clone();
-                let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    runtime.block_on(handle_request(request))
-                }));
-                match panic_result {
-                    Ok(Ok(result)) => Response {
-                        request_id: request_id.clone(),
-                        ok: true,
-                        result: Some(result),
-                        error: None,
-                    },
-                    Ok(Err(error)) => Response {
-                        request_id,
-                        ok: false,
-                        result: None,
-                        error: Some(json!({
-                            "code": error.code,
-                            "message": error.message,
-                            "details": error.details,
-                        })),
-                    },
-                    Err(panic_payload) => {
-                        let message = panic_payload_message(&panic_payload);
-                        emit_structured_log(
-                            "ERROR",
-                            "PanicRecovery",
-                            format!("Request handler panicked: {message}"),
-                            "sidecar",
-                        );
-                        Response {
-                            request_id,
-                            ok: false,
-                            result: None,
-                            error: Some(json!({
-                                "code": "internal_error",
-                                "message": message,
-                                "details": Value::Object(Map::new()),
-                            })),
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                println!(
-                    "{}",
-                    json!({"requestId": null, "ok": false, "error": {"code": "invalid_config", "message": "Malformed JSON request."}})
-                );
-                continue;
-            }
-        };
-
-        if let Ok(output) = serde_json::to_string(&response) {
-            println!("{output}");
+                let control = matches!(request.method.as_str(), "cancelToolExecution"|"pauseBenchmark"|"resumeBenchmark"|"stopBenchmark");
+                let _permit = if control { None } else { Some(slots.acquire_owned().await.unwrap()) };
+                let response = match tokio::spawn(handle_request(request)).await {
+                    Ok(Ok(result)) => Response { request_id, ok:true, result:Some(result), error:None },
+                    Ok(Err(error)) => Response { request_id, ok:false, result:None, error:Some(json!({"code":error.code,"message":error.message,"details":error.details})) },
+                    Err(error) => Response { request_id, ok:false, result:None, error:Some(json!({"code":"internal_error","message":error.to_string()})) },
+                };
+                if let Ok(output) = serde_json::to_string(&response) { println!("{output}"); }
+            });
+            while tasks.try_join_next().is_some() {}
         }
-    }
-}
-
-fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "Request handler panicked with a non-string payload.".to_string()
-    }
+        while tasks.join_next().await.is_some() {}
+    });
 }
 
 async fn handle_request(request: Request) -> SidecarResult {
@@ -364,6 +326,19 @@ async fn handle_request(request: Request) -> SidecarResult {
 async fn test_profile(profile_value: Value) -> SidecarResult {
     let profile = parse_profile(&profile_value)?;
     let client = build_client(&profile).await?;
+    if let Some(bucket) = profile_value["knownBucket"]
+        .as_str()
+        .filter(|v| !v.trim().is_empty())
+    {
+        client
+            .list_objects_v2()
+            .bucket(bucket.trim())
+            .max_keys(1)
+            .send()
+            .await
+            .map_err(map_sdk_error)?;
+        return Ok(json!({"ok":true,"bucketCount":1,"endpoint":profile.endpoint_url}));
+    }
     let output = client.list_buckets().send().await.map_err(map_sdk_error)?;
     let endpoint = url::Url::parse(&profile.endpoint_url)
         .ok()
@@ -379,20 +354,42 @@ async fn test_profile(profile_value: Value) -> SidecarResult {
 async fn list_buckets(profile_value: Value) -> SidecarResult {
     let profile = parse_profile(&profile_value)?;
     let client = build_client(&profile).await?;
-    let output = client.list_buckets().send().await.map_err(map_sdk_error)?;
-    let items: Vec<Value> = output
-        .buckets()
-        .iter()
-        .map(|bucket| {
-            json!({
-                "name": bucket.name().unwrap_or_default(),
-                "region": profile.region,
-                "objectCountHint": 0,
-                "versioningEnabled": false,
-                "createdAt": serialize_aws_datetime(bucket.creation_date()),
-            })
-        })
-        .collect();
+    if let Some(bucket) = profile_value["knownBucket"]
+        .as_str()
+        .filter(|v| !v.trim().is_empty())
+    {
+        return Ok(
+            json!({"items":[{"name":bucket.trim(),"region":profile.region,"objectCountHint":0,"versioningEnabled":false,"createdAt":now_iso()}]}),
+        );
+    }
+    let mut items = Vec::new();
+    let mut token: Option<String> = None;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let output = client
+            .list_buckets()
+            .max_buckets(1000)
+            .set_continuation_token(token.clone())
+            .send()
+            .await
+            .map_err(map_sdk_error)?;
+        items.extend(output.buckets().iter().map(|bucket|json!({"name":bucket.name().unwrap_or_default(),"region":profile.region,"objectCountHint":0,"versioningEnabled":false,"createdAt":serialize_aws_datetime(bucket.creation_date())})));
+        token = output
+            .continuation_token()
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned);
+        match &token {
+            None => break,
+            Some(t) => {
+                if !seen.insert(t.clone()) {
+                    return Err(SidecarError::new(
+                        "invalid_response",
+                        "Bucket listing repeated a continuation token.",
+                    ));
+                }
+            }
+        }
+    }
     Ok(json!({ "items": items }))
 }
 
@@ -485,6 +482,15 @@ async fn put_bucket_lifecycle(params: Value) -> SidecarResult {
             json!({"reason": error.to_string()}),
         )
     })?;
+    if parsed.as_object().is_none_or(|m| {
+        m.keys()
+            .any(|k| !matches!(k.as_str(), "Rules" | "TransitionDefaultMinimumObjectSize"))
+    }) {
+        return Err(SidecarError::new(
+            "unsupported_feature",
+            "Unsupported lifecycle configuration field; configuration was not changed.",
+        ));
+    }
     let rules = parse_lifecycle_rules(parsed.get("Rules").unwrap_or(&Value::Null))?;
     let config = BucketLifecycleConfiguration::builder()
         .set_rules(Some(rules))
@@ -494,6 +500,11 @@ async fn put_bucket_lifecycle(params: Value) -> SidecarResult {
         .put_bucket_lifecycle_configuration()
         .bucket(bucket_name)
         .lifecycle_configuration(config)
+        .set_transition_default_minimum_object_size(
+            parsed["TransitionDefaultMinimumObjectSize"]
+                .as_str()
+                .map(aws_sdk_s3::types::TransitionDefaultMinimumObjectSize::from),
+        )
         .send()
         .await
         .map_err(map_sdk_error)?;
@@ -738,7 +749,7 @@ async fn get_bucket_admin_state(params: Value) -> SidecarResult {
     let (_, bucket_name, client) = bucket_context(&params).await?;
     let mut api_calls: Vec<Value> = Vec::new();
 
-    let versioning = record_api(
+    let versioning = optional_api(
         &mut api_calls,
         "GetBucketVersioning",
         client.get_bucket_versioning().bucket(&bucket_name).send(),
@@ -793,7 +804,7 @@ async fn get_bucket_admin_state(params: Value) -> SidecarResult {
         .unwrap_or_default();
     let lifecycle_json = lifecycle
         .as_ref()
-        .map(|output| serde_json::to_string_pretty(&json!({"Rules": output.rules().iter().map(lifecycle_rule_raw).collect::<Vec<_>>() })).unwrap_or_else(|_| "{\n  \"Rules\": []\n}".to_string()))
+        .map(|output| serde_json::to_string_pretty(&lifecycle::without_nulls(json!({"Rules": output.rules().iter().map(lifecycle_rule_raw).collect::<Vec<_>>(), "TransitionDefaultMinimumObjectSize": output.transition_default_minimum_object_size().map(|v| v.as_str()) }))).unwrap_or_else(|_| "{\n  \"Rules\": []\n}".to_string()))
         .unwrap_or_else(|| "{\n  \"Rules\": []\n}".to_string());
 
     let encryption_enabled = encryption
@@ -839,41 +850,52 @@ async fn get_bucket_admin_state(params: Value) -> SidecarResult {
         })
         .unwrap_or_default();
 
-    let (object_lock_enabled, object_lock_mode, object_lock_retention_days) =
-        if let Some(output) = object_lock {
-            if let Some(configuration) = output.object_lock_configuration() {
-                if let Some(rule) = configuration.rule() {
-                    if let Some(retention) = rule.default_retention() {
-                        let retention_value = retention
-                            .days()
-                            .map(Value::from)
-                            .or_else(|| retention.years().map(Value::from))
-                            .unwrap_or(Value::Null);
-                        (
-                            true,
-                            retention
-                                .mode()
-                                .map(|value| Value::String(value.as_str().to_string()))
-                                .unwrap_or(Value::Null),
-                            retention_value,
-                        )
-                    } else {
-                        (true, Value::Null, Value::Null)
-                    }
+    let (
+        object_lock_enabled,
+        object_lock_mode,
+        object_lock_retention_value,
+        object_lock_retention_unit,
+    ) = if let Some(output) = object_lock {
+        if let Some(configuration) = output.object_lock_configuration() {
+            if let Some(rule) = configuration.rule() {
+                if let Some(retention) = rule.default_retention() {
+                    let retention_value = retention
+                        .days()
+                        .map(Value::from)
+                        .or_else(|| retention.years().map(Value::from))
+                        .unwrap_or(Value::Null);
+                    (
+                        true,
+                        retention
+                            .mode()
+                            .map(|value| Value::String(value.as_str().to_string()))
+                            .unwrap_or(Value::Null),
+                        retention_value,
+                        if retention.days().is_some() {
+                            json!("days")
+                        } else if retention.years().is_some() {
+                            json!("years")
+                        } else {
+                            Value::Null
+                        },
+                    )
                 } else {
-                    (true, Value::Null, Value::Null)
+                    (true, Value::Null, Value::Null, Value::Null)
                 }
             } else {
-                (false, Value::Null, Value::Null)
+                (true, Value::Null, Value::Null, Value::Null)
             }
         } else {
-            (false, Value::Null, Value::Null)
-        };
+            (false, Value::Null, Value::Null, Value::Null)
+        }
+    } else {
+        (false, Value::Null, Value::Null, Value::Null)
+    };
 
     Ok(json!({
         "bucketName": bucket_name,
-        "versioningEnabled": matches!(versioning.status(), Some(BucketVersioningStatus::Enabled)),
-        "versioningStatus": versioning.status().map(|value| value.as_str()).unwrap_or("Suspended"),
+        "versioningEnabled": matches!(versioning.as_ref().and_then(|v|v.status()), Some(BucketVersioningStatus::Enabled)),
+        "versioningStatus": versioning.as_ref().map(|v|v.status().map(|s|s.as_str()).unwrap_or("never-enabled")).unwrap_or("unknown"),
         "objectLockEnabled": object_lock_enabled,
         "lifecycleEnabled": !lifecycle_rules.is_empty(),
         "policyAttached": policy.as_ref().and_then(|v| v.policy()).map(|v| !v.is_empty()).unwrap_or(false),
@@ -881,13 +903,18 @@ async fn get_bucket_admin_state(params: Value) -> SidecarResult {
         "encryptionEnabled": encryption_enabled,
         "encryptionSummary": encryption_summary,
         "objectLockMode": object_lock_mode,
-        "objectLockRetentionDays": object_lock_retention_days,
+        "objectLockRetentionDays": if object_lock_retention_unit == "days" { object_lock_retention_value.clone() } else { Value::Null },
+        "objectLockRetentionYears": if object_lock_retention_unit == "years" { object_lock_retention_value.clone() } else { Value::Null },
+        "objectLockRetentionValue": object_lock_retention_value,
+        "objectLockRetentionUnit": object_lock_retention_unit,
         "tags": tags,
         "lifecycleRules": lifecycle_rules,
         "lifecycleJson": lifecycle_json,
         "policyJson": policy.and_then(|value| value.policy().map(str::to_owned)).unwrap_or_else(|| "{}".to_string()),
         "corsJson": serde_json::to_string_pretty(&cors.as_ref().map(|value| value.cors_rules().iter().map(cors_rule_raw).collect::<Vec<_>>()).unwrap_or_default()).unwrap_or_else(|_| "[]".to_string()),
         "encryptionJson": encryption_json,
+        "sections": section_statuses(&api_calls),
+        "versioningState": versioning.as_ref().map(|v|v.status().map(|s|s.as_str()).unwrap_or("never-enabled")).unwrap_or("unknown"),
         "apiCalls": api_calls,
     }))
 }
@@ -908,11 +935,26 @@ async fn list_object_versions(params: Value) -> SidecarResult {
     } else {
         key
     };
+    let cursor = params["cursor"]["value"].as_str().unwrap_or("");
+    let marker: Value =
+        serde_json::from_str(cursor).unwrap_or_else(|_| json!({"keyMarker":cursor}));
     let output = client
         .list_object_versions()
         .bucket(bucket_name)
         .prefix(effective_prefix)
         .max_keys(1000)
+        .set_key_marker(
+            marker["keyMarker"]
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned),
+        )
+        .set_version_id_marker(
+            marker["versionIdMarker"]
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned),
+        )
         .send()
         .await
         .map_err(map_sdk_error)?;
@@ -959,7 +1001,7 @@ async fn list_object_versions(params: Value) -> SidecarResult {
         .count();
     Ok(json!({
         "items": items,
-        "cursor": {"value": null, "hasMore": false},
+        "cursor": {"value": if output.is_truncated().unwrap_or(false) {Some(json!({"keyMarker":output.next_key_marker(),"versionIdMarker":output.next_version_id_marker()}).to_string())} else {None}, "hasMore": output.is_truncated().unwrap_or(false)},
         "totalCount": items.len(),
         "versionCount": items.len() - delete_marker_count,
         "deleteMarkerCount": delete_marker_count,
@@ -983,7 +1025,12 @@ async fn get_object_details(params: Value) -> SidecarResult {
     let head = record_api(
         &mut api_calls,
         "HeadObject",
-        client.head_object().bucket(&bucket_name).key(&key).send(),
+        client
+            .head_object()
+            .bucket(&bucket_name)
+            .key(&key)
+            .set_version_id(params["versionId"].as_str().map(str::to_owned))
+            .send(),
     )
     .await?;
     let tagging = optional_api(
@@ -993,6 +1040,7 @@ async fn get_object_details(params: Value) -> SidecarResult {
             .get_object_tagging()
             .bucket(&bucket_name)
             .key(&key)
+            .set_version_id(params["versionId"].as_str().map(str::to_owned))
             .send(),
     )
     .await?;
@@ -1069,6 +1117,7 @@ async fn get_object_details(params: Value) -> SidecarResult {
         "headers": headers,
         "tags": tags,
         "debugEvents": debug_events,
+        "sections": section_statuses(&api_calls),
         "apiCalls": api_calls,
         "debugLogExcerpt": [
             format!("Resolved endpoint {}.", profile.endpoint_url),
@@ -1103,41 +1152,28 @@ async fn create_folder(params: Value) -> SidecarResult {
 }
 
 async fn copy_object(params: Value) -> SidecarResult {
-    let profile = parse_profile(&params["profile"])?;
-    let source_bucket = required_text(
-        &params,
-        "sourceBucketName",
-        "Copy source and destination are required.",
-    )?;
-    let source_key = required_text(
-        &params,
-        "sourceKey",
-        "Copy source and destination are required.",
-    )?;
-    let destination_bucket = required_text(
-        &params,
-        "destinationBucketName",
-        "Copy source and destination are required.",
-    )?;
-    let destination_key = required_text(
-        &params,
-        "destinationKey",
-        "Copy source and destination are required.",
-    )?;
-    let client = build_client(&profile).await?;
-    client
-        .copy_object()
-        .bucket(destination_bucket)
-        .key(destination_key)
-        .copy_source(urlencoding::encode(&format!("{source_bucket}/{source_key}")).to_string())
-        .send()
-        .await
-        .map_err(map_sdk_error)?;
-    Ok(json!({"successCount": 1, "failureCount": 0, "failures": []}))
+    server_copy::run(params).await
 }
 
 async fn move_object(params: Value) -> SidecarResult {
-    let result = copy_object(params.clone()).await?;
+    if params["sourceBucketName"] == params["destinationBucketName"]
+        && params["sourceKey"] == params["destinationKey"]
+    {
+        return Err(SidecarError::new(
+            "invalid_config",
+            "A move requires different source and destination keys or buckets.",
+        ));
+    }
+    let mut result = copy_object(params.clone()).await?;
+    let version = result["sourceVersionId"].as_str().map(str::to_owned);
+    if version.is_none() && params["profile"]["endpointType"] != "awsS3" {
+        result["successCount"] = json!(0);
+        result["failureCount"] = json!(1);
+        result["copyCompleted"] = json!(true);
+        result["sourceRetained"] = json!(true);
+        result["failures"] = json!(["Copy completed. Source retained because this compatible endpoint has no verified conditional-delete capability."]);
+        return Ok(result);
+    }
     let profile = parse_profile(&params["profile"])?;
     let client = build_client(&profile).await?;
     client
@@ -1145,13 +1181,11 @@ async fn move_object(params: Value) -> SidecarResult {
         .bucket(required_text(
             &params,
             "sourceBucketName",
-            "Copy source and destination are required.",
+            "Source bucket required.",
         )?)
-        .key(required_text(
-            &params,
-            "sourceKey",
-            "Copy source and destination are required.",
-        )?)
+        .key(required_text(&params, "sourceKey", "Source key required.")?)
+        .set_version_id(version)
+        .set_if_match(result["sourceETag"].as_str().map(str::to_owned))
         .send()
         .await
         .map_err(map_sdk_error)?;
@@ -1322,6 +1356,10 @@ fn transfer_concurrency(profile: &Profile) -> usize {
     profile.max_pool_connections.clamp(1, 8)
 }
 
+// Bound file-reader chunks to 256 KiB instead of the SDK's 4 KiB default.
+// Multipart workers stream independently (at most eight); no whole part is buffered.
+const UPLOAD_FILE_BUFFER_BYTES: usize = 256 * 1024;
+
 async fn upload_file_multipart(
     client: &Client,
     bucket_name: &str,
@@ -1368,14 +1406,12 @@ async fn upload_file_multipart(
                 .acquire_owned()
                 .await
                 .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
-            let mut file = tokio::fs::File::open(&path)
-                .await
-                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
-            file.seek(SeekFrom::Start(offset))
-                .await
-                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
-            let mut buffer = vec![0_u8; length as usize];
-            file.read_exact(&mut buffer)
+            let body = ByteStream::read_from()
+                .path(&path)
+                .offset(offset)
+                .length(aws_sdk_s3::primitives::Length::Exact(length))
+                .buffer_size(UPLOAD_FILE_BUFFER_BYTES)
+                .build()
                 .await
                 .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
             let output = client
@@ -1384,7 +1420,7 @@ async fn upload_file_multipart(
                 .key(&key)
                 .upload_id(&upload_id)
                 .part_number(part_number)
-                .body(ByteStream::from(buffer))
+                .body(body)
                 .send()
                 .await
                 .map_err(map_sdk_error)?;
@@ -1582,7 +1618,10 @@ async fn start_upload(params: Value) -> SidecarResult {
             )
             .await?;
         } else {
-            let body = ByteStream::from_path(path)
+            let body = ByteStream::read_from()
+                .path(path)
+                .buffer_size(UPLOAD_FILE_BUFFER_BYTES)
+                .build()
                 .await
                 .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
             client
@@ -1651,6 +1690,7 @@ async fn start_upload(params: Value) -> SidecarResult {
 async fn download_object_ranged(
     client: &Client,
     validator: Option<String>,
+    version_id: Option<String>,
     bucket_name: &str,
     key: &str,
     target: &Path,
@@ -1675,6 +1715,7 @@ async fn download_object_ranged(
         let end = (start + chunk_bytes - 1).min(object_size.saturating_sub(1));
         let client = client.clone();
         let validator = validator.clone();
+        let version_id = version_id.clone();
         let bucket_name = bucket_name.to_string();
         let key = key.to_string();
         let target = target.to_path_buf();
@@ -1691,6 +1732,7 @@ async fn download_object_ranged(
                 .key(&key)
                 .range(format!("bytes={start}-{end}"))
                 .set_if_match(validator)
+                .set_version_id(version_id)
                 .send()
                 .await
                 .map_err(map_sdk_error)?;
@@ -1802,6 +1844,7 @@ async fn start_download(params: Value) -> SidecarResult {
             .head_object()
             .bucket(&bucket_name)
             .key(key)
+            .set_version_id(params["versionId"].as_str().map(str::to_owned))
             .send()
             .await
             .map_err(map_sdk_error)?;
@@ -1865,6 +1908,7 @@ async fn start_download(params: Value) -> SidecarResult {
             download_object_ranged(
                 &client,
                 validators.get(key).cloned().flatten(),
+                params["versionId"].as_str().map(str::to_owned),
                 &bucket_name,
                 key,
                 &target,
@@ -1879,6 +1923,7 @@ async fn start_download(params: Value) -> SidecarResult {
                 .get_object()
                 .bucket(&bucket_name)
                 .key(key)
+                .set_version_id(params["versionId"].as_str().map(str::to_owned))
                 .set_if_match(validators.get(key).cloned().flatten())
                 .send()
                 .await
@@ -1913,6 +1958,9 @@ async fn start_download(params: Value) -> SidecarResult {
             }
             progress.emit("running", Some(key.clone()));
         }
+        tokio::fs::OpenOptions::new().write(true).open(&target).await
+            .map_err(|e| SidecarError::new("invalid_config", e.to_string()))?
+            .sync_all().await.map_err(|e| SidecarError::new("invalid_config", e.to_string()))?;
         let final_path = staged
             .publish(
                 &destination,
@@ -1983,6 +2031,7 @@ async fn generate_presigned_url(params: Value) -> SidecarResult {
         .get_object()
         .bucket(bucket_name)
         .key(key)
+        .set_version_id(params["versionId"].as_str().map(str::to_owned))
         .presigned(
             PresigningConfig::expires_in(Duration::from_secs(expiration_seconds))
                 .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?,
@@ -2107,256 +2156,10 @@ async fn run_put_test_data(params: Value) -> SidecarResult {
 }
 
 async fn run_delete_all(params: Value) -> SidecarResult {
-    let profile = parse_profile(&params["profile"])?;
-    let config = &params["config"];
-    let bucket_name = config["bucketName"]
-        .as_str()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if bucket_name.is_empty() {
-        return Err(SidecarError::new(
-            "invalid_config",
-            "Bucket name is required.",
-        ));
-    }
-    let batch_size = config["batchSize"].as_u64().unwrap_or(1000).clamp(1, 1000) as usize;
-    let max_workers = config["maxWorkers"].as_u64().unwrap_or(4).clamp(1, 16) as usize;
-    let list_max_keys = config["listMaxKeys"]
-        .as_i64()
-        .unwrap_or(1000)
-        .clamp(1, 1000) as i32;
-    let deletion_delay_ms = config["deletionDelayMs"].as_u64().unwrap_or(0);
-    let client = build_client(&profile).await?;
-
-    let deleted_count = Arc::new(AtomicU64::new(0));
-    let failure_count = Arc::new(AtomicU64::new(0));
-    let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let semaphore = Arc::new(Semaphore::new(max_workers));
-
-    let mut use_versions = true;
-    let mut key_marker: Option<String> = None;
-    let mut version_id_marker: Option<String> = None;
-    let mut continuation_token: Option<String> = None;
-    let mut fatal: Option<SidecarError> = None;
-    let mut first_page = true;
-
-    loop {
-        let mut identifiers: Vec<ObjectIdentifier> = Vec::new();
-        let has_more;
-        if use_versions {
-            let mut request = client
-                .list_object_versions()
-                .bucket(&bucket_name)
-                .max_keys(list_max_keys);
-            if let Some(marker) = &key_marker {
-                request = request.key_marker(marker);
-            }
-            if let Some(marker) = &version_id_marker {
-                request = request.version_id_marker(marker);
-            }
-            match request.send().await {
-                Ok(output) => {
-                    for version in output.versions() {
-                        let mut builder =
-                            ObjectIdentifier::builder().key(version.key().unwrap_or_default());
-                        if let Some(version_id) = version.version_id() {
-                            if !version_id.is_empty() {
-                                builder = builder.version_id(version_id);
-                            }
-                        }
-                        if let Ok(identifier) = builder.build() {
-                            identifiers.push(identifier);
-                        }
-                    }
-                    for marker in output.delete_markers() {
-                        let mut builder =
-                            ObjectIdentifier::builder().key(marker.key().unwrap_or_default());
-                        if let Some(version_id) = marker.version_id() {
-                            if !version_id.is_empty() {
-                                builder = builder.version_id(version_id);
-                            }
-                        }
-                        if let Ok(identifier) = builder.build() {
-                            identifiers.push(identifier);
-                        }
-                    }
-                    has_more = output.is_truncated().unwrap_or(false);
-                    key_marker = output
-                        .next_key_marker()
-                        .filter(|marker| !marker.is_empty())
-                        .map(str::to_owned);
-                    version_id_marker = output
-                        .next_version_id_marker()
-                        .filter(|marker| !marker.is_empty())
-                        .map(str::to_owned);
-                    if has_more && key_marker.is_none() && version_id_marker.is_none() {
-                        fatal = Some(SidecarError::new(
-                            "engine_unavailable",
-                            "Version listing reported more results without pagination markers; aborting to avoid relisting from the start.",
-                        ));
-                        break;
-                    }
-                }
-                Err(error) => {
-                    if first_page {
-                        use_versions = false;
-                        continue;
-                    }
-                    fatal = Some(map_sdk_error(error));
-                    break;
-                }
-            }
-        } else {
-            let mut request = client
-                .list_objects_v2()
-                .bucket(&bucket_name)
-                .max_keys(list_max_keys);
-            if let Some(token) = &continuation_token {
-                request = request.continuation_token(token);
-            }
-            match request.send().await {
-                Ok(output) => {
-                    for object in output.contents() {
-                        if let Ok(identifier) = ObjectIdentifier::builder()
-                            .key(object.key().unwrap_or_default())
-                            .build()
-                        {
-                            identifiers.push(identifier);
-                        }
-                    }
-                    has_more = output.is_truncated().unwrap_or(false);
-                    continuation_token = output
-                        .next_continuation_token()
-                        .filter(|token| !token.is_empty())
-                        .map(str::to_owned);
-                    if has_more && continuation_token.is_none() {
-                        fatal = Some(SidecarError::new(
-                            "engine_unavailable",
-                            "Object listing reported more results without a continuation token; aborting to avoid relisting from the start.",
-                        ));
-                        break;
-                    }
-                }
-                Err(error) => {
-                    fatal = Some(map_sdk_error(error));
-                    break;
-                }
-            }
-        }
-        first_page = false;
-        if identifiers.is_empty() && !has_more {
-            break;
-        }
-        let mut join_set = JoinSet::new();
-        let mut batches = identifiers.chunks(batch_size).peekable();
-        while let Some(batch) = batches.next() {
-            let batch = batch.to_vec();
-            let batch_len = batch.len() as u64;
-            let client = client.clone();
-            let bucket = bucket_name.clone();
-            let semaphore = Arc::clone(&semaphore);
-            let deleted_count = Arc::clone(&deleted_count);
-            let failure_count = Arc::clone(&failure_count);
-            let last_error = Arc::clone(&last_error);
-            join_set.spawn(async move {
-                let Ok(_permit) = semaphore.acquire_owned().await else {
-                    return;
-                };
-                let delete = match Delete::builder()
-                    .set_objects(Some(batch))
-                    .quiet(false)
-                    .build()
-                {
-                    Ok(delete) => delete,
-                    Err(error) => {
-                        failure_count.fetch_add(batch_len, AtomicOrdering::Relaxed);
-                        *last_error.lock().unwrap() = Some(error.to_string());
-                        return;
-                    }
-                };
-                match client
-                    .delete_objects()
-                    .bucket(&bucket)
-                    .delete(delete)
-                    .send()
-                    .await
-                {
-                    Ok(output) => {
-                        deleted_count
-                            .fetch_add(output.deleted().len() as u64, AtomicOrdering::Relaxed);
-                        let errors = output.errors();
-                        if !errors.is_empty() {
-                            failure_count.fetch_add(errors.len() as u64, AtomicOrdering::Relaxed);
-                            if let Some(first) = errors.first() {
-                                *last_error.lock().unwrap() = Some(
-                                    first
-                                        .message()
-                                        .unwrap_or("Unknown delete error.")
-                                        .to_string(),
-                                );
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        failure_count.fetch_add(batch_len, AtomicOrdering::Relaxed);
-                        *last_error.lock().unwrap() = Some(map_sdk_error(error).message);
-                    }
-                }
-            });
-            if deletion_delay_ms > 0 && batches.peek().is_some() {
-                tokio::time::sleep(Duration::from_millis(deletion_delay_ms)).await;
-            }
-        }
-        while join_set.join_next().await.is_some() {}
-        if deletion_delay_ms > 0 && has_more {
-            tokio::time::sleep(Duration::from_millis(deletion_delay_ms)).await;
-        }
-        if !has_more {
-            break;
-        }
-    }
-
-    let deleted = deleted_count.load(AtomicOrdering::Relaxed);
-    let failures = failure_count.load(AtomicOrdering::Relaxed);
-    let mut output_lines = vec![
-        format!("Bucket: {bucket_name}"),
-        format!("Batch size: {batch_size}"),
-        format!("Workers: {max_workers}"),
-        format!("Deleted: {deleted}"),
-        format!("Failures: {failures}"),
-    ];
-    if let Some(message) = last_error.lock().unwrap().clone() {
-        output_lines.push(format!("Last error: {message}"));
-    }
-    if let Some(error) = fatal {
-        output_lines.push(format!("Error: {}", error.message));
-        return Ok(tool_state(
-            "delete-all",
-            format!("delete-all failed: {}", error.message),
-            output_lines,
-            1,
-        ));
-    }
-    Ok(tool_state(
-        "delete-all",
-        format!("Deleted {deleted} object version(s) from {bucket_name}."),
-        output_lines,
-        if failures > 0 { 1 } else { 0 },
-    ))
+    delete_all::run(params).await
 }
-
 fn cancel_tool_execution(params: &Value) -> Value {
-    let job_id = params["jobId"].as_str().unwrap_or_default();
-    json!({
-        "label": if job_id.is_empty() { "tool" } else { job_id },
-        "running": false,
-        "lastStatus": format!("Cancelled tool execution {job_id}."),
-        "jobId": job_id,
-        "cancellable": false,
-        "outputLines": [format!("Tool execution {job_id} cancelled.")],
-        "exitCode": 130
-    })
+    delete_all::cancel(params)
 }
 
 async fn start_benchmark(params: Value) -> SidecarResult {
@@ -2365,6 +2168,10 @@ async fn start_benchmark(params: Value) -> SidecarResult {
             "invalid_config",
             "Profile configuration is required for benchmark runs.",
         ));
+    }
+    benchmark_runtime::validate(&params["config"])?;
+    if LIVE_BENCHMARKS.get_or_init(Default::default).lock().unwrap().len() >= 4 {
+        return Err(SidecarError::new("invalid_config", "Stop an existing benchmark before starting another (maximum four live runs)."));
     }
     let run_id = format!("bench-{}", short_uuid());
     let config_map = benchmark_config_with_run_dir(
@@ -2378,6 +2185,7 @@ async fn start_benchmark(params: Value) -> SidecarResult {
     let state = json!({
         "id": run_id,
         "profile": params["profile"],
+        "profileId": params["profile"]["id"],
         "config": Value::Object(config_map.clone()),
         "status": "running",
         "processedCount": 0,
@@ -2412,60 +2220,156 @@ async fn start_benchmark(params: Value) -> SidecarResult {
             benchmark_bucket, benchmark_endpoint
         ),
     );
+    parse_profile(&params["profile"])?;
+    let generation = Uuid::new_v4().to_string();
+    state["workerGeneration"] = json!(generation);
     write_benchmark_state(&state)?;
-    materialize_benchmark_state(state).await
+    let result = public_benchmark_state(&state);
+    let live = Arc::new(tokio::sync::Mutex::new(state));
+    LIVE_BENCHMARKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(run_id, live.clone());
+    spawn_benchmark_worker(live, generation);
+    Ok(result)
+}
+
+type LiveBenchmark = Arc<tokio::sync::Mutex<Value>>;
+static LIVE_BENCHMARKS: OnceLock<Mutex<BTreeMap<String, LiveBenchmark>>> = OnceLock::new();
+
+fn public_benchmark_state(state: &Value) -> Value {
+    let mut result = state.clone();
+    if let Some(map) = result.as_object_mut() {
+        map.remove("profile");
+        map.remove("workerGeneration");
+        map.remove("_lastPersistUnixMs");
+    }
+    result
+}
+
+async fn live_benchmark(params: &Value) -> Result<LiveBenchmark, SidecarError> {
+    let id = required_text(params, "runId", "Benchmark run ID is required.")?;
+    let registry = LIVE_BENCHMARKS.get_or_init(Default::default);
+    if let Some(state) = registry.lock().unwrap().get(&id).cloned() {
+        return Ok(state);
+    }
+    let mut state = read_benchmark_state(id.clone())?;
+    if state["status"] == "running" {
+        state["status"] = json!("paused");
+        append_benchmark_log(
+            &mut state,
+            "Engine restarted; resume with the owning endpoint credentials.",
+        );
+    }
+    let live = Arc::new(tokio::sync::Mutex::new(state));
+    if live.lock().await["status"] == "paused" {
+        let mut registry = registry.lock().unwrap();
+        if registry.len() >= 4 { return Err(SidecarError::new("invalid_config", "Maximum four live benchmark runs.")); }
+        registry.insert(id, live.clone());
+    }
+    Ok(live)
+}
+
+fn spawn_benchmark_worker(live: LiveBenchmark, generation: String) {
+    tokio::spawn(async move {
+        let resources = { let state = live.lock().await; Arc::new(benchmark_runtime::Resources::new(&state["config"])) };
+        loop {
+            {
+                let mut state = live.lock().await;
+                if state["status"] != "running" || state["workerGeneration"] != generation {
+                    break;
+                }
+                match materialize_benchmark_state(state.clone(), resources.clone()).await {
+                    Ok(next) => *state = next,
+                    Err(error) => {
+                        state["status"] = json!("failed");
+                        append_benchmark_log(
+                            &mut state,
+                            &format!("Benchmark failed: {}", error.message),
+                        );
+                        let _ = write_benchmark_state(&state);
+                    }
+                }
+                if state["status"] != "running" {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        let mut state = live.lock().await;
+        if state["status"] != "running" {
+            state.as_object_mut().unwrap().remove("profile");
+            let id = state["id"].as_str().unwrap_or_default();
+            LIVE_BENCHMARKS.get_or_init(Default::default).lock().unwrap().remove(id);
+        }
+    });
 }
 
 async fn get_benchmark_status(params: Value) -> SidecarResult {
-    materialize_benchmark_state(read_benchmark_state(required_text(
-        &params,
-        "runId",
-        "Benchmark run ID is required.",
-    )?)?)
-    .await
+    let live = live_benchmark(&params).await?;
+    let state = live.lock().await;
+    Ok(public_benchmark_state(&state))
 }
 
 async fn pause_benchmark(params: Value) -> SidecarResult {
-    let mut state = read_benchmark_state(required_text(
-        &params,
-        "runId",
-        "Benchmark run ID is required.",
-    )?)?;
-    refresh_benchmark_snapshot(&mut state);
-    state["status"] = Value::String("paused".to_string());
-    append_benchmark_log(&mut state, "Benchmark paused by user.");
-    persist_benchmark_outputs(&state)?;
-    write_benchmark_state(&state)?;
-    Ok(state)
+    let live = live_benchmark(&params).await?;
+    let mut state = live.lock().await;
+    if state["status"] == "running" {
+        refresh_benchmark_snapshot(&mut state);
+        state["status"] = json!("paused");
+        state["workerGeneration"] = Value::Null;
+        state.as_object_mut().unwrap().remove("profile");
+        append_benchmark_log(&mut state, "Benchmark paused by user.");
+        persist_benchmark_outputs(&state)?;
+        write_benchmark_state(&state)?;
+    }
+    Ok(public_benchmark_state(&state))
 }
 
 async fn resume_benchmark(params: Value) -> SidecarResult {
-    let mut state = read_benchmark_state(required_text(
-        &params,
-        "runId",
-        "Benchmark run ID is required.",
-    )?)?;
-    state["status"] = Value::String("running".to_string());
-    state["lastUpdatedAt"] = Value::String(now_iso());
-    append_benchmark_log(&mut state, "Benchmark resumed by user.");
-    write_benchmark_state(&state)?;
-    materialize_benchmark_state(state).await
+    let live = live_benchmark(&params).await?;
+    let generation = Uuid::new_v4().to_string();
+    let result;
+    {
+        let mut state = live.lock().await;
+        if state["status"] != "paused" {
+            return Ok(public_benchmark_state(&state));
+        }
+        parse_profile(&params["profile"])?;
+        if state["profileId"].as_str().is_some() && state["profileId"] != params["profile"]["id"] {
+            return Err(SidecarError::new(
+                "invalid_config",
+                "Resume requires the original endpoint profile.",
+            ));
+        }
+        state["profile"] = params["profile"].clone();
+        state["status"] = json!("running");
+        state["lastUpdatedAt"] = json!(now_iso());
+        state["workerGeneration"] = json!(generation);
+        append_benchmark_log(&mut state, "Benchmark resumed by user.");
+        write_benchmark_state(&state)?;
+        result = public_benchmark_state(&state);
+    }
+    spawn_benchmark_worker(live, generation);
+    Ok(result)
 }
 
 async fn stop_benchmark(params: Value) -> SidecarResult {
-    let mut state = read_benchmark_state(required_text(
-        &params,
-        "runId",
-        "Benchmark run ID is required.",
-    )?)?;
-    refresh_benchmark_snapshot(&mut state);
-    state["status"] = Value::String("stopped".to_string());
-    state["completedAt"] = Value::String(now_iso());
+    let live = live_benchmark(&params).await?;
+    let mut state = live.lock().await;
+    if state["status"] == "running" {
+        refresh_benchmark_snapshot(&mut state);
+    }
+    state["status"] = json!("stopped");
+    state["workerGeneration"] = Value::Null;
+    state.as_object_mut().unwrap().remove("profile");
+    state["completedAt"] = json!(now_iso());
     state["resultSummary"] = benchmark_summary_from_state(&state);
     append_benchmark_log(&mut state, "Benchmark stopped by user.");
     persist_benchmark_outputs(&state)?;
     write_benchmark_state(&state)?;
-    Ok(state)
+    Ok(public_benchmark_state(&state))
 }
 
 async fn export_benchmark_results(params: Value) -> SidecarResult {
@@ -2490,20 +2394,55 @@ async fn export_benchmark_results(params: Value) -> SidecarResult {
     }))
 }
 
+static CLIENTS: OnceLock<tokio::sync::Mutex<Vec<(Profile, Client)>>> = OnceLock::new();
 async fn build_client(profile: &Profile) -> Result<Client, SidecarError> {
-    let credentials = Credentials::new(
-        profile.access_key.clone(),
-        profile.secret_key.clone(),
-        profile.session_token.clone(),
-        None,
-        "static",
-    );
-    let shared_config = aws_config::defaults(BehaviorVersion::latest())
+    let mut clients = CLIENTS.get_or_init(Default::default).lock().await;
+    if let Some((_, client)) = clients.iter().find(|(key, _)| key == profile) {
+        return Ok(client.clone());
+    }
+    let mut loader = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new(profile.region.clone()))
-        .credentials_provider(credentials)
-        .retry_config(RetryConfig::standard().with_max_attempts(profile.max_attempts))
-        .load()
-        .await;
+        .retry_config(RetryConfig::standard().with_max_attempts(profile.max_attempts));
+    if profile.auth_mode == "static" {
+        loader = loader.credentials_provider(Credentials::new(
+            profile.access_key.clone(),
+            profile.secret_key.clone(),
+            profile.session_token.clone(),
+            None,
+            "static",
+        ));
+    } else if profile.auth_mode == "awsProfile"
+        || (profile.auth_mode == "assumeRole" && !profile.aws_profile_name.is_empty())
+    {
+        let name = if profile.aws_profile_name.is_empty() {
+            "default"
+        } else {
+            &profile.aws_profile_name
+        };
+        loader = loader.profile_name(name).credentials_provider(
+            aws_config::profile::ProfileFileCredentialsProvider::builder()
+                .profile_name(name)
+                .build(),
+        );
+    }
+    let mut shared_config = loader.load().await;
+    if profile.auth_mode == "assumeRole" {
+        if profile.role_arn.is_empty() {
+            return Err(SidecarError::new("invalid_config", "Role ARN is required."));
+        }
+        let mut role = aws_config::sts::AssumeRoleProvider::builder(&profile.role_arn)
+            .session_name(&profile.role_session_name)
+            .configure(&shared_config);
+        if let Some(external) = &profile.external_id {
+            role = role.external_id(external);
+        }
+        shared_config = shared_config
+            .to_builder()
+            .credentials_provider(
+                aws_credential_types::provider::SharedCredentialsProvider::new(role.build().await),
+            )
+            .build();
+    }
     let timeout_config = TimeoutConfig::builder()
         .connect_timeout(Duration::from_secs(profile.connect_timeout_seconds as u64))
         .read_timeout(Duration::from_secs(profile.read_timeout_seconds as u64))
@@ -2512,11 +2451,20 @@ async fn build_client(profile: &Profile) -> Result<Client, SidecarError> {
         .endpoint_url(profile.endpoint_url.clone())
         .force_path_style(profile.path_style)
         .timeout_config(timeout_config)
+        .interceptor(ProfileHeaders {
+            requester_pays: profile.requester_pays,
+            expected_bucket_owner: profile.expected_bucket_owner.clone(),
+        })
         .interceptor(HttpTraceInterceptor {
             enable_api_logging: profile.enable_api_logging,
         })
         .build();
-    Ok(Client::from_conf(config))
+    let client = Client::from_conf(config);
+    if clients.len() >= 16 {
+        clients.remove(0);
+    }
+    clients.push((profile.clone(), client.clone()));
+    Ok(client)
 }
 
 async fn bucket_context(params: &Value) -> Result<(Profile, String, Client), SidecarError> {
@@ -2532,6 +2480,27 @@ fn parse_profile(value: &Value) -> Result<Profile, SidecarError> {
             "unsupported_feature",
             "Azure Blob profiles are not supported by the rust engine yet. Switch the engine to Go or Python in Settings.",
         ));
+    }
+    let auth_mode = value["authMode"].as_str().unwrap_or("static");
+    if !matches!(
+        auth_mode,
+        "static" | "awsDefault" | "awsProfile" | "assumeRole"
+    ) {
+        return Err(SidecarError::new(
+            "unsupported_feature",
+            "Unknown authentication mode.",
+        ));
+    }
+    if value["caBundlePath"]
+        .as_str()
+        .is_some_and(|v| !v.is_empty())
+        || (value["verifyTls"] == false
+            && value["endpointUrl"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("https://"))
+    {
+        return Err(SidecarError::new("unsupported_feature", "This Rust build does not support the requested custom-CA or disabled-TLS-verification option. Use Python."));
     }
     let endpoint_url = value["endpointUrl"]
         .as_str()
@@ -2562,13 +2531,30 @@ fn parse_profile(value: &Value) -> Result<Profile, SidecarError> {
             "Endpoint URL is required.",
         ));
     }
-    if access_key.is_empty() || secret_key.is_empty() {
+    if auth_mode == "static" && (access_key.is_empty() || secret_key.is_empty()) {
         return Err(SidecarError::new(
             "invalid_config",
             "Access key and secret key are required.",
         ));
     }
     Ok(Profile {
+        auth_mode: auth_mode.to_string(),
+        aws_profile_name: value["awsProfileName"].as_str().unwrap_or("").to_string(),
+        role_arn: value["roleArn"].as_str().unwrap_or("").to_string(),
+        external_id: value["externalId"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned),
+        role_session_name: value["roleSessionName"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .unwrap_or("object-browser")
+            .to_string(),
+        requester_pays: value["requesterPays"].as_bool().unwrap_or(false),
+        expected_bucket_owner: value["expectedBucketOwner"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned),
         endpoint_url,
         region,
         access_key,
@@ -2634,139 +2620,52 @@ where
     E: Into<aws_sdk_s3::Error>,
 {
     match record_api(api_calls, operation, future).await {
-        Ok(result) => Ok(Some(result)),
-        Err(error) => {
-            if matches!(
-                error.details.get("awsCode").and_then(Value::as_str),
-                Some(
-                    "NoSuchLifecycleConfiguration"
-                        | "NoSuchBucketPolicy"
-                        | "NoSuchCORSConfiguration"
-                        | "NoSuchBucket"
-                        | "NoSuchTagSet"
-                        | "ObjectLockConfigurationNotFoundError"
-                        | "NoSuchObjectLockConfiguration"
-                        | "ServerSideEncryptionConfigurationNotFoundError"
-                        | "MethodNotAllowed"
-                        | "NotImplemented"
-                        | "XNotImplemented"
-                )
-            ) {
-                Ok(None)
-            } else {
-                Err(error)
+        Ok(result) => {
+            if let Some(last) = api_calls.last_mut() {
+                last["sectionState"] = json!("available");
             }
+            Ok(Some(result))
+        }
+        Err(error) => {
+            let code = error.details["awsCode"].as_str().unwrap_or("Unknown");
+            let state = if matches!(
+                code,
+                "AccessDenied"
+                    | "InvalidAccessKeyId"
+                    | "SignatureDoesNotMatch"
+                    | "AllAccessDisabled"
+            ) {
+                "denied"
+            } else if matches!(
+                code,
+                "NotImplemented" | "XNotImplemented" | "MethodNotAllowed"
+            ) {
+                "unsupported"
+            } else if matches!(
+                code,
+                "NoSuchLifecycleConfiguration"
+                    | "NoSuchBucketPolicy"
+                    | "NoSuchCORSConfiguration"
+                    | "NoSuchTagSet"
+                    | "ObjectLockConfigurationNotFoundError"
+                    | "NoSuchObjectLockConfiguration"
+                    | "ServerSideEncryptionConfigurationNotFoundError"
+            ) {
+                "absent"
+            } else {
+                "error"
+            };
+            if let Some(last) = api_calls.last_mut() {
+                last["sectionState"] = json!(state);
+                last["code"] = json!(code);
+                last["reason"] = json!(error.message);
+            }
+            Ok(None)
         }
     }
 }
-
-fn parse_lifecycle_rules(value: &Value) -> Result<Vec<LifecycleRule>, SidecarError> {
-    let Some(items) = value.as_array() else {
-        return Ok(Vec::new());
-    };
-    let mut rules = Vec::new();
-    for item in items {
-        let mut builder = LifecycleRule::builder().status(
-            if item["Status"]
-                .as_str()
-                .unwrap_or("Disabled")
-                .eq_ignore_ascii_case("Enabled")
-            {
-                aws_sdk_s3::types::ExpirationStatus::Enabled
-            } else {
-                aws_sdk_s3::types::ExpirationStatus::Disabled
-            },
-        );
-        if let Some(id) = item["ID"].as_str().filter(|value| !value.is_empty()) {
-            builder = builder.id(id);
-        }
-        let prefix = item["Filter"]["Prefix"]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .or_else(|| item["Prefix"].as_str().filter(|value| !value.is_empty()));
-        if let Some(prefix) = prefix {
-            builder = builder.filter(LifecycleRuleFilter::builder().prefix(prefix).build());
-        }
-        if let Some(expiration) = item.get("Expiration").and_then(Value::as_object) {
-            let mut expiration_builder = LifecycleExpiration::builder();
-            if let Some(days) = expiration.get("Days").and_then(Value::as_i64) {
-                expiration_builder = expiration_builder.days(days as i32);
-            }
-            if let Some(delete_marker) = expiration
-                .get("ExpiredObjectDeleteMarker")
-                .and_then(Value::as_bool)
-            {
-                expiration_builder = expiration_builder.expired_object_delete_marker(delete_marker);
-            }
-            builder = builder.expiration(expiration_builder.build());
-        }
-        if let Some(transitions) = item.get("Transitions").and_then(Value::as_array) {
-            let parsed: Vec<Transition> = transitions
-                .iter()
-                .map(|transition| {
-                    let mut builder = Transition::builder();
-                    if let Some(days) = transition.get("Days").and_then(Value::as_i64) {
-                        builder = builder.days(days as i32);
-                    }
-                    if let Some(storage_class) =
-                        transition.get("StorageClass").and_then(Value::as_str)
-                    {
-                        builder =
-                            builder.storage_class(TransitionStorageClass::from(storage_class));
-                    }
-                    builder.build()
-                })
-                .collect();
-            builder = builder.set_transitions(Some(parsed));
-        }
-        if let Some(expiration) = item
-            .get("NoncurrentVersionExpiration")
-            .and_then(Value::as_object)
-        {
-            if let Some(days) = expiration.get("NoncurrentDays").and_then(Value::as_i64) {
-                builder = builder.noncurrent_version_expiration(
-                    NoncurrentVersionExpiration::builder()
-                        .noncurrent_days(days as i32)
-                        .build(),
-                );
-            }
-        }
-        if let Some(transitions) = item
-            .get("NoncurrentVersionTransitions")
-            .and_then(Value::as_array)
-        {
-            let parsed: Vec<NoncurrentVersionTransition> = transitions
-                .iter()
-                .map(|transition| {
-                    let mut builder = NoncurrentVersionTransition::builder();
-                    if let Some(days) = transition.get("NoncurrentDays").and_then(Value::as_i64) {
-                        builder = builder.noncurrent_days(days as i32);
-                    }
-                    if let Some(storage_class) =
-                        transition.get("StorageClass").and_then(Value::as_str)
-                    {
-                        builder =
-                            builder.storage_class(TransitionStorageClass::from(storage_class));
-                    }
-                    builder.build()
-                })
-                .collect();
-            builder = builder.set_noncurrent_version_transitions(Some(parsed));
-        }
-        if let Some(days) = item["AbortIncompleteMultipartUpload"]["DaysAfterInitiation"].as_i64() {
-            builder = builder.abort_incomplete_multipart_upload(
-                AbortIncompleteMultipartUpload::builder()
-                    .days_after_initiation(days as i32)
-                    .build(),
-            );
-        }
-        rules.push(
-            builder
-                .build()
-                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?,
-        );
-    }
-    Ok(rules)
+fn section_statuses(calls: &[Value]) -> Value {
+    Value::Object(calls.iter().map(|c|(c["operation"].as_str().unwrap_or("").to_string(),json!({"state":c["sectionState"].as_str().unwrap_or(if c["status"]=="200" {"available"}else{"error"}),"code":c["code"],"reason":c["reason"],"message":c["reason"]}))).collect())
 }
 
 fn parse_cors_rules(value: &Value) -> Result<Vec<CorsRule>, SidecarError> {
@@ -2866,32 +2765,6 @@ fn lifecycle_rule_summary(rule: &LifecycleRule) -> Value {
         "nonCurrentTransitionStorageClass": noncurrent.and_then(|value| value.storage_class()).map(|value| value.as_str()),
         "nonCurrentTransitionDays": noncurrent.and_then(|value| value.noncurrent_days()),
         "abortIncompleteMultipartUploadDays": rule.abort_incomplete_multipart_upload().and_then(|value| value.days_after_initiation()),
-    })
-}
-
-fn lifecycle_rule_raw(rule: &LifecycleRule) -> Value {
-    json!({
-        "ID": rule.id(),
-        "Status": rule.status().as_str(),
-        "Filter": {"Prefix": rule.filter().and_then(|value| value.prefix()).unwrap_or_default()},
-        "Expiration": rule.expiration().map(|value| json!({
-            "Days": value.days(),
-            "ExpiredObjectDeleteMarker": value.expired_object_delete_marker(),
-        })),
-        "Transitions": rule.transitions().iter().map(|transition| json!({
-            "Days": transition.days(),
-            "StorageClass": transition.storage_class().map(|value| value.as_str()),
-        })).collect::<Vec<_>>(),
-        "NoncurrentVersionExpiration": rule.noncurrent_version_expiration().map(|value| json!({
-            "NoncurrentDays": value.noncurrent_days(),
-        })),
-        "NoncurrentVersionTransitions": rule.noncurrent_version_transitions().iter().map(|transition| json!({
-            "NoncurrentDays": transition.noncurrent_days(),
-            "StorageClass": transition.storage_class().map(|value| value.as_str()),
-        })).collect::<Vec<_>>(),
-        "AbortIncompleteMultipartUpload": rule.abort_incomplete_multipart_upload().map(|value| json!({
-            "DaysAfterInitiation": value.days_after_initiation()
-        })),
     })
 }
 
@@ -3039,13 +2912,18 @@ fn read_benchmark_state(run_id: String) -> Result<Value, SidecarError> {
     }
     let contents = fs::read_to_string(path)
         .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
-    serde_json::from_str(&contents)
-        .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))
+    let state: Value = serde_json::from_str(&contents)
+        .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
+    let clean = public_benchmark_state(&state);
+    if clean != state {
+        write_benchmark_state(&clean)?;
+    }
+    Ok(clean)
 }
 
 fn write_benchmark_state(state: &Value) -> Result<(), SidecarError> {
     let path = benchmark_state_path(state["id"].as_str().unwrap_or_default())?;
-    let output = serde_json::to_string(state)
+    let output = serde_json::to_string(&public_benchmark_state(state))
         .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
     fs::write(path, output)
         .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))
@@ -3068,12 +2946,8 @@ fn refresh_benchmark_snapshot(state: &mut Value) {
         }
     }
     state["resultSummary"] = benchmark_summary_from_state(state);
-    let history = state["history"].as_array().cloned().unwrap_or_default();
-    let latencies: Vec<f64> = history
-        .iter()
-        .filter_map(|item| item.get("latencyMs").and_then(Value::as_f64))
-        .collect();
-    state["averageLatencyMs"] = Value::from(round1(mean_f64(&latencies)));
+    state["averageLatencyMs"] = json!(round1(state["totalLatencyMs"].as_f64().unwrap_or(0.0)
+        / state["totalRecordCount"].as_f64().unwrap_or(1.0).max(1.0)));
     let active_elapsed = state["activeElapsedSeconds"].as_f64().unwrap_or(0.0);
     let processed_count = state["processedCount"].as_i64().unwrap_or(0);
     state["throughputOpsPerSecond"] = Value::from(if active_elapsed <= 0.0 {
@@ -3083,7 +2957,7 @@ fn refresh_benchmark_snapshot(state: &mut Value) {
     });
 }
 
-async fn materialize_benchmark_state(mut state: Value) -> SidecarResult {
+async fn materialize_benchmark_state(mut state: Value, resources: Arc<benchmark_runtime::Resources>) -> SidecarResult {
     if matches!(
         state["status"].as_str(),
         Some("paused" | "completed" | "stopped" | "failed")
@@ -3128,11 +3002,8 @@ async fn materialize_benchmark_state(mut state: Value) -> SidecarResult {
         .and_then(Value::as_u64)
         .unwrap_or(1000)
         .max(1) as usize;
-    let parallelism = config
-        .get("concurrentThreads")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-        .max(1) as usize;
+    let parallelism = config.get("concurrentThreads").and_then(Value::as_u64).unwrap_or(1).clamp(1, 64)
+        .min(config.get("maxPoolConnections").and_then(Value::as_u64).unwrap_or(10).max(1)) as usize;
     let test_mode = config
         .get("testMode")
         .and_then(Value::as_str)
@@ -3141,6 +3012,12 @@ async fn materialize_benchmark_state(mut state: Value) -> SidecarResult {
         test_mode != "operation-count" && active_elapsed >= duration_seconds as f64;
     let operation_complete = test_mode == "operation-count"
         && state["processedCount"].as_u64().unwrap_or(0) as usize >= operation_count;
+    if state.get("totalRecordCount").is_none() {
+        state["processedCount"] = json!(0);
+        for record in state["history"].as_array().cloned().unwrap_or_default() {
+            accumulate_benchmark_record(&mut state, &record);
+        }
+    }
     let call_started = Instant::now();
     let call_base_elapsed_ms = active_elapsed * 1000.0;
     let execution_budget_seconds =
@@ -3150,7 +3027,11 @@ async fn materialize_benchmark_state(mut state: Value) -> SidecarResult {
             state.get("profile").cloned().unwrap_or(Value::Null),
             &config,
         )?;
-        let client = build_client(&profile).await?;
+        let shared = build_client(&profile).await?;
+        let client = Client::from_conf(shared.config().to_builder()
+            .interceptor(benchmark_runtime::MetricsInterceptor(resources.metrics.clone())).build());
+        let previous_errors = resources.metrics.errors.load(AtomicOrdering::Relaxed);
+        let previous_retries = resources.metrics.retries.load(AtomicOrdering::Relaxed);
         while call_started.elapsed().as_secs_f64() < execution_budget_seconds {
             if test_mode == "operation-count"
                 && state["processedCount"].as_u64().unwrap_or(0) as usize >= operation_count
@@ -3181,10 +3062,22 @@ async fn materialize_benchmark_state(mut state: Value) -> SidecarResult {
                 &state,
                 call_started,
                 call_base_elapsed_ms,
+                resources.clone(),
             )
             .await
             {
-                Ok(results) => apply_benchmark_batch_results(&mut state, results),
+                Ok((results, failure)) => {
+                    apply_benchmark_batch_results(&mut state, results, &resources)?;
+                    if let Some(error) = failure {
+                        state["status"] = json!("failed");
+                        state["completedAt"] = json!(now_iso());
+                        if resources.metrics.errors.load(AtomicOrdering::Relaxed) == previous_errors {
+                            resources.metrics.errors.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        append_benchmark_log(&mut state, &format!("Benchmark failed: {}", error.message));
+                        break;
+                    }
+                },
                 Err(error) => {
                     state["status"] = Value::String("failed".to_string());
                     state["completedAt"] = Value::String(now_iso());
@@ -3196,7 +3089,14 @@ async fn materialize_benchmark_state(mut state: Value) -> SidecarResult {
                 }
             }
         }
+        state["errorCount"] = json!(state["errorCount"].as_u64().unwrap_or(0)
+            + resources.metrics.errors.load(AtomicOrdering::Relaxed).saturating_sub(previous_errors));
+        state["retryCount"] = json!(state["retryCount"].as_u64().unwrap_or(0)
+            + resources.metrics.retries.load(AtomicOrdering::Relaxed).saturating_sub(previous_retries));
     }
+    state["activeElapsedSeconds"] = json!(active_elapsed + call_started.elapsed().as_secs_f64());
+    state["lastUpdatedAt"] = json!(now_iso());
+    state["cacheBytes"] = json!(resources.cache_bytes());
     refresh_benchmark_snapshot(&mut state);
     if state["status"].as_str() == Some("running") {
         let completed = if config
@@ -3219,8 +3119,13 @@ async fn materialize_benchmark_state(mut state: Value) -> SidecarResult {
             );
         }
     }
-    persist_benchmark_outputs(&state)?;
-    write_benchmark_state(&state)?;
+    resources.flush_records()?;
+    let now_ms = Utc::now().timestamp_millis();
+    if state["status"] != "running" || now_ms - state["_lastPersistUnixMs"].as_i64().unwrap_or(0) >= 1000 {
+        persist_benchmark_outputs(&state)?;
+        write_benchmark_state(&state)?;
+        state["_lastPersistUnixMs"] = json!(now_ms);
+    }
     Ok(state)
 }
 
@@ -3264,8 +3169,10 @@ fn persist_benchmark_outputs(state: &Value) -> Result<(), SidecarError> {
             record["key"].as_str().unwrap_or_default(),
         ));
     }
-    fs::write(csv_path, csv.join("\n") + "\n")
-        .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
+    if !Path::new(csv_path).exists() {
+        fs::write(csv_path, csv.join("\n") + "\n")
+            .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
+    }
     fs::write(
         json_path,
         serde_json::to_string_pretty(&state["resultSummary"]).unwrap_or_else(|_| "{}".to_string()),
@@ -3567,145 +3474,103 @@ fn plan_benchmark_batch(
     task_count: usize,
     remaining_operations: usize,
 ) -> Vec<BenchmarkTask> {
-    if task_count == 0 || remaining_operations == 0 {
-        return Vec::new();
-    }
     let config = state["config"].as_object().cloned().unwrap_or_default();
     let sizes = benchmark_size_list(&config);
     let object_limit = config
         .get("objectCount")
         .and_then(Value::as_u64)
-        .unwrap_or(sizes.len() as u64)
+        .unwrap_or(1)
         .max(1) as usize;
-    let mut planned_active_objects = state["activeObjects"]
+    let mut available = state["activeObjects"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let mut next_size_index = state["nextSizeIndex"].as_u64().unwrap_or(0) as usize;
-    let mut next_active_index = state["nextActiveIndex"].as_u64().unwrap_or(0) as usize;
-    let mut next_object_index = state["nextObjectIndex"].as_u64().unwrap_or(0);
-    let mut scheduled_operations = 0usize;
-    let mut tasks = Vec::new();
-
+    let mut active_count = available.len();
+    let mut next_object = state["nextObjectIndex"].as_u64().unwrap_or(0);
+    let mut next_size = state["nextSizeIndex"].as_u64().unwrap_or(0) as usize;
+    let mut next_active = state["nextActiveIndex"].as_u64().unwrap_or(0) as usize;
+    let mut scheduled = 0;
+    let mut tasks = vec![];
     for order in 0..task_count {
-        if scheduled_operations >= remaining_operations {
+        if scheduled >= remaining_operations {
             break;
         }
-        let size_bytes = sizes[next_size_index % sizes.len()];
-        next_size_index += 1;
-        let processed_slot =
-            state["processedCount"].as_u64().unwrap_or(0) as usize + scheduled_operations;
-        let mut operation = benchmark_operation_for_slot(&config, processed_slot);
-        if matches!(operation, "GET" | "DELETE") && planned_active_objects.is_empty() {
+        let mut operation = benchmark_operation_for_slot(
+            &config,
+            state["processedCount"].as_u64().unwrap_or(0) as usize + scheduled,
+        );
+        // Reserve keys across the batch so a GET never races a scheduled PUT/DELETE.
+        if matches!(operation, "GET" | "DELETE") && available.is_empty() {
+            if active_count >= object_limit {
+                break;
+            }
             operation = "PUT";
         }
-        match operation {
+        let size = sizes[next_size % sizes.len()];
+        next_size += 1;
+        let kind = match operation {
             "PUT" => {
-                let key = if planned_active_objects.len() >= object_limit
-                    && !planned_active_objects.is_empty()
-                {
-                    let selected = planned_active_objects
-                        [next_active_index % planned_active_objects.len()]["key"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
-                    next_active_index += 1;
-                    selected
-                } else {
-                    let selected = format!(
-                        "{}obj-{next_object_index:06}-{size_bytes}.bin",
-                        state["benchmarkPrefix"].as_str().unwrap_or_default()
-                    );
-                    next_object_index += 1;
-                    selected
-                };
-                let mut updated = false;
-                for item in &mut planned_active_objects {
-                    if item["key"].as_str().unwrap_or_default() == key {
-                        item["sizeBytes"] = Value::from(size_bytes as i64);
-                        updated = true;
+                let key = if active_count >= object_limit {
+                    if available.is_empty() {
                         break;
                     }
+                    let target = available.remove(next_active % available.len());
+                    next_active += 1;
+                    target["key"].as_str().unwrap_or_default().to_string()
+                } else {
+                    let key = format!(
+                        "{}obj-{next_object:06}-{size}.bin",
+                        state["benchmarkPrefix"].as_str().unwrap_or_default()
+                    );
+                    next_object += 1;
+                    active_count += 1;
+                    key
+                };
+                scheduled += 1;
+                BenchmarkTaskKind::Put {
+                    key,
+                    size_bytes: size,
                 }
-                if !updated {
-                    planned_active_objects.push(json!({"key": key, "sizeBytes": size_bytes}));
-                }
-                tasks.push(BenchmarkTask {
-                    order,
-                    kind: BenchmarkTaskKind::Put { key, size_bytes },
-                });
-                scheduled_operations += 1;
             }
             "GET" => {
-                let target = planned_active_objects
-                    [next_active_index % planned_active_objects.len()]
-                .clone();
-                next_active_index += 1;
-                tasks.push(BenchmarkTask {
-                    order,
-                    kind: BenchmarkTaskKind::Get {
-                        key: target["key"].as_str().unwrap_or_default().to_string(),
-                        size_bytes: target["sizeBytes"].as_u64().unwrap_or(size_bytes as u64)
-                            as usize,
-                    },
-                });
-                scheduled_operations += 1;
-            }
-            _ => {
-                let allowed_operations = remaining_operations
-                    .saturating_sub(scheduled_operations)
-                    .max(1);
-                let delete_batch_size =
-                    benchmark_delete_batch_size(&config, planned_active_objects.len())
-                        .min(allowed_operations);
-                if delete_batch_size <= 1 || benchmark_delete_mode(&config) != "multi-object-post" {
-                    let target = planned_active_objects
-                        [next_active_index % planned_active_objects.len()]
-                    .clone();
-                    next_active_index += 1;
-                    let selected_key = target["key"].as_str().unwrap_or_default().to_string();
-                    let selected_size =
-                        target["sizeBytes"].as_u64().unwrap_or(size_bytes as u64) as usize;
-                    planned_active_objects
-                        .retain(|item| item["key"].as_str().unwrap_or_default() != selected_key);
-                    tasks.push(BenchmarkTask {
-                        order,
-                        kind: BenchmarkTaskKind::DeleteSingle {
-                            key: selected_key,
-                            size_bytes: selected_size,
-                        },
-                    });
-                    scheduled_operations += 1;
-                } else {
-                    let selected_keys: Vec<String> = (0..delete_batch_size)
-                        .map(|offset| {
-                            planned_active_objects
-                                [(next_active_index + offset) % planned_active_objects.len()]["key"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_string()
-                        })
-                        .collect();
-                    next_active_index += delete_batch_size;
-                    planned_active_objects.retain(|item| {
-                        let key = item["key"].as_str().unwrap_or_default();
-                        !selected_keys.iter().any(|selected| selected == key)
-                    });
-                    tasks.push(BenchmarkTask {
-                        order,
-                        kind: BenchmarkTaskKind::DeleteMulti {
-                            keys: selected_keys,
-                        },
-                    });
-                    scheduled_operations += delete_batch_size;
+                let target = available.remove(next_active % available.len());
+                next_active += 1;
+                scheduled += 1;
+                BenchmarkTaskKind::Get {
+                    key: target["key"].as_str().unwrap_or_default().to_string(),
+                    size_bytes: target["sizeBytes"].as_u64().unwrap_or(size as u64) as usize,
                 }
             }
-        }
+            _ => {
+                let count = benchmark_delete_batch_size(&config, available.len())
+                    .min(remaining_operations - scheduled);
+                if count <= 1 || benchmark_delete_mode(&config) != "multi-object-post" {
+                    let target = available.remove(next_active % available.len());
+                    next_active += 1;
+                    active_count = active_count.saturating_sub(1);
+                    scheduled += 1;
+                    BenchmarkTaskKind::DeleteSingle {
+                        key: target["key"].as_str().unwrap_or_default().to_string(),
+                        size_bytes: target["sizeBytes"].as_u64().unwrap_or(size as u64) as usize,
+                    }
+                } else {
+                    let mut keys = vec![];
+                    for _ in 0..count {
+                        let target = available.remove(next_active % available.len());
+                        next_active += 1;
+                        keys.push(target["key"].as_str().unwrap_or_default().to_string());
+                    }
+                    active_count = active_count.saturating_sub(count);
+                    scheduled += count;
+                    BenchmarkTaskKind::DeleteMulti { keys }
+                }
+            }
+        };
+        tasks.push(BenchmarkTask { order, kind });
     }
-
-    state["nextSizeIndex"] = Value::from(next_size_index as u64);
-    state["nextActiveIndex"] = Value::from(next_active_index as u64);
-    state["nextObjectIndex"] = Value::from(next_object_index);
+    state["nextSizeIndex"] = json!(next_size);
+    state["nextActiveIndex"] = json!(next_active);
+    state["nextObjectIndex"] = json!(next_object);
     tasks
 }
 
@@ -3715,7 +3580,8 @@ async fn execute_benchmark_batch(
     state: &Value,
     call_started: Instant,
     call_base_elapsed_ms: f64,
-) -> Result<Vec<BenchmarkTaskResult>, SidecarError> {
+    resources: Arc<benchmark_runtime::Resources>,
+) -> Result<(Vec<BenchmarkTaskResult>, Option<SidecarError>), SidecarError> {
     let config = state["config"].as_object().cloned().unwrap_or_default();
     let bucket_name = config
         .get("bucketName")
@@ -3731,11 +3597,14 @@ async fn execute_benchmark_batch(
         .get("validateChecksum")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let checksum_algorithm = config.get("checksumAlgorithm").and_then(Value::as_str).unwrap_or("sha256").to_string();
     let mut join_set = tokio::task::JoinSet::new();
     for task in tasks.iter().cloned() {
         let task_client = client.clone();
         let task_bucket = bucket_name.clone();
         let task_run_id = run_id.clone();
+        let checksum_algorithm = checksum_algorithm.clone();
+        let resources = resources.clone();
         join_set.spawn(async move {
             execute_benchmark_task(
                 task,
@@ -3744,17 +3613,22 @@ async fn execute_benchmark_batch(
                 task_run_id,
                 random_data,
                 validate_checksum,
+                checksum_algorithm,
                 call_started,
                 call_base_elapsed_ms,
+                resources,
             )
             .await
         });
     }
     let mut results = Vec::new();
+    let mut failure = None;
     while let Some(joined) = join_set.join_next().await {
-        let result = joined
-            .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))??;
-        results.push(result);
+        match joined {
+            Ok(Ok(result)) => results.push(result),
+            Ok(Err(error)) => { if failure.is_none() { failure = Some(error); } },
+            Err(error) => { if failure.is_none() { failure = Some(SidecarError::new("engine_unavailable", error.to_string())); } }
+        }
     }
     results.sort_by(|left, right| {
         left.elapsed_ms
@@ -3762,7 +3636,7 @@ async fn execute_benchmark_batch(
             .unwrap_or(Ordering::Equal)
             .then(left.order.cmp(&right.order))
     });
-    Ok(results)
+    Ok((results, failure))
 }
 
 async fn execute_benchmark_task(
@@ -3772,27 +3646,31 @@ async fn execute_benchmark_task(
     run_id: String,
     random_data: bool,
     validate_checksum: bool,
+    checksum_algorithm: String,
     call_started: Instant,
     call_base_elapsed_ms: f64,
+    resources: Arc<benchmark_runtime::Resources>,
 ) -> Result<BenchmarkTaskResult, SidecarError> {
     let started = Instant::now();
     match task.kind {
         BenchmarkTaskKind::Put { key, size_bytes } => {
-            let payload = benchmark_payload(&run_id, &key, size_bytes, random_data);
+            let payload = resources.payload(&run_id, &key, size_bytes, random_data).await?;
             client
                 .put_object()
                 .bucket(&bucket_name)
                 .key(&key)
-                .body(ByteStream::from(payload.clone()))
+                .body(payload.body().await?)
                 .send()
                 .await
                 .map_err(map_sdk_error)?;
             Ok(BenchmarkTaskResult {
+                completed_at: now_iso(),
+                checksum: None,
                 order: task.order,
                 operation: "PUT",
                 key: key.clone(),
                 size_bytes,
-                bytes_transferred: payload.len() as i64,
+                bytes_transferred: size_bytes as i64,
                 checksum_state: "not_used".to_string(),
                 latency_ms: started.elapsed().as_secs_f64() * 1000.0,
                 operation_count: 1,
@@ -3815,6 +3693,8 @@ async fn execute_benchmark_task(
                     let mapped = map_sdk_error(error);
                     if is_missing_benchmark_key(&mapped) {
                         return Ok(BenchmarkTaskResult {
+                            completed_at: now_iso(),
+                            checksum: None,
                             order: task.order,
                             operation: "GET",
                             key: key.clone(),
@@ -3835,21 +3715,33 @@ async fn execute_benchmark_task(
                     return Err(mapped);
                 }
             };
-            let bytes = output
-                .body
-                .collect()
-                .await
-                .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?
-                .into_bytes();
-            let expected = benchmark_payload(&run_id, &key, size_bytes, random_data);
+            let mut body = output.body;
+            let pattern = validate_checksum.then(|| benchmark_runtime::pattern(&run_id, &key, size_bytes, random_data));
+            let mut expected = Vec::new();
+            let mut received = 0;
+            let mut actual_hash = validate_checksum.then(|| benchmark_runtime::SelectedDigest::new(&checksum_algorithm));
+            let mut expected_hash = validate_checksum.then(|| benchmark_runtime::SelectedDigest::new(&checksum_algorithm));
+            while let Some(bytes) = body.try_next().await.map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))? {
+                if let Some(pattern) = &pattern {
+                    expected.resize(bytes.len(), 0);
+                    benchmark_runtime::fill(&mut expected, pattern, received);
+                    actual_hash.as_mut().unwrap().update(&bytes);
+                    expected_hash.as_mut().unwrap().update(&expected);
+                }
+                received += bytes.len();
+            }
+            let checksum = actual_hash.map(benchmark_runtime::SelectedDigest::finish);
+            let valid = received == size_bytes && checksum == expected_hash.map(benchmark_runtime::SelectedDigest::finish);
             Ok(BenchmarkTaskResult {
+                completed_at: now_iso(),
+                checksum,
                 order: task.order,
                 operation: "GET",
                 key,
                 size_bytes,
-                bytes_transferred: bytes.len() as i64,
+                bytes_transferred: received as i64,
                 checksum_state: if validate_checksum {
-                    if bytes.as_ref() == expected.as_slice() {
+                    if valid {
                         "validated_success".to_string()
                     } else {
                         "validated_failure".to_string()
@@ -3878,6 +3770,8 @@ async fn execute_benchmark_task(
                     let mapped = map_sdk_error(error);
                     if is_missing_benchmark_key(&mapped) {
                         return Ok(BenchmarkTaskResult {
+                            completed_at: now_iso(),
+                            checksum: None,
                             order: task.order,
                             operation: "DELETE",
                             key: key.clone(),
@@ -3899,6 +3793,8 @@ async fn execute_benchmark_task(
                 }
             }
             Ok(BenchmarkTaskResult {
+                completed_at: now_iso(),
+                checksum: None,
                 order: task.order,
                 operation: "DELETE",
                 key: key.clone(),
@@ -4003,6 +3899,8 @@ async fn execute_benchmark_task(
             let mut removed_keys = deleted_keys.clone();
             removed_keys.extend(missing_keys);
             Ok(BenchmarkTaskResult {
+                completed_at: now_iso(),
+                checksum: None,
                 order: task.order,
                 operation: "DELETE",
                 key,
@@ -4020,13 +3918,14 @@ async fn execute_benchmark_task(
     }
 }
 
-fn apply_benchmark_batch_results(state: &mut Value, results: Vec<BenchmarkTaskResult>) {
+fn apply_benchmark_batch_results(state: &mut Value, results: Vec<BenchmarkTaskResult>, resources: &benchmark_runtime::Resources) -> Result<(), SidecarError> {
     let reduced_logging = state["config"]["reducedLogging"].as_bool().unwrap_or(false);
     let mut active_objects = state["activeObjects"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let mut history = state["history"].as_array().cloned().unwrap_or_default();
+    let mut history = match state["history"].take() { Value::Array(items) => items, _ => Vec::new() };
+    let mut completed_records = Vec::new();
     for result in results {
         if let Some((key, size_bytes)) = &result.upserted_object {
             let mut updated = false;
@@ -4054,8 +3953,8 @@ fn apply_benchmark_batch_results(state: &mut Value, results: Vec<BenchmarkTaskRe
             continue;
         }
         let second = ((result.elapsed_ms / 1000.0).floor() as i64).max(0) + 1;
-        history.push(json!({
-            "timestamp": now_iso(),
+        let record = json!({
+            "timestamp": result.completed_at,
             "second": second,
             "elapsedMs": round1(result.elapsed_ms),
             "operation": result.operation,
@@ -4065,8 +3964,12 @@ fn apply_benchmark_batch_results(state: &mut Value, results: Vec<BenchmarkTaskRe
             "bytesTransferred": result.bytes_transferred,
             "success": true,
             "checksumState": result.checksum_state,
+            "checksum": result.checksum,
+            "checksumAlgorithm": state["config"]["checksumAlgorithm"].as_str().unwrap_or("sha256"),
             "operationCount": result.operation_count,
-        }));
+        });
+        accumulate_benchmark_record(state, &record);
+        completed_records.push(record);
         if !reduced_logging {
             if result.operation == "DELETE" && result.operation_count > 1 {
                 append_benchmark_log(
@@ -4090,14 +3993,65 @@ fn apply_benchmark_batch_results(state: &mut Value, results: Vec<BenchmarkTaskRe
             }
         }
     }
+    append_benchmark_csv(state, &completed_records, resources)?;
+    history.extend(completed_records);
+    if history.len() > benchmark_runtime::HISTORY_LIMIT {
+        history.drain(..history.len() - benchmark_runtime::HISTORY_LIMIT);
+    }
     state["history"] = Value::Array(history);
     state["activeObjects"] = Value::Array(active_objects);
-    state["processedCount"] = Value::from(
-        state["history"]
-            .as_array()
-            .map(|items| items.iter().map(benchmark_operation_count).sum::<i64>())
-            .unwrap_or(0),
-    );
+    Ok(())
+}
+
+fn accumulate_benchmark_record(state: &mut Value, record: &Value) {
+    let count = benchmark_operation_count(record);
+    state["processedCount"] = json!(state["processedCount"].as_i64().unwrap_or(0) + count);
+    state["totalRecordCount"] = json!(state["totalRecordCount"].as_u64().unwrap_or(0) + 1);
+    state["totalBytes"] = json!(state["totalBytes"].as_u64().unwrap_or(0) + record["bytesTransferred"].as_u64().unwrap_or(0));
+    state["totalLatencyMs"] = json!(state["totalLatencyMs"].as_f64().unwrap_or(0.0) + record["latencyMs"].as_f64().unwrap_or(0.0));
+    for (field, key_field) in [("totalOperationsByType", "operation"), ("totalChecksumStats", "checksumState")] {
+        let key = record[key_field].as_str().unwrap_or("");
+        state[field][key] = json!(state[field][key].as_i64().unwrap_or(0) + count);
+    }
+    let second = record["second"].as_u64().unwrap_or(1).to_string();
+    let operation = record["operation"].as_str().unwrap_or("");
+    let window = &mut state["throughputWindows"][&second];
+    window["operationsCount"] = json!(window["operationsCount"].as_i64().unwrap_or(0) + count);
+    window["bytes"] = json!(window["bytes"].as_u64().unwrap_or(0) + record["bytesTransferred"].as_u64().unwrap_or(0));
+    window["latencyMs"] = json!(window["latencyMs"].as_f64().unwrap_or(0.0) + record["latencyMs"].as_f64().unwrap_or(0.0));
+    window["records"] = json!(window["records"].as_u64().unwrap_or(0) + 1);
+    window["operations"][operation] = json!(window["operations"][operation].as_i64().unwrap_or(0) + count);
+    let windows = state["throughputWindows"].as_object_mut().unwrap();
+    if windows.len() > 3600 {
+        let oldest = windows.keys().min_by_key(|k| k.parse::<u64>().unwrap_or(0)).unwrap().clone();
+        windows.remove(&oldest);
+    }
+    if record["checksumState"] == "validated_failure" {
+        state["errorCount"] = json!(state["errorCount"].as_u64().unwrap_or(0) + 1);
+    }
+}
+
+fn append_benchmark_csv(state: &Value, records: &[Value], resources: &benchmark_runtime::Resources) -> Result<(), SidecarError> {
+    let path = Path::new(state["config"]["csvOutputPath"].as_str().unwrap_or("benchmark-results.csv"));
+    let result = (|| -> io::Result<()> {
+        let mut writer = resources.csv.lock().unwrap();
+        if writer.is_none() {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) { fs::create_dir_all(parent)?; }
+            let header = !path.exists();
+            let mut output = io::BufWriter::new(fs::OpenOptions::new().create(true).append(true).open(path)?);
+            if header { writeln!(output, "second,operation,operationCount,latencyMs,sizeBytes,bytesTransferred,success,checksumState,key,elapsedMs")?; }
+            *writer = Some(output);
+        }
+        let output = writer.as_mut().unwrap();
+        for record in records {
+            let key = record["key"].as_str().unwrap_or("").replace('"', "\"\"");
+            writeln!(output, "{},{},{},{},{},{},true,{},\"{}\",{}", record["second"], record["operation"].as_str().unwrap_or(""),
+                benchmark_operation_count(record), record["latencyMs"], record["sizeBytes"], record["bytesTransferred"],
+                record["checksumState"].as_str().unwrap_or("not_used"), key, record["elapsedMs"])?;
+        }
+        Ok(())
+    })();
+    result.map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))
 }
 
 fn benchmark_summary_from_state(state: &Value) -> Value {
@@ -4154,7 +4108,7 @@ fn benchmark_summary_from_state(state: &Value) -> Value {
         .ceil()
         .max(windows.keys().last().copied().unwrap_or(0) as f64)
         .max(1.0) as i64;
-    let throughput_series: Vec<Value> = (1..=window_count)
+    let throughput_series: Vec<Value> = ((window_count - 3599).max(1)..=window_count)
         .map(|second| {
             let items = windows.get(&second).cloned().unwrap_or_default();
             let mut operations = Map::new();
@@ -4178,35 +4132,32 @@ fn benchmark_summary_from_state(state: &Value) -> Value {
                 bytes_per_second += item["bytesTransferred"].as_i64().unwrap_or(0);
                 ops_per_second += operation_count;
             }
+            let exact = &state["throughputWindows"][second.to_string()];
+            if exact.is_object() {
+                ops_per_second = exact["operationsCount"].as_i64().unwrap_or(0);
+                bytes_per_second = exact["bytes"].as_i64().unwrap_or(0);
+                operations = exact["operations"].as_object().cloned().unwrap_or_default();
+            }
             json!({
                 "second": second,
                 "label": format!("{second}s"),
                 "opsPerSecond": ops_per_second,
                 "bytesPerSecond": bytes_per_second,
-                "averageLatencyMs": round1(mean_f64(&window_latencies)),
+                "averageLatencyMs": if exact.is_object() { round1(exact["latencyMs"].as_f64().unwrap_or(0.0) / exact["records"].as_f64().unwrap_or(1.0).max(1.0)) } else { round1(mean_f64(&window_latencies)) },
                 "p95LatencyMs": round1(percentile(&window_latencies, 95.0)),
                 "operations": operations,
             })
         })
         .collect();
-    let mut second_positions: BTreeMap<i64, usize> = BTreeMap::new();
     let latency_timeline: Vec<Value> = history
         .iter()
         .enumerate()
         .map(|(index, record)| {
             let elapsed_ms = record["elapsedMs"].as_f64().unwrap_or(0.0).max(0.0);
             let second = ((elapsed_ms / 1000.0).floor() as i64).max(0) + 1;
-            let position = second_positions.get(&second).copied().unwrap_or(0) + 1;
-            second_positions.insert(second, position);
-            let mut plotted_elapsed_ms = elapsed_ms;
-            if plotted_elapsed_ms <= 0.0 {
-                let second_count = windows.get(&second).map(Vec::len).unwrap_or(0);
-                let elapsed_seconds =
-                    (second - 1) as f64 + (position as f64 / (second_count + 1) as f64);
-                plotted_elapsed_ms = elapsed_seconds * 1000.0;
-            }
+            let plotted_elapsed_ms = elapsed_ms;
             json!({
-                "sequence": index + 1,
+                "sequence": state["totalRecordCount"].as_u64().unwrap_or(0).saturating_sub(history.len() as u64) + index as u64 + 1,
                 "operation": record["operation"].as_str().unwrap_or_default().to_ascii_uppercase(),
                 "second": second,
                 "elapsedMs": round1(plotted_elapsed_ms),
@@ -4233,24 +4184,6 @@ fn benchmark_summary_from_state(state: &Value) -> Value {
             })
         })
         .collect();
-    let average_ops = if throughput_series.is_empty() {
-        0.0
-    } else {
-        throughput_series
-            .iter()
-            .filter_map(|item| item["opsPerSecond"].as_f64())
-            .sum::<f64>()
-            / throughput_series.len() as f64
-    };
-    let average_bytes = if throughput_series.is_empty() {
-        0.0
-    } else {
-        throughput_series
-            .iter()
-            .filter_map(|item| item["bytesPerSecond"].as_f64())
-            .sum::<f64>()
-            / throughput_series.len() as f64
-    };
     let peak_ops = throughput_series
         .iter()
         .filter_map(|item| item["opsPerSecond"].as_i64())
@@ -4269,8 +4202,8 @@ fn benchmark_summary_from_state(state: &Value) -> Value {
     };
     let sample_count = throughput_series.len();
     json!({
-        "totalOperations": history.iter().map(benchmark_operation_count).sum::<i64>(),
-        "operationsByType": operations_by_type,
+        "totalOperations": state["processedCount"].as_u64().unwrap_or(0),
+        "operationsByType": state.get("totalOperationsByType").cloned().unwrap_or(Value::Object(operations_by_type)),
         "latencyPercentilesMs": {
             "p50": round1(percentile(&latencies, 50.0)),
             "p75": round1(percentile(&latencies, 75.0)),
@@ -4282,380 +4215,30 @@ fn benchmark_summary_from_state(state: &Value) -> Value {
         "throughputSeries": throughput_series,
         "latencyTimeline": latency_timeline,
         "sizeLatencyBuckets": size_latency_buckets,
-        "checksumStats": checksum_stats,
+        "checksumStats": state.get("totalChecksumStats").cloned().unwrap_or(Value::Object(checksum_stats.clone())),
         "detailMetrics": {
+            "checksumAlgorithm": state["config"]["checksumAlgorithm"].as_str().unwrap_or("sha256"),
             "sampleCount": sample_count,
             "sampleWindowSeconds": 1,
-            "averageOpsPerSecond": round1(average_ops),
+            "averageOpsPerSecond": round1(state["processedCount"].as_f64().unwrap_or(0.0) / state["activeElapsedSeconds"].as_f64().unwrap_or(0.0).max(0.000001)),
             "peakOpsPerSecond": peak_ops,
-            "averageBytesPerSecond": round1(average_bytes),
+            "averageBytesPerSecond": round1(state["totalBytes"].as_f64().unwrap_or(0.0) / state["activeElapsedSeconds"].as_f64().unwrap_or(0.0).max(0.000001)),
             "peakBytesPerSecond": peak_bytes,
             "averageObjectSizeBytes": average_object_size,
-            "checksumValidated": checksum_stats.get("validated_success").and_then(Value::as_i64).unwrap_or(0),
-            "errorCount": 0,
-            "retryCount": 0,
+            "checksumValidated": state["totalChecksumStats"]["validated_success"].as_u64().unwrap_or(0),
+            "errorCount": state["errorCount"].as_u64().unwrap_or(0),
+            "retryCount": state["retryCount"].as_u64().unwrap_or(0),
+            "historyLimit": benchmark_runtime::HISTORY_LIMIT,
+            "historyRecordsRetained": history.len(),
+            "historyTruncated": state["totalRecordCount"].as_u64().unwrap_or(0) > history.len() as u64,
+            "latencyStatisticsScope": "retained-recent-requests",
+            "cacheBytes": state["cacheBytes"].as_u64().unwrap_or(0),
+            "connectionLimitScope": "in-flight-benchmark-requests",
+            "sdkConnectionPoolLimitSupported": false,
         },
     })
 }
 
-async fn run_benchmark_operation(state: &mut Value, client: &Client) -> Result<(), SidecarError> {
-    let config = state["config"].as_object().cloned().unwrap_or_default();
-    let mut active_objects = state["activeObjects"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let mut history = state["history"].as_array().cloned().unwrap_or_default();
-    let sizes = benchmark_size_list(&config);
-    let next_size_index = state["nextSizeIndex"].as_u64().unwrap_or(0) as usize;
-    let mut size_bytes = sizes[next_size_index % sizes.len()];
-    state["nextSizeIndex"] = Value::from((next_size_index + 1) as u64);
-    let object_limit = config
-        .get("objectCount")
-        .and_then(Value::as_u64)
-        .unwrap_or(sizes.len() as u64)
-        .max(1) as usize;
-    let bucket_name = config
-        .get("bucketName")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let operation: String;
-    let key: String;
-    let bytes_transferred: i64;
-    let checksum_state: String;
-    let latency_ms: f64;
-    let operation_count: i64;
-    loop {
-        let slot = state["processedCount"].as_u64().unwrap_or(0) as usize % 100;
-        let mut cumulative = 0usize;
-        let mut selected_operation = "PUT".to_string();
-        for ratio in benchmark_ratios(
-            config
-                .get("workloadType")
-                .and_then(Value::as_str)
-                .unwrap_or("mixed"),
-        ) {
-            cumulative += ratio.1 as usize;
-            if slot < cumulative {
-                selected_operation = ratio.0.to_string();
-                break;
-            }
-        }
-        if matches!(selected_operation.as_str(), "GET" | "DELETE") && active_objects.is_empty() {
-            selected_operation = "PUT".to_string();
-        }
-        let next_active_index = state["nextActiveIndex"].as_u64().unwrap_or(0) as usize;
-        let started = std::time::Instant::now();
-        match selected_operation.as_str() {
-            "PUT" => {
-                let selected_key =
-                    if active_objects.len() >= object_limit && !active_objects.is_empty() {
-                        state["nextActiveIndex"] = Value::from((next_active_index + 1) as u64);
-                        active_objects[next_active_index % active_objects.len()]["key"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_string()
-                    } else {
-                        let next_object_index = state["nextObjectIndex"].as_u64().unwrap_or(0);
-                        state["nextObjectIndex"] = Value::from(next_object_index + 1);
-                        format!(
-                            "{}obj-{next_object_index:06}-{size_bytes}.bin",
-                            state["benchmarkPrefix"].as_str().unwrap_or_default()
-                        )
-                    };
-                let payload = benchmark_payload(
-                    state["id"].as_str().unwrap_or_default(),
-                    &selected_key,
-                    size_bytes,
-                    config
-                        .get("randomData")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true),
-                );
-                client
-                    .put_object()
-                    .bucket(bucket_name)
-                    .key(&selected_key)
-                    .body(ByteStream::from(payload.clone()))
-                    .send()
-                    .await
-                    .map_err(map_sdk_error)?;
-                let mut updated = false;
-                for item in &mut active_objects {
-                    if item["key"].as_str().unwrap_or_default() == selected_key {
-                        item["sizeBytes"] = Value::from(size_bytes as i64);
-                        updated = true;
-                    }
-                }
-                if !updated {
-                    active_objects.push(json!({"key": selected_key, "sizeBytes": size_bytes}));
-                }
-                operation = selected_operation;
-                key = selected_key;
-                bytes_transferred = payload.len() as i64;
-                checksum_state = "not_used".to_string();
-                latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-                operation_count = 1;
-                break;
-            }
-            "GET" => {
-                let target = active_objects[next_active_index % active_objects.len()].clone();
-                let selected_key = target["key"].as_str().unwrap_or_default().to_string();
-                size_bytes = target["sizeBytes"].as_u64().unwrap_or(size_bytes as u64) as usize;
-                state["nextActiveIndex"] = Value::from((next_active_index + 1) as u64);
-                let output = match client
-                    .get_object()
-                    .bucket(bucket_name)
-                    .key(&selected_key)
-                    .send()
-                    .await
-                {
-                    Ok(output) => output,
-                    Err(error) => {
-                        let mapped = map_sdk_error(error);
-                        if is_missing_benchmark_key(&mapped) {
-                            active_objects.retain(|item| {
-                                item["key"].as_str().unwrap_or_default() != selected_key
-                            });
-                            state["activeObjects"] = Value::Array(active_objects.clone());
-                            append_benchmark_log(
-                                state,
-                                &format!("Skipped missing benchmark object {selected_key}; rotating to the next object."),
-                            );
-                            continue;
-                        }
-                        return Err(mapped);
-                    }
-                };
-                let bytes = output
-                    .body
-                    .collect()
-                    .await
-                    .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?
-                    .into_bytes();
-                let expected = benchmark_payload(
-                    state["id"].as_str().unwrap_or_default(),
-                    &selected_key,
-                    size_bytes,
-                    config
-                        .get("randomData")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true),
-                );
-                operation = selected_operation;
-                key = selected_key;
-                bytes_transferred = bytes.len() as i64;
-                checksum_state = if config
-                    .get("validateChecksum")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true)
-                {
-                    if bytes.as_ref() == expected.as_slice() {
-                        "validated_success".to_string()
-                    } else {
-                        "validated_failure".to_string()
-                    }
-                } else {
-                    "not_used".to_string()
-                };
-                latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-                operation_count = 1;
-                break;
-            }
-            _ => {
-                let delete_batch_size = benchmark_delete_batch_size(&config, active_objects.len());
-                let selected_keys: Vec<String> = (0..delete_batch_size)
-                    .map(|offset| {
-                        active_objects[(next_active_index + offset) % active_objects.len()]["key"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_string()
-                    })
-                    .collect();
-                state["nextActiveIndex"] =
-                    Value::from((next_active_index + delete_batch_size) as u64);
-                if benchmark_delete_mode(&config) == "multi-object-post" && selected_keys.len() > 1
-                {
-                    let objects: Vec<ObjectIdentifier> = selected_keys
-                        .iter()
-                        .map(|item| {
-                            ObjectIdentifier::builder()
-                                .key(item)
-                                .build()
-                                .map_err(|error| {
-                                    SidecarError::new("invalid_config", error.to_string())
-                                })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let delete = Delete::builder()
-                        .set_objects(Some(objects))
-                        .quiet(false)
-                        .build()
-                        .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
-                    let output = client
-                        .delete_objects()
-                        .bucket(bucket_name)
-                        .delete(delete)
-                        .send()
-                        .await
-                        .map_err(map_sdk_error)?;
-                    let mut deleted_keys = Vec::new();
-                    for item in output.deleted() {
-                        if let Some(target) = item.key() {
-                            if !target.is_empty() {
-                                deleted_keys.push(target.to_string());
-                            }
-                        }
-                    }
-                    let mut missing_keys = Vec::new();
-                    let mut fatal_errors = Vec::new();
-                    for item in output.errors() {
-                        let target = item.key().unwrap_or_default();
-                        let code = item.code().unwrap_or_default().to_ascii_lowercase();
-                        let message = item.message().unwrap_or_default().to_string();
-                        if matches!(code.as_str(), "nosuchkey" | "notfound" | "404")
-                            || message.to_ascii_lowercase().contains("does not exist")
-                        {
-                            if !target.is_empty() {
-                                missing_keys.push(target.to_string());
-                            }
-                            continue;
-                        }
-                        fatal_errors.push(format!(
-                            "{}: {}",
-                            if target.is_empty() {
-                                "(unknown)"
-                            } else {
-                                target
-                            },
-                            if message.is_empty() {
-                                item.code().unwrap_or("delete error")
-                            } else {
-                                message.as_str()
-                            }
-                        ));
-                    }
-                    if !fatal_errors.is_empty() {
-                        return Err(SidecarError::new("delete_failed", fatal_errors.join("; ")));
-                    }
-                    if !missing_keys.is_empty() {
-                        append_benchmark_log(
-                            state,
-                            &format!(
-                                "Skipped {} missing benchmark object(s) during multi-delete POST.",
-                                missing_keys.len()
-                            ),
-                        );
-                    }
-                    active_objects.retain(|item| {
-                        let current_key = item["key"].as_str().unwrap_or_default();
-                        !deleted_keys.iter().any(|entry| entry == current_key)
-                            && !missing_keys.iter().any(|entry| entry == current_key)
-                    });
-                    let deleted_count = deleted_keys.len() as i64;
-                    if deleted_count == 0 {
-                        state["activeObjects"] = Value::Array(active_objects.clone());
-                        continue;
-                    }
-                    let first_deleted_key = selected_keys
-                        .iter()
-                        .find(|item| deleted_keys.iter().any(|deleted| deleted == *item))
-                        .cloned()
-                        .or_else(|| deleted_keys.first().cloned())
-                        .unwrap_or_default();
-                    operation = selected_operation;
-                    key = if deleted_count > 1 {
-                        format!("{first_deleted_key} (+{} more)", deleted_count - 1)
-                    } else {
-                        first_deleted_key
-                    };
-                    size_bytes = 0;
-                    bytes_transferred = 0;
-                    checksum_state = "not_used".to_string();
-                    latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-                    operation_count = deleted_count;
-                    break;
-                }
-                let target = active_objects[next_active_index % active_objects.len()].clone();
-                let selected_key = target["key"].as_str().unwrap_or_default().to_string();
-                size_bytes = target["sizeBytes"].as_u64().unwrap_or(size_bytes as u64) as usize;
-                match client
-                    .delete_object()
-                    .bucket(bucket_name)
-                    .key(&selected_key)
-                    .send()
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(error) => {
-                        let mapped = map_sdk_error(error);
-                        if is_missing_benchmark_key(&mapped) {
-                            active_objects.retain(|item| {
-                                item["key"].as_str().unwrap_or_default() != selected_key
-                            });
-                            state["activeObjects"] = Value::Array(active_objects.clone());
-                            append_benchmark_log(
-                                state,
-                                &format!("Skipped missing benchmark object {selected_key}; rotating to the next object."),
-                            );
-                            continue;
-                        }
-                        return Err(mapped);
-                    }
-                }
-                active_objects
-                    .retain(|item| item["key"].as_str().unwrap_or_default() != selected_key);
-                operation = selected_operation;
-                key = selected_key;
-                bytes_transferred = 0;
-                checksum_state = "not_used".to_string();
-                latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-                operation_count = 1;
-                break;
-            }
-        }
-    }
-    let second = state["activeElapsedSeconds"].as_f64().unwrap_or(0.0) as i64 + 1;
-    history.push(json!({
-        "timestamp": now_iso(),
-        "second": second,
-        "operation": operation,
-        "key": key,
-        "sizeBytes": size_bytes,
-        "latencyMs": round1(latency_ms),
-        "bytesTransferred": bytes_transferred,
-        "success": true,
-        "checksumState": checksum_state,
-        "operationCount": operation_count,
-    }));
-    state["history"] = Value::Array(history);
-    state["activeObjects"] = Value::Array(active_objects);
-    state["processedCount"] = Value::from(
-        state["history"]
-            .as_array()
-            .map(|items| items.iter().map(benchmark_operation_count).sum::<i64>())
-            .unwrap_or(0),
-    );
-    if operation == "DELETE" && operation_count > 1 {
-        append_benchmark_log(
-            state,
-            &format!(
-                "DELETE POST removed {operation_count} object(s) in {:.1} ms.",
-                round1(latency_ms)
-            ),
-        );
-    } else {
-        append_benchmark_log(
-            state,
-            &format!(
-                "{} {} completed in {:.1} ms.",
-                operation,
-                key,
-                round1(latency_ms)
-            ),
-        );
-    }
-    Ok(())
-}
 
 fn append_log(state: &mut Value, line: &str) {
     if let Some(items) = state["liveLog"].as_array_mut() {
@@ -4666,7 +4249,13 @@ fn append_log(state: &mut Value, line: &str) {
 fn required_text(value: &Value, field: &str, message: &str) -> Result<String, SidecarError> {
     value[field]
         .as_str()
-        .map(str::trim)
+        .map(|v| {
+            if matches!(field, "key" | "sourceKey" | "destinationKey") {
+                v
+            } else {
+                v.trim()
+            }
+        })
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| SidecarError::new("invalid_config", message))
@@ -4679,7 +4268,6 @@ fn string_array(value: &Value) -> Vec<String> {
             items
                 .iter()
                 .filter_map(Value::as_str)
-                .map(str::trim)
                 .filter(|item| !item.is_empty())
                 .map(str::to_owned)
                 .collect()
@@ -4724,7 +4312,7 @@ fn serialize_aws_datetime(value: Option<&aws_sdk_s3::primitives::DateTime>) -> S
 }
 
 fn now_iso() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 fn short_uuid() -> String {
@@ -4789,6 +4377,37 @@ fn summarize_body(content_type: &str, body: &[u8]) -> String {
             }
         }
         Err(_) => "[omitted binary body]".to_string(),
+    }
+}
+
+#[derive(Debug)]
+struct ProfileHeaders {
+    requester_pays: bool,
+    expected_bucket_owner: Option<String>,
+}
+impl Intercept for ProfileHeaders {
+    fn name(&self) -> &'static str {
+        "ProfileHeaders"
+    }
+    fn modify_before_signing(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _: &RuntimeComponents,
+        _: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        if self.requester_pays {
+            context
+                .request_mut()
+                .headers_mut()
+                .insert("x-amz-request-payer", "requester");
+        }
+        if let Some(owner) = &self.expected_bucket_owner {
+            context
+                .request_mut()
+                .headers_mut()
+                .insert("x-amz-expected-bucket-owner", owner.clone());
+        }
+        Ok(())
     }
 }
 
@@ -4977,4 +4596,29 @@ fn message_indicates_tls_failure(message: &str) -> bool {
         || message.contains("tls")
         || message.contains("ssl")
         || message.contains("x509")
+}
+
+#[cfg(test)]
+mod advanced_regressions {
+    use super::*;
+    #[test]
+    fn parallel_benchmark_does_not_reuse_an_inflight_key() {
+        let mut state = json!({"config":{"workloadType":"write-only","objectCount":1,"objectSizes":[32]},"activeObjects":[{"key":"only-key","sizeBytes":32}],"processedCount":0});
+        let tasks = plan_benchmark_batch(&mut state, 8, 100);
+        assert_eq!(tasks.len(), 1);
+        match &tasks[0].kind {
+            BenchmarkTaskKind::Put { key, .. } => assert_eq!(key, "only-key"),
+            _ => panic!("expected PUT"),
+        }
+    }
+    #[test]
+    fn object_keys_preserve_spaces() {
+        let value = json!({"key":"  ","sourceKey":" %雪+ ","keys":["  "," %雪+ "]});
+        assert_eq!(required_text(&value, "key", "required").unwrap(), "  ");
+        assert_eq!(
+            required_text(&value, "sourceKey", "required").unwrap(),
+            " %雪+ "
+        );
+        assert_eq!(string_array(&value["keys"]), vec!["  ", " %雪+ "]);
+    }
 }

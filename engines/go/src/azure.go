@@ -4,14 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,6 +20,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 )
 
 const (
@@ -46,13 +49,38 @@ type azureClient struct {
 	key        []byte
 	base       *url.URL
 	httpClient *http.Client
+	sas        string
+	attempts   int
+	credential azcore.TokenCredential
+	tokenMu    sync.Mutex
+	token      azcore.AccessToken
 }
+
+var azureClientCache = struct {
+	sync.Mutex
+	clients map[profile]*azureClient
+	order   []profile
+}{clients: map[profile]*azureClient{}}
 
 func buildAzureClient(p profile) (*azureClient, context.Context, error) {
 	ctx := context.Background()
-	key, err := base64.StdEncoding.DecodeString(p.SecretKey)
-	if err != nil {
-		return nil, ctx, &sidecarError{Code: "invalid_config", Message: "Azure account access key must be valid base64."}
+	azureClientCache.Lock()
+	defer azureClientCache.Unlock()
+	if client := azureClientCache.clients[p]; client != nil {
+		return client, ctx, nil
+	}
+	var key []byte
+	var err error
+	if p.AuthMode != "azureSas" && p.AuthMode != "azureDefault" {
+		if p.AuthMode != "" && p.AuthMode != "static" {
+			return nil, ctx, &sidecarError{Code: "unsupported_feature", Message: "Azure supports Shared Key or SAS authentication in this engine."}
+		}
+		key, err = base64.StdEncoding.DecodeString(p.SecretKey)
+		if err != nil {
+			return nil, ctx, &sidecarError{Code: "invalid_config", Message: "Azure account access key must be valid base64."}
+		}
+	} else if p.AuthMode == "azureSas" && p.AzureSASToken == "" {
+		return nil, ctx, &sidecarError{Code: "invalid_config", Message: "An Azure SAS token is required."}
 	}
 	endpoint := strings.TrimRight(strings.TrimSpace(p.EndpointURL), "/")
 	if endpoint == "" {
@@ -62,25 +90,33 @@ func buildAzureClient(p profile) (*azureClient, context.Context, error) {
 	if err != nil || base.Host == "" {
 		return nil, ctx, &sidecarError{Code: "invalid_config", Message: "Azure Blob endpoint URL is invalid."}
 	}
-	baseTransport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout: time.Duration(p.ConnectTimeoutSeconds) * time.Second,
-		}).DialContext,
-		MaxIdleConns:        p.MaxPoolConnections,
-		MaxIdleConnsPerHost: p.MaxPoolConnections,
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: !p.VerifyTLS},
+	if base.RawQuery != "" {
+		return nil, ctx, &sidecarError{Code: "invalid_config", Message: "Place SAS credentials in the secure SAS token field, not the endpoint URL."}
 	}
-	httpClient := &http.Client{
-		Timeout:   time.Duration(p.ConnectTimeoutSeconds+p.ReadTimeoutSeconds) * time.Second,
-		Transport: loggingRoundTripper{base: baseTransport, diagnostics: p.Diagnostics},
+	if p.AuthMode == "azureDefault" && base.Scheme != "https" {
+		return nil, ctx, &sidecarError{Code: "invalid_config", Message: "Azure identity authentication requires an HTTPS endpoint."}
 	}
-	return &azureClient{
-		account:    p.AccessKey,
-		key:        key,
-		base:       base,
-		httpClient: httpClient,
-	}, ctx, nil
+	transport, err := profileTransport(p)
+	if err != nil {
+		return nil, ctx, err
+	}
+	client := &azureClient{account: p.AccessKey, key: key, base: base, sas: strings.TrimPrefix(p.AzureSASToken, "?"), attempts: p.MaxAttempts, httpClient: &http.Client{Timeout: time.Duration(p.ConnectTimeoutSeconds+p.ReadTimeoutSeconds) * time.Second, Transport: loggingRoundTripper{base: transport, diagnostics: p.Diagnostics}}}
+	if p.AuthMode == "azureDefault" {
+		client.sas = ""
+		client.credential, err = azidentity.NewDefaultAzureCredential(&azidentity.DefaultAzureCredentialOptions{ClientOptions: azcore.ClientOptions{Transport: &http.Client{Transport: transport}}})
+		if err != nil {
+			return nil, ctx, err
+		}
+	}
+	if len(azureClientCache.order) >= 16 {
+		oldest := azureClientCache.order[0]
+		azureClientCache.order = azureClientCache.order[1:]
+		azureClientCache.clients[oldest].httpClient.CloseIdleConnections()
+		delete(azureClientCache.clients, oldest)
+	}
+	azureClientCache.order = append(azureClientCache.order, p)
+	azureClientCache.clients[p] = client
+	return client, ctx, nil
 }
 
 func (c *azureClient) urlFor(container, key string) *url.URL {
@@ -102,9 +138,28 @@ func (c *azureClient) urlFor(container, key string) *url.URL {
 	return &u
 }
 
-func (c *azureClient) sign(req *http.Request, query url.Values) {
+func (c *azureClient) sign(req *http.Request, query url.Values) error {
 	req.Header.Set("x-ms-version", azureAPIVersion)
 	req.Header.Set("x-ms-date", time.Now().UTC().Format(http.TimeFormat))
+	if c.sas != "" {
+		return nil
+	}
+	if c.credential != nil {
+		if req.URL.Scheme != "https" {
+			return &sidecarError{Code: "invalid_config", Message: "Azure identity authentication requires HTTPS."}
+		}
+		c.tokenMu.Lock()
+		defer c.tokenMu.Unlock()
+		if c.token.Token == "" || time.Until(c.token.ExpiresOn) < 2*time.Minute {
+			token, err := c.credential.GetToken(req.Context(), policy.TokenRequestOptions{Scopes: []string{"https://storage.azure.com/.default"}})
+			if err != nil {
+				return err
+			}
+			c.token = token
+		}
+		req.Header.Set("Authorization", "Bearer "+c.token.Token)
+		return nil
+	}
 
 	contentLength := ""
 	if req.ContentLength > 0 {
@@ -162,34 +217,75 @@ func (c *azureClient) sign(req *http.Request, query url.Values) {
 	mac.Write([]byte(stringToSign))
 	signature := base64.StdEncoding.EncodeToString(mac.Sum(nil))
 	req.Header.Set("Authorization", fmt.Sprintf("SharedKey %s:%s", c.account, signature))
+	return nil
 }
 
 func (c *azureClient) do(ctx context.Context, method, container, key string, query url.Values, headers map[string]string, body []byte) (*http.Response, error) {
+	return c.doReader(ctx, method, container, key, query, headers, int64(len(body)), func() io.Reader { return bytes.NewReader(body) })
+}
+func (c *azureClient) doReader(ctx context.Context, method, container, key string, query url.Values, headers map[string]string, length int64, body func() io.Reader) (*http.Response, error) {
 	u := c.urlFor(container, key)
-	if len(query) > 0 {
-		u.RawQuery = query.Encode()
+	merged := url.Values{}
+	for k, values := range query {
+		merged[k] = append([]string{}, values...)
 	}
-	var reader io.Reader
-	if len(body) > 0 {
-		reader = bytes.NewReader(body)
+	if c.sas != "" {
+		sas, err := url.ParseQuery(c.sas)
+		if err != nil {
+			return nil, &sidecarError{Code: "invalid_config", Message: "SAS token is not valid URL query data."}
+		}
+		for key, values := range sas {
+			merged[key] = values
+		}
 	}
-	req, err := http.NewRequestWithContext(ctx, method, u.String(), reader)
-	if err != nil {
-		return nil, err
+	u.RawQuery = merged.Encode()
+	attempts := 1
+	// Only reads and upload-unique block writes may be replayed automatically.
+	if method == http.MethodGet || method == http.MethodHead || (method == http.MethodPut && query.Get("comp") == "block") {
+		attempts = maxInt(c.attempts, 1, 3)
+		if attempts > 5 {
+			attempts = 5
+		}
 	}
-	for name, value := range headers {
-		req.Header.Set(name, value)
+	for attempt := 0; attempt < attempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, method, u.String(), body())
+		if err != nil {
+			return nil, err
+		}
+		req.ContentLength = length
+		for name, value := range headers {
+			req.Header.Set(name, value)
+		}
+		if err = c.sign(req, merged); err != nil {
+			return nil, err
+		}
+		resp, err := c.httpClient.Do(req)
+		retry := err != nil
+		if err == nil {
+			retry = resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode == 500 || resp.StatusCode == 502 || resp.StatusCode == 503 || resp.StatusCode == 504
+		}
+		if retry && attempt+1 < attempts {
+			if resp != nil {
+				drainAndClose(resp.Body)
+			}
+			if pauseErr := retryPause(ctx, attempt); pauseErr != nil {
+				return nil, pauseErr
+			}
+			continue
+		}
+		if err != nil {
+			if wrapped, ok := err.(*url.Error); ok {
+				return nil, wrapped.Err
+			}
+			return nil, err
+		}
+		if resp.StatusCode >= 300 {
+			defer resp.Body.Close()
+			return nil, azureResponseError(resp)
+		}
+		return resp, nil
 	}
-	c.sign(req, query)
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode >= 400 {
-		defer resp.Body.Close()
-		return nil, azureResponseError(resp)
-	}
-	return resp, nil
+	return nil, fmt.Errorf("Azure request attempts exhausted")
 }
 
 func azureResponseError(resp *http.Response) error {
@@ -367,6 +463,22 @@ func azureUnsupported(method string) error {
 
 func handleAzureRequest(method string, params map[string]interface{}) (bool, map[string]interface{}, error) {
 	switch method {
+	case "getCapabilities":
+		items := []map[string]interface{}{}
+		for _, key := range []string{"benchmark", "azure.parallelTransfers", "auth.azureSas", "auth.azureDefault"} {
+			items = append(items, map[string]interface{}{"key": key, "label": key, "state": "supported"})
+		}
+		copyState, copyReason := "supported", "Server-side copy and conditional source deletion are available."
+		if asString(asMap(params["profile"])["authMode"]) == "azureDefault" {
+			copyState, copyReason = "unsupported", "Azure identity copy requires source delegation; use the Python advanced adapter."
+		}
+		items = append(items, map[string]interface{}{"key": "object.copy_move", "label": "Copy / move", "state": copyState, "reason": copyReason})
+		for _, key := range []string{"bucket.lifecycle", "bucket.policy", "bucket.cors", "bucket.encryption", "bucket.tagging", "bucket.versioning", "object.resumable", "storage.admin", "tools.bulk-delete"} {
+			items = append(items, map[string]interface{}{"key": key, "label": key, "state": "unsupported", "reason": "Use the Python advanced storage adapter for supported Azure administration."})
+		}
+		return true, map[string]interface{}{"items": items}, nil
+	case "runDeleteAll", "runPutTestData":
+		return true, nil, azureUnsupported(method)
 	case "testProfile":
 		result, err := azureTestProfile(asMap(params["profile"]))
 		return true, result, err
@@ -426,6 +538,15 @@ func azureTestProfile(profilePayload map[string]interface{}) (map[string]interfa
 	if err != nil {
 		return nil, err
 	}
+	if p.KnownBucket != "" {
+		resp, err := client.do(ctx, http.MethodHead, p.KnownBucket, "", url.Values{"restype": {"container"}}, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		drainAndClose(resp.Body)
+		return map[string]interface{}{"ok": true, "bucketCount": 1, "endpoint": client.base.Host, "items": []map[string]interface{}{{"name": p.KnownBucket, "region": p.Region, "objectCountHint": 0, "versioningEnabled": false}}}, nil
+	}
+
 	page, err := client.listContainersPage(ctx, "", 1)
 	if err != nil {
 		return nil, err
@@ -446,6 +567,15 @@ func azureListBuckets(profilePayload map[string]interface{}) (map[string]interfa
 	if err != nil {
 		return nil, err
 	}
+	if p.KnownBucket != "" {
+		resp, err := client.do(ctx, http.MethodHead, p.KnownBucket, "", url.Values{"restype": {"container"}}, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		drainAndClose(resp.Body)
+		return map[string]interface{}{"ok": true, "bucketCount": 1, "endpoint": client.base.Host, "items": []map[string]interface{}{{"name": p.KnownBucket, "region": p.Region, "objectCountHint": 0, "versioningEnabled": false}}}, nil
+	}
+
 	items := make([]map[string]interface{}, 0)
 	marker := ""
 	for {
@@ -635,7 +765,7 @@ func azureGetObjectDetails(params map[string]interface{}) (map[string]interface{
 	if err != nil {
 		return nil, err
 	}
-	key := strings.TrimSpace(asString(params["key"]))
+	key := asString(params["key"])
 	if key == "" {
 		return nil, &sidecarError{Code: "invalid_config", Message: "Bucket name and object key are required for object inspection."}
 	}
@@ -716,7 +846,7 @@ func azureCreateFolder(params map[string]interface{}) (map[string]interface{}, e
 	if err != nil {
 		return nil, err
 	}
-	key := strings.TrimSpace(asString(params["key"]))
+	key := asString(params["key"])
 	if key == "" {
 		return nil, &sidecarError{Code: "invalid_config", Message: "Bucket name and key are required to create a folder."}
 	}
@@ -734,10 +864,13 @@ func azureCopyObject(params map[string]interface{}) (map[string]interface{}, err
 	if err != nil {
 		return nil, err
 	}
+	if p.AuthMode == "azureDefault" {
+		return nil, &sidecarError{Code: "unsupported_feature", Message: "Azure identity copy requires source delegation; use the Python advanced adapter."}
+	}
 	sourceBucket := strings.TrimSpace(asString(params["sourceBucketName"]))
-	sourceKey := strings.TrimSpace(asString(params["sourceKey"]))
+	sourceKey := asString(params["sourceKey"])
 	destinationBucket := strings.TrimSpace(asString(params["destinationBucketName"]))
-	destinationKey := strings.TrimSpace(asString(params["destinationKey"]))
+	destinationKey := asString(params["destinationKey"])
 	if sourceBucket == "" || sourceKey == "" || destinationBucket == "" || destinationKey == "" {
 		return nil, &sidecarError{Code: "invalid_config", Message: "Copy source and destination are required."}
 	}
@@ -745,9 +878,21 @@ func azureCopyObject(params map[string]interface{}) (map[string]interface{}, err
 	if err != nil {
 		return nil, err
 	}
-	sourceURL := client.urlFor(sourceBucket, sourceKey).String()
+	sourceHead, headErr := client.do(ctx, http.MethodHead, sourceBucket, sourceKey, nil, nil, nil)
+	if headErr != nil {
+		return nil, headErr
+	}
+	sourceETag := sourceHead.Header.Get("ETag")
+	drainAndClose(sourceHead.Body)
+	if sourceETag == "" {
+		return nil, &sidecarError{Code: "unsupported_feature", Message: "Source has no validator; a consistent copy cannot be guaranteed."}
+	}
+	source := client.urlFor(sourceBucket, sourceKey)
+	source.RawQuery = client.sas
+	sourceURL := source.String()
 	resp, err := client.do(ctx, http.MethodPut, destinationBucket, destinationKey, nil, map[string]string{
-		"x-ms-copy-source": sourceURL,
+		"x-ms-copy-source":     sourceURL,
+		"x-ms-source-if-match": sourceETag,
 	}, nil)
 	if err != nil {
 		return nil, err
@@ -782,11 +927,11 @@ func azureCopyObject(params map[string]interface{}) (map[string]interface{}, err
 			Message: fmt.Sprintf("Azure copy not confirmed (%q); source retained. Inspect destination before retrying.", copyStatus),
 		}
 	}
-	return map[string]interface{}{"successCount": 1, "failureCount": 0, "failures": []interface{}{}}, nil
+	return map[string]interface{}{"successCount": 1, "failureCount": 0, "failures": []interface{}{}, "sourceETag": sourceETag}, nil
 }
 
 func azureMoveObject(params map[string]interface{}) (map[string]interface{}, error) {
-	if strings.TrimSpace(asString(params["sourceBucketName"])) == strings.TrimSpace(asString(params["destinationBucketName"])) && strings.TrimSpace(asString(params["sourceKey"])) == strings.TrimSpace(asString(params["destinationKey"])) {
+	if strings.TrimSpace(asString(params["sourceBucketName"])) == strings.TrimSpace(asString(params["destinationBucketName"])) && asString(params["sourceKey"]) == asString(params["destinationKey"]) {
 		return nil, &sidecarError{Code: "invalid_config", Message: "Move source and destination must differ."}
 	}
 	result, err := azureCopyObject(params)
@@ -801,13 +946,12 @@ func azureMoveObject(params map[string]interface{}) (map[string]interface{}, err
 	if err != nil {
 		return nil, err
 	}
-	if err = client.deleteBlob(
-		ctx,
-		strings.TrimSpace(asString(params["sourceBucketName"])),
-		strings.TrimSpace(asString(params["sourceKey"])),
-	); err != nil {
+	response, err := client.do(ctx, http.MethodDelete, asString(params["sourceBucketName"]), asString(params["sourceKey"]), nil, map[string]string{"If-Match": asString(result["sourceETag"])}, nil)
+	if err != nil {
 		return nil, err
 	}
+	drainAndClose(response.Body)
+
 	return result, nil
 }
 
@@ -865,11 +1009,11 @@ func azureDeleteObjects(params map[string]interface{}) (map[string]interface{}, 
 }
 
 func azureStartUpload(params map[string]interface{}) (map[string]interface{}, error) {
-	_, bucketName, client, ctx, err := azureBucketClient(params)
+	p, bucketName, client, ctx, err := azureBucketClient(params)
 	if err != nil {
 		return nil, err
 	}
-	prefix := strings.TrimSpace(asString(params["prefix"]))
+	prefix := asString(params["prefix"])
 	filePaths := asStringSlice(params["filePaths"])
 	objectKeyByPath := asStringMap(params["objectKeyByPath"])
 	if len(filePaths) == 0 {
@@ -888,7 +1032,11 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 		totalBytes += info.Size()
 		if info.Size() >= thresholdBytes {
 			usesMultipart = true
-			partsTotal += int((info.Size() + chunkBytes - 1) / chunkBytes)
+			chosen, sizingErr := azureBlockSizing(info.Size(), int64(asInt(params["multipartChunkMiB"]))*1024*1024)
+			if sizingErr != nil {
+				return nil, sizingErr
+			}
+			partsTotal += int((info.Size() + chosen - 1) / chosen)
 		}
 	}
 	jobID := fmt.Sprintf("upload-%d", time.Now().UnixNano())
@@ -918,47 +1066,52 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 		}
 		targetKey := filepath.Base(filePath)
 		if mappedKey, ok := objectKeyByPath[filePath]; ok && strings.TrimSpace(mappedKey) != "" {
-			targetKey = strings.TrimLeft(strings.ReplaceAll(mappedKey, "\\", "/"), "/")
+			targetKey = mappedKey
 		}
 		if prefix != "" {
 			targetKey = prefix + targetKey
 		}
 		outputLines = append(outputLines, fmt.Sprintf("Uploading %s (%d bytes) to %s.", info.Name(), info.Size(), targetKey))
 		if info.Size() >= thresholdBytes {
-			blockIDs := make([]string, 0, int((info.Size()+chunkBytes-1)/chunkBytes))
-			partNumber := 1
-			for {
-				chunk := make([]byte, chunkBytes)
-				readBytes, readErr := io.ReadFull(handle, chunk)
-				if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
-					handle.Close()
-					return nil, readErr
-				}
-				if readBytes == 0 {
-					break
-				}
-				chunk = chunk[:readBytes]
-				blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("block-%08d", partNumber)))
-				query := url.Values{
-					"comp":    []string{"block"},
-					"blockid": []string{blockID},
-				}
-				resp, blockErr := client.do(ctx, http.MethodPut, bucketName, targetKey, query, nil, chunk)
-				if blockErr != nil {
-					handle.Close()
-					return nil, blockErr
+			chunkBytes, err = azureBlockSizing(info.Size(), int64(asInt(params["multipartChunkMiB"]))*1024*1024)
+			if err != nil {
+				handle.Close()
+				return nil, err
+			}
+			partSize = chunkBytes
+			count := int((info.Size() + chunkBytes - 1) / chunkBytes)
+			blockIDs := make([]string, count)
+			nonce := make([]byte, 16)
+			if _, err = rand.Read(nonce); err != nil {
+				handle.Close()
+				return nil, err
+			}
+			for index := range blockIDs {
+				blockIDs[index] = base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%x-%08d", nonce, index)))
+			}
+			var stateMu sync.Mutex
+			err = parallelParts(ctx, count, transferConcurrency(p), func(workerCtx context.Context, index int) error {
+				offset := int64(index) * chunkBytes
+				length := minInt64(chunkBytes, info.Size()-offset)
+				resp, partErr := client.doReader(workerCtx, http.MethodPut, bucketName, targetKey, url.Values{"comp": {"block"}, "blockid": {blockIDs[index]}}, nil, length, func() io.Reader { return io.NewSectionReader(handle, offset, length) })
+				if partErr != nil {
+					return partErr
 				}
 				drainAndClose(resp.Body)
-				blockIDs = append(blockIDs, blockID)
-				bytesTransferred += int64(readBytes)
+				stateMu.Lock()
+				defer stateMu.Unlock()
+				bytesTransferred += length
 				partsCompleted++
 				partDone = partsCompleted
-				outputLines = append(outputLines, fmt.Sprintf("Uploaded part %d for %s.", partNumber, info.Name()))
-				emitTransferEvent(buildTransferJob(jobID, label, "upload", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), info.Name(), len(filePaths), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
-				partNumber++
-				if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
-					break
+				if partsCompleted <= maxPartOutputLines {
+					outputLines = append(outputLines, fmt.Sprintf("Uploaded part %d for %s.", index+1, info.Name()))
 				}
+				emitTransferEvent(buildTransferJob(jobID, label, "upload", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), info.Name(), len(filePaths), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+				return nil
+			})
+			if err != nil {
+				handle.Close()
+				return nil, err
 			}
 			blockListXML := &strings.Builder{}
 			blockListXML.WriteString(`<?xml version="1.0" encoding="utf-8"?><BlockList>`)
@@ -996,7 +1149,7 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 }
 
 func azureStartDownload(params map[string]interface{}) (map[string]interface{}, error) {
-	_, bucketName, client, ctx, err := azureBucketClient(params)
+	p, bucketName, client, ctx, err := azureBucketClient(params)
 	if err != nil {
 		return nil, err
 	}
@@ -1057,32 +1210,45 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 		defer handle.Close()
 		outputLines = append(outputLines, fmt.Sprintf("Downloading %s (%d bytes) to %s.", key, size, target))
 		if size >= thresholdBytes {
-			for start := int64(0); start < size; start += chunkBytes {
-				end := start + chunkBytes - 1
-				if end >= size {
-					end = size - 1
-				}
-				rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
-				resp, getErr := client.do(ctx, http.MethodGet, bucketName, key, nil, map[string]string{"Range": rangeHeader, "If-Match": validators[key]}, nil)
+			count := int((size + chunkBytes - 1) / chunkBytes)
+			var stateMu sync.Mutex
+			err = parallelParts(ctx, count, transferConcurrency(p), func(workerCtx context.Context, index int) error {
+				start := int64(index) * chunkBytes
+				end := minInt64(start+chunkBytes, size) - 1
+				resp, getErr := client.do(workerCtx, http.MethodGet, bucketName, key, nil, map[string]string{"Range": fmt.Sprintf("bytes=%d-%d", start, end), "If-Match": validators[key]}, nil)
 				if getErr != nil {
-					handle.Close()
-					return nil, getErr
+					return getErr
 				}
-				copied, copyErr := io.Copy(handle, io.LimitReader(resp.Body, end-start+2))
-				if copyErr == nil && (copied != end-start+1 || resp.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", start, end, size)) {
-					copyErr = fmt.Errorf("download range mismatch; partial file discarded")
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", start, end, size) {
+					return fmt.Errorf("download range mismatch; partial file discarded")
 				}
-				resp.Body.Close()
+				if received := resp.Header.Get("ETag"); received != "" && validators[key] != "" && received != validators[key] {
+					return fmt.Errorf("download source changed during range request; partial file discarded")
+				}
+				copied, copyErr := copyTransferRange(&offsetFileWriter{file: handle, offset: start}, io.LimitReader(resp.Body, end-start+2))
 				if copyErr != nil {
-					handle.Close()
-					return nil, copyErr
+					return copyErr
 				}
+				if copied != end-start+1 {
+					return fmt.Errorf("download range length mismatch; partial file discarded")
+				}
+				stateMu.Lock()
+				defer stateMu.Unlock()
 				bytesTransferred += copied
 				partsCompleted++
 				partDone = partsCompleted
-				outputLines = append(outputLines, fmt.Sprintf("Downloaded byte range %d-%d for %s.", start, end, key))
+				if partsCompleted <= maxPartOutputLines {
+					outputLines = append(outputLines, fmt.Sprintf("Downloaded byte range %d-%d for %s.", start, end, key))
+				}
 				emitTransferEvent(buildTransferJob(jobID, label, "download", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), key, len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+				return nil
+			})
+			if err != nil {
+				handle.Close()
+				return nil, err
 			}
+
 		} else {
 			resp, getErr := client.do(ctx, http.MethodGet, bucketName, key, nil, map[string]string{"If-Match": validators[key]}, nil)
 			if getErr != nil {
@@ -1134,20 +1300,28 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 	return buildTransferJob(jobID, label, "download", 1, "completed", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), keys[len(keys)-1], len(keys), itemsCompleted, partSize, partDone, partCount, false, false, false, outputLines), nil
 }
 
-func buildAzureBenchmarkExecutor(p profile, bucketName string) (*benchmarkExecutor, error) {
+func buildAzureBenchmarkExecutor(p profile, bucketName string, counters *benchmarkCounters) (*benchmarkExecutor, error) {
 	client, ctx, err := buildAzureClient(p)
 	if err != nil {
 		return nil, err
 	}
 	return &benchmarkExecutor{
-		put: func(key string, payload []byte) error {
-			return client.putBlob(ctx, bucketName, key, payload, nil)
+		putReader: func(key string, payload io.ReadSeeker, size int64) error {
+			resp, err := client.doReader(benchmarkRequestContext(ctx, counters), http.MethodPut, bucketName, key, nil, map[string]string{"x-ms-blob-type": "BlockBlob"}, size, func() io.Reader { return struct{ io.Reader }{payload} })
+			if resp != nil {
+				drainAndClose(resp.Body)
+			}
+			return err
 		},
-		get: func(key string) ([]byte, error) {
-			return client.getBlobAll(ctx, bucketName, key)
+		getReader: func(key string) (io.ReadCloser, error) {
+			resp, err := client.do(benchmarkRequestContext(ctx, counters), http.MethodGet, bucketName, key, nil, nil, nil)
+			if err != nil {
+				return nil, err
+			}
+			return resp.Body, nil
 		},
 		deleteOne: func(key string) error {
-			return client.deleteBlob(ctx, bucketName, key)
+			return client.deleteBlob(benchmarkRequestContext(ctx, counters), bucketName, key)
 		},
 		deleteBatch: nil,
 	}, nil

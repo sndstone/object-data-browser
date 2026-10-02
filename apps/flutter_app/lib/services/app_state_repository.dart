@@ -224,7 +224,7 @@ class LocalAppStateRepository implements AppStateRepository {
   /// empty so an exported file can be re-imported without crashing. Users
   /// re-enter credentials after importing.
   Map<String, Object?> _profileToExportJson(EndpointProfile profile) {
-    final json = profile.toJson();
+    final json = {..._profileMetadataToJson(profile)};
     json['accessKey'] = '';
     json['secretKey'] = '';
     json['sessionToken'] = null;
@@ -360,9 +360,10 @@ class LocalAppStateRepository implements AppStateRepository {
         profile.id: <String, String?>{
           'accessKey': profile.accessKey,
           'secretKey': profile.secretKey,
-          'sessionToken': (profile.sessionToken ?? '').isEmpty
-              ? null
-              : profile.sessionToken,
+          'sessionToken': _embeddedSas(profile) ??
+              ((profile.sessionToken ?? '').isEmpty
+                  ? null
+                  : profile.sessionToken),
         },
     };
     final bundleJson = _encodeProfileSecretBundle(secretsByProfile);
@@ -432,13 +433,30 @@ class LocalAppStateRepository implements AppStateRepository {
     };
   }
 
+  String? _embeddedSas(EndpointProfile profile) {
+    final uri = Uri.tryParse(profile.endpointUrl);
+    return profile.endpointType == EndpointProfileType.azureBlob &&
+            uri != null &&
+            uri.queryParameters.containsKey('sig')
+        ? uri.query
+        : null;
+  }
+
   Map<String, Object?> _profileMetadataToJson(
     EndpointProfile profile,
   ) {
     return <String, Object?>{
+      ...profile.connection.toJson(),
+      if (_embeddedSas(profile) != null) 'authMode': 'azureSas',
       'id': profile.id,
       'name': profile.name,
-      'endpointUrl': profile.endpointUrl,
+      'endpointUrl': _embeddedSas(profile) == null
+          ? profile.endpointUrl
+          : Uri.parse(profile.endpointUrl)
+              .replace(query: '', fragment: '')
+              .toString()
+              .split('?')
+              .first,
       'region': profile.region,
       'endpointType': profile.endpointType.name,
       'pathStyle': profile.pathStyle,

@@ -92,16 +92,7 @@ void main() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
       if (call.method == 'dispatch') {
-        return {
-          'key': 'docs/readme.txt',
-          'metadata': {'owner': 'qa'},
-          'headers': {'Content-Length': '32'},
-          'tags': {'env': 'test'},
-          'debugEvents': const [],
-          'apiCalls': const [],
-          'debugLogExcerpt': const ['bridge ok'],
-          'rawDiagnostics': const {'engineState': 'healthy'},
-        };
+        return {'items': <Map<String, Object?>>[]};
       }
       return null;
     });
@@ -116,11 +107,9 @@ void main() {
       ),
     );
 
-    await service.getObjectDetails(
+    await service.listBuckets(
       engineId: 'rust',
       profile: profile(),
-      bucketName: 'docs',
-      key: 'docs/readme.txt',
     );
 
     expect(
@@ -132,7 +121,7 @@ void main() {
     expect(records.first.requestId, isNotEmpty);
     expect(records.first.requestId, records.last.requestId);
     expect(records.first.engineId, 'rust');
-    expect(records.last.method, 'getObjectDetails');
+    expect(records.last.method, 'listBuckets');
   });
 
   test('native unsupported errors surface instead of mock data', () async {

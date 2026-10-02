@@ -1,0 +1,841 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Object Data Browser · Menus and toggles</title>
+<style>
+  :root{color-scheme:light;
+    --bg:#f7f8f5;--panel:#fff;--muted-panel:#f3f5f0;--ink:#141b18;--muted:#5e6a66;--line:#dde3dd;--outline:#9aa79f;
+    --accent:#004d19;--soft:#eaf3e4;--on-soft:#0f4b16;--rail:#002117;--rail-thumb:#8dcc88;--error:#b3261e;--error-soft:#f9dedc;
+    --shadow:0 8px 22px rgba(12,23,21,.13),0 1px 3px rgba(12,23,21,.08);--hover:rgba(20,27,24,.08);--on-accent:#fff}
+  body.dark{color-scheme:dark;
+    --bg:#08110e;--panel:#111c18;--muted-panel:#18251f;--ink:#eaf1ec;--muted:#abb8b1;--line:#2b3a34;--outline:#7a8981;
+    --accent:#8dcc88;--soft:#193b27;--on-soft:#d5f3d2;--rail:#001a12;--rail-thumb:#8dcc88;--error:#f2b8b5;--error-soft:#8c1d18;
+    --shadow:0 10px 26px rgba(0,0,0,.5),0 1px 3px rgba(0,0,0,.4);--hover:rgba(234,241,236,.08);--on-accent:#062112}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;transition:background .2s,color .2s}
+  main{max-width:1180px;padding:54px 32px 72px;margin:auto}
+  .intro{display:flex;justify-content:space-between;align-items:start;gap:24px;margin-bottom:28px}
+  .eyebrow{font-size:11px;font-weight:700;letter-spacing:1.7px;text-transform:uppercase;color:var(--accent)}
+  h1{font-size:30px;letter-spacing:-1px;margin:8px 0}
+  h2.section{font-size:21px;letter-spacing:-.5px;margin:56px 0 6px}
+  h3{font-size:15px;font-weight:650;margin:0}
+  p{margin:0;color:var(--muted)}
+  code{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--muted-panel);border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--ink)}
+  button{font:inherit;cursor:pointer}
+  .theme{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:9px 14px;white-space:nowrap}
+  .lede{max-width:760px;margin-top:6px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-top:24px}
+  .grid.three{grid-template-columns:repeat(3,1fr)}
+  article{min-width:0}
+  .caption{display:flex;align-items:center;gap:10px;margin:0 0 12px}
+  .number{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .tag{margin-left:auto;font-size:10px;letter-spacing:.5px;border-radius:5px;padding:3px 7px;white-space:nowrap;background:var(--muted-panel);color:var(--muted);border:1px solid var(--line)}
+  .tag.rec{background:var(--soft);color:var(--accent);border-color:transparent}
+  .stage{border:1px solid var(--line);border-radius:14px;background:var(--muted-panel);padding:24px;overflow:hidden;position:relative}
+  .note{font-size:12.5px;line-height:1.65;padding:12px 2px 0}
+  .note b{color:var(--ink);font-weight:650}
+
+  /* ---------- audit table ---------- */
+  table{width:100%;border-collapse:collapse;margin-top:20px;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;font-size:13px}
+  th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-size:11px;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);font-weight:700;background:var(--muted-panel)}
+  tr:last-child td{border-bottom:0}
+  td .file{display:block;font:11.5px ui-monospace,Menlo,monospace;color:var(--muted);margin-top:2px}
+  .pill{display:inline-block;font-size:11px;font-weight:650;border-radius:5px;padding:1px 7px}
+  .pill.ok{background:var(--soft);color:var(--accent)}
+  .pill.gap{background:var(--error-soft);color:var(--error)}
+  body.dark .pill.gap{color:#f9dedc}
+
+  /* ---------- menus ---------- */
+  .anchor-field{width:260px;border:1.5px solid var(--accent);border-radius:8px;background:var(--panel);padding:16px 12px 8px;position:relative;font-weight:500}
+  .anchor-field small{position:absolute;top:3px;left:12px;font-size:11px;font-weight:800;color:var(--accent)}
+  .anchor-field .arrow{position:absolute;right:12px;top:15px;color:var(--muted)}
+  .menu{background:var(--panel);border:1px solid color-mix(in srgb,var(--line) 90%,transparent);border-radius:10px;box-shadow:var(--shadow);padding:6px 0;width:260px;transform-origin:top left}
+  .menu.anim{animation:grow .18s cubic-bezier(.215,.61,.355,1) both}
+  .menu.from-point{position:absolute}
+  @keyframes grow{from{opacity:0;clip-path:inset(0 0 100% 0 round 10px)}to{opacity:1;clip-path:inset(0 0 0 0 round 10px)}}
+  .mi{height:40px;display:flex;align-items:center;gap:8px;padding:0 12px;font-size:14px;font-weight:500;color:var(--ink);cursor:default;white-space:nowrap}
+  .mi:hover,.mi.hl{background:var(--hover)}
+  .mi svg{width:16px;height:16px;flex:none}
+  .mi .label{flex:1;overflow:hidden;text-overflow:ellipsis}
+  .mi .check{color:var(--accent)}
+  .mi .kbd{font-size:11.5px;color:var(--muted);font-weight:600}
+  .mi.sel{background:color-mix(in srgb,var(--soft) 55%,transparent);color:var(--on-soft);font-weight:700}
+  body:not(.dark) .mi.sel{background:#f2f8ee}
+  .mi.danger{color:var(--error)}
+  .mi.disabled{color:color-mix(in srgb,var(--muted) 50%,transparent)}
+  .msep{height:1px;background:var(--line);margin:6px 0}
+  .mhead{font-size:10.5px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;color:var(--muted);padding:6px 12px 4px}
+  /* approximation of the current Material 3 popup defaults */
+  .menu.m3{border:0;border-radius:4px;padding:8px 0;box-shadow:0 2px 6px rgba(0,0,0,.15),0 1px 2px rgba(0,0,0,.2);width:250px}
+  .menu.m3 .mi{height:48px;padding:0 12px;gap:0}
+  .menu.m3 .mi.lt{height:52px}
+  .menu.m3 .mi.lt svg{width:22px;height:22px;margin-right:16px;color:var(--muted)}
+  .menu.m3 .mi.danger svg{color:var(--error)}
+  .menu.m3 .msep{margin:8px 0}
+  .pair{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start}
+  .pair .lbl{font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
+  .pair .lbl.good{color:var(--accent)}
+  .stage.menus{min-height:120px}
+  .replay{position:absolute;right:14px;top:12px;border:1px solid var(--line);background:var(--panel);color:var(--muted);border-radius:6px;padding:3px 9px;font-size:11.5px}
+  .search{display:flex;align-items:center;width:280px;border:1px solid var(--line);border-radius:8px;background:var(--panel);height:44px;padding:0 6px}
+  .search .mode{display:flex;gap:4px;align-items:center;font-weight:700;font-size:13px;padding:6px 8px;border-radius:6px;background:var(--hover)}
+  .search .ph{color:var(--muted);margin-left:10px;font-size:13.5px}
+  .tabs{display:flex;align-items:center;gap:18px;border-bottom:1px solid var(--line);width:300px;padding:0 4px;font-weight:700;font-size:13px;color:var(--muted)}
+  .tabs span{padding:9px 0}.tabs .on{color:var(--accent);box-shadow:inset 0 -2px var(--accent)}
+  .tabs .more{margin-left:auto;display:grid;place-items:center;width:30px;height:30px;border-radius:7px;background:var(--hover);color:var(--ink)}
+  .spec{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-top:20px}
+  .spec div{background:var(--panel);padding:12px 14px;font-size:12.5px}
+  .spec b{display:block;font-size:10.5px;letter-spacing:.6px;text-transform:uppercase;color:var(--muted);margin-bottom:3px}
+  pre{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;overflow:auto;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink);margin:12px 0 0}
+  pre .c{color:var(--muted)}pre .k{color:var(--accent);font-weight:600}
+  ol.steps{margin:18px 0 0;padding-left:20px;color:var(--muted);font-size:13.5px;line-height:1.7}
+  ol.steps b{color:var(--ink)}
+
+  /* ---------- settings mini card ---------- */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:4px 16px}
+  .row{display:flex;align-items:center;gap:16px;padding:12px 0;border-bottom:1px solid var(--line)}
+  .row:last-child{border-bottom:0}
+  .row .txt{flex:1;min-width:0}
+  .row .t{font-weight:600;font-size:14px}
+  .row .s{font-size:12px;color:var(--muted);line-height:1.4;margin-top:2px}
+  .states{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;margin-top:14px;padding:0 2px}
+  .states figure{margin:0;display:flex;flex-direction:column;align-items:center;gap:6px}
+  .states figcaption{font-size:10.5px;color:var(--muted);letter-spacing:.3px}
+
+  /* ---------- toggles: shared ---------- */
+  .sw{position:relative;flex:none;border:0;padding:0;background:none;outline:none;--d:.17s;-webkit-tap-highlight-color:transparent}
+  .sw[disabled]{cursor:not-allowed;opacity:.42}
+  .sw .thumb,.sw .track,.sw .lbl-on,.sw .lbl-off{transition:all var(--d) cubic-bezier(.215,.61,.355,1)}
+  .sw.focus{box-shadow:0 0 0 2px var(--panel),0 0 0 4px color-mix(in srgb,var(--accent) 70%,transparent);border-radius:999px}
+  .sw:focus-visible{box-shadow:0 0 0 2px var(--panel),0 0 0 4px color-mix(in srgb,var(--accent) 70%,transparent);border-radius:999px}
+
+  /* today (diagnosis) */
+  .today-m3{width:52px;height:32px;border-radius:16px;background:var(--muted-panel);border:2px solid color-mix(in srgb,var(--line) 70%,transparent)}
+  .today-m3 .thumb{position:absolute;width:16px;height:16px;border-radius:50%;background:var(--muted);left:6px;top:6px}
+  .today-m3[aria-checked=true]{background:color-mix(in srgb,var(--soft) 72%,transparent)}
+  .today-m3[aria-checked=true] .thumb{width:24px;height:24px;left:22px;top:2px;background:var(--accent)}
+  .today-cup{width:51px;height:31px;border-radius:16px;background:#e3e3e8}
+  body.dark .today-cup{background:#39393d}
+  .today-cup .thumb{position:absolute;width:27px;height:27px;border-radius:50%;background:#fff;left:2px;top:2px;box-shadow:0 3px 8px rgba(0,0,0,.15),0 1px 1px rgba(0,0,0,.16)}
+  .today-cup[aria-checked=true]{background:var(--accent)}
+  .today-cup[aria-checked=true] .thumb{left:22px}
+  .today .row:nth-child(2) .sw{margin-right:-16px}
+
+  /* 01 Forest pill */
+  .d1 .sw{width:36px;height:20px;border-radius:10px;background:#d6ddd5;box-shadow:inset 0 0 0 1px rgba(20,27,24,.06)}
+  body.dark .d1 .sw{background:#33443c}
+  .d1 .sw .thumb{position:absolute;left:2px;top:2px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(12,23,21,.28)}
+  .d1 .sw[aria-checked=true]{background:var(--accent)}
+  body.dark .d1 .sw[aria-checked=true] .thumb{background:#062112}
+  .d1 .sw[aria-checked=true] .thumb{left:18px}
+  .d1 .sw:active .thumb{width:19px}.d1 .sw[aria-checked=true]:active .thumb{left:15px}
+
+  /* 02 Soft tint (evolution of today) */
+  .d2 .sw{width:40px;height:24px;border-radius:12px;background:var(--muted-panel);border:1.5px solid var(--outline)}
+  .d2 .sw .thumb{position:absolute;left:3px;top:3px;width:15px;height:15px;border-radius:50%;background:var(--muted)}
+  .d2 .sw[aria-checked=true]{background:var(--soft);border-color:color-mix(in srgb,var(--accent) 45%,transparent)}
+  .d2 .sw[aria-checked=true] .thumb{left:19px;background:var(--accent)}
+
+  /* 03 Icon thumb */
+  .d3 .sw{width:44px;height:24px;border-radius:12px;background:var(--muted-panel);border:1.5px solid var(--outline)}
+  .d3 .sw .thumb{position:absolute;left:2px;top:2px;width:17px;height:17px;border-radius:50%;background:var(--muted);display:grid;place-items:center;color:var(--panel)}
+  .d3 .sw .thumb svg{width:11px;height:11px}
+  .d3 .sw .i-on{display:none}
+  .d3 .sw[aria-checked=true]{background:var(--accent);border-color:var(--accent)}
+  .d3 .sw[aria-checked=true] .thumb{left:22px;background:var(--on-accent);color:var(--accent)}
+  .d3 .sw[aria-checked=true] .i-on{display:block}.d3 .sw[aria-checked=true] .i-off{display:none}
+
+  /* 04 Squared */
+  .d4 .sw{width:38px;height:22px;border-radius:6px;background:var(--muted-panel);border:1px solid var(--outline)}
+  .d4 .sw .thumb{position:absolute;left:2px;top:2px;width:16px;height:16px;border-radius:4px;background:var(--panel);box-shadow:0 1px 2px rgba(12,23,21,.3),inset 0 0 0 1px var(--line)}
+  .d4 .sw[aria-checked=true]{background:var(--accent);border-color:var(--accent)}
+  .d4 .sw[aria-checked=true] .thumb{left:18px;box-shadow:0 1px 2px rgba(0,0,0,.25)}
+  body.dark .d4 .sw[aria-checked=true] .thumb{background:#062112}
+  .d4 .sw.focus,.d4 .sw:focus-visible{border-radius:7px}
+
+  /* 05 Labelled track */
+  .d5 .sw{width:50px;height:22px;border-radius:11px;background:var(--muted-panel);border:1px solid var(--outline)}
+  .d5 .sw .thumb{position:absolute;left:2px;top:2px;width:16px;height:16px;border-radius:50%;background:var(--muted)}
+  .d5 .sw .lbl-on,.d5 .sw .lbl-off{position:absolute;top:0;line-height:20px;font-size:9.5px;font-weight:800;letter-spacing:.6px}
+  .d5 .sw .lbl-off{right:7px;color:var(--muted)}
+  .d5 .sw .lbl-on{left:8px;color:var(--on-accent);opacity:0}
+  .d5 .sw[aria-checked=true]{background:var(--accent);border-color:var(--accent)}
+  .d5 .sw[aria-checked=true] .thumb{left:30px;background:var(--on-accent)}
+  .d5 .sw[aria-checked=true] .lbl-on{opacity:1}.d5 .sw[aria-checked=true] .lbl-off{opacity:0}
+
+  /* 06 Segmented Off / On */
+  .d6 .sw{display:inline-flex;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:3px;gap:0}
+  .d6 .sw span{display:block;min-width:38px;padding:3px 8px;border-radius:6px;font-size:12px;font-weight:700;color:var(--muted);text-align:center;transition:all var(--d)}
+  .d6 .sw[aria-checked=false] .seg-off{background:var(--muted-panel);color:var(--ink);font-weight:800}
+  .d6 .sw[aria-checked=true] .seg-on{background:color-mix(in srgb,var(--soft) 95%,transparent);color:var(--on-soft);font-weight:800}
+  .d6 .sw.focus,.d6 .sw:focus-visible{border-radius:9px}
+
+  /* 07 Rail */
+  .d7 .sw{width:40px;height:22px;border-radius:11px;background:var(--muted-panel);border:1px solid var(--outline)}
+  .d7 .sw .thumb{position:absolute;left:3px;top:3px;width:14px;height:14px;border-radius:50%;background:var(--outline)}
+  .d7 .sw[aria-checked=true]{background:var(--rail);border-color:var(--rail)}
+  body.dark .d7 .sw[aria-checked=true]{border-color:#2f5c43;background:#073322}
+  .d7 .sw[aria-checked=true] .thumb{left:21px;background:var(--rail-thumb);box-shadow:0 0 0 3px rgba(141,204,136,.22),0 0 8px rgba(141,204,136,.55)}
+
+  /* 08 Hairline */
+  .d8 .sw{width:36px;height:20px}
+  .d8 .sw .track{position:absolute;left:2px;right:2px;top:8.5px;height:3px;border-radius:2px;background:var(--line)}
+  .d8 .sw .thumb{position:absolute;left:0;top:1px;width:18px;height:18px;border-radius:50%;background:var(--panel);border:2px solid var(--outline)}
+  .d8 .sw[aria-checked=true] .track{background:color-mix(in srgb,var(--accent) 55%,transparent)}
+  .d8 .sw[aria-checked=true] .thumb{left:18px;background:var(--accent);border-color:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 14%,transparent)}
+
+  .verdict{margin-top:26px;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:10px;padding:16px 18px;font-size:13.5px;color:var(--muted);line-height:1.7}
+  .verdict b{color:var(--ink)}
+  /* ---------- sliders: shared ---------- */
+  .srow{padding:14px 0;border-bottom:1px solid var(--line)}
+  .srow:last-child{border-bottom:0}
+  .shead{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}
+  .shead .t{font-weight:600;font-size:14px;flex:1;min-width:0}
+  .shead .s{display:block;font-size:12px;color:var(--muted);font-weight:500;line-height:1.4;margin-top:2px}
+  .vchip{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--on-soft);background:var(--soft);border-radius:6px;padding:2px 8px;min-width:54px;text-align:center}
+  .reset{border:0;background:none;color:var(--accent);font-size:12px;font-weight:650;padding:0;visibility:hidden}
+  .srow.off-default .reset{visibility:visible}
+  .minmax{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:6px;font-variant-numeric:tabular-nums}
+  .sl{position:relative;height:24px;cursor:pointer;touch-action:none;outline:none;--p:.5;--dp:.5}
+  .sl .tr,.sl .fill,.sl .th,.sl .def{position:absolute}
+  .sl .tr{left:0;right:0;top:50%;transform:translateY(-50%)}
+  .sl .fill{left:0;top:50%;transform:translateY(-50%);width:calc(var(--p)*100%)}
+  .sl .th{top:50%;left:calc(var(--p)*100%);transform:translate(-50%,-50%);transition:box-shadow .15s,width .12s}
+  .sl .def{top:50%;left:calc(var(--dp)*100%);transform:translate(-50%,-50%)}
+  .sl:focus-visible .th{box-shadow:0 0 0 2px var(--panel),0 0 0 4px color-mix(in srgb,var(--accent) 70%,transparent)!important}
+
+  /* today: M3 2023 defaults */
+  .s0 .sl{height:40px;margin:0 -0px}
+  .s0 .sl{margin:0 24px}
+  .s0 .tr{height:4px;border-radius:2px;background:#f3f5f0}
+  body.dark .s0 .tr{background:#18251f}
+  .s0 .fill{height:4px;border-radius:2px;background:var(--accent)}
+  .s0 .th{width:20px;height:20px;border-radius:50%;background:var(--accent);box-shadow:0 1px 2px rgba(0,0,0,.25)}
+  .s0 .ticks{position:absolute;left:0;right:0;top:50%;height:2px;transform:translateY(-50%);background-image:radial-gradient(circle,color-mix(in srgb,var(--muted) 45%,transparent) 1px,transparent 1.3px);background-size:var(--tick) 2px;background-position:-1px 0}
+  .s0 .sline{font-weight:600;font-size:14px}
+  .s0 .ssub{font-size:12px;color:var(--muted);line-height:1.4;margin-top:2px}
+
+  /* S1 Forest rail */
+  .s1 .tr{height:4px;border-radius:2px;background:#d6ddd5}
+  body.dark .s1 .tr{background:#33443c}
+  .s1 .fill{height:4px;border-radius:2px;background:var(--accent)}
+  .s1 .def{width:2px;height:10px;border-radius:1px;background:var(--outline)}
+  .s1 .th{width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(12,23,21,.35),0 0 0 1px rgba(12,23,21,.06)}
+  body.dark .s1 .th{background:#eaf1ec}
+  .s1 .sl:active .th{box-shadow:0 1px 3px rgba(12,23,21,.35),0 0 0 6px color-mix(in srgb,var(--accent) 16%,transparent)}
+
+  /* S2 Soft tint */
+  .s2 .tr{height:6px;border-radius:3px;background:var(--line)}
+  .s2 .fill{height:6px;border-radius:3px;background:color-mix(in srgb,var(--accent) 35%,var(--soft))}
+  .s2 .th{width:20px;height:20px;border-radius:50%;background:var(--accent);border:3px solid var(--panel);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 40%,transparent)}
+  .s2 .bubble{position:absolute;bottom:calc(100% + 4px);left:calc(var(--p)*100%);transform:translateX(-50%) scale(.6);opacity:0;background:var(--accent);color:var(--on-accent);font-size:11px;font-weight:700;border-radius:6px;padding:2px 7px;transition:all .12s;pointer-events:none;white-space:nowrap}
+  .s2 .sl:active .bubble,.s2 .sl:focus-visible .bubble{opacity:1;transform:translateX(-50%) scale(1)}
+
+  /* S3 Ruler */
+  .s3 .sl{height:34px}
+  .s3 .tr{height:4px;border-radius:2px;background:var(--line);top:9px}
+  .s3 .fill{height:4px;border-radius:2px;background:var(--accent);top:9px}
+  .s3 .th{top:9px;width:4px;height:20px;border-radius:2px;background:var(--accent);box-shadow:0 0 0 3px var(--panel)}
+  .s3 .ruler{position:absolute;left:0;right:0;top:20px;height:14px}
+  .s3 .ruler i{position:absolute;top:0;width:1px;height:5px;background:var(--outline);transform:translateX(-.5px)}
+  .s3 .ruler i.major{height:8px;background:var(--muted)}
+  .s3 .ruler i.on{background:var(--accent)}
+  .s3 .ruler b{position:absolute;top:9px;font-size:10px;font-weight:600;color:var(--muted);transform:translateX(-50%);font-variant-numeric:tabular-nums}
+  .s3 .minmax{display:none}
+
+  /* S4 Squared handle */
+  .s4 .tr{height:8px;border-radius:3px;background:var(--muted-panel);box-shadow:inset 0 0 0 1px var(--line)}
+  .s4 .fill{height:8px;border-radius:3px 0 0 3px;background:var(--accent)}
+  .s4 .th{width:10px;height:22px;border-radius:3px;background:var(--panel);box-shadow:0 1px 2px rgba(12,23,21,.3),inset 0 0 0 1px var(--outline)}
+  .s4 .th::after{content:"";position:absolute;left:4px;top:7px;width:2px;height:8px;border-radius:1px;background:var(--outline)}
+  .s4 .sl:active .th{width:12px}
+
+  /* S5 Inline value field */
+  .s5 .ctl{display:flex;align-items:center;gap:14px}
+  .s5 .sl{flex:1}
+  .s5 .tr{height:4px;border-radius:2px;background:var(--line)}
+  .s5 .fill{height:4px;border-radius:2px;background:var(--accent)}
+  .s5 .th{width:16px;height:16px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--panel),0 0 0 4px color-mix(in srgb,var(--accent) 30%,transparent)}
+  .s5 .field{display:flex;align-items:center;border:1px solid var(--line);border-radius:8px;background:var(--panel);height:32px;flex:none}
+  .s5 .field input{width:46px;border:0;background:none;color:var(--ink);font:600 13px Inter,-apple-system,sans-serif;text-align:right;padding:0 2px 0 6px;outline:none;font-variant-numeric:tabular-nums}
+  .s5 .field span{font-size:12px;color:var(--muted);padding-right:4px}
+  .s5 .field button{border:0;border-left:1px solid var(--line);background:none;color:var(--muted);width:24px;height:100%;font-weight:700;padding:0}
+  .s5 .field:focus-within{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+  .s5 .vchip,.s5 .minmax{display:none}
+
+  /* S6 Step blocks */
+  .s6 .sl{height:22px;display:flex;gap:3px}
+  .s6 .blk{flex:1;border-radius:3px;background:var(--line);transition:background .1s}
+  .s6 .blk:first-child{border-radius:6px 3px 3px 6px}.s6 .blk:last-child{border-radius:3px 6px 6px 3px}
+  .s6 .blk.on{background:color-mix(in srgb,var(--accent) 70%,var(--soft))}
+  .s6 .blk.cur{background:var(--accent)}
+  .s6 .blk.dft{box-shadow:inset 0 -3px 0 var(--outline)}
+  .s6 .blk.on.dft,.s6 .blk.cur.dft{box-shadow:inset 0 -3px 0 color-mix(in srgb,var(--on-accent) 60%,transparent)}
+  .s6 .sl:focus-visible .blk.cur{box-shadow:0 0 0 2px var(--panel),0 0 0 4px color-mix(in srgb,var(--accent) 70%,transparent)}
+
+  /* S7 Filled level bar */
+  .s7 .sl{height:34px;border-radius:9px;background:var(--muted-panel);box-shadow:inset 0 0 0 1px var(--line);overflow:hidden}
+  .s7 .fill{top:0;bottom:0;transform:none;background:var(--soft);box-shadow:inset -2px 0 0 var(--accent)}
+  .s7 .th{display:none}
+  .s7 .inside{position:absolute;left:12px;top:0;bottom:0;display:flex;align-items:center;font-size:13px;font-weight:700;color:var(--on-soft);pointer-events:none;font-variant-numeric:tabular-nums}
+  .s7 .def{width:1px;height:14px;background:var(--outline)}
+  .s7 .sl:focus-visible{box-shadow:inset 0 0 0 1.5px var(--accent)}
+  .s7 .vchip{display:none}
+
+  /* S8 Hairline + floating value */
+  .s8 .sl{height:40px;margin-top:6px}
+  .s8 .tr{height:2px;background:var(--line);top:28px}
+  .s8 .fill{height:2px;background:var(--accent);top:28px}
+  .s8 .th{top:28px;width:16px;height:16px;border-radius:50%;background:var(--panel);border:2px solid var(--accent)}
+  .s8 .sl:active .th{background:var(--accent)}
+  .s8 .float{position:absolute;top:0;left:calc(var(--p)*100%);transform:translateX(-50%);font-size:11.5px;font-weight:700;color:var(--accent);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .s8 .vchip{display:none}
+
+  /* benchmark mix */
+  .mixbar{position:relative;display:flex;height:34px;border-radius:9px;overflow:hidden;touch-action:none;user-select:none}
+  .mixbar .seg{display:flex;align-items:center;padding:0 10px;font-size:12px;font-weight:700;color:#fff;white-space:nowrap;overflow:hidden;min-width:0;font-variant-numeric:tabular-nums}
+  .mixbar .w{background:var(--accent)} .mixbar .r{background:#2b4f7a} .mixbar .d{background:var(--error)}
+  body.dark .mixbar .seg{color:#062112} body.dark .mixbar .r{background:#aec6f1}
+  .mixbar .hd{position:absolute;top:0;bottom:0;width:14px;margin-left:-7px;cursor:ew-resize;display:grid;place-items:center;outline:none}
+  .mixbar .hd::after{content:"";width:4px;height:20px;border-radius:2px;background:var(--panel);box-shadow:0 0 0 1px rgba(0,0,0,.15)}
+  .mixbar .hd:focus-visible::after{box-shadow:0 0 0 2px var(--accent)}
+  .legend{display:flex;gap:18px;margin-top:12px;font-size:12.5px;flex-wrap:wrap}
+  .legend span{display:flex;align-items:center;gap:6px}
+  .legend i{width:10px;height:10px;border-radius:3px}
+  .legend b{font-variant-numeric:tabular-nums}
+  .presets{display:flex;gap:6px;margin-top:14px;flex-wrap:wrap}
+  .presets button{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:6px;padding:4px 10px;font-size:12px;font-weight:650}
+  .presets button:hover{background:var(--hover)}
+  .oldmix .mrow{display:flex;align-items:center;gap:10px;font-size:12px;height:36px}
+  .oldmix .mrow span:first-child{width:80px}
+  .oldmix .mtr{flex:1;height:4px;border-radius:2px;background:#f3f5f0;position:relative}
+  body.dark .oldmix .mtr{background:#18251f}
+  .oldmix .mtr i{position:absolute;left:0;top:0;height:4px;border-radius:2px}
+  .oldmix .mtr b{position:absolute;top:-8px;width:20px;height:20px;border-radius:50%;margin-left:-10px}
+  .oldmix .mrow em{font-style:normal;font-weight:700;width:34px;text-align:right}
+  .oldmix .err{font-size:12px;color:var(--error);margin-top:6px}
+
+  footer{margin-top:40px;padding-top:20px;border-top:1px solid var(--line);font-size:12px;color:var(--muted)}
+  @media(max-width:900px){.grid,.grid.three,.pair{grid-template-columns:1fr}.spec{grid-template-columns:1fr 1fr}main{padding:28px 18px}.intro{flex-wrap:wrap}}
+</style>
+</head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" style="position:absolute;width:0;height:0" aria-hidden="true">
+  <defs>
+    <symbol id="i-open" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4.5l2 2.5H19a2 2 0 0 1 2 2V10M3 7v11h15.5l2.8-7.2a1 1 0 0 0-.9-1.3H7.2a1 1 0 0 0-.9.6L3 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5h.01"/></g></symbol>
+    <symbol id="i-dl" viewBox="0 0 24 24"><path d="M12 4v11m-4.5-4.5L12 15l4.5-4.5M5 19.5h14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1.2 1.2M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1.2-1.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></g></symbol>
+    <symbol id="i-uri" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="6" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><path d="M7 7h.01M7 17h.01"/></g></symbol>
+    <symbol id="i-del" viewBox="0 0 24 24"><path d="M4.5 7h15M9.5 7V4.5h5V7M6.5 7l.8 12.5h9.4L17.5 7M10 11v5M14 11v5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-delf" viewBox="0 0 24 24"><path d="M4.5 7h15M9.5 7V4.5h5V7M6.5 7l.8 12.5h9.4L17.5 7M10 11l4 4M14 11l-4 4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-minus" viewBox="0 0 24 24"><path d="M6 12h12" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/></symbol>
+    <symbol id="i-history" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.4-5.7M4 4v4h4M12 8v4.5l3 2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-sched" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></g></symbol>
+    <symbol id="i-policy" viewBox="0 0 24 24"><path d="M12 3l7 3v5.5c0 4.4-3 8-7 9.5-4-1.5-7-5.1-7-9.5V6Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/></g></symbol>
+    <symbol id="i-tag" viewBox="0 0 24 24"><path d="M3.5 12.5V4.5a1 1 0 0 1 1-1h8l8 8-9 9Z M8 8h.01" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><g fill="currentColor"><circle cx="6" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="18" cy="12" r="1.6"/></g></symbol>
+    <symbol id="i-caret" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5Z" fill="currentColor"/></symbol>
+  </defs>
+</svg>
+<main>
+  <div class="intro">
+    <div><div class="eyebrow">Object Data Browser / Design study</div>
+      <h1>One menu, one toggle, one slider.</h1>
+      <p class="lede">An audit of every menu in the Flutter app against the backend-engine selector, eight toggle designs to replace the three switch styles that currently appear side by side in Settings, and eight slider designs plus a new benchmark mix control.</p></div>
+    <button class="theme" id="themeBtn" type="button" aria-pressed="false">Dark preview</button>
+  </div>
+
+  <!-- ===================================================== MENUS -->
+  <h2 class="section">Part 1 · Context menus</h2>
+  <p class="lede">The engine and profile selectors use the custom panel in <code>AppSelectField</code>. Every other menu uses <code>showMenu</code> or <code>PopupMenuButton</code>. <code>app_theme.dart</code> has no <code>popupMenuTheme</code>, so those menus fall back to Material 3 defaults.</p>
+
+  <div class="grid">
+    <article>
+      <div class="caption"><span class="number">REF</span><h3>Engine selector, the target look</h3><span class="tag rec">SOURCE OF TRUTH</span></div>
+      <div class="stage menus" style="min-height:300px">
+        <button class="replay" data-replay="ref">Replay</button>
+        <div class="anchor-field"><small>Backend engine</small>Go Engine<svg class="arrow" width="18" height="18"><use href="#i-caret"/></svg></div>
+        <div class="menu anim" id="ref" style="margin-top:4px">
+          <div class="mi"><span class="label">Python Engine</span></div>
+          <div class="mi sel"><span class="label">Go Engine</span><svg class="check"><use href="#i-check"/></svg></div>
+          <div class="mi hl"><span class="label">Rust Engine</span></div>
+          <div class="mi"><span class="label">Java Engine</span></div>
+        </div>
+      </div>
+      <p class="note">From <code>app_select_field.dart:507</code>: a surface panel with a 10&nbsp;px radius, a 1&nbsp;px <code>outlineVariant</code> border, elevation 6, 6&nbsp;px vertical padding and 40&nbsp;px rows. The selected row has a green tint and a check, the hover state is an 8&nbsp;% ink overlay, and the panel fades and grows from its anchor over 180&nbsp;ms.</p>
+    </article>
+    <article>
+      <div class="caption"><span class="number">SPEC</span><h3>Tokens to share</h3></div>
+      <div class="spec" style="margin-top:0">
+        <div><b>Surface</b>colorScheme.surface</div>
+        <div><b>Border</b>outlineVariant · 90%</div>
+        <div><b>Radius</b>10</div>
+        <div><b>Elevation</b>6 · scheme.shadow</div>
+        <div><b>Padding</b>6 vertical</div>
+        <div><b>Row</b>40 high · 12 sides</div>
+        <div><b>Icon</b>16 · 8 gap</div>
+        <div><b>Text</b>bodyMedium w500</div>
+        <div><b>Selected</b>primaryContainer 55% · w700 · check</div>
+        <div><b>Hover</b>onSurface 8%</div>
+        <div><b>Danger</b>colorScheme.error</div>
+        <div><b>Motion</b>180 ms in / 120 ms out · easeOutCubic</div>
+      </div>
+      <p class="note">Touch platforms keep the route-based <code>DropdownButtonFormField</code> for native accessibility. Give it the same colour, border and radius, and keep 48&nbsp;px rows for touch targets.</p>
+    </article>
+  </div>
+
+  <table>
+    <thead><tr><th style="width:26%">Menu</th><th>Today</th><th style="width:34%">Gap versus engine menu</th></tr></thead>
+    <tbody>
+      <tr><td>Engine and profile selectors<span class="file">s3_browser_app.dart:995, :1041 → AppSelectField</span></td><td>Custom overlay panel</td><td><span class="pill ok">Reference</span></td></tr>
+      <tr><td>Object right-click menu<span class="file">browser_workspace.dart:552 · showMenu</span></td><td>M3 popup with a 4&nbsp;px radius, no border and elevation 3. Some rows are <code>ListTile</code>s with icons; the three Copy rows are plain <code>Text</code>.</td><td><span class="pill gap">Mixed rows</span> Labels sit at two different x positions, rows are 48–56&nbsp;px, and nothing explains the shape.</td></tr>
+      <tr><td>Bucket menu<span class="file">browser_workspace.dart:2535 · showMenu</span></td><td>M3 popup where every row is a <code>ListTile</code> inside a <code>PopupMenuItem</code></td><td><span class="pill gap">Too tall</span> Nine rows at about 52&nbsp;px make a menu of roughly 500&nbsp;px. It has 24&nbsp;px icons and no border.</td></tr>
+      <tr><td>Search mode (Prefix / Text / Regex)<span class="file">object_panel.dart:633 · PopupMenuButton</span></td><td>M3 popup that opens over the button, with plain text rows</td><td><span class="pill gap">No selection cue</span> <code>initialValue</code> gives only a faint highlight, with no check and no green tint. The popup covers its anchor.</td></tr>
+      <tr><td>Tab overflow (…)<span class="file">underline_tabs.dart:54 · PopupMenuButton</span></td><td>M3 popup with plain text rows</td><td><span class="pill gap">Default</span> It has M3 surface and radius and does not mark the active tab.</td></tr>
+      <tr><td>Touch fallback of AppSelectField<span class="file">app_select_field.dart:358</span></td><td>DropdownButtonFormField with a 10&nbsp;px radius</td><td><span class="pill ok">Close</span> It lacks the border and check and uses the M3 menu colour.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="grid">
+    <article>
+      <div class="caption"><span class="number">01</span><h3>Object right-click menu</h3></div>
+      <div class="stage menus">
+        <div class="pair">
+          <div><div class="lbl">Today (approx.)</div>
+            <div class="menu m3" style="width:100%">
+              <div class="mi lt"><svg><use href="#i-info"/></svg>Inspect object</div>
+              <div class="mi lt"><svg><use href="#i-dl"/></svg>Download</div>
+              <div class="mi lt"><svg><use href="#i-link"/></svg>Generate presigned URL</div>
+              <div class="mi">Copy key</div>
+              <div class="mi">Copy s3:// URI</div>
+              <div class="mi">Copy presigned URL</div>
+              <div class="msep"></div>
+              <div class="mi lt danger"><svg><use href="#i-del"/></svg>Delete object</div>
+            </div></div>
+          <div><div class="lbl good">Unified</div>
+            <div class="menu anim" id="m1" style="width:100%">
+              <div class="mi"><svg><use href="#i-info"/></svg><span class="label">Inspect object</span></div>
+              <div class="mi"><svg><use href="#i-dl"/></svg><span class="label">Download</span></div>
+              <div class="mi hl"><svg><use href="#i-link"/></svg><span class="label">Generate presigned URL</span></div>
+              <div class="msep"></div>
+              <div class="mi"><svg><use href="#i-copy"/></svg><span class="label">Copy key</span></div>
+              <div class="mi"><svg><use href="#i-uri"/></svg><span class="label">Copy s3:// URI</span></div>
+              <div class="mi"><svg><use href="#i-link"/></svg><span class="label">Copy presigned URL</span></div>
+              <div class="msep"></div>
+              <div class="mi danger"><svg><use href="#i-del"/></svg><span class="label">Delete object</span></div>
+            </div></div>
+        </div>
+        <button class="replay" data-replay="m1">Replay</button>
+      </div>
+      <p class="note">Every row gets a 16&nbsp;px icon so all labels line up. A divider separates the copy actions from the other actions. Destructive rows keep the error colour.</p>
+    </article>
+
+    <article>
+      <div class="caption"><span class="number">02</span><h3>Bucket menu</h3></div>
+      <div class="stage menus">
+        <div class="pair">
+          <div><div class="lbl">Today (approx.)</div>
+            <div class="menu m3" style="width:100%">
+              <div class="mi lt"><svg><use href="#i-open"/></svg>Open bucket</div>
+              <div class="mi lt"><svg><use href="#i-history"/></svg>Enable versioning</div>
+              <div class="msep"></div>
+              <div class="mi lt"><svg><use href="#i-sched"/></svg>Lifecycle policy</div>
+              <div class="mi lt"><svg><use href="#i-policy"/></svg>Bucket policy</div>
+              <div class="mi lt"><svg><use href="#i-lock"/></svg>Bucket encryption</div>
+              <div class="mi lt"><svg><use href="#i-tag"/></svg>Bucket tagging</div>
+              <div class="mi lt"><svg><use href="#i-copy"/></svg>Copy bucket</div>
+              <div class="msep"></div>
+              <div class="mi lt danger"><svg><use href="#i-del"/></svg>Delete bucket</div>
+              <div class="mi lt danger"><svg><use href="#i-delf"/></svg>Force delete bucket</div>
+            </div></div>
+          <div><div class="lbl good">Unified</div>
+            <div class="menu anim" id="m2" style="width:100%">
+              <div class="mi"><svg><use href="#i-open"/></svg><span class="label">Open bucket</span></div>
+              <div class="mi"><svg><use href="#i-copy"/></svg><span class="label">Copy bucket</span></div>
+              <div class="msep"></div>
+              <div class="mhead">Configuration</div>
+              <div class="mi"><svg><use href="#i-history"/></svg><span class="label">Enable versioning</span></div>
+              <div class="mi"><svg><use href="#i-sched"/></svg><span class="label">Lifecycle policy</span></div>
+              <div class="mi hl"><svg><use href="#i-policy"/></svg><span class="label">Bucket policy</span></div>
+              <div class="mi"><svg><use href="#i-lock"/></svg><span class="label">Bucket encryption</span></div>
+              <div class="mi"><svg><use href="#i-tag"/></svg><span class="label">Bucket tagging</span></div>
+              <div class="msep"></div>
+              <div class="mi danger"><svg><use href="#i-del"/></svg><span class="label">Delete bucket</span></div>
+              <div class="mi danger"><svg><use href="#i-delf"/></svg><span class="label">Force delete bucket</span></div>
+            </div></div>
+        </div>
+        <button class="replay" data-replay="m2">Replay</button>
+      </div>
+      <p class="note">With 40&nbsp;px rows the menu is about 25&nbsp;% shorter. An optional small heading groups the S3-only admin actions, so the Azure variant only drops one block. <i>Copy bucket</i> moves up next to <i>Open</i>.</p>
+    </article>
+
+    <article>
+      <div class="caption"><span class="number">03</span><h3>Search mode</h3></div>
+      <div class="stage menus" style="min-height:250px">
+        <button class="replay" data-replay="m3">Replay</button>
+        <div class="search"><span class="mode">Prefix <svg width="14" height="14"><use href="#i-caret"/></svg></span><span class="ph">Search objects…</span></div>
+        <div class="menu anim" id="m3" style="margin-top:4px;width:200px">
+          <div class="mi sel"><span class="label">Prefix</span><svg class="check"><use href="#i-check"/></svg></div>
+          <div class="mi hl"><span class="label">Text</span></div>
+          <div class="mi"><span class="label">Regex</span></div>
+        </div>
+      </div>
+      <p class="note">This menu works like the engine selector: it opens below the button and marks the current mode with a tint and a check. Pass <code>position: PopupMenuPosition.under</code> so it no longer covers the button.</p>
+    </article>
+
+    <article>
+      <div class="caption"><span class="number">04</span><h3>Tab overflow</h3></div>
+      <div class="stage menus" style="min-height:250px">
+        <button class="replay" data-replay="m4">Replay</button>
+        <div class="tabs"><span class="on">Overview</span><span>Versions</span><span>Tags</span><span class="more"><svg width="18" height="18"><use href="#i-more"/></svg></span></div>
+        <div class="menu anim" id="m4" style="margin:4px 0 0 120px;width:200px;transform-origin:top right">
+          <div class="mi"><span class="label">Metadata</span></div>
+          <div class="mi hl"><span class="label">Headers</span></div>
+          <div class="mi"><span class="label">Debug</span></div>
+        </div>
+      </div>
+      <p class="note">The overflow menu is right-aligned under the <i>more</i> button and uses the same rows. If the active tab is in the overflow, it gets the selected treatment so it is still visible.</p>
+    </article>
+  </div>
+
+  <h3 style="margin-top:34px">How to get there</h3>
+  <ol class="steps">
+    <li><b>Theme first (one change, covers all four menus).</b> Add a <code>popupMenuTheme</code> to <code>AppTheme._themeFromScheme</code> that matches the panel tokens above. Every <code>showMenu</code> and <code>PopupMenuButton</code> then gets the surface, border, radius, shadow and padding.</li>
+    <li><b>One shared row.</b> Move the row from <code>_AppSelectFieldState._menuItem</code> into <code>widgets/app_menu.dart</code> as <code>AppMenuRow</code>, and add an <code>appMenuItem(…)</code> helper that returns a 40&nbsp;px <code>PopupMenuItem</code>. Replace the <code>ListTile</code> and bare <code>Text</code> children with it. AppSelectField uses the same row, so the two can't drift apart.</li>
+    <li><b>Same motion.</b> Wrap <code>showMenu</code> in <code>showAppMenu(…)</code> with <code>popUpAnimationStyle</code> set to 180&nbsp;ms / 120&nbsp;ms easeOutCubic. Use <code>PopupMenuPosition.under</code> for button-anchored menus.</li>
+    <li><b>Touch fallback.</b> Set <code>dropdownColor: scheme.surface</code> and add the check to the selected item in the iOS/Android branch of AppSelectField.</li>
+  </ol>
+<pre><span class="c">// app_theme.dart — inside base.copyWith(...)</span>
+<span class="k">popupMenuTheme</span>: PopupMenuThemeData(
+  color: scheme.surface,
+  surfaceTintColor: Colors.transparent,
+  elevation: 6,
+  shadowColor: scheme.shadow,
+  menuPadding: const EdgeInsets.symmetric(vertical: 6),
+  shape: RoundedRectangleBorder(
+    borderRadius: BorderRadius.circular(10),
+    side: BorderSide(color: scheme.outlineVariant.withValues(alpha: 0.9)),
+  ),
+  labelTextStyle: WidgetStatePropertyAll(
+    textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w500)),
+),
+
+<span class="c">// widgets/app_menu.dart</span>
+PopupMenuItem&lt;T&gt; <span class="k">appMenuItem</span>&lt;T&gt;({required T value, required String label,
+    IconData? icon, bool selected = false, bool destructive = false, String? shortcut}) =&gt;
+  PopupMenuItem&lt;T&gt;(
+    value: value, height: 40,
+    padding: const EdgeInsets.symmetric(horizontal: 12),
+    child: AppMenuRow(label: label, icon: icon, selected: selected,
+        destructive: destructive, shortcut: shortcut));</pre>
+
+  <!-- ===================================================== TOGGLES -->
+  <h2 class="section">Part 2 · Toggles</h2>
+  <p class="lede">Your screenshot is the Appearance card. It shows three different switch looks in one card, because the theme only recolours the M3 switch and one row uses <code>SwitchListTile.adaptive</code>.</p>
+
+  <div class="grid">
+    <article class="today">
+      <div class="caption"><span class="number">NOW</span><h3>What the screenshot shows</h3><span class="tag">settings_workspace.dart:383–404</span></div>
+      <div class="stage"><div class="card">
+        <div class="row"><div class="txt"><div class="t">Enable animations</div></div><button class="sw today-m3" role="switch" aria-checked="true" aria-label="Enable animations"><span class="thumb"></span></button></div>
+        <div class="row"><div class="txt"><div class="t">Compact desktop rows</div><div class="s">Keep text readable while reducing row padding.</div></div><button class="sw today-cup" role="switch" aria-checked="false" aria-label="Compact desktop rows"><span class="thumb"></span></button></div>
+        <div class="row"><div class="txt"><div class="t">Dark mode</div></div><button class="sw today-m3" role="switch" aria-checked="false" aria-label="Dark mode"><span class="thumb"></span></button></div>
+      </div></div>
+    </article>
+    <article>
+      <div class="caption"><span class="number">WHY</span><h3>Three problems</h3></div>
+      <ol class="steps" style="margin-top:0">
+        <li><b>The adaptive switch is a different control.</b> <code>SwitchListTile.adaptive</code> for “Compact desktop rows” renders a Cupertino switch on macOS: wider, with a white thumb and a grey track, and it ignores <code>switchTheme</code>.</li>
+        <li><b>The same row also has different padding.</b> It sets <code>contentPadding: EdgeInsets.zero</code> while its neighbours don't, so its switch sits 16&nbsp;px further right. That is the misalignment in your crop.</li>
+        <li><b>The M3 thumb changes size.</b> It shrinks from 24 to 16&nbsp;px when off and is a dark grey dot on a pale track. Combined with the muted “on” track (green at 72&nbsp;%), the on and off states look like two different widgets.</li>
+      </ol>
+      <p class="note">The app has 21 <code>SwitchListTile</code>s (14 in Settings, 6 in Browser, 1 in Benchmark). Any of the designs below should go into one shared <code>AppSwitch</code> / <code>AppSwitchTile</code> so they all change together.</p>
+    </article>
+  </div>
+
+  <p class="lede" style="margin-top:34px">All eight designs below are clickable. Try them in dark mode too. Each one shows the same three Appearance rows, plus off, on, disabled and keyboard-focus states.</p>
+  <div class="grid" id="toggles"></div>
+
+  <div class="verdict">
+    <b>Recommendation:</b> use <b>01 Forest pill</b> as the default <code>AppSwitch</code>. On and off contrast clearly, it reads as a native control on macOS and Windows, and it fits the compact 36×20 desktop row. If you need a non-colour cue for accessibility, add the check and minus glyphs from <b>03</b> to the thumb. Keep <b>06 Segmented</b> for the few settings where seeing the word “On” or “Off” helps more than a quick flip, such as <i>Dynamic multipart sizing</i>. If you want the smallest possible change, <b>02 Soft tint</b> can be done with <code>switchTheme</code> alone.
+  </div>
+
+  <!-- ===================================================== SLIDERS -->
+  <h2 class="section">Part 3 · Sliders</h2>
+  <p class="lede">The app has three plain <code>Slider</code>s in Settings → Appearance and three coupled mix sliders in Benchmark. There is no <code>sliderTheme</code>, so they use Flutter's 2023 Material 3 slider.</p>
+
+  <div class="grid">
+    <article class="s0">
+      <div class="caption"><span class="number">NOW</span><h3>Appearance sliders today</h3><span class="tag">settings_workspace.dart:434–500</span></div>
+      <div class="stage"><div class="card" id="s0card"></div></div>
+    </article>
+    <article>
+      <div class="caption"><span class="number">WHY</span><h3>What to fix</h3></div>
+      <ol class="steps" style="margin-top:0">
+        <li><b>The unfilled track is almost invisible.</b> It uses <code>surfaceContainerHighest</code> (#F3F5F0) on a white panel, at roughly 1.1:1 contrast, so you can't see where the range ends.</li>
+        <li><b>The division dots add noise.</b> The sliders have 16, 18 and 10 divisions, which render as rows of grey dots along the track.</li>
+        <li><b>The value is inside the title.</b> “UI scale: 100%” changes width while you drag. There are no min/max labels, no marker for the default, and no reset.</li>
+        <li><b>The track doesn't line up with the text.</b> The slider adds about 24&nbsp;px of overlay padding on each side, so the track starts inside the title's left edge.</li>
+        <li><b>The benchmark mix uses off-palette colours.</b> Material teal, blue and red are used for three separate sliders that must sum to 100, which leads to a “Percentages must sum to 100” error state.</li>
+      </ol>
+    </article>
+  </div>
+
+  <p class="lede" style="margin-top:34px">All eight designs below can be dragged, clicked, or adjusted with the arrow keys after you Tab to them. Each uses the real ranges, steps and defaults: Inspector 240–560&nbsp;px in steps of 20 (default 360), UI scale 60–150&nbsp;% in steps of 5 (default 100), and Log text 80–130&nbsp;% in steps of 5 (default 80). <i>Reset</i> appears when a value differs from its default.</p>
+  <div class="grid" id="sliders"></div>
+
+  <h3 style="margin-top:40px">Benchmark operation mix</h3>
+  <div class="grid">
+    <article class="oldmix">
+      <div class="caption"><span class="number">NOW</span><h3>Three coupled sliders</h3><span class="tag">benchmark_workspace.dart:3315</span></div>
+      <div class="stage"><div class="card" style="padding:12px 16px">
+        <div class="mrow"><span>Write (PUT)</span><span class="mtr"><i style="width:40%;background:#00897b"></i><b style="left:40%;background:#00897b"></b></span><em style="color:#00897b">40%</em></div>
+        <div class="mrow"><span>Read (GET)</span><span class="mtr"><i style="width:45%;background:#1e88e5"></i><b style="left:45%;background:#1e88e5"></b></span><em style="color:#1e88e5">45%</em></div>
+        <div class="mrow"><span>Delete</span><span class="mtr"><i style="width:15%;background:#e53935"></i><b style="left:15%;background:#e53935"></b></span><em style="color:#e53935">15%</em></div>
+      </div></div>
+      <p class="note">Dragging one slider silently moves another, and the colours aren't from the app palette. The control doesn't show visually that the three values are parts of one whole.</p>
+    </article>
+    <article>
+      <div class="caption"><span class="number">M1</span><h3>Split bar</h3><span class="tag rec">RECOMMENDED</span></div>
+      <div class="stage"><div class="card" style="padding:16px">
+        <div class="mixbar" id="mixbar">
+          <div class="seg w"></div><div class="seg r"></div><div class="seg d"></div>
+          <span class="hd" tabindex="0" role="slider" aria-label="Write and read boundary" data-h="0"></span>
+          <span class="hd" tabindex="0" role="slider" aria-label="Read and delete boundary" data-h="1"></span>
+        </div>
+        <div class="legend" id="mixlegend"></div>
+        <div class="presets">
+          <button data-mix="34,33,33">Balanced</button><button data-mix="10,85,5">Read heavy</button><button data-mix="80,15,5">Ingest</button><button data-mix="45,45,10">Churn</button>
+        </div>
+      </div></div>
+      <p class="note"><b>One bar with two handles.</b> The three parts always sum to 100, so the error state goes away. Colours come from the app: accent green for writes, the status blue for reads, and the error red for deletes. Presets cover the common workloads. Implementation: a custom <code>MixBar</code> widget using <code>GestureDetector</code> and <code>CustomPaint</code>, with keyboard support on both handles.</p>
+    </article>
+  </div>
+
+  <div class="verdict">
+    <b>Slider recommendation:</b> use <b>S1 Forest rail</b> as a shared <code>AppSliderTile</code>. It pairs with the Forest pill toggle: the same grey track, white thumb and green fill. It also adds a value chip, a default marker, min/max labels and a reset link. Most of it is a <code>sliderTheme</code> plus a small custom thumb and a track shape without side padding. Use <b>S5</b>'s numeric field where exact values matter, such as the inspector size in pixels. Replace the benchmark sliders with the <b>M1 split bar</b>.
+  </div>
+
+  <footer>Design study only; no app code has changed. Colours come from <code>AppTheme</code> light and dark tokens. The “today” mocks are approximations of Flutter's Material 3 defaults.</footer>
+</main>
+
+<script>
+  const designs = [
+    {n:'01', name:'Forest pill', cls:'d1', tag:'RECOMMENDED', rec:true, impl:'Custom AppSwitch',
+     note:'<b>Solid accent track with a white thumb that keeps the same size in both states.</b> At 36×20 it fits compact desktop rows and has the strongest on/off contrast. Pressing stretches the thumb, like the macOS and Windows switches.'},
+    {n:'02', name:'Soft tint', cls:'d2', tag:'THEME ONLY', impl:'switchTheme',
+     note:'<b>Today\'s colours, made consistent.</b> It keeps the pale green track and green thumb but stops the thumb from shrinking and adds a clear outline when off. You get this with <code>switchTheme</code> plus the <code>thumbIcon</code> trick, which keeps the thumb at full size.'},
+    {n:'03', name:'Icon thumb', cls:'d3', tag:'THEME ONLY', impl:'switchTheme.thumbIcon',
+     note:'<b>A check when on and a minus when off,</b> so the state doesn\'t depend on colour alone, which helps with WCAG 1.4.1. This is built into M3 through <code>thumbIcon</code>, so only the theme changes.'},
+    {n:'04', name:'Squared', cls:'d4', tag:'CUSTOM', impl:'Custom AppSwitch',
+     note:'<b>A 6&nbsp;px track radius and a 4&nbsp;px thumb,</b> matching the app\'s fields, buttons and CompactSelector segments. It suits the app\'s technical, tool-like feel and differs most from a stock Material switch.'},
+    {n:'05', name:'Labelled track', cls:'d5', tag:'CUSTOM', impl:'Custom AppSwitch',
+     note:'<b>The words ON and OFF are inside the track,</b> opposite the thumb. The state reads at a glance in dense lists like Transfer settings. It is slightly wider at 50&nbsp;px, and the labels need localisation.'},
+    {n:'06', name:'Segmented', cls:'d6', tag:'REUSES COMPACTSELECTOR', impl:'CompactSelector(dense)',
+     note:'<b>An Off | On control built from the existing <code>CompactSelector</code> styling.</b> It is the most explicit option and matches the header and workspace segment controls. It takes the most space, so it works best for a few high-impact settings.'},
+    {n:'07', name:'Rail', cls:'d7', tag:'CUSTOM', impl:'Custom AppSwitch',
+     note:'<b>The deep rail colour with a glowing green thumb when on,</b> echoing the navigation rail and the running status dots. It is distinctive and on-brand, though the dark track is heavy when many switches are on.'},
+    {n:'08', name:'Hairline', cls:'d8', tag:'CUSTOM', impl:'Custom AppSwitch',
+     note:'<b>A thin line with a ring thumb that fills green when on,</b> a lighter look reminiscent of Material 2. It is the quietest option for long settings pages, but the off state has the lowest contrast, so pair it with a strong focus ring.'},
+  ];
+  const ICONS = '<span class="thumb"><svg class="i-on"><use href="#i-check"/></svg><svg class="i-off"><use href="#i-minus"/></svg></span>';
+  function sw(cls, on, label, extra=''){
+    let inner = '<span class="thumb"></span>';
+    if (cls==='d3') inner = ICONS;
+    if (cls==='d5') inner = '<span class="lbl-on">ON</span><span class="lbl-off">OFF</span><span class="thumb"></span>';
+    if (cls==='d6') inner = '<span class="seg-off">Off</span><span class="seg-on">On</span>';
+    if (cls==='d8') inner = '<span class="track"></span><span class="thumb"></span>';
+    return `<button class="sw ${extra}" type="button" role="switch" aria-checked="${on}" aria-label="${label}" ${extra.includes('dis')?'disabled':''}>${inner}</button>`;
+  }
+  document.getElementById('toggles').innerHTML = designs.map(d => `
+    <article class="${d.cls}">
+      <div class="caption"><span class="number">${d.n}</span><h3>${d.name}</h3><span class="tag ${d.rec?'rec':''}">${d.tag}</span></div>
+      <div class="stage">
+        <div class="card">
+          <div class="row"><div class="txt"><div class="t">Enable animations</div></div>${sw(d.cls,true,'Enable animations')}</div>
+          <div class="row"><div class="txt"><div class="t">Compact desktop rows</div><div class="s">Keep text readable while reducing row padding.</div></div>${sw(d.cls,false,'Compact desktop rows')}</div>
+          <div class="row"><div class="txt"><div class="t">Dark mode</div></div>${sw(d.cls,false,'Dark mode','theme-link')}</div>
+        </div>
+        <div class="states">
+          <figure>${sw(d.cls,false,'Off sample')}<figcaption>Off</figcaption></figure>
+          <figure>${sw(d.cls,true,'On sample')}<figcaption>On</figcaption></figure>
+          <figure>${sw(d.cls,false,'Disabled off','dis')}<figcaption>Disabled</figcaption></figure>
+          <figure>${sw(d.cls,true,'Disabled on','dis')}<figcaption>Disabled on</figcaption></figure>
+          <figure>${sw(d.cls,true,'Focused','focus')}<figcaption>Focus</figcaption></figure>
+        </div>
+      </div>
+      <p class="note">${d.note} <span style="opacity:.75">Implementation: <code>${d.impl}</code>.</span></p>
+    </article>`).join('');
+
+  const body = document.body, themeBtn = document.getElementById('themeBtn');
+  function setDark(on){
+    body.classList.toggle('dark', on);
+    themeBtn.setAttribute('aria-pressed', on);
+    themeBtn.textContent = on ? 'Light preview' : 'Dark preview';
+    document.querySelectorAll('.theme-link').forEach(b => b.setAttribute('aria-checked', on));
+  }
+  themeBtn.addEventListener('click', () => setDark(!body.classList.contains('dark')));
+  document.addEventListener('click', e => {
+    const b = e.target.closest('.sw');
+    if (b && !b.disabled) {
+      if (b.classList.contains('theme-link')) { setDark(b.getAttribute('aria-checked') !== 'true'); return; }
+      b.setAttribute('aria-checked', b.getAttribute('aria-checked') !== 'true');
+    }
+    const r = e.target.closest('[data-replay]');
+    if (r) { const m = document.getElementById(r.dataset.replay); m.classList.remove('anim'); void m.offsetWidth; m.classList.add('anim'); }
+  });
+</script>
+<script>
+  const SCFG = [
+    {t:'Inspector panel size', s:'Height when stacked, width when shown on the right.', min:240, max:560, step:20, v:400, def:360, u:'px'},
+    {t:'UI scale', s:'Text size is independent of row density.', min:60, max:150, step:5, v:100, def:100, u:'%'},
+    {t:'Log text scale', s:'Applies only to Event Log and Events & Debug.', min:80, max:130, step:5, v:95, def:80, u:'%'},
+  ];
+  const SDESIGNS = [
+    {n:'S1', name:'Forest rail', cls:'s1', tag:'RECOMMENDED', rec:true, impl:'sliderTheme + custom thumb/track shapes',
+     note:'<b>The slider version of the Forest pill:</b> a visible grey track, a green fill and a white thumb. The value sits in a fixed-width chip so the title doesn\'t move while you drag. A small notch marks the default, and <i>Reset</i> appears when the value has changed.'},
+    {n:'S2', name:'Soft tint', cls:'s2', tag:'THEME ONLY', impl:'sliderTheme',
+     note:'<b>The smallest change from today.</b> The track is thicker and visible, the fill is a softer green, and the thumb gets a ring. A value bubble appears only while dragging. It has no tick dots and needs only a <code>SliderThemeData</code>.'},
+    {n:'S3', name:'Ruler', cls:'s3', tag:'CUSTOM', impl:'Slider + CustomPaint ruler',
+     note:'<b>A ruler under the track shows every step,</b> with labels at the minimum, default and maximum. The thumb is a slim bar. It suits stepped values like these, where users benefit from seeing how many stops there are.'},
+    {n:'S4', name:'Squared handle', cls:'s4', tag:'CUSTOM SHAPE', impl:'custom SliderComponentShape',
+     note:'<b>A tall rectangular handle with a grip line on an 8&nbsp;px track,</b> matching the Squared toggle and the app\'s 6–8&nbsp;px corner radii. It looks like a desktop tool control.'},
+    {n:'S5', name:'Slider + field', cls:'s5', tag:'COMPOSITE', impl:'Slider + TextField + steppers',
+     note:'<b>Drag for a rough value, or type an exact one.</b> The numeric field with − / + buttons replaces the value chip. It is best for pixel sizes such as the inspector width, and the field snaps to valid steps when you leave it.'},
+    {n:'S6', name:'Step blocks', cls:'s6', tag:'CUSTOM', impl:'Row of tappable segments',
+     note:'<b>Each allowed value is a block,</b> and the default block has a small underline. It fits ranges with roughly 20 steps or fewer, which covers all three settings. Large blocks are easy to hit on touch.'},
+    {n:'S7', name:'Level bar', cls:'s7', tag:'CUSTOM', impl:'GestureDetector + CustomPaint',
+     note:'<b>The whole 34&nbsp;px bar is the control,</b> with the value written inside the fill, like the volume and brightness sliders on iOS and macOS. It has the largest drag area, which makes it a good iOS fit, and it shares the card radius.'},
+    {n:'S8', name:'Hairline', cls:'s8', tag:'CUSTOM SHAPE', impl:'sliderTheme + value indicator always shown',
+     note:'<b>A 2&nbsp;px line with a ring thumb</b> and the value floating above it, pairing with the Hairline toggle. It is the lightest option visually, but the thin track needs a generous invisible hit area.'},
+  ];
+  const fmt = (c, v) => v + (c.u === '%' ? '%' : ' ' + c.u);
+  const steps = c => Math.round((c.max - c.min) / c.step) + 1;
+  function control(cls, c, i){
+    const aria = `tabindex="0" role="slider" aria-label="${c.t}" aria-valuemin="${c.min}" aria-valuemax="${c.max}"`;
+    const base = '<span class="tr"></span><span class="fill"></span><span class="def"></span><span class="th"></span>';
+    if (cls === 's6') return `<div class="sl" ${aria}>${Array.from({length:steps(c)},(_,k)=>`<span class="blk${c.min+k*c.step===c.def?' dft':''}"></span>`).join('')}</div>`;
+    if (cls === 's7') return `<div class="sl" ${aria}><span class="fill"></span><span class="def"></span><span class="inside" data-val></span></div>`;
+    if (cls === 's2') return `<div class="sl" ${aria}>${base}<span class="bubble" data-val></span></div>`;
+    if (cls === 's8') return `<div class="sl" ${aria}>${base}<span class="float" data-val></span></div>`;
+    if (cls === 's3') {
+      const n = steps(c); let r = '';
+      for (let k = 0; k < n; k++) { const v = c.min + k*c.step, major = v===c.min||v===c.max||v===c.def;
+        r += `<i class="${major?'major':''}" data-tv="${v}" style="left:${k/(n-1)*100}%"></i>`;
+        if (major) r += `<b style="left:${k/(n-1)*100}%;transform:translateX(${k===0?'0':k===n-1?'-100%':'-50%'})">${v}</b>`; }
+      return `<div class="sl" ${aria}><span class="tr"></span><span class="fill"></span><span class="th"></span><span class="ruler">${r}</span></div>`;
+    }
+    if (cls === 's5') return `<div class="ctl"><div class="sl" ${aria}>${base}</div><div class="field"><input data-in inputmode="numeric" aria-label="${c.t} value"><span>${c.u}</span><button data-step="-1" aria-label="Decrease">−</button><button data-step="1" aria-label="Increase">+</button></div></div>`;
+    return `<div class="sl" ${aria}>${base}</div>`;
+  }
+  function srow(cls, c, i){
+    return `<div class="srow" data-k="${i}" data-v="${c.v}">
+      <div class="shead"><div class="t">${c.t}<span class="s">${c.s}</span></div><button class="reset" type="button">Reset</button><span class="vchip" data-val></span></div>
+      ${control(cls, c, i)}
+      <div class="minmax"><span>${fmt(c,c.min)}</span><span>${fmt(c,c.max)}</span></div></div>`;
+  }
+  document.getElementById('sliders').innerHTML = SDESIGNS.map(d => `
+    <article class="${d.cls}">
+      <div class="caption"><span class="number">${d.n}</span><h3>${d.name}</h3><span class="tag ${d.rec?'rec':''}">${d.tag}</span></div>
+      <div class="stage"><div class="card">${SCFG.map((c,i)=>srow(d.cls,c,i)).join('')}</div></div>
+      <p class="note">${d.note} <span style="opacity:.75">Implementation: <code>${d.impl}</code>.</span></p>
+    </article>`).join('');
+  // Today's M3 rendering
+  document.getElementById('s0card').innerHTML = SCFG.map((c,i)=>`
+    <div class="srow" data-k="${i}" data-v="${c.v}" data-today="1">
+      <div class="sline"><span data-title></span></div><div class="ssub">${c.s}</div>
+      <div class="sl" tabindex="0" role="slider" aria-label="${c.t}"><span class="tr"></span><span class="fill"></span>${Array.from({length:steps(c)},(_,k)=>`<i style="position:absolute;top:50%;left:${k/(steps(c)-1)*100}%;width:2px;height:2px;margin:-1px 0 0 -1px;border-radius:50%;background:color-mix(in srgb,var(--muted) 45%,transparent)"></i>`).join('')}<span class="th"></span></div>
+    </div>`).join('');
+
+  function setRow(row, v){
+    const c = SCFG[row.dataset.k];
+    v = Math.min(c.max, Math.max(c.min, Math.round((v - c.min)/c.step)*c.step + c.min));
+    row.dataset.v = v;
+    const sl = row.querySelector('.sl'), p = (v-c.min)/(c.max-c.min);
+    sl.style.setProperty('--p', p); sl.style.setProperty('--dp', (c.def-c.min)/(c.max-c.min));
+    sl.setAttribute('aria-valuenow', v); sl.setAttribute('aria-valuetext', fmt(c,v));
+    row.querySelectorAll('[data-val]').forEach(e => e.textContent = fmt(c,v));
+    const title = row.querySelector('[data-title]'); if (title) title.textContent = `${c.t}: ${v}${c.u}`;
+    const inp = row.querySelector('[data-in]'); if (inp && document.activeElement !== inp) inp.value = v;
+    row.querySelectorAll('.ruler i').forEach(t => t.classList.toggle('on', +t.dataset.tv <= v));
+    row.querySelectorAll('.blk').forEach((b,k) => { const bv = c.min+k*c.step; b.classList.toggle('on', bv < v); b.classList.toggle('cur', bv === v); });
+    row.classList.toggle('off-default', v !== c.def);
+  }
+  document.querySelectorAll('.srow').forEach(r => setRow(r, +r.dataset.v));
+
+  function valueAt(sl, x){
+    const row = sl.closest('.srow'), c = SCFG[row.dataset.k], rect = sl.getBoundingClientRect();
+    const p = Math.min(1, Math.max(0, (x - rect.left)/rect.width));
+    if (sl.querySelector('.blk')) { const n = steps(c); return c.min + Math.min(n-1, Math.floor(p*n))*c.step; }
+    return c.min + p*(c.max-c.min);
+  }
+  document.addEventListener('pointerdown', e => {
+    const sl = e.target.closest('.sl'); if (!sl) return;
+    e.preventDefault(); sl.focus(); sl.setPointerCapture(e.pointerId);
+    const row = sl.closest('.srow'); setRow(row, valueAt(sl, e.clientX));
+    const move = ev => setRow(row, valueAt(sl, ev.clientX));
+    const up = () => { sl.removeEventListener('pointermove', move); sl.removeEventListener('pointerup', up); sl.removeEventListener('pointercancel', up); };
+    sl.addEventListener('pointermove', move); sl.addEventListener('pointerup', up); sl.addEventListener('pointercancel', up);
+  });
+  document.addEventListener('keydown', e => {
+    const sl = e.target.closest && e.target.closest('.sl'); if (!sl) return;
+    const row = sl.closest('.srow'), c = SCFG[row.dataset.k], v = +row.dataset.v;
+    const d = {ArrowRight:1, ArrowUp:1, ArrowLeft:-1, ArrowDown:-1, PageUp:4, PageDown:-4}[e.key];
+    if (d) { setRow(row, v + d*c.step); e.preventDefault(); }
+    if (e.key === 'Home') { setRow(row, c.min); e.preventDefault(); }
+    if (e.key === 'End') { setRow(row, c.max); e.preventDefault(); }
+  });
+  document.addEventListener('click', e => {
+    const row = e.target.closest('.srow'); if (!row) return;
+    const c = SCFG[row.dataset.k];
+    if (e.target.closest('.reset')) setRow(row, c.def);
+    const st = e.target.closest('[data-step]'); if (st) setRow(row, +row.dataset.v + (+st.dataset.step)*c.step);
+  });
+  document.addEventListener('change', e => { if (e.target.matches('[data-in]')) { const row = e.target.closest('.srow'); e.target.blur(); setRow(row, +e.target.value || SCFG[row.dataset.k].def); } });
+  document.addEventListener('keydown', e => { if (e.target.matches && e.target.matches('[data-in]') && e.key === 'Enter') e.target.blur(); });
+  document.addEventListener('focusout', e => { if (e.target.matches && e.target.matches('[data-in]')) { const row = e.target.closest('.srow'); setRow(row, +e.target.value || SCFG[row.dataset.k].def); } });
+
+  // Benchmark split bar
+  let mix = [40, 45, 15];
+  const bar = document.getElementById('mixbar'), segs = bar.querySelectorAll('.seg'), hds = bar.querySelectorAll('.hd');
+  const MIXN = ['Write (PUT)', 'Read (GET)', 'Delete'], MIXS = ['Write', 'Read', 'Delete'], MIXC = ['w','r','d'];
+  function renderMix(){
+    mix.forEach((v,i) => { segs[i].style.width = v + '%'; segs[i].textContent = v >= 16 ? `${MIXS[i]} ${v}%` : v >= 7 ? v + '%' : ''; });
+    hds[0].style.left = mix[0] + '%'; hds[1].style.left = (mix[0]+mix[1]) + '%';
+    hds[0].setAttribute('aria-valuenow', mix[0]); hds[1].setAttribute('aria-valuenow', mix[0]+mix[1]);
+    hds[0].setAttribute('aria-valuetext', `Write ${mix[0]}%, Read ${mix[1]}%`); hds[1].setAttribute('aria-valuetext', `Read ${mix[1]}%, Delete ${mix[2]}%`);
+    document.getElementById('mixlegend').innerHTML = mix.map((v,i)=>`<span><i class="seg ${MIXC[i]}" style="padding:0"></i>${MIXN[i]} <b>${v}%</b></span>`).join('');
+    document.querySelectorAll('#mixlegend i').forEach((el,i)=>{ el.style.background = getComputedStyle(segs[i]).backgroundColor; });
+  }
+  function moveHandle(h, b){
+    b = Math.round(b);
+    if (h === 0) { const wr = mix[0]+mix[1]; b = Math.min(wr, Math.max(0, b)); mix = [b, wr-b, mix[2]]; }
+    else { b = Math.min(100, Math.max(mix[0], b)); mix = [mix[0], b-mix[0], 100-b]; }
+    renderMix();
+  }
+  hds.forEach(h => {
+    h.addEventListener('pointerdown', e => {
+      e.preventDefault(); e.stopPropagation(); h.focus(); h.setPointerCapture(e.pointerId);
+      const idx = +h.dataset.h, move = ev => { const r = bar.getBoundingClientRect(); moveHandle(idx, (ev.clientX - r.left)/r.width*100); };
+      const up = () => { h.removeEventListener('pointermove', move); h.removeEventListener('pointerup', up); };
+      h.addEventListener('pointermove', move); h.addEventListener('pointerup', up);
+    });
+    h.addEventListener('keydown', e => {
+      const idx = +h.dataset.h, cur = idx === 0 ? mix[0] : mix[0]+mix[1], s = e.shiftKey ? 5 : 1;
+      if (e.key === 'ArrowRight' || e.key === 'ArrowUp') { moveHandle(idx, cur+s); e.preventDefault(); }
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') { moveHandle(idx, cur-s); e.preventDefault(); }
+    });
+  });
+  document.querySelectorAll('[data-mix]').forEach(b => b.addEventListener('click', () => { mix = b.dataset.mix.split(',').map(Number); renderMix(); }));
+  renderMix();
+  document.getElementById('themeBtn').addEventListener('click', () => setTimeout(renderMix, 0));
+</script>
+</body>
+</html>

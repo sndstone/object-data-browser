@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/semantics.dart';
 import '../models/domain_models.dart';
 import '../services/app_platform.dart';
+import '../widgets/app_menu.dart';
 
 /// Lazy rows, real batch checkboxes and an independent inspection focus.
 class ObjectTable extends StatelessWidget {
@@ -31,7 +32,9 @@ class ObjectTable extends StatelessWidget {
   final void Function(ObjectEntry object, bool range) onToggle;
   final String Function(ObjectEntry) contentTypeFor;
   final ValueChanged<ObjectEntry> onSelect;
-  final Future<void> Function(ObjectEntry, Offset) onShowContextMenu;
+  /// Opens the object menu. The rectangle is the trigger's global bounds, or
+  /// a zero-size rectangle at the pointer for right-clicks.
+  final Future<void> Function(ObjectEntry, Rect) onShowContextMenu;
 
   @override
   Widget build(BuildContext context) =>
@@ -106,13 +109,21 @@ class ObjectTable extends StatelessWidget {
                                         ? theme.colorScheme.surfaceContainerLow
                                         : Colors.transparent,
                                 child: Builder(builder: (rowContext) {
+                                  // Keyboard and long-press open the menu
+                                  // from the row's action slot, where the
+                                  // actions button sits.
                                   void actions() {
                                     final box = rowContext.findRenderObject()
                                         as RenderBox;
+                                    final slot = Rect.fromLTWH(
+                                        box.size.width - 8 - _actionSlot,
+                                        0,
+                                        _actionSlot,
+                                        box.size.height);
                                     onShowContextMenu(
                                         object,
-                                        box.localToGlobal(
-                                            box.size.center(Offset.zero)));
+                                        slot.shift(
+                                            box.localToGlobal(Offset.zero)));
                                   }
 
                                   return CallbackShortcuts(
@@ -137,8 +148,10 @@ class ObjectTable extends StatelessWidget {
                                           },
                                           onLongPress: actions,
                                           onSecondaryTapDown: (details) =>
-                                              onShowContextMenu(object,
-                                                  details.globalPosition),
+                                              onShowContextMenu(
+                                                  object,
+                                                  details.globalPosition &
+                                                      Size.zero),
                                           child: Padding(
                                               padding:
                                                   const EdgeInsets.symmetric(
@@ -222,14 +235,20 @@ class ObjectTable extends StatelessWidget {
                                                         maintainState: true,
                                                         maintainAnimation: true,
                                                         maintainSize: true,
-                                                        child: IconButton(
-                                                            tooltip:
-                                                                'Object actions for ${object.name}',
-                                                            icon: const Icon(
-                                                                Icons
-                                                                    .more_horiz),
-                                                            onPressed:
-                                                                actions))),
+                                                        // The menu opens from
+                                                        // this button's bounds.
+                                                        child: Builder(
+                                                            builder: (buttonContext) => IconButton(
+                                                                tooltip:
+                                                                    'Object actions for ${object.name}',
+                                                                icon: const Icon(
+                                                                    Icons
+                                                                        .more_horiz),
+                                                                onPressed: () =>
+                                                                    onShowContextMenu(
+                                                                        object,
+                                                                        globalRectOf(
+                                                                            buttonContext)))))),
                                               ]))));
                                 }))));
                   })),

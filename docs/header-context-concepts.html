@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Object Data Browser · Header concepts</title>
+<style>
+  :root{color-scheme:light;--bg:#f3f5f1;--card:#fff;--ink:#182c23;--muted:#708077;--line:#dbe3da;--green:#07572d;--soft:#edf4e7}
+  *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  main{max-width:1120px;padding:54px 32px 64px;margin:auto}
+  .intro{display:flex;justify-content:space-between;align-items:start;gap:24px;margin-bottom:36px}
+  .eyebrow{font-size:11px;font-weight:700;letter-spacing:1.7px;text-transform:uppercase;color:var(--green)}
+  h1{font-size:30px;letter-spacing:-1px;margin:8px 0}p{margin:0;color:var(--muted)}
+  button{font:inherit;cursor:pointer}.theme{border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:9px 14px;white-space:nowrap}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+  article{min-width:0}.caption{display:flex;align-items:center;gap:10px;margin:0 0 12px}.number{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}h2{font-size:15px;font-weight:650;margin:0}.recommended{margin-left:auto;color:var(--green);font-size:10px;letter-spacing:.5px;background:var(--soft);border-radius:5px;padding:3px 7px}
+  .stage{height:202px;border:1px solid var(--line);border-radius:14px;background:var(--card);display:flex;align-items:center;padding:30px;overflow:hidden}
+  .context{width:100%;min-width:0}.row{display:flex;align-items:center;gap:12px;min-width:0}.stack{min-width:0}.title{font-size:17px;font-weight:700;letter-spacing:-.35px}.small{font-size:12px;color:var(--muted)}.crumbs{display:flex;align-items:center;gap:8px;margin-top:7px;min-width:0;font-size:12px;color:var(--muted)}.bucket{color:var(--green);font-weight:650}.truncate{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.chevron{color:var(--muted);opacity:.65}
+  .icon{height:34px;width:34px;flex:none;display:grid;place-items:center;color:var(--green);background:var(--soft);border-radius:9px}.icon svg{width:18px;height:18px}
+  .note{font-size:12px;line-height:1.7;padding:13px 2px 0;max-width:440px}
+  .app-label{font-size:10px;font-weight:700;letter-spacing:1.4px;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+  .hero-icon{height:44px;width:44px;border-radius:12px}.hero-icon svg{width:22px;height:22px}.hero-title{font-size:20px;letter-spacing:-.6px;font-weight:700}
+  .chips{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}.chip{display:flex;gap:6px;align-items:center;padding:5px 9px;border:1px solid var(--line);border-radius:6px;font-size:11px}.chip strong{font-weight:600}.chip.active{background:var(--soft);border-color:transparent;color:var(--green)}.chip-label{color:var(--muted);font-size:10px}
+  .minimal{border-left:3px solid var(--green);padding-left:17px}.minimal .title{font-size:16px}.minimal .crumbs{margin-top:5px}.minimal .bucket{font-weight:600}
+  footer{margin-top:32px;padding-top:20px;border-top:1px solid var(--line);font-size:12px;color:var(--muted)}
+  body.dark{color-scheme:dark;--bg:#111c16;--card:#19271f;--ink:#e9f0e9;--muted:#a0afa4;--line:#334539;--green:#a9dba0;--soft:#283e2c}
+  @media(max-width:850px){.grid{grid-template-columns:1fr}.stage{height:180px}main{max-width:600px;padding:28px 20px}.intro{flex-wrap:wrap}h1{font-size:26px}}
+</style>
+</head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" style="position:absolute;width:0;height:0" aria-hidden="true">
+  <symbol id="storage" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><rect x="3" y="3" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 6.5h.01M7 17.5h.01M12 6.5h5M12 17.5h5"/></g></symbol>
+  <symbol id="folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9H3Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+</svg>
+<main>
+  <div class="intro"><div><div class="eyebrow">Object Data Browser / Design study</div><h1>A clearer sense of place.</h1><p>Four alternatives for the app identity and current location only.</p></div><button class="theme" type="button" aria-pressed="false">Dark preview</button></div>
+  <div class="grid">
+    <article><div class="caption"><span class="number">01</span><h2>Compact breadcrumb</h2><span class="recommended">RECOMMENDED</span></div>
+      <div class="stage"><div class="context row"><span class="icon"><svg aria-hidden="true"><use href="#storage"/></svg></span><div class="stack"><div class="title">Object Data Browser</div><div class="crumbs"><span>aws eu_north_1</span><span class="chevron">›</span><span class="bucket truncate" title="sndstone-testgrid">sndstone-testgrid</span></div></div></div></div>
+      <p class="note">A smaller icon and a simple breadcrumb keep the product name clear, with endpoint and bucket on one quiet line.</p>
+    </article>
+    <article><div class="caption"><span class="number">02</span><h2>Bucket first</h2></div>
+      <div class="stage"><div class="context"><div class="app-label">Object Data Browser</div><div class="row"><span class="icon hero-icon"><svg aria-hidden="true"><use href="#folder"/></svg></span><div class="stack"><div class="hero-title truncate" title="sndstone-testgrid">sndstone-testgrid</div><div class="small">aws eu_north_1</div></div></div></div></div>
+      <p class="note">Make the current bucket the focal point. The app name becomes a small signature above the working context.</p>
+    </article>
+    <article><div class="caption"><span class="number">03</span><h2>Labeled context</h2></div>
+      <div class="stage"><div class="context"><div class="title">Object Data Browser</div><div class="chips"><span class="chip"><span class="chip-label">Endpoint</span><strong>aws eu_north_1</strong></span><span class="chip active"><span>Bucket</span><strong>sndstone-testgrid</strong></span></div></div></div>
+      <p class="note">Explicit labels distinguish the endpoint from the bucket. Soft green emphasizes the current bucket without another large icon.</p>
+    </article>
+    <article><div class="caption"><span class="number">04</span><h2>Quiet identity</h2></div>
+      <div class="stage"><div class="context minimal"><div class="title">Object Data Browser</div><div class="crumbs"><span>aws eu_north_1</span><span class="chevron">/</span><span class="bucket truncate" title="sndstone-testgrid">sndstone-testgrid</span></div></div></div>
+      <p class="note">A slim green accent replaces the icon tile. This is the lightest treatment and leaves the most room for location text.</p>
+    </article>
+  </div>
+  <footer>Isolated header concepts · Existing green palette · Static sample endpoint and bucket · Toggle the theme to compare both appearances.</footer>
+</main>
+<script>
+document.querySelector('.theme').addEventListener('click', function () {
+  const dark = document.body.classList.toggle('dark');
+  this.setAttribute('aria-pressed', String(dark));
+  this.textContent = dark ? 'Light preview' : 'Dark preview';
+});
+</script>
+</body>
+</html>

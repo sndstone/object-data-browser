@@ -1,3 +1,4 @@
+import '../services/bucket_copy_journal.dart';
 import 'transfer_presentation.dart';
 import 'action_scope.dart';
 import 'persistence_state.dart';
@@ -96,7 +97,7 @@ String awsEndpointForRegion(String region) {
   if (normalizedRegion == 'us-east-1') {
     return 'https://s3.amazonaws.com';
   }
-  return 'https://s3.$normalizedRegion.amazonaws.com';
+  return 'https://s3.$normalizedRegion.amazonaws.com${normalizedRegion.startsWith('cn-') ? '.cn' : ''}';
 }
 
 String azureEndpointForAccount(String accountName) {
@@ -112,6 +113,17 @@ EndpointProfile normalizeEndpointProfile(EndpointProfile profile) {
     // accessKey carries the storage account name; an empty endpoint URL means
     // the engine derives https://<account>.blob.core.windows.net. A custom
     // endpoint (Azurite, sovereign clouds) is normalized like any other URL.
+    final parsed = Uri.tryParse(profile.endpointUrl.trim());
+    if (parsed != null && parsed.queryParameters.containsKey('sig')) {
+      profile = profile.copyWith(
+          endpointUrl: parsed
+              .replace(query: '', fragment: '')
+              .toString()
+              .split('?')
+              .first,
+          sessionToken: parsed.query,
+          connection: profile.connection.update('authMode', 'azureSas'));
+    }
     final customEndpoint = profile.endpointUrl.trim();
     final usesHttps = customEndpoint.isEmpty ||
         endpointUsesHttps(customEndpoint, fallback: true);
@@ -187,7 +199,10 @@ class AppController extends ChangeNotifier {
     String? initialSelectedProfileId,
     String? initialCredentialStoreError,
     AppStateRepository? appStateRepository,
-  })  : _engineService = engineService,
+    Future<BucketCopyJournal> Function()? bucketCopyJournalProvider,
+  })  : _bucketCopyJournalProvider =
+            bucketCopyJournalProvider ?? BucketCopyJournal.open,
+        _engineService = engineService,
         _initialSelectedProfileId = initialSelectedProfileId,
         _credentialStoreError = initialCredentialStoreError,
         _appStateRepository = appStateRepository,
@@ -2085,6 +2100,14 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> startBenchmark() async {
+    if (benchmarkRun != null &&
+        {'starting', 'running', 'pausing', 'paused', 'resuming', 'stopping'}
+            .contains(benchmarkRun!.status)) {
+      bannerMessage =
+          'Stop or finish the active benchmark before starting another run.';
+      notifyListeners();
+      return;
+    }
     final profile = selectedProfile;
     if (profile == null) {
       _addEvent(
@@ -2391,10 +2414,15 @@ class AppController extends ChangeNotifier {
   Future<void> testProfileById(String profileId) =>
       testProfileDraft(profiles.firstWhere((item) => item.id == profileId));
 
-  bool supportsProfile(EndpointProfile profile) =>
-      profile.endpointType != EndpointProfileType.azureBlob ||
-      (!AppPlatform.isMobile &&
-          const {'python', 'go'}.contains(activeEngineId));
+  bool supportsProfile(EndpointProfile profile) {
+    if (AppPlatform.isMobile &&
+        !const {'static', 'azureSas'}.contains(profile.connection.authMode)) {
+      return false;
+    }
+    if (profile.endpointType != EndpointProfileType.azureBlob) return true;
+    return AppPlatform.isMobile ||
+        const {'python', 'go'}.contains(activeEngineId);
+  }
 
   Future<void> testProfileDraft(EndpointProfile draft) async {
     final profile = normalizeEndpointProfile(draft);
@@ -3240,36 +3268,68 @@ class AppController extends ChangeNotifier {
     }
     Future<T> read<T>(Future<T> Function() request) =>
         cancellableListing ? _awaitListing(request) : request();
-    final versionResult = await read(() => _engineService.listObjectVersions(
-          engineId: activeEngineId,
-          profile: profile,
-          bucketName: bucket.name,
-          key: object?.key,
-          options: versionBrowserOptions,
-        ));
-    versions = versionResult.items;
-    versionCursor = versionResult.cursor;
+    Future<void> readVersions() async {
+      try {
+        final versionResult =
+            await read(() => _engineService.listObjectVersions(
+                  engineId: activeEngineId,
+                  profile: profile,
+                  bucketName: bucket.name,
+                  key: object?.key,
+                  options: versionBrowserOptions,
+                ));
+        versions = versionResult.items;
+        versionCursor = versionResult.cursor;
+      } on ListingCancelled {
+        rethrow;
+      } on EngineException catch (error) {
+        versions = const [];
+        versionCursor = const ListCursor(value: null, hasMore: false);
+        _addEvent(
+            level: 'WARN',
+            category: 'Versions',
+            message: error.message,
+            profileId: profile.id,
+            bucketName: bucket.name,
+            source: 'version-browser');
+      }
+      notifyListeners();
+    }
+
+    Future<void> readDetails() async {
+      if (object == null) {
+        selectedObjectDetails = null;
+        selectedObjectPreview = null;
+        return;
+      }
+      try {
+        selectedObjectDetails = await read(() =>
+            _engineService.getObjectDetails(
+                engineId: activeEngineId,
+                profile: profile,
+                bucketName: bucket.name,
+                key: object.key));
+        _primeSelectedObjectPreview(object, notify: false);
+        notifyListeners();
+      } on ListingCancelled {
+        rethrow;
+      } on EngineException catch (error) {
+        selectedObjectDetails = null;
+        _addEvent(
+            level: 'WARN',
+            category: 'Objects',
+            message: error.message,
+            profileId: profile.id,
+            bucketName: bucket.name,
+            source: 'object-inspector');
+      }
+    }
+
+    await Future.wait([readDetails(), readVersions()]);
     if (object == null) {
-      selectedObjectDetails = null;
-      selectedObjectPreview = null;
-      _addEvent(
-        level: 'INFO',
-        category: 'Versions',
-        message:
-            'Loaded ${versions.length} version entries for bucket ${bucket.name}.',
-        includeSelectionContext: true,
-        source: 'version-browser',
-      );
       notifyListeners();
       return;
     }
-    selectedObjectDetails = await read(() => _engineService.getObjectDetails(
-          engineId: activeEngineId,
-          profile: profile,
-          bucketName: bucket.name,
-          key: object.key,
-        ));
-    _primeSelectedObjectPreview(object, notify: false);
     _addEvent(
       level: 'INFO',
       category: 'Objects',
@@ -3976,6 +4036,8 @@ class AppController extends ChangeNotifier {
         profile: profile,
         bucketName: bucket.name,
         lifecycleJson: lifecycleJson,
+        transitionDefaultMinimumObjectSize:
+            adminState?.transitionDefaultMinimumObjectSize,
       ),
     );
   }
@@ -4019,102 +4081,370 @@ class AppController extends ChangeNotifier {
     );
   }
 
+  /// Provider-aware administration uses the desktop reference adapter. Profiles
+  /// stay in memory; only their IDs may appear in job history.
+  Future<Map<String, Object?>> storageAction(
+    String action, {
+    Map<String, Object?> arguments = const {},
+    EndpointProfile? profile,
+    EndpointProfile? destinationProfile,
+  }) async {
+    final source = profile ?? selectedProfile;
+    if (source == null) throw StateError('Select an endpoint first.');
+    ActionScope.current?.check();
+    return _engineService.storageAction(
+        profile: source,
+        action: action,
+        arguments: arguments,
+        destinationProfile: destinationProfile);
+  }
+
+  Future<void> applyAccessPreset(String policy, String expectedPolicy,
+      {String? acl}) async {
+    final bucket = selectedBucket;
+    if (bucket == null) return;
+    await _runBusy('access-preset', 'Applying access preset...', () async {
+      await storageAction('putAccess', arguments: {
+        'bucketName': bucket.name,
+        'policyJson': policy,
+        'expectedPolicyJson': expectedPolicy,
+        if (acl != null) 'acl': acl,
+      });
+      await refreshBucketAdminState();
+    }, doneMessage: 'Access preset applied.');
+  }
+
+  Future<void> loadMoreVersions() async {
+    final profile = selectedProfile;
+    final bucket = selectedBucket;
+    if (profile == null || bucket == null || !versionCursor.hasMore) return;
+    await _runBusy('more-versions', 'Loading more versions...', () async {
+      await _guard('Versions', () async {
+        final page = await _engineService.listObjectVersions(
+            engineId: activeEngineId,
+            profile: profile,
+            bucketName: bucket.name,
+            key: selectedObject?.key,
+            cursor: versionCursor,
+            options: versionBrowserOptions);
+        final seen = versions.map((v) => (v.key, v.versionId)).toSet();
+        versions = [
+          ...versions,
+          ...page.items.where((v) => seen.add((v.key, v.versionId)))
+        ];
+        versionCursor = page.cursor;
+      });
+    });
+  }
+
+  final Future<BucketCopyJournal> Function() _bucketCopyJournalProvider;
+
   Future<void> copyBucketContents({
     required String sourceBucketName,
     required String destinationBucketName,
+    EndpointProfile? destinationProfile,
+    EndpointProfile? sourceProfile,
     bool createDestinationIfMissing = false,
+    String conflictPolicy = 'skip',
+    String prefix = '',
+    bool resume = false,
+    bool includeHistory = false,
+    List<String> configurationSections = const [],
+    Future<bool> Function(Map<String, Object?> plan)? reviewPlan,
+    Future<String?> Function(Map<String, Object?> outcome)?
+        resolveHistoryOutcome,
   }) async {
-    final profile = selectedProfile;
-    if (profile == null) {
-      return;
+    final profile = sourceProfile ?? selectedProfile;
+    if (profile == null) return;
+    final destination = destinationProfile ?? profile;
+    final bucket = destinationBucketName.trim();
+    String endpoint(EndpointProfile p) =>
+        p.endpointType == EndpointProfileType.azureBlob && p.endpointUrl.isEmpty
+            ? azureEndpointForAccount(p.accessKey)
+            : p.endpointUrl;
+    String endpointIdentity(EndpointProfile p) {
+      final uri = Uri.parse(endpoint(p));
+      return jsonEncode([
+        uri.scheme.toLowerCase(),
+        uri.host.toLowerCase(),
+        uri.port,
+        uri.path.replaceAll(RegExp(r'/+$'), '')
+      ]);
     }
-    final trimmedDestination = destinationBucketName.trim();
-    if (trimmedDestination.isEmpty || trimmedDestination == sourceBucketName) {
-      bannerMessage = 'Choose a different destination bucket.';
+
+    final sameEndpoint =
+        endpointIdentity(profile) == endpointIdentity(destination) ||
+            (profile.endpointType == EndpointProfileType.awsS3 &&
+                destination.endpointType == EndpointProfileType.awsS3 &&
+                profile.region.startsWith('cn-') ==
+                    destination.region.startsWith('cn-') &&
+                profile.region.startsWith('us-gov-') ==
+                    destination.region.startsWith('us-gov-'));
+    if (bucket.isEmpty || (sameEndpoint && bucket == sourceBucketName)) {
+      bannerMessage = 'Choose a different destination bucket or endpoint.';
       notifyListeners();
       return;
     }
-    await _runBusy(
-      'copy-bucket',
-      'Copying bucket $sourceBucketName to $trimmedDestination...',
-      () async {
-        await _guard('Buckets', () async {
-          var destinationBucket = _bucketByName(trimmedDestination);
-          if (destinationBucket == null && createDestinationIfMissing) {
-            destinationBucket = await _engineService.createBucket(
-              engineId: activeEngineId,
-              profile: profile,
-              bucketName: trimmedDestination,
-              enableVersioning: false,
-              enableObjectLock: false,
-            );
-            buckets = [
-              destinationBucket,
-              ...buckets
-                  .where((bucket) => bucket.name != destinationBucket!.name),
-            ]..sort(
-                (left, right) =>
-                    left.name.toLowerCase().compareTo(right.name.toLowerCase()),
-              );
+    await _runBusy('copy-bucket',
+        'Copying $sourceBucketName to ${destination.name}/$bucket...',
+        () async {
+      await _guard('Buckets', () async {
+        final journal = await _bucketCopyJournalProvider();
+        final configuration = <String, Object?>{
+          'sourceProfileId': profile.id,
+          'destinationProfileId': destination.id,
+          'sourceEndpoint': endpointIdentity(profile),
+          'destinationEndpoint': endpointIdentity(destination),
+          'sourceBucket': sourceBucketName,
+          'destinationBucket': bucket,
+          'prefix': prefix,
+          'conflictPolicy': conflictPolicy,
+          if (includeHistory) 'includeHistory': true,
+          if (configurationSections.isNotEmpty)
+            'configurationSections': configurationSections,
+        };
+        final checkpoint = resume ? await journal.read(configuration) : null;
+        if (resume && checkpoint == null) {
+          throw StateError('No saved bucket-copy checkpoint was found.');
+        }
+        if (createDestinationIfMissing) {
+          await storageAction('ensureBucket', profile: destination, arguments: {
+            'bucketName': bucket,
+            if (includeHistory) 'versioningEnabled': true
+          });
+        }
+        final references = <String, Object?>{
+          'sourceBucketName': sourceBucketName,
+          'destinationBucketName': bucket,
+          'prefix': prefix,
+        };
+        Future<Map<String, Object?>> workflow(
+                String action, Map<String, Object?> args) =>
+            storageAction(action,
+                profile: profile,
+                destinationProfile: destination,
+                arguments: {...references, ...args});
+        String? configurationPlanId =
+            checkpoint?['configurationPlanId'] as String?;
+        var contentComplete = checkpoint?['contentComplete'] == true;
+        if (configurationSections.isNotEmpty && configurationPlanId == null) {
+          final plan = await workflow('planBucketConfigurationCopy',
+              {'sections': configurationSections});
+          if (reviewPlan == null || !await reviewPlan(plan)) return;
+          if ((plan['blocked'] as List? ?? []).isNotEmpty) {
+            throw StateError(
+                'Some configuration changes are blocked. Select supported sections and review again.');
           }
-          if (destinationBucket == null) {
-            throw const EngineException(
-              code: ErrorCode.invalidConfig,
-              message:
-                  'Destination bucket does not exist. Create it first or choose Create destination in the dialog.',
-            );
+          configurationPlanId = plan['planId'] as String;
+        }
+        Future<void> applyConfiguration() async {
+          if (configurationPlanId == null) return;
+          final result = await workflow(
+              'applyBucketConfigurationCopy', {'planId': configurationPlanId});
+          if (result['status'] != 'completed') {
+            throw StateError(
+                'Configuration copy did not complete: ${result['status']}');
           }
+        }
 
-          var cursor = const ListCursor(value: null, hasMore: false);
-          var copiedCount = 0;
-          final failures = <String>[];
-          var hasMore = true;
-          while (hasMore) {
-            final page = await _engineService.listObjects(
-              engineId: activeEngineId,
-              profile: profile,
-              bucketName: sourceBucketName,
-              prefix: '',
-              flat: true,
-              cursor: cursor.value == null && !cursor.hasMore ? null : cursor,
-            );
-            for (final object in page.items.where((entry) => !entry.isFolder)) {
-              try {
-                await _engineService.copyObject(
-                  engineId: activeEngineId,
-                  profile: profile,
-                  sourceBucketName: sourceBucketName,
-                  sourceKey: object.key,
-                  destinationBucketName: trimmedDestination,
-                  destinationKey: object.key,
-                );
-                copiedCount += 1;
-              } on EngineException catch (error) {
-                failures.add('${object.key}: ${error.message}');
+        if (includeHistory) {
+          var recoveryId = checkpoint?['historyRecoveryId'] as String?;
+          if (recoveryId == null) {
+            final plan = await workflow('planHistoryCopy', {});
+            if (reviewPlan == null || !await reviewPlan(plan)) return;
+            recoveryId = plan['recoveryId'] as String;
+          }
+          Future<void> saveHistory() => journal.write({
+                'configuration': configuration,
+                'historyRecoveryId': recoveryId,
+                'configurationPlanId': configurationPlanId,
+                'contentComplete': contentComplete,
+              });
+          await saveHistory();
+          Map<String, Object?> result = {};
+          if (!contentComplete) {
+            while (true) {
+              ActionScope.current?.check();
+              result = await workflow('resumeHistoryCopy',
+                  {'recoveryId': recoveryId, 'maxEntries': 25});
+              bannerMessage =
+                  'Copied ${result['completedCount'] ?? 0} history entries; recovery $recoveryId';
+              notifyListeners();
+              if (result['status'] == 'completed') break;
+              if (result['status'] == 'outcomeUnknown') {
+                final resolvedVersion =
+                    await resolveHistoryOutcome?.call(result);
+                if (resolvedVersion == null || resolvedVersion.isEmpty) {
+                  throw StateError(
+                      'Copy paused with an uncertain write. Recovery $recoveryId. Resume after inspecting the destination version.');
+                }
+                await workflow('resolveHistoryCopy', {
+                  'recoveryId': recoveryId,
+                  'destinationVersionId': resolvedVersion
+                });
+              } else if (result['status'] != 'running') {
+                throw StateError(
+                    'History copy paused: ${result['status']}. Recovery $recoveryId.');
               }
             }
-            cursor = page.cursor;
-            hasMore = page.cursor.hasMore;
+            contentComplete = true;
+            await saveHistory();
           }
-          bannerMessage = failures.isEmpty
-              ? 'Copied $copiedCount objects to $trimmedDestination.'
-              : 'Copied $copiedCount objects to $trimmedDestination with ${failures.length} failures.';
+          await applyConfiguration();
+          await journal.clear();
+          bannerMessage =
+              'Version history copied to ${destination.name}/$bucket. Version IDs were mapped to new destination IDs. Recovery: $recoveryId.';
           _addEvent(
-            level: failures.isEmpty ? 'INFO' : 'WARN',
+              level: 'INFO',
+              category: 'Buckets',
+              message: bannerMessage!,
+              profileId: profile.id,
+              bucketName: sourceBucketName,
+              source: 'bucket-copy');
+          return;
+        }
+        Map<String, Object?>? cursor = checkpoint?['cursor'] is Map
+            ? Map<String, Object?>.from(checkpoint!['cursor'] as Map)
+            : null;
+        final completed =
+            Set<String>.from(checkpoint?['completed'] as List? ?? []);
+        var copied = (checkpoint?['copied'] as num?)?.toInt() ?? 0;
+        var skipped = (checkpoint?['skipped'] as num?)?.toInt() ?? 0;
+        var failed = 0, bytes = (checkpoint?['bytes'] as num?)?.toInt() ?? 0;
+        Future<void> save({String? inFlight}) => journal.write({
+              'configuration': configuration,
+              if (configurationPlanId != null)
+                'configurationPlanId': configurationPlanId,
+              if (contentComplete) 'contentComplete': true,
+              'cursor': cursor,
+              'completed': completed.toList(),
+              'copied': copied,
+              'skipped': skipped,
+              'bytes': bytes,
+              'inFlight': inFlight,
+              'updatedAt': DateTime.now().toUtc().toIso8601String(),
+            });
+        if (checkpoint?['inFlight'] != null && conflictPolicy != 'skip') {
+          throw StateError(
+              'The last copy of ${checkpoint!['inFlight']} has an unknown outcome. Inspect the destination, then start a new copy with Skip existing keys.');
+        }
+        await save();
+        final failures = <String>[];
+        final seenCursors = <String>{};
+        if (!contentComplete) {
+          do {
+            ActionScope.current?.check();
+            final page = await storageAction('listObjects',
+                profile: profile,
+                arguments: {
+                  'bucketName': sourceBucketName,
+                  'prefix': prefix,
+                  'flat': true,
+                  if (cursor != null) 'cursor': cursor
+                });
+            final pageCursor = page['nextCursor'] ?? page['cursor'];
+            if (page['items'] is! List ||
+                pageCursor is! Map ||
+                pageCursor['hasMore'] is! bool) {
+              throw StateError(
+                  'The endpoint returned an incomplete listing result. Copy stopped.');
+            }
+            for (final raw in page['items'] as List) {
+              ActionScope.current?.check();
+              final item = Map<String, Object?>.from(raw as Map);
+              final key = item['key'] as String;
+              final identity = jsonEncode([key, item['etag'], item['size']]);
+              if (completed.contains(identity)) continue;
+              await save(inFlight: key);
+              // Flat listings contain actual zero-byte folder-marker objects too.
+              try {
+                final outcome = await storageAction('copyObject',
+                    profile: profile,
+                    destinationProfile: destination,
+                    arguments: {
+                      'sourceBucketName': sourceBucketName,
+                      'sourceKey': key,
+                      'destinationBucketName': bucket,
+                      'destinationKey': key,
+                      'conflictPolicy': conflictPolicy,
+                      if (item['etag'] != null)
+                        'expectedSourceETag': item['etag'],
+                    });
+                if (outcome['status'] == 'cancelled') {
+                  throw const ListingCancelled();
+                }
+                if (outcome['status'] == 'unknown') {
+                  throw StateError(
+                      'Copy outcome unknown. Inspect the destination before retrying.');
+                }
+                final failuresInResult =
+                    (outcome['failureCount'] as num?)?.toInt() ?? 0;
+                if (failuresInResult > 0) {
+                  throw StateError('${outcome['failures']}');
+                }
+                if (outcome['skipped'] == true ||
+                    (outcome['skipped'] is num &&
+                        (outcome['skipped'] as num) > 0)) {
+                  skipped++;
+                } else {
+                  if (outcome['successCount'] != 1) {
+                    throw StateError(
+                        'Copy outcome is unknown. Inspect the destination before retrying.');
+                  }
+                  copied++;
+                  bytes += (outcome['bytesCopied'] as num?)?.toInt() ?? 0;
+                }
+                completed.add(identity);
+                await save();
+              } on ListingCancelled {
+                rethrow;
+              } catch (error) {
+                failed++;
+                if (failures.length < 50) {
+                  failures
+                      .add('$key: ${DiagnosticSafety.text(error.toString())}');
+                }
+                throw StateError(
+                    'Copy stopped at $key after $copied completed and $skipped skipped objects. ${DiagnosticSafety.text(error.toString())}');
+              }
+              bannerMessage =
+                  'Copied $copied · skipped $skipped · failed $failed · $bytes bytes';
+              notifyListeners();
+            }
+            if (failed > 0) {
+              await save();
+              throw StateError(
+                  'Copy stopped after $failed failures. Completed objects in this page are checkpointed. ${failures.join(' | ')}');
+            }
+            completed.clear();
+            cursor = Map<String, Object?>.from(pageCursor);
+            if (cursor['hasMore'] != true) break;
+            await save();
+            if (seenCursors.length >= 64) seenCursors.remove(seenCursors.first);
+            if (!seenCursors.add(jsonEncode(cursor))) {
+              throw StateError(
+                  'Endpoint repeated its listing cursor. Copy stopped.');
+            }
+          } while (true);
+        }
+        contentComplete = true;
+        await save();
+        await applyConfiguration();
+        await journal.clear();
+        final summary =
+            'Copied $copied objects to ${destination.name}/$bucket; skipped $skipped; failed $failed.';
+        bannerMessage = summary;
+        _addEvent(
+            level: failed == 0 ? 'INFO' : 'ERROR',
             category: 'Buckets',
-            message: failures.isEmpty
-                ? 'Copied $copiedCount objects from $sourceBucketName to $trimmedDestination.'
-                : 'Copied $copiedCount objects from $sourceBucketName to $trimmedDestination with failures: ${failures.join(' | ')}',
+            message:
+                '$summary${failures.isEmpty ? '' : '\n${failures.join('\n')}'}',
             profileId: profile.id,
             bucketName: sourceBucketName,
-            source: 'bucket-admin',
-          );
-          if (selectedBucket?.name == sourceBucketName) {
-            await refreshObjects(prefix: currentPrefix);
-          }
-        });
-      },
-    );
+            source: 'bucket-copy');
+        if (failed > 0) throw StateError(summary);
+      });
+    });
   }
 
   void _replaceTransfer(TransferJob updated) {
@@ -4425,6 +4755,23 @@ class AppController extends ChangeNotifier {
     }
     await _runBusy(actionKey, busyMessage, () async {
       await _guard('Buckets', () async {
+        final sectionName = switch (actionKey) {
+          'bucket-policy' => 'GetBucketPolicy',
+          'bucket-lifecycle' => 'GetBucketLifecycleConfiguration',
+          'bucket-cors' => 'GetBucketCors',
+          'bucket-encryption' => 'GetBucketEncryption',
+          'bucket-tags' => 'GetBucketTagging',
+          _ => ''
+        };
+        final section = adminState?.sections[sectionName];
+        if (section is Map &&
+            {'denied', 'error', 'unsupported', 'unknown'}
+                .contains(section['state'])) {
+          throw EngineException(
+              code: ErrorCode.invalidConfig,
+              message:
+                  'Cannot safely replace configuration that could not be read. ${section['message'] ?? section['state']}');
+        }
         adminState = await operation(profile, bucket);
         _addEvent(
           level: 'INFO',
@@ -4461,6 +4808,12 @@ class AppController extends ChangeNotifier {
       profile: profile,
       config: deleteAllConfig,
     );
+    if (deleteAllState.running || deleteAllState.exitCode != 0) {
+      throw EngineException(
+          code: ErrorCode.objectConflict,
+          message:
+              'Bucket cleanup did not complete: ${deleteAllState.lastStatus}');
+    }
     _addEvent(
       level: (deleteAllState.exitCode == null || deleteAllState.exitCode == 0)
           ? 'INFO'

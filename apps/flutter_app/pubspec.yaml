@@ -2,7 +2,7 @@ name: s3_browser_crossplat
 description: Cross-platform object data browser with pluggable backend engines.
 publish_to: "none"
 # GitHub Releases are published from this version value.
-version: 2.2.8+1
+version: 2.3.0+1
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
@@ -11,6 +11,7 @@ dependencies:
   flutter:
     sdk: flutter
   cupertino_icons: ^1.0.8
+  crypto: ^3.0.6
   desktop_drop: ^0.6.0
   file_picker: ^8.0.0+1
   flutter_secure_storage: ^10.3.1
@@ -19,6 +20,7 @@ dependencies:
   highlight: ^0.7.0
   path_provider: ^2.1.4
   share_plus: ^12.0.2
+  xml: ^6.6.1
 
 dev_dependencies:
   flutter_test:

@@ -1,3 +1,6 @@
+import 'connection_options.dart';
+export 'connection_options.dart';
+
 enum BannerSeverity { info, success, warning, error }
 
 extension ErrorCodeLabel on ErrorCode {
@@ -200,6 +203,7 @@ class EndpointProfile {
     this.maxConcurrentRequests = 10,
     this.maxAttempts = 5,
     this.maxRequestsPerSecond = 0,
+    this.connection = const ConnectionOptions(),
   });
 
   final String id;
@@ -219,6 +223,7 @@ class EndpointProfile {
   final int maxConcurrentRequests;
   final int maxAttempts;
   final int maxRequestsPerSecond;
+  final ConnectionOptions connection;
 
   @override
   bool operator ==(Object other) =>
@@ -239,7 +244,8 @@ class EndpointProfile {
       readTimeoutSeconds == other.readTimeoutSeconds &&
       maxConcurrentRequests == other.maxConcurrentRequests &&
       maxAttempts == other.maxAttempts &&
-      maxRequestsPerSecond == other.maxRequestsPerSecond;
+      maxRequestsPerSecond == other.maxRequestsPerSecond &&
+      connection == other.connection;
   @override
   int get hashCode => Object.hashAll([
         id,
@@ -258,7 +264,8 @@ class EndpointProfile {
         readTimeoutSeconds,
         maxConcurrentRequests,
         maxAttempts,
-        maxRequestsPerSecond
+        maxRequestsPerSecond,
+        connection,
       ]);
 
   Map<String, Object?> toJson() {
@@ -280,18 +287,34 @@ class EndpointProfile {
       'maxConcurrentRequests': maxConcurrentRequests,
       'maxAttempts': maxAttempts,
       'maxRequestsPerSecond': maxRequestsPerSecond,
+      ...connection.toJson(),
     };
   }
 
   factory EndpointProfile.fromJson(Map<String, Object?> json) {
+    final endpoint = Uri.tryParse(json['endpointUrl'] as String? ?? '');
+    final embeddedSas = json['endpointType'] == 'azureBlob' &&
+        endpoint?.queryParameters.containsKey('sig') == true;
     return EndpointProfile(
       id: (json['id'] as String?) ?? '',
       name: (json['name'] as String?) ?? '',
-      endpointUrl: (json['endpointUrl'] as String?) ?? '',
+      endpointUrl: embeddedSas
+          ? endpoint!
+              .replace(query: '', fragment: '')
+              .toString()
+              .split('?')
+              .first
+          : (json['endpointUrl'] as String?) ?? '',
       region: (json['region'] as String?) ?? '',
       accessKey: (json['accessKey'] as String?) ?? '',
       secretKey: (json['secretKey'] as String?) ?? '',
-      sessionToken: json['sessionToken'] as String?,
+      sessionToken: embeddedSas
+          ? endpoint!.query
+          : (json['azureSasToken'] ?? json['sessionToken']) as String?,
+      connection: ConnectionOptions.fromJson({
+        ...json,
+        if (embeddedSas) 'authMode': 'azureSas',
+      }),
       pathStyle: json['pathStyle'] as bool? ?? true,
       verifyTls: json['verifyTls'] as bool? ?? true,
       endpointType: switch (json['endpointType'] as String? ?? 's3Compatible') {
@@ -329,6 +352,7 @@ class EndpointProfile {
     int? maxConcurrentRequests,
     int? maxAttempts,
     int? maxRequestsPerSecond,
+    ConnectionOptions? connection,
   }) {
     return EndpointProfile(
       id: id,
@@ -350,6 +374,7 @@ class EndpointProfile {
           maxConcurrentRequests ?? this.maxConcurrentRequests,
       maxAttempts: maxAttempts ?? this.maxAttempts,
       maxRequestsPerSecond: maxRequestsPerSecond ?? this.maxRequestsPerSecond,
+      connection: connection ?? this.connection,
     );
   }
 }
@@ -451,6 +476,9 @@ class BucketAdminState {
     required this.corsJson,
     this.lifecycleJson = '{\n  "Rules": []\n}',
     this.encryptionJson = '{}',
+    this.objectLockRetentionYears,
+    this.transitionDefaultMinimumObjectSize,
+    this.sections = const {},
     this.apiCalls = const [],
   });
 
@@ -465,6 +493,9 @@ class BucketAdminState {
   final String encryptionSummary;
   final String? objectLockMode;
   final int? objectLockRetentionDays;
+  final int? objectLockRetentionYears;
+  final String? transitionDefaultMinimumObjectSize;
+  final Map<String, Object?> sections;
   final Map<String, String> tags;
   final List<LifecycleRule> lifecycleRules;
   final String policyJson;
@@ -490,6 +521,9 @@ class BucketAdminState {
     String? corsJson,
     String? lifecycleJson,
     String? encryptionJson,
+    int? objectLockRetentionYears,
+    String? transitionDefaultMinimumObjectSize,
+    Map<String, Object?>? sections,
     List<ApiCallRecord>? apiCalls,
   }) {
     return BucketAdminState(
@@ -511,6 +545,11 @@ class BucketAdminState {
       corsJson: corsJson ?? this.corsJson,
       lifecycleJson: lifecycleJson ?? this.lifecycleJson,
       encryptionJson: encryptionJson ?? this.encryptionJson,
+      objectLockRetentionYears:
+          objectLockRetentionYears ?? this.objectLockRetentionYears,
+      transitionDefaultMinimumObjectSize: transitionDefaultMinimumObjectSize ??
+          this.transitionDefaultMinimumObjectSize,
+      sections: sections ?? this.sections,
       apiCalls: apiCalls ?? this.apiCalls,
     );
   }
@@ -1446,6 +1485,10 @@ class BrowserTaskRecord {
 }
 
 class AppSettings {
+  static const int defaultBrowserInspectorSize = 360;
+  static const int defaultUiScalePercent = 100;
+  static const int defaultLogTextScalePercent = 80;
+
   const AppSettings({
     required this.darkMode,
     required this.defaultEngineId,
@@ -1562,7 +1605,8 @@ class AppSettings {
   }
 
   factory AppSettings.fromJson(Map<String, Object?> json) {
-    final uiScalePercent = (json['uiScalePercent'] as num?)?.toInt() ?? 100;
+    final uiScalePercent =
+        (json['uiScalePercent'] as num?)?.toInt() ?? defaultUiScalePercent;
     return AppSettings(
       darkMode: json['darkMode'] as bool? ?? false,
       defaultEngineId: (json['defaultEngineId'] as String?) ?? 'python',
@@ -1599,14 +1643,15 @@ class AppSettings {
       benchmarkDebugMode: json['benchmarkDebugMode'] as bool? ?? false,
       benchmarkLogPath: (json['benchmarkLogPath'] as String?) ?? '',
       browserInspectorLayout: _inspectorLayoutFromJson(json),
-      browserInspectorSize:
-          (json['browserInspectorSize'] as num?)?.toInt() ?? 360,
+      browserInspectorSize: (json['browserInspectorSize'] as num?)?.toInt() ??
+          defaultBrowserInspectorSize,
       relistObjectsAfterMutation:
           json['relistObjectsAfterMutation'] as bool? ?? true,
       uiScalePercent: uiScalePercent,
       compactRows: json['compactRows'] as bool? ?? false,
       browserInspectorVisible: json['browserInspectorVisible'] as bool? ?? true,
-      logTextScalePercent: (json['logTextScalePercent'] as num?)?.toInt() ?? 80,
+      logTextScalePercent: (json['logTextScalePercent'] as num?)?.toInt() ??
+          defaultLogTextScalePercent,
     );
   }
 

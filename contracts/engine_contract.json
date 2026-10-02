@@ -54,7 +54,8 @@
         "pauseBenchmark",
         "resumeBenchmark",
         "stopBenchmark",
-        "exportBenchmarkResults"
+        "exportBenchmarkResults",
+        "storageAction"
       ]
     },
     "engineVersion": {
@@ -63,5 +64,62 @@
     "params": {
       "type": "object"
     }
-  }
+  },
+  "$defs": {
+    "storageAction": {
+      "type": "object",
+      "required": [
+        "profile",
+        "action"
+      ],
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "object"
+        },
+        "sourceProfile": {
+          "type": "object"
+        },
+        "destinationProfile": {
+          "type": "object"
+        },
+        "versionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conflictPolicy": {
+          "enum": [
+            "replace",
+            "skip",
+            "fail"
+          ]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "storageAction"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/storageAction"
+          }
+        },
+        "required": [
+          "params"
+        ]
+      }
+    }
+  ]
 }

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'app_menu.dart';
 import 'edge_fade_scroll.dart';
 import 'navigation_item.dart';
 
@@ -54,10 +55,16 @@ class UnderlineTabs<T> extends StatelessWidget {
           PopupMenuButton<T>(
             tooltip: overflowTooltip,
             icon: const Icon(Icons.more_horiz),
+            position: PopupMenuPosition.under,
+            offset: const Offset(0, AppMenuStyle.anchorGap),
+            popUpAnimationStyle: AppMenuStyle.animation,
             onSelected: onChanged,
             itemBuilder: (_) => [
               for (final tab in hidden)
-                PopupMenuItem(value: tab.value, child: Text(tab.label)),
+                appMenuItem(
+                    value: tab.value,
+                    label: tab.label,
+                    selected: tab.value == selected),
             ],
           ),
       ]),

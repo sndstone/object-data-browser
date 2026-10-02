@@ -7,6 +7,8 @@ import 'package:flutter/services.dart';
 
 import '../models/domain_models.dart';
 import 'engine_service.dart';
+import 'mobile_storage_admin.dart';
+import 'mobile_benchmark_service.dart';
 import 'mock_engine_service.dart';
 
 class IosEngineService
@@ -20,6 +22,22 @@ class IosEngineService
   })  : _channel =
             channel ?? const MethodChannel('s3_browser_crossplat/ios_engine'),
         _fallback = fallback ?? MockEngineService();
+
+  final MobileStorageAdmin _storage = MobileStorageAdmin();
+  final MobileBenchmarkService _benchmark = MobileBenchmarkService();
+  final Map<String, EndpointProfile> _benchmarkProfiles = {};
+
+  @override
+  Future<Map<String, Object?>> storageAction(
+          {required EndpointProfile profile,
+          required String action,
+          Map<String, Object?> arguments = const {},
+          EndpointProfile? destinationProfile}) =>
+      _storage.action(
+          profile: profile,
+          action: action,
+          arguments: arguments,
+          destinationProfile: destinationProfile);
 
   final MethodChannel _channel;
   final EngineService _fallback;
@@ -41,6 +59,9 @@ class IosEngineService
 
   @override
   void shutdown() {
+    _storage.close();
+    unawaited(_benchmark.close());
+    _benchmarkProfiles.clear();
     _fallback.shutdown();
   }
 
@@ -70,7 +91,7 @@ class IosEngineService
           id: value['id'] as String? ?? 'ios',
           label: value['label'] as String? ?? 'iOS Engine',
           language: value['language'] as String? ?? 'native',
-          version: value['version'] as String? ?? '2.2.5',
+          version: value['version'] as String? ?? '2.3.0',
           available: value['available'] as bool? ?? true,
           desktopSupported: false,
           mobileSupported: true,
@@ -218,6 +239,7 @@ class IosEngineService
     required EndpointProfile profile,
     required String bucketName,
     required String lifecycleJson,
+    String? transitionDefaultMinimumObjectSize,
   }) async {
     final result = await _dispatch(
       engineId: engineId,
@@ -226,6 +248,9 @@ class IosEngineService
         'profile': _profileToJson(profile),
         'bucketName': bucketName,
         'lifecycleJson': lifecycleJson,
+        if (transitionDefaultMinimumObjectSize != null)
+          'transitionDefaultMinimumObjectSize':
+              transitionDefaultMinimumObjectSize,
       },
     );
     return _bucketAdminStateFromJson(result);
@@ -802,6 +827,10 @@ class IosEngineService
           'jsonOutputPath': config.jsonOutputPath,
           'logFilePath': config.logFilePath,
           'debugMode': config.debugMode,
+          'readPercent': config.readPercent,
+          'writePercent': config.writePercent,
+          'deletePercent': config.deletePercent,
+          'reducedLogging': config.reducedLogging,
         },
       },
     );
@@ -866,6 +895,28 @@ class IosEngineService
     required String method,
     required Map<String, Object?> params,
   }) async {
+    if (MobileBenchmarkService.methods.contains(method)) {
+      final profile = params['profile'] is Map
+          ? EndpointProfile.fromJson(
+              Map<String, Object?>.from(params['profile'] as Map))
+          : _benchmarkProfiles[params['runId']];
+      if (profile == null) {
+        throw const EngineException(
+            code: ErrorCode.invalidConfig,
+            message:
+                'This benchmark does not belong to the active mobile engine session.');
+      }
+      final result =
+          await _benchmark.dispatch(method, profile: profile, params: params);
+      if (result['id'] is String) {
+        _benchmarkProfiles[result['id'] as String] = profile;
+        if (_benchmarkProfiles.length > 500) {
+          _benchmarkProfiles.remove(_benchmarkProfiles.keys.first);
+        }
+      }
+      return result;
+    }
+
     final requestId =
         'ios-${DateTime.now().microsecondsSinceEpoch}-$method-$engineId';
     final startedAt = DateTime.now();
@@ -926,15 +977,17 @@ class IosEngineService
           }
         }));
       }
-      final pending = _channel.invokeMethod<Object?>(
-        'dispatch',
-        <String, Object?>{
-          'engineId': engineId,
-          'method': method,
-          'requestId': requestId,
-          'params': params,
-        },
-      );
+      final pending = _storage.handles(method, params)
+          ? _storage.dispatch(method, params)
+          : _channel.invokeMethod<Object?>(
+              'dispatch',
+              <String, Object?>{
+                'engineId': engineId,
+                'method': method,
+                'requestId': requestId,
+                'params': params,
+              },
+            );
       Object? result;
       try {
         result = scope != null ? await scope.wait(pending) : await pending;
@@ -1180,9 +1233,8 @@ class IosEngineService
     return '${encoded.substring(0, maxLength)}...';
   }
 
-  static Map<String, Object?> _profileToJson(EndpointProfile profile) {
-    return profile.toJson();
-  }
+  static Map<String, Object?> _profileToJson(EndpointProfile profile) =>
+      profile.toJson();
 
   static BucketSummary _bucketFromJson(Map<String, Object?> json) {
     return BucketSummary(
@@ -1309,6 +1361,11 @@ class IosEngineService
       lifecycleJson:
           (json['lifecycleJson'] as String?) ?? '{\n  "Rules": []\n}',
       encryptionJson: (json['encryptionJson'] as String?) ?? '{}',
+      objectLockRetentionYears:
+          (json['objectLockRetentionYears'] as num?)?.toInt(),
+      transitionDefaultMinimumObjectSize:
+          json['transitionDefaultMinimumObjectSize'] as String?,
+      sections: Map<String, Object?>.from(json['sections'] as Map? ?? {}),
       apiCalls: apiCalls,
     );
   }

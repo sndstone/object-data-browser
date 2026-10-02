@@ -5,10 +5,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -23,12 +26,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
-const engineVersion = "2.2.8"
+const engineVersion = "2.3.0"
 
 var supportedMethods = []string{
 	"health", "getCapabilities", "testProfile", "listBuckets",
@@ -70,6 +77,16 @@ func (e *sidecarError) Error() string {
 }
 
 type profile struct {
+	AuthMode              string
+	AWSProfileName        string
+	RoleARN               string
+	ExternalID            string
+	RoleSessionName       string
+	KnownBucket           string
+	RequesterPays         bool
+	ExpectedBucketOwner   string
+	CABundlePath          string
+	AzureSASToken         string
 	EndpointURL           string
 	EndpointType          string
 	Region                string
@@ -158,6 +175,17 @@ func main() {
 // so mapError renders it in the standard error-response shape.
 func dispatchRequest(req request) (result map[string]interface{}, err error) {
 	defer func() {
+		if strings.Contains(strings.ToLower(req.Method), "benchmark") && result != nil {
+			safe := make(map[string]interface{}, len(result))
+			for k, v := range result {
+				if k != "profile" {
+					safe[k] = v
+				}
+			}
+			result = safe
+		}
+	}()
+	defer func() {
 		if r := recover(); r != nil {
 			result = nil
 			err = &sidecarError{
@@ -191,20 +219,19 @@ func handleRequest(req request) (map[string]interface{}, error) {
 			"endpointTypes": []string{"s3Compatible", "awsS3", "azureBlob"},
 		}, nil
 	case "getCapabilities":
-		return map[string]interface{}{
-			"items": []map[string]interface{}{
-				{"key": "bucket.lifecycle", "label": "Lifecycle policy CRUD", "state": "supported"},
-				{"key": "bucket.policy", "label": "Bucket policy CRUD", "state": "supported"},
-				{"key": "bucket.cors", "label": "Bucket CORS CRUD", "state": "supported"},
-				{"key": "bucket.encryption", "label": "Bucket encryption", "state": "supported"},
-				{"key": "bucket.tagging", "label": "Bucket tagging", "state": "supported"},
-				{"key": "bucket.versioning", "label": "Bucket versioning", "state": "supported"},
-				{"key": "object.copy_move", "label": "Copy, move, rename", "state": "supported"},
-				{"key": "object.resumable", "label": "Resumable transfer jobs", "state": "unknown", "reason": "Desktop host currently uses one request per sidecar process."},
-				{"key": "tools.bulk-delete", "label": "Delete-all maintenance tool", "state": "supported"},
-				{"key": "benchmark", "label": "Integrated benchmark mode", "state": "supported"},
-			},
-		}, nil
+		state := "supported"
+		reason := "Engine implementation available; service permissions are checked per operation."
+		if asString(asMap(req.Params["profile"])["endpointType"]) != "awsS3" {
+			state = "unknown"
+			reason = "S3-compatible endpoint capabilities require an operation probe."
+		}
+		items := []map[string]interface{}{}
+		for _, key := range []string{"bucket.lifecycle", "bucket.policy", "bucket.cors", "bucket.encryption", "bucket.tagging", "bucket.versioning", "object.copy_move", "tools.bulk-delete"} {
+			items = append(items, map[string]interface{}{"key": key, "label": key, "state": state, "implementationState": "supported", "reason": reason})
+		}
+		items = append(items, map[string]interface{}{"key": "benchmark", "label": "Benchmark", "state": "supported", "implementationState": "supported", "reason": "Engine benchmark runner is available; storage access is checked when the run starts."})
+		items = append(items, map[string]interface{}{"key": "object.resumable", "label": "Resumable transfer jobs", "state": "unsupported", "reason": "Durable transfer checkpoints are not implemented."}, map[string]interface{}{"key": "storage.admin", "label": "Advanced administration adapter", "state": "unsupported", "reason": "Use the Python advanced storage adapter."}, map[string]interface{}{"key": "auth.awsProfiles", "label": "AWS credential providers", "state": "supported"})
+		return map[string]interface{}{"items": items}, nil
 	case "testProfile":
 		return testProfile(asMap(req.Params["profile"]))
 	case "listBuckets":
@@ -299,10 +326,22 @@ func parseProfile(payload map[string]interface{}) (profile, error) {
 	if endpointURL == "" && !isAzureProfilePayload(payload) {
 		return profile{}, &sidecarError{Code: "invalid_config", Message: "Endpoint URL is required."}
 	}
-	if accessKey == "" || secretKey == "" {
+	authMode := nonEmpty(asString(payload["authMode"]), "static")
+	if signer := asString(payload["signerOverride"]); signer != "" && signer != "s3v4" {
+		return profile{}, &sidecarError{Code: "unsupported_feature", Message: "The Go engine supports AWS Signature V4 only."}
+	}
+	if asFloat(payload["maxRequestsPerSecond"]) > 0 {
+		return profile{}, &sidecarError{Code: "unsupported_feature", Message: "Profile request-rate limits are not implemented in the Go engine."}
+	}
+	if authMode == "assumeRole" && asString(payload["awsProfileName"]) == "" && ((accessKey != "") != (secretKey != "")) {
+		return profile{}, &sidecarError{Code: "invalid_config", Message: "Both source access key and secret key are required for role assumption, or leave both empty to use AWS default credentials."}
+	}
+
+	if authMode == "static" && (accessKey == "" || secretKey == "") {
 		return profile{}, &sidecarError{Code: "invalid_config", Message: "Access key and secret key are required."}
 	}
 	return profile{
+		AuthMode: authMode, AWSProfileName: asString(payload["awsProfileName"]), RoleARN: asString(payload["roleArn"]), ExternalID: asString(payload["externalId"]), RoleSessionName: asString(payload["roleSessionName"]), KnownBucket: asString(payload["knownBucket"]), RequesterPays: asBool(payload["requesterPays"]), ExpectedBucketOwner: asString(payload["expectedBucketOwner"]), CABundlePath: asString(payload["caBundlePath"]), AzureSASToken: asString(payload["azureSasToken"]),
 		EndpointURL:           endpointURL,
 		EndpointType:          endpointType,
 		Region:                region,
@@ -319,43 +358,108 @@ func parseProfile(payload map[string]interface{}) (profile, error) {
 	}, nil
 }
 
+var s3ClientCache = struct {
+	sync.Mutex
+	clients    map[profile]*s3.Client
+	transports map[profile]*http.Transport
+	order      []profile
+}{clients: map[profile]*s3.Client{}, transports: map[profile]*http.Transport{}}
+
 func buildClient(p profile) (*s3.Client, context.Context, error) {
 	ctx := context.Background()
-	baseTransport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout: time.Duration(p.ConnectTimeoutSeconds) * time.Second,
-		}).DialContext,
-		MaxIdleConns:        p.MaxPoolConnections,
-		MaxIdleConnsPerHost: p.MaxPoolConnections,
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: !p.VerifyTLS},
+	s3ClientCache.Lock()
+	defer s3ClientCache.Unlock()
+	if client := s3ClientCache.clients[p]; client != nil {
+		return client, ctx, nil
 	}
-	httpClient := &http.Client{
-		Timeout:   time.Duration(p.ConnectTimeoutSeconds+p.ReadTimeoutSeconds) * time.Second,
-		Transport: loggingRoundTripper{base: baseTransport, diagnostics: p.Diagnostics},
-	}
-
-	cfg, err := config.LoadDefaultConfig(
-		ctx,
-		config.WithRegion(p.Region),
-		config.WithHTTPClient(httpClient),
-		config.WithRetryMaxAttempts(p.MaxAttempts),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			p.AccessKey,
-			p.SecretKey,
-			p.SessionToken,
-		)),
-	)
+	baseTransport, err := profileTransport(p)
 	if err != nil {
 		return nil, ctx, err
 	}
-
-	client := s3.NewFromConfig(cfg, func(options *s3.Options) {
-		options.UsePathStyle = p.PathStyle
-		options.BaseEndpoint = aws.String(p.EndpointURL)
+	httpClient := &http.Client{Timeout: time.Duration(p.ConnectTimeoutSeconds+p.ReadTimeoutSeconds) * time.Second, Transport: loggingRoundTripper{base: baseTransport, diagnostics: p.Diagnostics}}
+	options := []func(*config.LoadOptions) error{config.WithRegion(p.Region), config.WithHTTPClient(httpClient), config.WithRetryMaxAttempts(p.MaxAttempts)}
+	switch p.AuthMode {
+	case "", "static":
+		options = append(options, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(p.AccessKey, p.SecretKey, p.SessionToken)))
+	case "awsProfile":
+		if p.AWSProfileName == "" {
+			return nil, ctx, &sidecarError{Code: "invalid_config", Message: "An AWS profile name is required."}
+		}
+		options = append(options, config.WithSharedConfigProfile(p.AWSProfileName))
+	case "assumeRole":
+		if p.RoleARN == "" {
+			return nil, ctx, &sidecarError{Code: "invalid_config", Message: "A role ARN is required."}
+		}
+		if p.AWSProfileName != "" {
+			options = append(options, config.WithSharedConfigProfile(p.AWSProfileName))
+		} else if p.AccessKey != "" && p.SecretKey != "" {
+			options = append(options, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(p.AccessKey, p.SecretKey, p.SessionToken)))
+		}
+	case "awsDefault":
+	default:
+		return nil, ctx, &sidecarError{Code: "unsupported_feature", Message: "Authentication mode is not supported by this S3 engine."}
+	}
+	cfg, err := config.LoadDefaultConfig(ctx, options...)
+	if err != nil {
+		return nil, ctx, err
+	}
+	if p.AuthMode == "assumeRole" {
+		cfg.Credentials = aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), p.RoleARN, func(o *stscreds.AssumeRoleOptions) {
+			o.ExternalID = stringPtr(p.ExternalID)
+			if p.RoleSessionName != "" {
+				o.RoleSessionName = p.RoleSessionName
+			}
+		}))
+	}
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.UsePathStyle = p.PathStyle
+		if p.EndpointURL != "" {
+			o.BaseEndpoint = aws.String(p.EndpointURL)
+		}
+		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+			return stack.Build.Add(middleware.BuildMiddlewareFunc("ObjectBrowserRequestContext", func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
+				if req, ok := in.Request.(*smithyhttp.Request); ok {
+					if p.RequesterPays {
+						req.Header.Set("x-amz-request-payer", "requester")
+					}
+					if p.ExpectedBucketOwner != "" {
+						req.Header.Set("x-amz-expected-bucket-owner", p.ExpectedBucketOwner)
+					}
+				}
+				return next.HandleBuild(ctx, in)
+			}), middleware.Before)
+		})
 	})
-
+	if len(s3ClientCache.order) >= 16 {
+		oldest := s3ClientCache.order[0]
+		s3ClientCache.order = s3ClientCache.order[1:]
+		s3ClientCache.transports[oldest].CloseIdleConnections()
+		delete(s3ClientCache.clients, oldest)
+		delete(s3ClientCache.transports, oldest)
+	}
+	s3ClientCache.order = append(s3ClientCache.order, p)
+	s3ClientCache.clients[p] = client
+	s3ClientCache.transports[p] = baseTransport
 	return client, ctx, nil
+}
+
+func profileTransport(p profile) (*http.Transport, error) {
+	tlsConfig := &tls.Config{InsecureSkipVerify: !p.VerifyTLS, MinVersion: tls.VersionTLS12}
+	if p.CABundlePath != "" {
+		roots, err := x509.SystemCertPool()
+		if err != nil {
+			roots = x509.NewCertPool()
+		}
+		data, err := os.ReadFile(p.CABundlePath)
+		if err != nil {
+			return nil, err
+		}
+		if !roots.AppendCertsFromPEM(data) {
+			return nil, &sidecarError{Code: "invalid_config", Message: "CA bundle contains no certificates."}
+		}
+		tlsConfig.RootCAs = roots
+	}
+	return &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: time.Duration(p.ConnectTimeoutSeconds) * time.Second}).DialContext, MaxIdleConns: p.MaxPoolConnections, MaxIdleConnsPerHost: p.MaxPoolConnections, IdleConnTimeout: 90 * time.Second, TLSClientConfig: tlsConfig}, nil
 }
 
 type loggingRoundTripper struct {
@@ -363,7 +467,14 @@ type loggingRoundTripper struct {
 	diagnostics diagnosticsConfig
 }
 
+func (rt loggingRoundTripper) CloseIdleConnections() {
+	if closer, ok := rt.base.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+}
+
 func (rt loggingRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	recordBenchmarkAttempt(request.Context())
 	if rt.diagnostics.EnableAPILogging {
 		requestBody := summarizeHTTPBody(
 			request.Header.Get("Content-Type"),
@@ -376,7 +487,7 @@ func (rt loggingRoundTripper) RoundTrip(request *http.Request) (*http.Response, 
 			fmt.Sprintf(
 				"SEND %s %s HEADERS=%s BODY=%s",
 				request.Method,
-				request.URL.String(),
+				redactedURL(request.URL),
 				mustJSONString(sanitizeHeaders(request.Header)),
 				requestBody,
 			),
@@ -402,7 +513,7 @@ func (rt loggingRoundTripper) RoundTrip(request *http.Request) (*http.Response, 
 			fmt.Sprintf(
 				"RECV %s %s STATUS=%d HEADERS=%s BODY=%s",
 				request.Method,
-				request.URL.String(),
+				redactedURL(request.URL),
 				response.StatusCode,
 				mustJSONString(sanitizeHeaders(response.Header)),
 				responseBody,
@@ -414,7 +525,7 @@ func (rt loggingRoundTripper) RoundTrip(request *http.Request) (*http.Response, 
 }
 
 func readRequestBody(request *http.Request) []byte {
-	if request.Body == nil {
+	if request.Body == nil || request.ContentLength < 0 || request.ContentLength > 256*1024 {
 		return nil
 	}
 	body, err := io.ReadAll(request.Body)
@@ -426,7 +537,7 @@ func readRequestBody(request *http.Request) []byte {
 }
 
 func readResponseBody(response *http.Response) []byte {
-	if response.Body == nil || response.ContentLength > 1024*256 {
+	if response.Body == nil || response.ContentLength < 0 || response.ContentLength > 1024*256 {
 		return nil
 	}
 	body, err := io.ReadAll(response.Body)
@@ -445,7 +556,7 @@ func sanitizeHeaders(headers http.Header) map[string]string {
 			strings.Contains(lower, "security-token") ||
 			strings.Contains(lower, "access-key") ||
 			strings.Contains(lower, "secret") ||
-			strings.Contains(lower, "token") {
+			strings.Contains(lower, "token") || strings.Contains(lower, "copy-source") {
 			sanitized[key] = "[redacted]"
 			continue
 		}
@@ -496,6 +607,13 @@ func testProfile(profilePayload map[string]interface{}) (map[string]interface{},
 	if err != nil {
 		return nil, err
 	}
+	if p.KnownBucket != "" {
+		_, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(p.KnownBucket)})
+		if err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{"ok": true, "bucketCount": 1, "endpoint": p.EndpointURL, "items": []map[string]interface{}{{"name": p.KnownBucket, "region": p.Region, "objectCountHint": 0, "versioningEnabled": false}}}, nil
+	}
 	output, err := client.ListBuckets(ctx, &s3.ListBucketsInput{})
 	if err != nil {
 		return nil, err
@@ -519,6 +637,13 @@ func listBuckets(profilePayload map[string]interface{}) (map[string]interface{},
 	client, ctx, err := buildClient(p)
 	if err != nil {
 		return nil, err
+	}
+	if p.KnownBucket != "" {
+		_, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(p.KnownBucket)})
+		if err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{"ok": true, "bucketCount": 1, "endpoint": p.EndpointURL, "items": []map[string]interface{}{{"name": p.KnownBucket, "region": p.Region, "objectCountHint": 0, "versioningEnabled": false}}}, nil
 	}
 	output, err := client.ListBuckets(ctx, &s3.ListBucketsInput{})
 	if err != nil {
@@ -714,51 +839,93 @@ func getBucketAdminState(params map[string]interface{}) (map[string]interface{},
 	}
 
 	apiCalls := make([]map[string]interface{}, 0, 7)
-	versioningOut, err := callAPI(ctx, client, &apiCalls, "GetBucketVersioning", func(ctx context.Context, client *s3.Client) (interface{}, error) {
+	sections := map[string]interface{}{}
+	requested := asStringSlice(params["sections"])
+	inspect := func(operation string, fn func(context.Context, *s3.Client) (interface{}, error)) (interface{}, error) {
+		section := map[string]string{"GetBucketVersioning": "versioning", "GetBucketEncryption": "encryption", "GetBucketLifecycleConfiguration": "lifecycle", "GetBucketPolicy": "policy", "GetBucketCors": "cors", "GetBucketTagging": "tagging", "GetObjectLockConfiguration": "objectLock"}[operation]
+		if len(requested) > 0 {
+			enabled := false
+			for _, name := range requested {
+				if name == section || name == operation {
+					enabled = true
+				}
+			}
+			if !enabled {
+				sections[operation] = map[string]interface{}{"state": "notLoaded"}
+				return nil, nil
+			}
+		}
+		result, callErr := callAPI(ctx, client, &apiCalls, operation, fn)
+		state := "supported"
+		message := ""
+		code := ""
+		if callErr != nil {
+			code = awsErrorCode(callErr)
+			message = callErr.Error()
+			state = "unknown"
+			switch code {
+			case "AccessDenied", "AccessDeniedException", "Forbidden", "401", "403":
+				state = "denied"
+			case "NotImplemented", "XNotImplemented", "MethodNotAllowed", "501", "405":
+				state = "unsupported"
+			default:
+				if _, ok := missingBucketConfigCodes()[code]; ok && code != "NoSuchBucket" {
+					state = "missing"
+				}
+			}
+			result = nil
+		}
+		sections[operation] = map[string]interface{}{"state": state, "message": message, "code": code}
+		return result, nil
+	}
+	versioningOut, err := inspect("GetBucketVersioning", func(ctx context.Context, client *s3.Client) (interface{}, error) {
 		return client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(bucketName)})
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	encryptionOut, err := optionalAPI(ctx, client, &apiCalls, "GetBucketEncryption", missingBucketConfigCodes(), func(ctx context.Context, client *s3.Client) (interface{}, error) {
+	encryptionOut, err := inspect("GetBucketEncryption", func(ctx context.Context, client *s3.Client) (interface{}, error) {
 		return client.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: aws.String(bucketName)})
 	})
 	if err != nil {
 		return nil, err
 	}
-	lifecycleOut, err := optionalAPI(ctx, client, &apiCalls, "GetBucketLifecycleConfiguration", missingBucketConfigCodes(), func(ctx context.Context, client *s3.Client) (interface{}, error) {
+	lifecycleOut, err := inspect("GetBucketLifecycleConfiguration", func(ctx context.Context, client *s3.Client) (interface{}, error) {
 		return client.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{Bucket: aws.String(bucketName)})
 	})
 	if err != nil {
 		return nil, err
 	}
-	policyOut, err := optionalAPI(ctx, client, &apiCalls, "GetBucketPolicy", missingBucketConfigCodes(), func(ctx context.Context, client *s3.Client) (interface{}, error) {
+	policyOut, err := inspect("GetBucketPolicy", func(ctx context.Context, client *s3.Client) (interface{}, error) {
 		return client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String(bucketName)})
 	})
 	if err != nil {
 		return nil, err
 	}
-	corsOut, err := optionalAPI(ctx, client, &apiCalls, "GetBucketCors", missingBucketConfigCodes(), func(ctx context.Context, client *s3.Client) (interface{}, error) {
+	corsOut, err := inspect("GetBucketCors", func(ctx context.Context, client *s3.Client) (interface{}, error) {
 		return client.GetBucketCors(ctx, &s3.GetBucketCorsInput{Bucket: aws.String(bucketName)})
 	})
 	if err != nil {
 		return nil, err
 	}
-	taggingOut, err := optionalAPI(ctx, client, &apiCalls, "GetBucketTagging", missingBucketConfigCodes(), func(ctx context.Context, client *s3.Client) (interface{}, error) {
+	taggingOut, err := inspect("GetBucketTagging", func(ctx context.Context, client *s3.Client) (interface{}, error) {
 		return client.GetBucketTagging(ctx, &s3.GetBucketTaggingInput{Bucket: aws.String(bucketName)})
 	})
 	if err != nil {
 		return nil, err
 	}
-	lockOut, err := optionalAPI(ctx, client, &apiCalls, "GetObjectLockConfiguration", missingBucketConfigCodes(), func(ctx context.Context, client *s3.Client) (interface{}, error) {
+	lockOut, err := inspect("GetObjectLockConfiguration", func(ctx context.Context, client *s3.Client) (interface{}, error) {
 		return client.GetObjectLockConfiguration(ctx, &s3.GetObjectLockConfigurationInput{Bucket: aws.String(bucketName)})
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	versioning := versioningOut.(*s3.GetBucketVersioningOutput)
+	versioning := &s3.GetBucketVersioningOutput{Status: types.BucketVersioningStatus("Unknown")}
+	if versioningOut != nil {
+		versioning = versioningOut.(*s3.GetBucketVersioningOutput)
+	}
 	var encryption *s3.GetBucketEncryptionOutput
 	if encryptionOut != nil {
 		encryption = encryptionOut.(*s3.GetBucketEncryptionOutput)
@@ -794,8 +961,11 @@ func getBucketAdminState(params map[string]interface{}) (map[string]interface{},
 	encryptionSummary := "Not configured"
 	if encryption != nil && encryption.ServerSideEncryptionConfiguration != nil && len(encryption.ServerSideEncryptionConfiguration.Rules) > 0 {
 		applyDefault := encryption.ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault
-		algo := string(applyDefault.SSEAlgorithm)
-		if applyDefault.KMSMasterKeyID != nil && aws.ToString(applyDefault.KMSMasterKeyID) != "" {
+		algo := ""
+		if applyDefault != nil {
+			algo = string(applyDefault.SSEAlgorithm)
+		}
+		if applyDefault != nil && applyDefault.KMSMasterKeyID != nil && aws.ToString(applyDefault.KMSMasterKeyID) != "" {
 			encryptionSummary = fmt.Sprintf("%s (%s)", algo, aws.ToString(applyDefault.KMSMasterKeyID))
 		} else {
 			encryptionSummary = algo
@@ -811,12 +981,19 @@ func getBucketAdminState(params map[string]interface{}) (map[string]interface{},
 
 	objectLockMode := ""
 	objectLockRetention := interface{}(nil)
+	objectLockRetentionUnit := ""
+	objectLockRetentionDays := interface{}(nil)
+	objectLockRetentionYears := interface{}(nil)
 	if lockConfig != nil && lockConfig.ObjectLockConfiguration != nil && lockConfig.ObjectLockConfiguration.Rule != nil && lockConfig.ObjectLockConfiguration.Rule.DefaultRetention != nil {
 		objectLockMode = string(lockConfig.ObjectLockConfiguration.Rule.DefaultRetention.Mode)
 		if lockConfig.ObjectLockConfiguration.Rule.DefaultRetention.Days != nil {
 			objectLockRetention = aws.ToInt32(lockConfig.ObjectLockConfiguration.Rule.DefaultRetention.Days)
+			objectLockRetentionUnit = "days"
+			objectLockRetentionDays = objectLockRetention
 		} else if lockConfig.ObjectLockConfiguration.Rule.DefaultRetention.Years != nil {
 			objectLockRetention = aws.ToInt32(lockConfig.ObjectLockConfiguration.Rule.DefaultRetention.Years)
+			objectLockRetentionUnit = "years"
+			objectLockRetentionYears = objectLockRetention
 		}
 	}
 
@@ -833,29 +1010,36 @@ func getBucketAdminState(params map[string]interface{}) (map[string]interface{},
 		encryptionJSON = mustJSON(encryption.ServerSideEncryptionConfiguration)
 	}
 	lifecycleJSON := `{"Rules":[]}`
+	lifecycleMinimumSize := ""
 	if lifecycle != nil {
 		lifecycleJSON = mustJSON(map[string]interface{}{"Rules": lifecycle.Rules})
+		lifecycleMinimumSize = string(lifecycle.TransitionDefaultMinimumObjectSize)
 	}
 
 	return map[string]interface{}{
-		"bucketName":              bucketName,
-		"versioningEnabled":       versioning.Status == types.BucketVersioningStatusEnabled,
-		"versioningStatus":        string(versioning.Status),
-		"objectLockEnabled":       lockConfig != nil && lockConfig.ObjectLockConfiguration != nil,
-		"lifecycleEnabled":        len(lifecycleRules) > 0,
-		"policyAttached":          policy != nil && policy.Policy != nil && aws.ToString(policy.Policy) != "",
-		"corsEnabled":             cors != nil && len(cors.CORSRules) > 0,
-		"encryptionEnabled":       encryption != nil && encryption.ServerSideEncryptionConfiguration != nil && len(encryption.ServerSideEncryptionConfiguration.Rules) > 0,
-		"encryptionSummary":       encryptionSummary,
-		"objectLockMode":          emptyToNil(objectLockMode),
-		"objectLockRetentionDays": objectLockRetention,
-		"tags":                    tags,
-		"lifecycleRules":          lifecycleRules,
-		"lifecycleJson":           lifecycleJSON,
-		"policyJson":              policyJSON,
-		"corsJson":                corsJSON,
-		"encryptionJson":          encryptionJSON,
-		"apiCalls":                apiCalls,
+		"bucketName":               bucketName,
+		"versioningEnabled":        versioning.Status == types.BucketVersioningStatusEnabled,
+		"versioningStatus":         string(versioning.Status),
+		"objectLockEnabled":        lockConfig != nil && lockConfig.ObjectLockConfiguration != nil,
+		"lifecycleEnabled":         len(lifecycleRules) > 0,
+		"policyAttached":           policy != nil && policy.Policy != nil && aws.ToString(policy.Policy) != "",
+		"corsEnabled":              cors != nil && len(cors.CORSRules) > 0,
+		"encryptionEnabled":        encryption != nil && encryption.ServerSideEncryptionConfiguration != nil && len(encryption.ServerSideEncryptionConfiguration.Rules) > 0,
+		"encryptionSummary":        encryptionSummary,
+		"objectLockMode":           emptyToNil(objectLockMode),
+		"objectLockRetentionDays":  objectLockRetentionDays,
+		"objectLockRetentionYears": objectLockRetentionYears,
+		"objectLockRetention":      map[string]interface{}{"value": objectLockRetention, "unit": objectLockRetentionUnit},
+		"objectLockRetentionValue": objectLockRetention, "objectLockRetentionUnit": objectLockRetentionUnit,
+		"tags":                               tags,
+		"lifecycleRules":                     lifecycleRules,
+		"transitionDefaultMinimumObjectSize": emptyToNil(lifecycleMinimumSize),
+		"lifecycleJson":                      lifecycleJSON,
+		"policyJson":                         policyJSON,
+		"corsJson":                           corsJSON,
+		"encryptionJson":                     encryptionJSON,
+		"sections":                           sections,
+		"apiCalls":                           apiCalls,
 	}, nil
 }
 
@@ -871,11 +1055,14 @@ func putBucketLifecycle(params map[string]interface{}) (map[string]interface{}, 
 	var configPayload struct {
 		Rules []types.LifecycleRule `json:"Rules"`
 	}
-	if err = json.Unmarshal([]byte(lifecycleJSON), &configPayload); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(lifecycleJSON))
+	decoder.DisallowUnknownFields()
+	if err = decoder.Decode(&configPayload); err != nil {
 		return nil, &sidecarError{Code: "invalid_config", Message: "Lifecycle JSON could not be parsed.", Details: map[string]interface{}{"reason": err.Error()}}
 	}
 	if _, err = client.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
-		Bucket: aws.String(bucketName),
+		Bucket:                             aws.String(bucketName),
+		TransitionDefaultMinimumObjectSize: types.TransitionDefaultMinimumObjectSize(asString(params["transitionDefaultMinimumObjectSize"])),
 		LifecycleConfiguration: &types.BucketLifecycleConfiguration{
 			Rules: configPayload.Rules,
 		},
@@ -1028,7 +1215,7 @@ func listObjectVersions(params map[string]interface{}) (map[string]interface{}, 
 	if err != nil {
 		return nil, err
 	}
-	key := strings.TrimSpace(asString(params["key"]))
+	key := asString(params["key"])
 	options := asMap(params["options"])
 	filterValue := ""
 	filterMode := "prefix"
@@ -1110,7 +1297,7 @@ func getObjectDetails(params map[string]interface{}) (map[string]interface{}, er
 	if err != nil {
 		return nil, err
 	}
-	key := strings.TrimSpace(asString(params["key"]))
+	key := asString(params["key"])
 	if key == "" {
 		return nil, &sidecarError{Code: "invalid_config", Message: "Bucket name and object key are required for object inspection."}
 	}
@@ -1125,13 +1312,13 @@ func getObjectDetails(params map[string]interface{}) (map[string]interface{}, er
 	}
 
 	headAny, err := callAPI(ctx, client, &apiCalls, "HeadObject", func(ctx context.Context, client *s3.Client) (interface{}, error) {
-		return client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucketName), Key: aws.String(key)})
+		return client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucketName), Key: aws.String(key), VersionId: stringPtr(asString(params["versionId"]))})
 	})
 	if err != nil {
 		return nil, err
 	}
 	tagAny, err := optionalAPI(ctx, client, &apiCalls, "GetObjectTagging", missingBucketConfigCodes(), func(ctx context.Context, client *s3.Client) (interface{}, error) {
-		return client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{Bucket: aws.String(bucketName), Key: aws.String(key)})
+		return client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{Bucket: aws.String(bucketName), Key: aws.String(key), VersionId: stringPtr(asString(params["versionId"]))})
 	})
 	if err != nil {
 		return nil, err
@@ -1188,7 +1375,7 @@ func createFolder(params map[string]interface{}) (map[string]interface{}, error)
 	if err != nil {
 		return nil, err
 	}
-	key := strings.TrimSpace(asString(params["key"]))
+	key := asString(params["key"])
 	if key == "" {
 		return nil, &sidecarError{Code: "invalid_config", Message: "Bucket name and key are required to create a folder."}
 	}
@@ -1206,30 +1393,7 @@ func createFolder(params map[string]interface{}) (map[string]interface{}, error)
 }
 
 func copyObject(params map[string]interface{}) (map[string]interface{}, error) {
-	p, err := parseProfile(asMap(params["profile"]))
-	if err != nil {
-		return nil, err
-	}
-	sourceBucket := strings.TrimSpace(asString(params["sourceBucketName"]))
-	sourceKey := strings.TrimSpace(asString(params["sourceKey"]))
-	destinationBucket := strings.TrimSpace(asString(params["destinationBucketName"]))
-	destinationKey := strings.TrimSpace(asString(params["destinationKey"]))
-	if sourceBucket == "" || sourceKey == "" || destinationBucket == "" || destinationKey == "" {
-		return nil, &sidecarError{Code: "invalid_config", Message: "Copy source and destination are required."}
-	}
-	client, ctx, err := buildClient(p)
-	if err != nil {
-		return nil, err
-	}
-	copySource := url.PathEscape(sourceBucket + "/" + sourceKey)
-	if _, err = client.CopyObject(ctx, &s3.CopyObjectInput{
-		Bucket:     aws.String(destinationBucket),
-		Key:        aws.String(destinationKey),
-		CopySource: aws.String(copySource),
-	}); err != nil {
-		return nil, err
-	}
-	return map[string]interface{}{"successCount": 1, "failureCount": 0, "failures": []interface{}{}}, nil
+	return copyObjectAdvanced(params)
 }
 
 func moveObject(params map[string]interface{}) (map[string]interface{}, error) {
@@ -1246,10 +1410,17 @@ func moveObject(params map[string]interface{}) (map[string]interface{}, error) {
 		return nil, err
 	}
 	if _, err = client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(strings.TrimSpace(asString(params["sourceBucketName"]))),
-		Key:    aws.String(strings.TrimSpace(asString(params["sourceKey"]))),
+		Bucket:    aws.String(strings.TrimSpace(asString(params["sourceBucketName"]))),
+		Key:       aws.String(asString(params["sourceKey"])),
+		IfMatch:   stringPtr(asString(result["sourceETag"])),
+		VersionId: stringPtr(asString(params["sourceVersionId"])),
 	}); err != nil {
-		return nil, err
+		result["successCount"] = 0
+		result["failureCount"] = 1
+		result["copiedCount"] = 1
+		result["sourceRetained"] = true
+		result["failures"] = []map[string]interface{}{{"target": asString(params["sourceKey"]), "code": "source_delete_failed", "message": "Copy completed; source deletion failed: " + err.Error()}}
+		return result, nil
 	}
 	return result, nil
 }
@@ -1349,7 +1520,7 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 	if err != nil {
 		return nil, err
 	}
-	prefix := strings.TrimSpace(asString(params["prefix"]))
+	prefix := asString(params["prefix"])
 	filePaths := asStringSlice(params["filePaths"])
 	objectKeyByPath := asStringMap(params["objectKeyByPath"])
 	if len(filePaths) == 0 {
@@ -1357,6 +1528,12 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 	}
 	thresholdBytes := int64(maxInt(asInt(params["multipartThresholdMiB"]), 1, 32)) * 1024 * 1024
 	chunkBytes := int64(maxInt(asInt(params["multipartChunkMiB"]), 1, 8)) * 1024 * 1024
+	if chunkBytes < 5*1024*1024 {
+		chunkBytes = 5 * 1024 * 1024
+	}
+	if chunkBytes > 5*1024*1024*1024 {
+		chunkBytes = 5 * 1024 * 1024 * 1024
+	}
 	totalBytes := int64(0)
 	partsTotal := 0
 	usesMultipart := false
@@ -1364,6 +1541,9 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 		info, statErr := os.Stat(filePath)
 		if statErr != nil {
 			return nil, statErr
+		}
+		if info.Size() > 50000*1024*1024*1024 || (info.Size() >= thresholdBytes && (info.Size()+chunkBytes-1)/chunkBytes > 10000) {
+			return nil, &sidecarError{Code: "invalid_config", Message: "Upload exceeds S3 object or 10,000-part limits; select a larger part size."}
 		}
 		totalBytes += info.Size()
 		if info.Size() >= thresholdBytes {
@@ -1398,7 +1578,7 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 		}
 		targetKey := filepath.Base(filePath)
 		if mappedKey, ok := objectKeyByPath[filePath]; ok && strings.TrimSpace(mappedKey) != "" {
-			targetKey = strings.TrimLeft(strings.ReplaceAll(mappedKey, "\\", "/"), "/")
+			targetKey = mappedKey
 		}
 		if prefix != "" {
 			targetKey = prefix + targetKey
@@ -1444,24 +1624,14 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 					if offset+length > fileSize {
 						length = fileSize - offset
 					}
-					buffer := make([]byte, length)
-					readBytes, readErr := handle.ReadAt(buffer, offset)
-					if readErr != nil && !(errors.Is(readErr, io.EOF) && int64(readBytes) == length) {
-						stateMu.Lock()
-						if uploadErr == nil {
-							uploadErr = readErr
-						}
-						stateMu.Unlock()
-						cancelWorkers()
-						return
-					}
 					partNumber := int32(partIndex + 1)
 					partOutput, partErr := client.UploadPart(workerCtx, &s3.UploadPartInput{
-						Bucket:     aws.String(bucketName),
-						Key:        aws.String(targetKey),
-						UploadId:   createOutput.UploadId,
-						PartNumber: aws.Int32(partNumber),
-						Body:       bytes.NewReader(buffer),
+						Bucket:        aws.String(bucketName),
+						Key:           aws.String(targetKey),
+						UploadId:      createOutput.UploadId,
+						PartNumber:    aws.Int32(partNumber),
+						Body:          io.NewSectionReader(handle, offset, length),
+						ContentLength: aws.Int64(length),
 					})
 					if partErr != nil {
 						stateMu.Lock()
@@ -1515,6 +1685,9 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 					Parts: completed,
 				},
 			})
+			if err != nil {
+				_, _ = client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: aws.String(bucketName), Key: aws.String(targetKey), UploadId: createOutput.UploadId})
+			}
 		} else {
 			_, err = client.PutObject(ctx, &s3.PutObjectInput{
 				Bucket: aws.String(bucketName),
@@ -1557,8 +1730,9 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 	validators := make(map[string]string, len(keys))
 	for _, key := range keys {
 		headOutput, headErr := client.HeadObject(ctx, &s3.HeadObjectInput{
-			Bucket: aws.String(bucketName),
-			Key:    aws.String(key),
+			Bucket:    aws.String(bucketName),
+			Key:       aws.String(key),
+			VersionId: stringPtr(asString(params["versionId"])),
 		})
 		if headErr != nil {
 			return nil, headErr
@@ -1642,32 +1816,39 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 					}
 					rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
 					output, getErr := client.GetObject(workerCtx, &s3.GetObjectInput{
-						Bucket:  aws.String(bucketName),
-						Key:     aws.String(objectKey),
-						IfMatch: optionalString(validators[objectKey]),
-						Range:   aws.String(rangeHeader),
+						Bucket:    aws.String(bucketName),
+						Key:       aws.String(objectKey),
+						VersionId: stringPtr(asString(params["versionId"])),
+						IfMatch:   optionalString(validators[objectKey]),
+						Range:     aws.String(rangeHeader),
 					})
 					if getErr != nil {
 						recordFailure(getErr)
 						return
 					}
-					buffer, readErr := io.ReadAll(io.LimitReader(output.Body, end-start+2))
+					expectedLength := end - start + 1
+					if aws.ToString(output.ContentRange) != fmt.Sprintf("bytes %d-%d/%d", start, end, size) {
+						output.Body.Close()
+						recordFailure(fmt.Errorf("download range mismatch"))
+						return
+					}
+					if received := aws.ToString(output.ETag); received != "" && validators[objectKey] != "" && received != validators[objectKey] {
+						output.Body.Close()
+						recordFailure(fmt.Errorf("download source changed during range request"))
+						return
+					}
+					copied, readErr := copyTransferRange(&offsetFileWriter{file: handle, offset: start}, io.LimitReader(output.Body, expectedLength+1))
 					output.Body.Close()
 					if readErr != nil {
 						recordFailure(readErr)
 						return
 					}
-					expectedLength := end - start + 1
-					if aws.ToString(output.ContentRange) != fmt.Sprintf("bytes %d-%d/%d", start, end, size) || int64(len(buffer)) != expectedLength {
-						recordFailure(fmt.Errorf("short read for byte range %d-%d of %s: expected %d bytes, received %d", start, end, objectKey, expectedLength, len(buffer)))
-						return
-					}
-					if _, writeErr := handle.WriteAt(buffer, start); writeErr != nil {
-						recordFailure(writeErr)
+					if copied != expectedLength {
+						recordFailure(fmt.Errorf("download range length mismatch"))
 						return
 					}
 					stateMu.Lock()
-					bytesTransferred += int64(len(buffer))
+					bytesTransferred += copied
 					partsCompleted++
 					partDone = partsCompleted
 					if partsCompleted <= maxPartOutputLines {
@@ -1691,9 +1872,10 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 			}
 		} else {
 			output, getErr := client.GetObject(ctx, &s3.GetObjectInput{
-				Bucket:  aws.String(bucketName),
-				Key:     aws.String(key),
-				IfMatch: optionalString(validators[key]),
+				Bucket:    aws.String(bucketName),
+				Key:       aws.String(key),
+				VersionId: stringPtr(asString(params["versionId"])),
+				IfMatch:   optionalString(validators[key]),
 			})
 			if getErr != nil {
 				handle.Close()
@@ -1749,15 +1931,16 @@ func generatePresignedURL(params map[string]interface{}) (map[string]interface{}
 	if err != nil {
 		return nil, err
 	}
-	key := strings.TrimSpace(asString(params["key"]))
+	key := asString(params["key"])
 	expiration := maxInt(asInt(params["expirationSeconds"]), 1, 3600)
 	if key == "" {
 		return nil, &sidecarError{Code: "invalid_config", Message: "Bucket name and object key are required to generate a presigned URL."}
 	}
 	presignClient := s3.NewPresignClient(client)
 	output, err := presignClient.PresignGetObject(context.Background(), &s3.GetObjectInput{
-		Bucket: aws.String(bucketName),
-		Key:    aws.String(key),
+		Bucket:    aws.String(bucketName),
+		Key:       aws.String(key),
+		VersionId: stringPtr(asString(params["versionId"])),
 	}, func(options *s3.PresignOptions) {
 		options.Expires = time.Duration(expiration) * time.Second
 	})
@@ -1934,171 +2117,7 @@ func runPutTestData(params map[string]interface{}) map[string]interface{} {
 }
 
 func runDeleteAll(params map[string]interface{}) map[string]interface{} {
-	const label = "delete-all"
-	config := asMap(params["config"])
-	bucketName := strings.TrimSpace(asString(config["bucketName"]))
-	if bucketName == "" {
-		return toolFailure(label, &sidecarError{Code: "invalid_config", Message: "Bucket name is required."})
-	}
-	listMaxKeys := maxInt(asInt(config["listMaxKeys"]), 1, 1000)
-	if listMaxKeys > 1000 {
-		listMaxKeys = 1000
-	}
-	batchSize := maxInt(asInt(config["batchSize"]), 1, 1000)
-	if batchSize > 1000 {
-		batchSize = 1000
-	}
-	maxWorkers := maxInt(asInt(config["maxWorkers"]), 1, 4)
-	if maxWorkers > 16 {
-		maxWorkers = 16
-	}
-	deletionDelay := time.Duration(max(asInt(config["deletionDelayMs"]), 0)) * time.Millisecond
-	p, err := parseProfile(asMap(params["profile"]))
-	if err != nil {
-		return toolFailure(label, err)
-	}
-	client, ctx, err := buildClient(p)
-	if err != nil {
-		return toolFailure(label, err)
-	}
-	started := time.Now()
-	var (
-		wg           sync.WaitGroup
-		countMu      sync.Mutex
-		deletedCount int
-		failureCount int
-		firstFailure error
-	)
-	sem := make(chan struct{}, maxWorkers)
-	dispatchedBatches := 0
-	dispatchBatch := func(identifiers []types.ObjectIdentifier) {
-		if len(identifiers) == 0 {
-			return
-		}
-		if dispatchedBatches > 0 && deletionDelay > 0 {
-			time.Sleep(deletionDelay)
-		}
-		dispatchedBatches++
-		sem <- struct{}{}
-		wg.Add(1)
-		go func(identifiers []types.ObjectIdentifier) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			output, deleteErr := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-				Bucket: aws.String(bucketName),
-				Delete: &types.Delete{Objects: identifiers, Quiet: aws.Bool(true)},
-			})
-			countMu.Lock()
-			defer countMu.Unlock()
-			if deleteErr != nil {
-				failureCount += len(identifiers)
-				if firstFailure == nil {
-					firstFailure = deleteErr
-				}
-				return
-			}
-			failed := len(output.Errors)
-			failureCount += failed
-			deletedCount += len(identifiers) - failed
-			if failed > 0 && firstFailure == nil {
-				firstFailure = fmt.Errorf("%s: %s", aws.ToString(output.Errors[0].Code), aws.ToString(output.Errors[0].Message))
-			}
-		}(identifiers)
-	}
-	dispatchIdentifiers := func(identifiers []types.ObjectIdentifier) {
-		for start := 0; start < len(identifiers); start += batchSize {
-			end := start + batchSize
-			if end > len(identifiers) {
-				end = len(identifiers)
-			}
-			dispatchBatch(identifiers[start:end])
-		}
-	}
-	listedCount := 0
-	listMode := "versions"
-	var keyMarker, versionMarker *string
-	for {
-		versionOutput, listErr := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
-			Bucket:          aws.String(bucketName),
-			MaxKeys:         aws.Int32(int32(listMaxKeys)),
-			KeyMarker:       keyMarker,
-			VersionIdMarker: versionMarker,
-		})
-		if listErr != nil {
-			if keyMarker == nil && versionMarker == nil {
-				listMode = "objects"
-				break
-			}
-			wg.Wait()
-			return toolFailure(label, listErr)
-		}
-		identifiers := make([]types.ObjectIdentifier, 0, listMaxKeys)
-		for _, version := range versionOutput.Versions {
-			identifiers = append(identifiers, types.ObjectIdentifier{Key: version.Key, VersionId: version.VersionId})
-		}
-		for _, marker := range versionOutput.DeleteMarkers {
-			identifiers = append(identifiers, types.ObjectIdentifier{Key: marker.Key, VersionId: marker.VersionId})
-		}
-		listedCount += len(identifiers)
-		dispatchIdentifiers(identifiers)
-		if !aws.ToBool(versionOutput.IsTruncated) {
-			break
-		}
-		nextKeyMarker := versionOutput.NextKeyMarker
-		nextVersionMarker := versionOutput.NextVersionIdMarker
-		if aws.ToString(nextKeyMarker) == "" && aws.ToString(nextVersionMarker) == "" {
-			// Non-strict S3-compatible servers may report truncation without
-			// returning continuation markers; stop instead of looping forever.
-			break
-		}
-		if aws.ToString(nextKeyMarker) == aws.ToString(keyMarker) && aws.ToString(nextVersionMarker) == aws.ToString(versionMarker) {
-			wg.Wait()
-			return toolFailure(label, fmt.Errorf("version listing made no progress (markers did not advance); aborting delete-all"))
-		}
-		keyMarker = nextKeyMarker
-		versionMarker = nextVersionMarker
-	}
-	if listMode == "objects" {
-		var continuationToken *string
-		for {
-			listOutput, listErr := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-				Bucket:            aws.String(bucketName),
-				MaxKeys:           aws.Int32(int32(listMaxKeys)),
-				ContinuationToken: continuationToken,
-			})
-			if listErr != nil {
-				wg.Wait()
-				return toolFailure(label, listErr)
-			}
-			identifiers := make([]types.ObjectIdentifier, 0, listMaxKeys)
-			for _, object := range listOutput.Contents {
-				identifiers = append(identifiers, types.ObjectIdentifier{Key: object.Key})
-			}
-			listedCount += len(identifiers)
-			dispatchIdentifiers(identifiers)
-			if !aws.ToBool(listOutput.IsTruncated) {
-				break
-			}
-			continuationToken = listOutput.NextContinuationToken
-		}
-	}
-	wg.Wait()
-	duration := time.Since(started)
-	outputLines := []string{
-		fmt.Sprintf("Bucket: %s", bucketName),
-		fmt.Sprintf("Listing mode: %s (page size %d)", listMode, listMaxKeys),
-		fmt.Sprintf("Batch size: %d", batchSize),
-		fmt.Sprintf("Workers: %d", maxWorkers),
-		fmt.Sprintf("Listed: %d", listedCount),
-		fmt.Sprintf("Deleted: %d", deletedCount),
-		fmt.Sprintf("Failures: %d", failureCount),
-		fmt.Sprintf("Duration: %s", duration.Round(time.Millisecond)),
-	}
-	if firstFailure != nil {
-		outputLines = append(outputLines, fmt.Sprintf("First error: %s", firstFailure.Error()))
-		return toolState(label, fmt.Sprintf("Deleted %d object version(s) from %s with %d failure(s).", deletedCount, bucketName, failureCount), outputLines, 1)
-	}
-	return toolState(label, fmt.Sprintf("Deleted %d object version(s) from %s.", deletedCount, bucketName), outputLines, 0)
+	return deleteAllAdvanced(params)
 }
 
 func cancelToolExecution(params map[string]interface{}) map[string]interface{} {
@@ -2116,7 +2135,8 @@ func cancelToolExecution(params map[string]interface{}) map[string]interface{} {
 
 func runtimeDir() string {
 	path := filepath.Join(os.TempDir(), "object-data-browser-go-engine")
-	_ = os.MkdirAll(path, 0o755)
+	_ = os.MkdirAll(path, 0o700)
+	_ = os.Chmod(path, 0o700)
 	return path
 }
 
@@ -2166,6 +2186,38 @@ func benchmarkRatios(workloadType string) []struct {
 			{name: "DELETE", ratio: 33},
 		}
 	}
+}
+
+func benchmarkOperationForIndex(config map[string]interface{}, index int) string {
+	mode := asString(config["workloadType"])
+	if mode == "write-only" {
+		return "PUT"
+	}
+	if mode == "read-only" {
+		return "GET"
+	}
+	ratios := benchmarkRatios(mode)
+	if mode == "custom" {
+		ratios[0].ratio = max(0, asInt(config["writePercent"]))
+		ratios[1].ratio = max(0, asInt(config["readPercent"]))
+		ratios[2].ratio = max(0, asInt(config["deletePercent"]))
+	}
+	total := 0
+	for _, ratio := range ratios {
+		total += ratio.ratio
+	}
+	if total <= 0 {
+		return "PUT"
+	}
+	slot := index % total
+	cumulative := 0
+	for _, ratio := range ratios {
+		cumulative += ratio.ratio
+		if slot < cumulative {
+			return ratio.name
+		}
+	}
+	return "PUT"
 }
 
 func benchmarkProfile(profilePayload, config map[string]interface{}) (profile, error) {
@@ -2345,28 +2397,33 @@ func benchmarkLatencyPercentiles(values []float64) map[string]interface{} {
 	}
 }
 
+// Old recovery files contain only a one-second bucket. Keep that coarse endpoint
+// explicit rather than inventing evenly spaced subsecond completion timestamps.
+func benchmarkRecordElapsed(record map[string]interface{}) (float64, string) {
+	if value, present := record["elapsedMs"]; present && value != nil {
+		elapsed := asFloat(value)
+		if elapsed >= 0 && !math.IsNaN(elapsed) && !math.IsInf(elapsed, 0) {
+			source := asString(record["timingSource"])
+			if source == "" {
+				source = "recorded-elapsed"
+			}
+			return elapsed, source
+		}
+	}
+	return float64(max(asInt(record["second"]), 1)) * 1000, "legacy-coarse"
+}
+
 func benchmarkSummaryFromState(state map[string]interface{}) map[string]interface{} {
 	history := asMapSlice(state["history"])
-	operationsByType := map[string]interface{}{}
+	cumulative := benchmarkCumulativeMetrics(state)
+	operationsByType := maps.Clone(asMap(cumulative["operationsByType"]))
+	checksumStats := maps.Clone(asMap(cumulative["checksumStats"]))
 	latencies := make([]float64, 0, len(history))
-	checksumStats := map[string]interface{}{
-		"validated_success": 0,
-		"validated_failure": 0,
-		"not_used":          0,
-	}
 	windows := map[int][]map[string]interface{}{}
 	sizeLatency := map[int][]float64{}
 	for _, record := range history {
-		operation := strings.ToUpper(asString(record["operation"]))
-		operationCount := benchmarkOperationCount(record)
-		operationsByType[operation] = asInt(operationsByType[operation]) + operationCount
 		latency := asFloat(record["latencyMs"])
 		latencies = append(latencies, latency)
-		checksumKey := asString(record["checksumState"])
-		if checksumKey == "" {
-			checksumKey = "not_used"
-		}
-		checksumStats[checksumKey] = asInt(checksumStats[checksumKey]) + operationCount
 		second := max(asInt(record["second"]), 1)
 		windows[second] = append(windows[second], record)
 		sizeBytes := asInt(record["sizeBytes"])
@@ -2380,27 +2437,32 @@ func benchmarkSummaryFromState(state map[string]interface{}) map[string]interfac
 	}
 	sort.Ints(windowKeys)
 	throughputSeries := make([]map[string]interface{}, 0, len(windowKeys))
-	averageOps := 0.0
-	averageBytes := 0.0
-	peakOps := 0
-	peakBytes := 0
+	totalOps := asInt(cumulative["operationCount"])
+	totalBytes := asInt(cumulative["bytesTransferred"])
+	peakOps := 0.0
+	peakBytes := 0.0
+	activeElapsed := math.Max(asFloat(state["activeElapsedSeconds"]), 0)
 	for _, second := range windowKeys {
 		records := windows[second]
 		perOperation := map[string]interface{}{}
 		windowLatencies := make([]float64, 0, len(records))
-		bytesPerSecond := 0
+		windowBytes := 0
 		for _, record := range records {
 			operation := strings.ToUpper(asString(record["operation"]))
 			perOperation[operation] = asInt(perOperation[operation]) + benchmarkOperationCount(record)
 			windowLatencies = append(windowLatencies, asFloat(record["latencyMs"]))
-			bytesPerSecond += asInt(record["bytesTransferred"])
+			windowBytes += asInt(record["bytesTransferred"])
 		}
-		opsPerSecond := 0
+		windowOps := 0
 		for _, record := range records {
-			opsPerSecond += benchmarkOperationCount(record)
+			windowOps += benchmarkOperationCount(record)
 		}
-		averageOps += float64(opsPerSecond)
-		averageBytes += float64(bytesPerSecond)
+		windowSeconds := math.Min(1.0, math.Max(activeElapsed-float64(second-1), 0))
+		opsPerSecond, bytesPerSecond := 0.0, 0.0
+		if windowSeconds > 0 {
+			opsPerSecond = float64(windowOps) / windowSeconds
+			bytesPerSecond = float64(windowBytes) / windowSeconds
+		}
 		if opsPerSecond > peakOps {
 			peakOps = opsPerSecond
 		}
@@ -2410,29 +2472,27 @@ func benchmarkSummaryFromState(state map[string]interface{}) map[string]interfac
 		throughputSeries = append(throughputSeries, map[string]interface{}{
 			"second":           second,
 			"label":            fmt.Sprintf("%ds", second),
-			"opsPerSecond":     opsPerSecond,
-			"bytesPerSecond":   bytesPerSecond,
+			"opsPerSecond":     roundFloat(opsPerSecond),
+			"bytesPerSecond":   roundFloat(bytesPerSecond),
+			"windowSeconds":    windowSeconds,
+			"operationCount":   windowOps,
+			"bytesTransferred": windowBytes,
 			"averageLatencyMs": roundFloat(meanFloat(windowLatencies)),
 			"p95LatencyMs":     roundFloat(benchmarkPercentile(windowLatencies, 95)),
 			"operations":       perOperation,
 		})
 	}
-	secondPositions := map[int]int{}
 	latencyTimeline := make([]map[string]interface{}, 0, len(history))
 	for index, record := range history {
 		second := max(asInt(record["second"]), 1)
-		position := secondPositions[second] + 1
-		secondPositions[second] = position
-		elapsedMs := asFloat(record["elapsedMs"])
-		if elapsedMs <= 0 {
-			elapsedSeconds := float64(second-1) + (float64(position) / float64(len(windows[second])+1))
-			elapsedMs = elapsedSeconds * 1000
-		}
+		elapsedMs, timingSource := benchmarkRecordElapsed(record)
 		latencyTimeline = append(latencyTimeline, map[string]interface{}{
-			"sequence":         index + 1,
+			"sequence":         asInt(cumulative["recordCount"]) - len(history) + index + 1,
 			"operation":        strings.ToUpper(asString(record["operation"])),
 			"second":           second,
-			"elapsedMs":        roundFloat(elapsedMs),
+			"elapsedMs":        elapsedMs,
+			"timestamp":        record["timestamp"],
+			"timingSource":     timingSource,
 			"label":            benchmarkTimelineLabel(elapsedMs / 1000),
 			"latencyMs":        roundFloat(asFloat(record["latencyMs"])),
 			"sizeBytes":        asInt(record["sizeBytes"]),
@@ -2467,35 +2527,41 @@ func benchmarkSummaryFromState(state map[string]interface{}) map[string]interfac
 	if len(sizes) > 0 {
 		averageObjectSize /= len(sizes)
 	}
-	sampleCount := len(throughputSeries)
-	if sampleCount == 0 {
-		sampleCount = 1
+	averageOps, averageBytes := 0.0, 0.0
+	if activeElapsed > 0 {
+		averageOps = float64(totalOps) / activeElapsed
+		averageBytes = float64(totalBytes) / activeElapsed
 	}
 	return map[string]interface{}{
-		"totalOperations": func() int {
-			total := 0
-			for _, record := range history {
-				total += benchmarkOperationCount(record)
-			}
-			return total
-		}(),
-		"operationsByType":     operationsByType,
-		"latencyPercentilesMs": benchmarkLatencyPercentiles(latencies),
-		"throughputSeries":     throughputSeries,
-		"latencyTimeline":      latencyTimeline,
-		"sizeLatencyBuckets":   sizeLatencyBuckets,
-		"checksumStats":        checksumStats,
+		"totalOperations":       totalOps,
+		"totalBytesTransferred": totalBytes,
+		"operationsByType":      operationsByType,
+		"latencyPercentilesMs":  benchmarkLatencyPercentiles(latencies),
+		"throughputSeries":      throughputSeries,
+		"latencyTimeline":       latencyTimeline,
+		"sizeLatencyBuckets":    sizeLatencyBuckets,
+		"checksumStats":         checksumStats,
 		"detailMetrics": map[string]interface{}{
-			"sampleCount":            sampleCount,
+			"sampleCount":            len(throughputSeries),
+			"historyLimit":           benchmarkHistoryLimit,
+			"retainedHistoryCount":   len(history),
+			"totalHistoryCount":      asInt(cumulative["recordCount"]),
+			"historyTruncated":       asInt(cumulative["recordCount"]) > len(history),
+			"latencyPercentileScope": "recent retained history",
+			"peakThroughputScope":    "recent retained completion windows",
 			"sampleWindowSeconds":    1,
-			"averageOpsPerSecond":    roundFloat(averageOps / float64(sampleCount)),
-			"peakOpsPerSecond":       peakOps,
-			"averageBytesPerSecond":  roundFloat(averageBytes / float64(sampleCount)),
-			"peakBytesPerSecond":     peakBytes,
+			"activeElapsedSeconds":   activeElapsed,
+			"throughputBasis":        "completed operations and transferred bytes per active second",
+			"averageOpsPerSecond":    roundFloat(averageOps),
+			"peakOpsPerSecond":       roundFloat(peakOps),
+			"averageBytesPerSecond":  roundFloat(averageBytes),
+			"peakBytesPerSecond":     roundFloat(peakBytes),
 			"averageObjectSizeBytes": averageObjectSize,
 			"checksumValidated":      asInt(checksumStats["validated_success"]),
-			"errorCount":             0,
-			"retryCount":             0,
+			"errorCount":             asInt(state["errorCount"]),
+			"retryCount":             asInt(state["retryCount"]),
+			"errorCountMeaning":      "Failed logical storage operations and checksum mismatches.",
+			"retryCountMeaning":      "Additional HTTP attempts within a logical storage operation.",
 			"runMode":                asString(asMap(state["config"])["testMode"]),
 			"workloadType":           asString(asMap(state["config"])["workloadType"]),
 		},
@@ -2511,41 +2577,64 @@ func readBenchmarkState(runID string) (map[string]interface{}, error) {
 	if err = json.Unmarshal(data, &state); err != nil {
 		return nil, err
 	}
+	sanitized := false
+	if history := asMapSlice(state["history"]); len(history) > benchmarkHistoryLimit {
+		benchmarkCumulativeMetrics(state)
+		// Upgrade old unbounded recovery files only after preserving the full CSV.
+		csvErr := flushBenchmarkCSV(state)
+		closeBenchmarkCSV(state)
+		if csvErr != nil {
+			return nil, csvErr
+		}
+		state["history"] = append([]map[string]interface{}(nil), history[len(history)-benchmarkHistoryLimit:]...)
+		sanitized = true
+	}
+	for key := range state {
+		if key == "profile" || strings.HasPrefix(key, "_benchmark") {
+			delete(state, key)
+			sanitized = true
+		}
+	}
+	if sanitized {
+		if err = writeBenchmarkState(state); err != nil {
+			return nil, err
+		}
+	}
 	return state, nil
 }
 
 func writeBenchmarkState(state map[string]interface{}) error {
-	data, err := json.Marshal(state)
+	data, err := json.Marshal(benchmarkSafeState(state))
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(benchmarkStatePath(asString(state["id"])), data, 0o644)
+	path := benchmarkStatePath(asString(state["id"]))
+	temp, err := os.CreateTemp(runtimeDir(), ".benchmark-*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(temp.Name())
+	if _, err = temp.Write(data); err != nil {
+		temp.Close()
+		return err
+	}
+	if err = temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temp.Name(), path)
 }
 
 func refreshBenchmarkSnapshot(state map[string]interface{}) {
-	status := asString(state["status"])
-	if status != "completed" && status != "stopped" && status != "failed" {
-		lastUpdated, err := time.Parse(time.RFC3339, nonEmpty(asString(state["lastUpdatedAt"]), asString(state["startedAt"])))
-		if err != nil {
-			lastUpdated = time.Now().UTC()
-		}
-		now := time.Now().UTC()
-		state["activeElapsedSeconds"] = asFloat(state["activeElapsedSeconds"]) + now.Sub(lastUpdated).Seconds()
-		state["lastUpdatedAt"] = serializeTimePtr(now)
-	}
 	state["resultSummary"] = benchmarkSummaryFromState(state)
-	history := asMapSlice(state["history"])
-	latencies := make([]float64, 0, len(history))
-	for _, record := range history {
-		latencies = append(latencies, asFloat(record["latencyMs"]))
+	cumulative := benchmarkCumulativeMetrics(state)
+	state["averageLatencyMs"] = 0.0
+	if count := asInt(cumulative["recordCount"]); count > 0 {
+		state["averageLatencyMs"] = roundFloat(asFloat(cumulative["latencySumMs"]) / float64(count))
 	}
-	state["averageLatencyMs"] = roundFloat(meanFloat(latencies))
-	throughputSeries := asMapSlice(asMap(state["resultSummary"])["throughputSeries"])
-	if len(throughputSeries) > 0 {
-		state["throughputOpsPerSecond"] = asFloat(throughputSeries[len(throughputSeries)-1]["opsPerSecond"])
-	} else {
-		state["throughputOpsPerSecond"] = 0
-	}
+	details := asMap(asMap(state["resultSummary"])["detailMetrics"])
+	state["throughputOpsPerSecond"] = asFloat(details["averageOpsPerSecond"])
+	state["throughputBytesPerSecond"] = asFloat(details["averageBytesPerSecond"])
+	state["throughputBasis"] = "active-run-average"
 }
 
 func materializeBenchmarkState(state map[string]interface{}) (map[string]interface{}, error) {
@@ -2554,14 +2643,8 @@ func materializeBenchmarkState(state map[string]interface{}) (map[string]interfa
 		return state, nil
 	}
 	config := asMap(state["config"])
-	lastUpdated, err := time.Parse(time.RFC3339, nonEmpty(asString(state["lastUpdatedAt"]), asString(state["startedAt"])))
-	if err != nil {
-		lastUpdated = time.Now().UTC()
-	}
-	now := time.Now().UTC()
-	activeElapsed := asFloat(state["activeElapsedSeconds"]) + now.Sub(lastUpdated).Seconds()
-	state["activeElapsedSeconds"] = activeElapsed
-	state["lastUpdatedAt"] = serializeTimePtr(now)
+	advanceBenchmarkClock(state)
+	activeElapsed := asFloat(state["activeElapsedSeconds"])
 	if asBool(config["debugMode"]) {
 		emitStructuredLog(
 			"DEBUG",
@@ -2578,60 +2661,60 @@ func materializeBenchmarkState(state map[string]interface{}) (map[string]interfa
 	durationSeconds := maxInt(asInt(config["durationSeconds"]), 1, 60)
 	operationCount := maxInt(asInt(config["operationCount"]), 1, 1000)
 	threads := maxInt(asInt(config["concurrentThreads"]), 1, 1)
+	if threads > 64 {
+		threads = 64
+	}
 	processedCount := asInt(state["processedCount"])
 	durationComplete := asString(config["testMode"]) != "operation-count" && activeElapsed >= float64(durationSeconds)
 	operationComplete := asString(config["testMode"]) == "operation-count" && processedCount >= operationCount
-	effectiveElapsed := activeElapsed
-	if durationComplete {
-		effectiveElapsed = float64(durationSeconds)
-		state["activeElapsedSeconds"] = effectiveElapsed
+	// The owner runs continuously. Poll cadence never schedules storage work.
+	batchSize := threads
+	if batchSize > 64 {
+		batchSize = 64
 	}
-	rateTarget := int(effectiveElapsed * float64(threads) * 8)
-	if processedCount == 0 && rateTarget == 0 && !durationComplete && !operationComplete {
-		rateTarget = 1
+	if asString(config["testMode"]) == "operation-count" && batchSize > operationCount-processedCount {
+		batchSize = operationCount - processedCount
 	}
-	targetProcessed := rateTarget
-	if asString(config["testMode"]) == "operation-count" && targetProcessed > operationCount {
-		targetProcessed = operationCount
-	}
-	deficit := targetProcessed - processedCount
-	if deficit < 0 {
-		deficit = 0
-	}
-	batchSize := deficit
 	if durationComplete || operationComplete {
 		batchSize = 0
 	}
-	batchCap := threads * 32
-	if batchCap < 32 {
-		batchCap = 32
-	}
-	if batchCap > 8192 {
-		batchCap = 8192
-	}
-	if batchSize > batchCap {
-		batchSize = batchCap
-	}
-	if batchSize == 0 && processedCount == 0 && !durationComplete && !operationComplete {
-		batchSize = 1
-	}
 	if batchSize > 0 {
+		payloads, ok := state["_benchmarkPayloadStore"].(*benchmarkPayloadStore)
+		if !ok {
+			var storeErr error
+			payloads, storeErr = newBenchmarkPayloadStore(config)
+			if storeErr != nil {
+				return nil, storeErr
+			}
+			state["_benchmarkPayloadStore"] = payloads
+		}
+		counters, ok := state["_benchmarkCounters"].(*benchmarkCounters)
+		if !ok {
+			counters = &benchmarkCounters{}
+			counters.retries.Store(int64(asInt(state["retryCount"])))
+			state["_benchmarkCounters"] = counters
+		}
 		p, profileErr := benchmarkProfile(asMap(state["profile"]), config)
 		if profileErr != nil {
 			return nil, profileErr
 		}
-		executor, executorErr := buildBenchmarkExecutor(p, asString(config["bucketName"]))
+		executor, executorErr := buildBenchmarkExecutor(p, asString(config["bucketName"]), counters)
 		if executorErr != nil {
 			return nil, executorErr
 		}
+		executor.payloads = payloads
 		if batchErr := runBenchmarkBatch(state, executor, config, batchSize, threads, operationCount); batchErr != nil {
+			advanceBenchmarkClock(state)
 			mapped := mapError(batchErr)
 			state["status"] = "failed"
 			state["completedAt"] = serializeTimePtr(time.Now().UTC())
 			appendBenchmarkLog(state, "Benchmark failed: "+asString(mapped["message"]))
 		}
+		state["retryCount"] = int(counters.retries.Load())
 	}
-	refreshBenchmarkSnapshot(state)
+	// Keep scheduling and counters current without rebuilding the complete
+	// history and rewriting every artifact after each worker batch.
+	advanceBenchmarkClock(state)
 	if asString(state["status"]) == "running" {
 		completed := false
 		if asString(config["testMode"]) == "operation-count" {
@@ -2645,10 +2728,7 @@ func materializeBenchmarkState(state map[string]interface{}) (map[string]interfa
 			appendBenchmarkLog(state, fmt.Sprintf("Benchmark completed after %d request(s).", asInt(state["processedCount"])))
 		}
 	}
-	if err = persistBenchmarkOutputs(state); err != nil {
-		return nil, err
-	}
-	if err = writeBenchmarkState(state); err != nil {
+	if err := checkpointBenchmarkState(state, asString(state["status"]) != "running"); err != nil {
 		return nil, err
 	}
 	return state, nil
@@ -2656,6 +2736,10 @@ func materializeBenchmarkState(state map[string]interface{}) (map[string]interfa
 
 func startBenchmark(params map[string]interface{}) (map[string]interface{}, error) {
 	config := asMap(params["config"])
+	payloads, err := newBenchmarkPayloadStore(config)
+	if err != nil {
+		return nil, err
+	}
 	profilePayload := asMap(params["profile"])
 	if len(profilePayload) == 0 {
 		return nil, &sidecarError{Code: "invalid_config", Message: "Profile configuration is required for benchmark runs."}
@@ -2663,6 +2747,7 @@ func startBenchmark(params map[string]interface{}) (map[string]interface{}, erro
 	runID := fmt.Sprintf("bench-%d", time.Now().UnixNano())
 	config = benchmarkConfigWithRunDir(config, runID)
 	state := map[string]interface{}{
+		"_benchmarkPayloadStore": payloads,
 		"id":                     runID,
 		"profile":                profilePayload,
 		"config":                 config,
@@ -2683,73 +2768,28 @@ func startBenchmark(params map[string]interface{}) (map[string]interface{}, erro
 		"nextSizeIndex":          0,
 		"benchmarkPrefix":        benchmarkBasePrefix(config, runID),
 	}
-	appendBenchmarkLog(state, fmt.Sprintf("Benchmark target bucket: %s via %s.", asString(config["bucketName"]), asString(profilePayload["endpointUrl"])))
-	if err := writeBenchmarkState(state); err != nil {
+	appendBenchmarkLog(state, fmt.Sprintf("Benchmark target bucket: %s via %s.", asString(config["bucketName"]), redactedEndpoint(asString(profilePayload["endpointUrl"]))))
+	if err := checkpointBenchmarkState(state, true); err != nil {
 		return nil, err
 	}
-	return materializeBenchmarkState(state)
+	return registerBenchmarkOwner(state), nil
 }
 
 func getBenchmarkStatus(params map[string]interface{}) (map[string]interface{}, error) {
-	state, err := readBenchmarkState(strings.TrimSpace(asString(params["runId"])))
-	if err != nil {
-		return nil, err
-	}
-	return materializeBenchmarkState(state)
+	return benchmarkOwnedControl(params, "status")
 }
-
 func pauseBenchmark(params map[string]interface{}) (map[string]interface{}, error) {
-	state, err := readBenchmarkState(strings.TrimSpace(asString(params["runId"])))
-	if err != nil {
-		return nil, err
-	}
-	refreshBenchmarkSnapshot(state)
-	state["status"] = "paused"
-	appendBenchmarkLog(state, "Benchmark paused by user.")
-	if err = writeBenchmarkState(state); err != nil {
-		return nil, err
-	}
-	if err = persistBenchmarkOutputs(state); err != nil {
-		return nil, err
-	}
-	return state, nil
+	return benchmarkOwnedControl(params, "paused")
 }
-
 func resumeBenchmark(params map[string]interface{}) (map[string]interface{}, error) {
-	state, err := readBenchmarkState(strings.TrimSpace(asString(params["runId"])))
-	if err != nil {
-		return nil, err
-	}
-	state["status"] = "running"
-	state["lastUpdatedAt"] = serializeTimePtr(time.Now().UTC())
-	appendBenchmarkLog(state, "Benchmark resumed by user.")
-	if err = writeBenchmarkState(state); err != nil {
-		return nil, err
-	}
-	return materializeBenchmarkState(state)
+	return benchmarkOwnedControl(params, "running")
 }
-
 func stopBenchmark(params map[string]interface{}) (map[string]interface{}, error) {
-	state, err := readBenchmarkState(strings.TrimSpace(asString(params["runId"])))
-	if err != nil {
-		return nil, err
-	}
-	refreshBenchmarkSnapshot(state)
-	state["status"] = "stopped"
-	state["completedAt"] = serializeTimePtr(time.Now().UTC())
-	state["resultSummary"] = benchmarkSummaryFromState(state)
-	appendBenchmarkLog(state, "Benchmark stopped by user.")
-	if err = writeBenchmarkState(state); err != nil {
-		return nil, err
-	}
-	if err = persistBenchmarkOutputs(state); err != nil {
-		return nil, err
-	}
-	return state, nil
+	return benchmarkOwnedControl(params, "stopped")
 }
 
 func exportBenchmarkResults(params map[string]interface{}) (map[string]interface{}, error) {
-	state, err := getBenchmarkStatus(params)
+	state, err := benchmarkOwnedControl(params, "export")
 	if err != nil {
 		return nil, err
 	}
@@ -2770,46 +2810,49 @@ func exportBenchmarkResults(params map[string]interface{}) (map[string]interface
 }
 
 type benchmarkExecutor struct {
+	payloads    *benchmarkPayloadStore
+	putReader   func(key string, payload io.ReadSeeker, size int64) error
+	getReader   func(key string) (io.ReadCloser, error)
 	put         func(key string, payload []byte) error
 	get         func(key string) ([]byte, error)
 	deleteOne   func(key string) error
 	deleteBatch func(keys []string) (deleted map[string]bool, missing map[string]bool, fatalErrors []string, err error)
 }
 
-func buildBenchmarkExecutor(p profile, bucketName string) (*benchmarkExecutor, error) {
+func buildBenchmarkExecutor(p profile, bucketName string, counters *benchmarkCounters) (*benchmarkExecutor, error) {
 	if isAzureProfile(p) {
-		return buildAzureBenchmarkExecutor(p, bucketName)
+		return buildAzureBenchmarkExecutor(p, bucketName, counters)
 	}
-	return buildS3BenchmarkExecutor(p, bucketName)
+	return buildS3BenchmarkExecutor(p, bucketName, counters)
 }
 
-func buildS3BenchmarkExecutor(p profile, bucketName string) (*benchmarkExecutor, error) {
+func buildS3BenchmarkExecutor(p profile, bucketName string, counters *benchmarkCounters) (*benchmarkExecutor, error) {
 	client, ctx, err := buildClient(p)
 	if err != nil {
 		return nil, err
 	}
 	return &benchmarkExecutor{
-		put: func(key string, payload []byte) error {
-			_, putErr := client.PutObject(ctx, &s3.PutObjectInput{
-				Bucket: aws.String(bucketName),
-				Key:    aws.String(key),
-				Body:   bytes.NewReader(payload),
+		putReader: func(key string, payload io.ReadSeeker, size int64) error {
+			_, putErr := client.PutObject(benchmarkRequestContext(ctx, counters), &s3.PutObjectInput{
+				Bucket:        aws.String(bucketName),
+				Key:           aws.String(key),
+				Body:          payload,
+				ContentLength: aws.Int64(size),
 			})
 			return putErr
 		},
-		get: func(key string) ([]byte, error) {
-			output, getErr := client.GetObject(ctx, &s3.GetObjectInput{
+		getReader: func(key string) (io.ReadCloser, error) {
+			output, getErr := client.GetObject(benchmarkRequestContext(ctx, counters), &s3.GetObjectInput{
 				Bucket: aws.String(bucketName),
 				Key:    aws.String(key),
 			})
 			if getErr != nil {
 				return nil, getErr
 			}
-			defer output.Body.Close()
-			return io.ReadAll(output.Body)
+			return output.Body, nil
 		},
 		deleteOne: func(key string) error {
-			_, deleteErr := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			_, deleteErr := client.DeleteObject(benchmarkRequestContext(ctx, counters), &s3.DeleteObjectInput{
 				Bucket: aws.String(bucketName),
 				Key:    aws.String(key),
 			})
@@ -2820,7 +2863,7 @@ func buildS3BenchmarkExecutor(p profile, bucketName string) (*benchmarkExecutor,
 			for _, selectedKey := range keys {
 				identifiers = append(identifiers, types.ObjectIdentifier{Key: aws.String(selectedKey)})
 			}
-			output, deleteErr := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			output, deleteErr := client.DeleteObjects(benchmarkRequestContext(ctx, counters), &s3.DeleteObjectsInput{
 				Bucket: aws.String(bucketName),
 				Delete: &types.Delete{Objects: identifiers, Quiet: aws.Bool(false)},
 			})
@@ -2862,6 +2905,7 @@ type benchmarkOpPlan struct {
 }
 
 type benchmarkOpResult struct {
+	completedAt      time.Time
 	displayKey       string
 	sizeBytes        int
 	latencyMs        float64
@@ -2895,16 +2939,7 @@ func removeBenchmarkActiveObject(state map[string]interface{}, key string) {
 func planBenchmarkOperation(state map[string]interface{}, plannedCount int, supportsBatchDelete bool) benchmarkOpPlan {
 	config := asMap(state["config"])
 	activeObjects := asMapSlice(state["activeObjects"])
-	slot := plannedCount % 100
-	operation := "PUT"
-	cumulative := 0
-	for _, ratio := range benchmarkRatios(asString(config["workloadType"])) {
-		cumulative += ratio.ratio
-		if slot < cumulative {
-			operation = ratio.name
-			break
-		}
-	}
+	operation := benchmarkOperationForIndex(config, plannedCount)
 	if (operation == "GET" || operation == "DELETE") && len(activeObjects) == 0 {
 		operation = "PUT"
 	}
@@ -2972,29 +3007,54 @@ func executeBenchmarkOperation(executor *benchmarkExecutor, runID string, config
 	}
 	switch plan.operation {
 	case "PUT":
-		payload := benchmarkPayload(runID, plan.key, plan.sizeBytes, asBool(config["randomData"]))
-		started := time.Now()
-		if err := executor.put(plan.key, payload); err != nil {
-			return result, err
+		store := executor.payloads
+		if store == nil {
+			var err error
+			store, err = newBenchmarkPayloadStore(config)
+			if err != nil {
+				return result, err
+			}
 		}
-		result.latencyMs = float64(time.Since(started).Milliseconds())
-		result.bytesTransferred = len(payload)
-	case "GET":
-		started := time.Now()
-		body, err := executor.get(plan.key)
+		payload, cleanup, err := store.open(runID, plan.key, plan.sizeBytes, asBool(config["randomData"]))
 		if err != nil {
 			return result, err
 		}
-		result.latencyMs = float64(time.Since(started).Milliseconds())
-		result.bytesTransferred = len(body)
-		if asBool(config["validateChecksum"]) {
-			expected := benchmarkPayload(runID, plan.key, plan.sizeBytes, asBool(config["randomData"]))
-			if bytes.Equal(body, expected) {
-				result.checksumState = "validated_success"
-			} else {
-				result.checksumState = "validated_failure"
+		defer cleanup()
+		started := time.Now()
+		if executor.putReader != nil {
+			err = executor.putReader(plan.key, payload, int64(plan.sizeBytes))
+		} else {
+			var data []byte
+			data, err = io.ReadAll(payload)
+			if err == nil {
+				err = executor.put(plan.key, data)
 			}
 		}
+		if err != nil {
+			return result, err
+		}
+		result.latencyMs = float64(time.Since(started)) / float64(time.Millisecond)
+		result.bytesTransferred = plan.sizeBytes
+	case "GET":
+		started := time.Now()
+		var body io.ReadCloser
+		var err error
+		if executor.getReader != nil {
+			body, err = executor.getReader(plan.key)
+		} else {
+			var data []byte
+			data, err = executor.get(plan.key)
+			body = io.NopCloser(bytes.NewReader(data))
+		}
+		if err != nil {
+			return result, err
+		}
+		defer body.Close()
+		result.bytesTransferred, result.checksumState, err = benchmarkReadResult(body, runID, config, plan)
+		if err != nil {
+			return result, err
+		}
+		result.latencyMs = float64(time.Since(started)) / float64(time.Millisecond)
 	default:
 		started := time.Now()
 		if plan.multiDelete {
@@ -3002,7 +3062,7 @@ func executeBenchmarkOperation(executor *benchmarkExecutor, runID string, config
 			if err != nil {
 				return result, err
 			}
-			result.latencyMs = float64(time.Since(started).Milliseconds())
+			result.latencyMs = float64(time.Since(started)) / float64(time.Millisecond)
 			if len(fatalErrors) > 0 {
 				return result, &sidecarError{Code: "delete_failed", Message: strings.Join(fatalErrors, "; ")}
 			}
@@ -3036,7 +3096,7 @@ func executeBenchmarkOperation(executor *benchmarkExecutor, runID string, config
 			if err := executor.deleteOne(plan.key); err != nil {
 				return result, err
 			}
-			result.latencyMs = float64(time.Since(started).Milliseconds())
+			result.latencyMs = float64(time.Since(started)) / float64(time.Millisecond)
 		}
 	}
 	return result, nil
@@ -3045,22 +3105,25 @@ func executeBenchmarkOperation(executor *benchmarkExecutor, runID string, config
 // applyBenchmarkResult records a completed operation. The caller must hold
 // the benchmark state mutex.
 func applyBenchmarkResult(state map[string]interface{}, plan benchmarkOpPlan, result benchmarkOpResult, elapsedSeconds float64) {
-	history := asMapSlice(state["history"])
-	second := int(elapsedSeconds) + 1
-	history = append(history, map[string]interface{}{
-		"timestamp":        serializeTimePtr(time.Now().UTC()),
+	second := max(int(math.Ceil(elapsedSeconds)), 1)
+	completedAt := result.completedAt
+	if completedAt.IsZero() {
+		completedAt = time.Now()
+	}
+	appendBenchmarkHistory(state, map[string]interface{}{
+		"timestamp":        serializeTimePtr(completedAt),
 		"second":           second,
-		"elapsedMs":        roundFloat(elapsedSeconds * 1000),
+		"elapsedMs":        elapsedSeconds * 1000,
+		"timingSource":     "monotonic-completion",
 		"operation":        plan.operation,
 		"key":              result.displayKey,
 		"sizeBytes":        result.sizeBytes,
-		"latencyMs":        roundFloat(result.latencyMs),
+		"latencyMs":        result.latencyMs,
 		"bytesTransferred": result.bytesTransferred,
-		"success":          true,
+		"success":          result.checksumState != "validated_failure",
 		"checksumState":    result.checksumState,
 		"operationCount":   result.operationCount,
 	})
-	state["history"] = history
 	if plan.operation == "PUT" {
 		activeObjects := asMapSlice(state["activeObjects"])
 		updated := false
@@ -3076,6 +3139,13 @@ func applyBenchmarkResult(state map[string]interface{}, plan benchmarkOpPlan, re
 		}
 	}
 	state["processedCount"] = asInt(state["processedCount"]) + result.operationCount
+	if result.checksumState == "validated_failure" {
+		state["errorCount"] = asInt(state["errorCount"]) + 1
+		appendBenchmarkLog(state, "Checksum validation failed for "+plan.key)
+	}
+	if asBool(asMap(state["config"])["reducedLogging"]) {
+		return
+	}
 	if plan.operation == "DELETE" && result.operationCount > 1 {
 		appendBenchmarkLog(state, fmt.Sprintf("DELETE POST removed %d object(s) in %.1f ms.", result.operationCount, roundFloat(result.latencyMs)))
 	} else {
@@ -3096,7 +3166,10 @@ func runBenchmarkBatch(state map[string]interface{}, executor *benchmarkExecutor
 	operationMode := asString(config["testMode"]) == "operation-count"
 	runID := asString(state["id"])
 	baseElapsed := asFloat(state["activeElapsedSeconds"])
-	tickStart := time.Now()
+	tickStart, ok := state["_benchmarkClock"].(time.Time)
+	if !ok {
+		tickStart = time.Now()
+	}
 	supportsBatchDelete := executor.deleteBatch != nil
 
 	var mu sync.Mutex
@@ -3121,7 +3194,11 @@ func runBenchmarkBatch(state map[string]interface{}, executor *benchmarkExecutor
 				mu.Unlock()
 
 				result, err := executeBenchmarkOperation(executor, runID, config, plan)
+				result.completedAt = time.Now()
 				if err != nil {
+					mu.Lock()
+					state["errorCount"] = asInt(state["errorCount"]) + 1
+					mu.Unlock()
 					if isMissingBenchmarkKeyErr(err) && plan.operation != "PUT" && !plan.multiDelete {
 						mu.Lock()
 						if plan.operation == "GET" {
@@ -3140,7 +3217,7 @@ func runBenchmarkBatch(state map[string]interface{}, executor *benchmarkExecutor
 					mu.Unlock()
 					return
 				}
-				elapsedSeconds := baseElapsed + time.Since(tickStart).Seconds()
+				elapsedSeconds := baseElapsed + result.completedAt.Sub(tickStart).Seconds()
 				mu.Lock()
 				if result.logLine != "" {
 					appendBenchmarkLog(state, result.logLine)
@@ -3158,6 +3235,9 @@ func runBenchmarkBatch(state map[string]interface{}, executor *benchmarkExecutor
 		}()
 	}
 	wg.Wait()
+	if failure == nil {
+		failure, _ = state["_benchmarkCSVError"].(error)
+	}
 	return failure
 }
 
@@ -3174,24 +3254,8 @@ func persistBenchmarkOutputs(state map[string]interface{}) error {
 			return err
 		}
 	}
-	lines := []string{"second,operation,operationCount,latencyMs,sizeBytes,bytesTransferred,success,checksumState,key"}
-	for _, record := range asMapSlice(state["history"]) {
-		lines = append(lines, fmt.Sprintf(
-			"%d,%s,%d,%.1f,%d,%d,true,%s,%s",
-			asInt(record["second"]),
-			asString(record["operation"]),
-			benchmarkOperationCount(record),
-			asFloat(record["latencyMs"]),
-			asInt(record["sizeBytes"]),
-			asInt(record["bytesTransferred"]),
-			asString(record["checksumState"]),
-			asString(record["key"]),
-		))
-	}
-	if csvPath != "" {
-		if err := os.WriteFile(csvPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
-			return err
-		}
+	if err := flushBenchmarkCSV(state); err != nil {
+		return err
 	}
 	if jsonPath != "" {
 		if err := os.WriteFile(jsonPath, []byte(mustJSON(state["resultSummary"])), 0o644); err != nil {
@@ -3535,7 +3599,7 @@ func asStringSlice(value interface{}) []string {
 	}
 	result := make([]string, 0, len(items))
 	for _, item := range items {
-		text := strings.TrimSpace(asString(item))
+		text := asString(item)
 		if text != "" {
 			result = append(result, text)
 		}
@@ -3553,7 +3617,7 @@ func asStringMap(value interface{}) map[string]string {
 		return result
 	}
 	for key, item := range raw {
-		text := strings.TrimSpace(asString(item))
+		text := asString(item)
 		if text != "" {
 			result[key] = text
 		}
@@ -3616,7 +3680,7 @@ func serializeTime(value *time.Time) string {
 }
 
 func serializeTimePtr(value time.Time) string {
-	return value.UTC().Format(time.RFC3339)
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 func mustJSON(value interface{}) string {
