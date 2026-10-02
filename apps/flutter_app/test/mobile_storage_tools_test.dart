@@ -12,18 +12,31 @@ void main() {
     test(
         'deferred deletion finishes listing before mutations (failure=$listingFails)',
         () async {
+      // Mobile privacy comes from the app-owned temporary parent. Desktop Dart
+      // createTemp does not promise a portable POSIX mode for each child.
+      final fixtureRoot = await Directory.systemTemp
+          .createTemp('object-browser-tools-fixture-');
+      addTearDown(() async {
+        if (await fixtureRoot.exists()) {
+          await fixtureRoot.delete(recursive: true);
+        }
+      });
+      if (!Platform.isWindows) {
+        final chmod = await Process.run('chmod', ['700', fixtureRoot.path]);
+        expect(chmod.exitCode, 0, reason: '${chmod.stderr}');
+      }
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       final admin = MobileStorageAdmin();
       addTearDown(() async {
         admin.close();
         await server.close(force: true);
       });
-      Future<Set<String>> plans() async => (await Directory.systemTemp
+      Future<Set<String>> plans() async => (await fixtureRoot
               .list()
               .where((entry) =>
                   entry is Directory &&
-                  entry.path
-                      .split('/')
+                  entry.uri.pathSegments
+                      .where((segment) => segment.isNotEmpty)
                       .last
                       .startsWith('object-browser-delete-plan-'))
               .toList())
@@ -40,8 +53,13 @@ void main() {
         } else if (query['list-type'] == '2') {
           pages++;
           observedPlans.addAll((await plans()).difference(before));
+          if (!Platform.isWindows) {
+            expect((await fixtureRoot.stat()).mode & 0x3f, 0,
+                reason: 'The simulated app-private parent must stay private.');
+          }
           for (final path in observedPlans) {
-            expect((await Directory(path).stat()).mode & 0x3f, 0);
+            expect(Directory(path).parent.path, fixtureRoot.path,
+                reason: 'Deletion plans must remain inside the app sandbox.');
           }
           if (listingFails && pages == 3) {
             request.response.statusCode = 403;
@@ -65,18 +83,21 @@ void main() {
         }
         await request.response.close();
       });
-      final result = await admin.runStorageTool(
-          _profile(server.port)
-              .copyWith(endpointType: EndpointProfileType.awsS3),
-          {
-            'config': {
-              'bucketName': 'bucket',
-              'immediateDeletion': false,
-              'listMaxKeys': 1,
-              'batchSize': 1,
-              'maxRetries': 0,
-            }
-          });
+      final result = await IOOverrides.runZoned(
+        () => admin.runStorageTool(
+            _profile(server.port)
+                .copyWith(endpointType: EndpointProfileType.awsS3),
+            {
+              'config': {
+                'bucketName': 'bucket',
+                'immediateDeletion': false,
+                'listMaxKeys': 1,
+                'batchSize': 1,
+                'maxRetries': 0,
+              }
+            }),
+        getSystemTempDirectory: () => fixtureRoot,
+      );
       expect(result['exitCode'], listingFails ? 1 : 0);
       expect(result['listedCount'], listingFails ? 2 : 3);
       expect(result['successCount'], listingFails ? 0 : 3);
