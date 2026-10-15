@@ -1294,6 +1294,9 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
         child: ExpansionTile(
           controller: _editorExpansion,
           initiallyExpanded: _expanded,
+          // Form rows and the action bar align with the field edges instead
+          // of ExpansionTile's default centring.
+          expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
           onExpansionChanged: (value) => setState(() {
             _expanded = value;
             if (!value) {
@@ -1594,6 +1597,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
               ),
             ExpansionTile(
                 title: const Text('Advanced transport'),
+                expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
                 // Timeout errors live here; never hide the reason Save is
                 // disabled inside a collapsed section.
                 initiallyExpanded: !valid,

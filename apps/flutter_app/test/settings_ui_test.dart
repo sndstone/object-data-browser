@@ -158,4 +158,16 @@ void main() {
     expect(tester.widget<TextField>(read).controller!.text, '45');
     await tester.pumpWidget(const SizedBox());
   });
+
+  testWidgets('profile actions align with the form edge', (tester) async {
+    await openEditor(tester);
+    final save = find.widgetWithText(FilledButton, 'Save');
+    await tester.ensureVisible(save);
+    await tester.pumpAndSettle();
+    final name = find.widgetWithText(TextField, 'Profile name');
+    expect(tester.getTopLeft(save).dx,
+        moreOrLessEquals(tester.getTopLeft(name).dx, epsilon: 1));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
 }
