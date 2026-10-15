@@ -493,8 +493,10 @@ class _LogRow extends StatelessWidget {
           Tooltip(
             message: formatDateTime(entry.timestamp),
             child: SizedBox(
-              width: 68,
+              width: 68 * MediaQuery.textScalerOf(context).scale(12) / 12,
               child: Text(_clockTime(entry.timestamp),
+                  maxLines: 1,
+                  softWrap: false,
                   style: muted?.copyWith(
                       fontFeatures: const [FontFeature.tabularFigures()])),
             ),

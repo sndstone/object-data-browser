@@ -6,6 +6,7 @@ import 'package:flutter/semantics.dart';
 import '../models/domain_models.dart';
 import '../services/app_platform.dart';
 import '../widgets/app_menu.dart';
+import '../widgets/edge_fade_scroll.dart';
 
 /// Lazy rows, real batch checkboxes and an independent inspection focus.
 class ObjectTable extends StatelessWidget {
@@ -83,7 +84,7 @@ class ObjectTable extends StatelessWidget {
                     ])),
           const Divider(height: 1),
           Expanded(
-              child: ListView.builder(
+              child: VerticalEdgeFade(child: ListView.builder(
                   key: const ValueKey('object-panel-list'),
                   itemExtent: height,
                   itemCount: objects.length,
@@ -251,7 +252,7 @@ class ObjectTable extends StatelessWidget {
                                                                             buttonContext)))))),
                                               ]))));
                                 }))));
-                  })),
+                  }))),
         ]);
       });
   static const double _checkSlot = 48;

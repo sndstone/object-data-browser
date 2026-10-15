@@ -10,6 +10,40 @@ Widget host(List<EventLogEntry> entries) => MaterialApp(
             entries: entries, textScalePercent: 100, emptyMessage: 'Empty')));
 
 void main() {
+  testWidgets('time stays fully visible on one line at 130 percent', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: StructuredLogList(
+            entries: [
+              EventLogEntry(
+                timestamp: DateTime(2026, 1, 1, 23, 59, 59),
+                level: 'INFO',
+                category: 'Browser',
+                message: 'Listed objects',
+              ),
+            ],
+            textScalePercent: 130,
+            emptyMessage: 'Empty',
+          ),
+        ),
+      ),
+    );
+    final time = find.text('23:59:59');
+    final text = tester.widget<Text>(time);
+    expect(MediaQuery.textScalerOf(tester.element(time)).scale(12),
+        closeTo(15.6, .001));
+    expect(text.maxLines, 1);
+    expect(text.softWrap, isFalse);
+    // The test font draws every glyph as a full em square, so assert the
+    // column scales with text size rather than measuring rendered glyphs.
+    final column = tester.getSize(
+        find.ancestor(of: time, matching: find.byType(SizedBox)).first);
+    expect(column.width, closeTo(68 * 1.3, .001));
+    expect(tester.takeException(), isNull);
+  });
   testWidgets('trace rows announce their expanded state', (tester) async {
     final handle = tester.ensureSemantics();
     await tester.pumpWidget(host([
