@@ -1429,6 +1429,18 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
     bytes_transferred = 0
     items_completed = 0
     parts_completed = 0
+    control = _register_transfer(
+        TransferControl(
+            job_id=job_id,
+            label=label,
+            direction="upload",
+            total_bytes=total_bytes,
+            item_count=len(paths),
+            strategy_label=strategy_label,
+            part_size_bytes=part_size_bytes,
+            parts_total=parts_total if part_size_bytes is not None else None,
+        )
+    )
     _emit_transfer_event(
         _build_transfer_job(
             job_id=job_id,
@@ -1448,18 +1460,6 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
             parts_total=parts_total if part_size_bytes is not None else None,
             can_pause=True,
             can_cancel=True,
-        )
-    )
-    control = _register_transfer(
-        TransferControl(
-            job_id=job_id,
-            label=label,
-            direction="upload",
-            total_bytes=total_bytes,
-            item_count=len(paths),
-            strategy_label=strategy_label,
-            part_size_bytes=part_size_bytes,
-            parts_total=parts_total if part_size_bytes is not None else None,
         )
     )
     for path in paths:
@@ -1589,16 +1589,18 @@ def _staged_download(destination: Path, key: str, policy: str, output_lines: lis
             os.fsync(handle.fileno())
         name = _download_name(key)
         base = Path(name)
+        occupied = {}
+        for item in destination.iterdir():
+            occupied.setdefault(item.name.casefold(), item)
         for index in range(100000):
             target = destination / (name if index == 0 else f'{base.stem} ({index}){base.suffix}')
             if policy == 'replace':
-                matches = [item for item in destination.iterdir() if item.name.casefold() == target.name.casefold()]
-                target = matches[0] if matches else target
+                target = occupied.get(target.name.casefold(), target)
                 os.replace(temporary, target)
                 output_lines.append(f'Saved {key} to {target}.')
                 break
             # Treat case-only differences as conflicts on every platform.
-            if any(item.name.casefold() == target.name.casefold() for item in destination.iterdir()):
+            if target.name.casefold() in occupied:
                 continue
             try:
                 os.link(temporary, target)
@@ -1654,6 +1656,18 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
     bytes_transferred = 0
     items_completed = 0
     parts_completed = 0
+    control = _register_transfer(
+        TransferControl(
+            job_id=job_id,
+            label=label,
+            direction="download",
+            total_bytes=total_bytes,
+            item_count=len(keys),
+            strategy_label=strategy_label,
+            part_size_bytes=part_size_bytes,
+            parts_total=parts_total if part_size_bytes is not None else None,
+        )
+    )
     _emit_transfer_event(
         _build_transfer_job(
             job_id=job_id,
@@ -1673,18 +1687,6 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
             parts_total=parts_total if part_size_bytes is not None else None,
             can_pause=True,
             can_cancel=True,
-        )
-    )
-    control = _register_transfer(
-        TransferControl(
-            job_id=job_id,
-            label=label,
-            direction="download",
-            total_bytes=total_bytes,
-            item_count=len(keys),
-            strategy_label=strategy_label,
-            part_size_bytes=part_size_bytes,
-            parts_total=parts_total if part_size_bytes is not None else None,
         )
     )
     for key in keys:
@@ -2918,15 +2920,20 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
     if not bucket_name or not file_paths:
         raise SidecarError("invalid_config", "Bucket name and file paths are required.")
     multipart_threshold_bytes = _int_param(params, "multipartThresholdMiB", 32) * 1024 * 1024
-    multipart_chunk_bytes = _int_param(params, "multipartChunkMiB", 8) * 1024 * 1024
-    client = _build_client(profile)
+    multipart_chunk_bytes = min(max(_int_param(params, "multipartChunkMiB", 8), 5), 5120) * 1024 * 1024
     paths = [Path(file_path) for file_path in file_paths]
-    total_bytes = sum(path.stat().st_size for path in paths)
-    uses_multipart = any(path.stat().st_size >= multipart_threshold_bytes for path in paths)
+    sizes = {path: path.stat().st_size for path in paths}
+    for size in sizes.values():
+        if size > 50000 * 1024**3 or (size >= multipart_threshold_bytes and
+                (size + multipart_chunk_bytes - 1) // multipart_chunk_bytes > 10000):
+            raise SidecarError("invalid_config", "Upload exceeds S3 object or 10,000-part limits; select a larger part size.")
+    client = _build_client(profile)
+    total_bytes = sum(sizes[path] for path in paths)
+    uses_multipart = any(size >= multipart_threshold_bytes for size in sizes.values())
     parts_total = sum(
-        max((path.stat().st_size + multipart_chunk_bytes - 1) // multipart_chunk_bytes, 1)
+        max((sizes[path] + multipart_chunk_bytes - 1) // multipart_chunk_bytes, 1)
         for path in paths
-        if path.stat().st_size >= multipart_threshold_bytes
+        if sizes[path] >= multipart_threshold_bytes
     )
     part_size_bytes = multipart_chunk_bytes if parts_total > 0 else None
     job_id = f"upload-{uuid.uuid4().hex[:8]}"
@@ -3016,12 +3023,10 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
             completed_parts: list[dict[str, Any]] = []
             try:
                 with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                    futures = [
-                        pool.submit(_upload_one_part, part_number)
-                        for part_number in range(1, file_parts_total + 1)
-                    ]
+                    futures = _bounded_parallel(pool, _upload_one_part,
+                                                range(1, file_parts_total + 1), max_workers * 2)
                     try:
-                        for future in as_completed(futures):
+                        for future in futures:
                             part_number, etag, chunk_length = future.result()
                             completed_parts.append(
                                 {
@@ -3061,8 +3066,7 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
                                 )
                             )
                     except BaseException:
-                        for pending in futures:
-                            pending.cancel()
+                        futures.close()
                         raise
             except BaseException:
                 try:
@@ -3184,6 +3188,18 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
     bytes_transferred = 0
     items_completed = 0
     parts_completed = 0
+    control = _register_transfer(
+        TransferControl(
+            job_id=job_id,
+            label=label,
+            direction="download",
+            total_bytes=total_bytes,
+            item_count=len(keys),
+            strategy_label=strategy_label,
+            part_size_bytes=part_size_bytes,
+            parts_total=parts_total if part_size_bytes is not None else None,
+        )
+    )
     _emit_transfer_event(
         _build_transfer_job(
             job_id=job_id,
@@ -3203,18 +3219,6 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
             parts_total=parts_total if part_size_bytes is not None else None,
             can_pause=True,
             can_cancel=True,
-        )
-    )
-    control = _register_transfer(
-        TransferControl(
-            job_id=job_id,
-            label=label,
-            direction="download",
-            total_bytes=total_bytes,
-            item_count=len(keys),
-            strategy_label=strategy_label,
-            part_size_bytes=part_size_bytes,
-            parts_total=parts_total if part_size_bytes is not None else None,
         )
     )
     for key in keys:
@@ -3237,6 +3241,7 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
                     write_lock=write_lock,
                     key=key,
                 ) -> tuple[int, int, int]:
+                    _transfer_gate(control)
                     response = client.get_object(
                         Bucket=bucket_name,
                         Key=key,
@@ -3244,8 +3249,8 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
                         **version_kwargs(key),
                         **({"IfMatch": heads[key]["ETag"]} if heads[key].get("ETag") else {}),
                     )
-                    _transfer_gate(control)
                     try:
+                        _transfer_gate(control)
                         expected = end - start + 1
                         _validate_download_range(response.get('ContentRange', ''), start, end, object_size, expected)
                         received = 0

@@ -1198,8 +1198,25 @@ public final class Main {
         );
     }
 
+    static long uploadPartSizeBytes(JsonNode value) {
+        long mib = value.isIntegralNumber() && !value.canConvertToLong()
+            ? value.bigIntegerValue().signum() > 0 ? 5120 : 5
+            : value.asLong(8);
+        return Math.clamp(mib, 5L, 5120L) * 1024L * 1024L;
+    }
+
+    static void validateUploadSize(long size, long threshold, long chunk) {
+        if (size > 50000L * 1024L * 1024L * 1024L
+                || (size >= threshold && (size / chunk + (size % chunk == 0 ? 0 : 1)) > 10000)) {
+            throw new SidecarException(
+                "invalid_config",
+                "Upload exceeds S3 object or 10,000-part limits; select a larger part size.");
+        }
+    }
+
     private static Map<String, Object> startUpload(JsonNode params) throws IOException {
-        BucketContext context = bucketContext(params);
+        Profile profile = parseProfile(params.path("profile"));
+        String bucketName = requiredText(params, "bucketName", "Bucket name is required.");
         List<String> filePaths = stringArray(params.path("filePaths"));
         Map<String, String> objectKeyByPath = stringMap(params.path("objectKeyByPath"));
         if (filePaths.isEmpty()) {
@@ -1208,34 +1225,23 @@ public final class Main {
         }
         String prefix = params.path("prefix").asText("");
         int multipartThresholdMiB = Math.max(params.path("multipartThresholdMiB").asInt(32), 1);
-        int multipartChunkMiB = Math.max(params.path("multipartChunkMiB").asInt(8), 1);
         long multipartThresholdBytes = multipartThresholdMiB * 1024L * 1024L;
-        long multipartChunkBytes = multipartChunkMiB * 1024L * 1024L;
+        long multipartChunkBytes = uploadPartSizeBytes(params.path("multipartChunkMiB"));
         List<Path> paths = filePaths.stream().map(Path::of).toList();
-        long totalBytes = paths.stream().mapToLong(path -> {
-            try {
-                return Files.size(path);
-            } catch (IOException error) {
-                throw new RuntimeException(error);
+        long validatedTotalBytes = 0;
+        boolean usesMultipart = false;
+        int partsTotal = 0;
+        for (Path path : paths) {
+            long size = Files.size(path);
+            validateUploadSize(size, multipartThresholdBytes, multipartChunkBytes);
+            validatedTotalBytes += size;
+            if (size >= multipartThresholdBytes) {
+                usesMultipart = true;
+                partsTotal += (int) ((size + multipartChunkBytes - 1L) / multipartChunkBytes);
             }
-        }).sum();
-        boolean usesMultipart = paths.stream().anyMatch(path -> {
-            try {
-                return Files.size(path) >= multipartThresholdBytes;
-            } catch (IOException error) {
-                throw new RuntimeException(error);
-            }
-        });
-        int partsTotal = paths.stream().mapToInt(path -> {
-            try {
-                long size = Files.size(path);
-                return size >= multipartThresholdBytes
-                    ? (int) ((size + multipartChunkBytes - 1L) / multipartChunkBytes)
-                    : 0;
-            } catch (IOException error) {
-                throw new RuntimeException(error);
-            }
-        }).sum();
+        }
+        long totalBytes = validatedTotalBytes;
+        BucketContext context = new BucketContext(profile, bucketName, buildClient(profile));
         Long partSizeBytes = partsTotal > 0 ? multipartChunkBytes : null;
         Integer partCount = partsTotal > 0 ? partsTotal : null;
         String jobId = "upload-" + UUID.randomUUID().toString().substring(0, 8);

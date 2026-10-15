@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
 };
@@ -47,6 +48,13 @@ impl StagedDownload {
             name = format!("_{name}");
         }
         let base = Path::new(&name);
+        let mut occupied = HashMap::new();
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            occupied
+                .entry(entry.file_name().to_string_lossy().to_lowercase())
+                .or_insert_with(|| entry.path());
+        }
         for index in 0..100000 {
             let candidate = if index == 0 {
                 name.clone()
@@ -61,27 +69,15 @@ impl StagedDownload {
                     base.file_stem().unwrap_or_default().to_string_lossy()
                 )
             };
+            let existing = occupied.get(&candidate.to_lowercase());
             if policy == "replace" {
-                let mut target = directory.join(&candidate);
-                for entry in fs::read_dir(directory)? {
-                    let entry = entry?;
-                    if entry.file_name().to_string_lossy().to_lowercase()
-                        == candidate.to_lowercase()
-                    {
-                        target = entry.path();
-                        break;
-                    }
-                }
+                let target = existing
+                    .cloned()
+                    .unwrap_or_else(|| directory.join(&candidate));
                 fs::rename(&self.0, &target)?;
                 return Ok(target);
             }
-            if fs::read_dir(directory)?.any(|entry| {
-                entry
-                    .map(|e| {
-                        e.file_name().to_string_lossy().to_lowercase() == candidate.to_lowercase()
-                    })
-                    .unwrap_or(false)
-            }) {
+            if existing.is_some() {
                 continue;
             }
             let target = directory.join(candidate);
@@ -100,5 +96,104 @@ impl StagedDownload {
 impl Drop for StagedDownload {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Directory(PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("odb-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn staged(&self) -> StagedDownload {
+            let staged = StagedDownload::new(&self.0).unwrap();
+            fs::write(&staged.0, b"download").unwrap();
+            staged
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn keep_both_skips_case_insensitive_collisions() {
+        let directory = Directory::new();
+        fs::write(directory.0.join("FILE.txt"), b"original").unwrap();
+        for index in 1..=256 {
+            fs::write(directory.0.join(format!("FILE ({index}).txt")), b"original").unwrap();
+        }
+        let staged = directory.staged();
+        let target = staged
+            .publish(&directory.0, "prefix/file.txt", "keepBoth")
+            .unwrap();
+        assert_eq!(target.file_name().unwrap(), "file (257).txt");
+        assert_eq!(fs::read(target).unwrap(), b"download");
+        assert_eq!(fs::read(directory.0.join("FILE.txt")).unwrap(), b"original");
+        fs::write(directory.0.join("Ä.txt"), b"original").unwrap();
+        assert_eq!(
+            directory
+                .staged()
+                .publish(&directory.0, "ä.txt", "keepBoth")
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            "ä (1).txt"
+        );
+    }
+
+    #[test]
+    fn replace_preserves_existing_case_and_refuses_directories() {
+        let directory = Directory::new();
+        let target = directory.0.join("FILE.txt");
+        fs::write(&target, b"original").unwrap();
+        assert_eq!(
+            directory
+                .staged()
+                .publish(&directory.0, "file.txt", "replace")
+                .unwrap(),
+            target
+        );
+        assert_eq!(fs::read(target).unwrap(), b"download");
+        fs::create_dir(directory.0.join("folder")).unwrap();
+        let staged = directory.staged();
+        assert!(staged.publish(&directory.0, "FOLDER", "replace").is_err());
+        assert!(staged.0.exists());
+        assert!(directory.0.join("folder").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_never_follows_existing_symlinks() {
+        use std::os::unix::fs::symlink;
+        for dangling in [false, true] {
+            for policy in ["keepBoth", "replace"] {
+                let directory = Directory::new();
+                let outside = Directory::new();
+                let referent = outside.0.join("outside.txt");
+                if !dangling {
+                    fs::write(&referent, b"original").unwrap();
+                }
+                let link = directory.0.join("FILE.txt");
+                symlink(&referent, &link).unwrap();
+                let staged = directory.staged();
+                let target = staged.publish(&directory.0, "file.txt", policy).unwrap();
+                assert_eq!(fs::read(&target).unwrap(), b"download");
+                assert_eq!(referent.exists(), !dangling);
+                if !dangling {
+                    assert_eq!(fs::read(&referent).unwrap(), b"original");
+                }
+                assert_eq!(
+                    fs::symlink_metadata(link).unwrap().file_type().is_symlink(),
+                    policy == "keepBoth"
+                );
+            }
+        }
     }
 }

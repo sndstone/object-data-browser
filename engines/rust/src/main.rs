@@ -1500,8 +1500,28 @@ async fn upload_file_multipart(
     complete_result
 }
 
+fn upload_part_size_bytes(value: &Value) -> u64 {
+    let mib = match (value.as_i64(), value.as_u64()) {
+        (Some(size), _) => size.clamp(5, 5120) as u64,
+        (_, Some(size)) => size.clamp(5, 5120),
+        _ => 8,
+    };
+    mib * 1024 * 1024
+}
+
+fn validate_upload_size(size: u64, threshold: u64, chunk: u64) -> Result<(), SidecarError> {
+    if size > 50000 * 1024_u64.pow(3) || (size >= threshold && size.div_ceil(chunk) > 10000) {
+        return Err(SidecarError::new(
+            "invalid_config",
+            "Upload exceeds S3 object or 10,000-part limits; select a larger part size.",
+        ));
+    }
+    Ok(())
+}
+
 async fn start_upload(params: Value) -> SidecarResult {
-    let (profile, bucket_name, client) = bucket_context(&params).await?;
+    let profile = parse_profile(&params["profile"])?;
+    let bucket_name = required_text(&params, "bucketName", "Bucket name is required.")?;
     let prefix = params["prefix"].as_str().unwrap_or_default();
     let file_paths = string_array(params.get("filePaths").unwrap_or(&Value::Null));
     let object_key_by_path = string_map(params.get("objectKeyByPath").unwrap_or(&Value::Null));
@@ -1517,8 +1537,7 @@ async fn start_upload(params: Value) -> SidecarResult {
         .max(1)
         * 1024
         * 1024;
-    let multipart_chunk_bytes =
-        params["multipartChunkMiB"].as_u64().unwrap_or(8).max(1) * 1024 * 1024;
+    let multipart_chunk_bytes = upload_part_size_bytes(&params["multipartChunkMiB"]);
     let paths = file_paths.iter().map(PathBuf::from).collect::<Vec<_>>();
     let mut total_bytes = 0_u64;
     let mut parts_total = 0_u64;
@@ -1526,12 +1545,18 @@ async fn start_upload(params: Value) -> SidecarResult {
     for path in &paths {
         let metadata = fs::metadata(path)
             .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+        validate_upload_size(
+            metadata.len(),
+            multipart_threshold_bytes,
+            multipart_chunk_bytes,
+        )?;
         total_bytes += metadata.len();
         if metadata.len() >= multipart_threshold_bytes {
             uses_multipart = true;
             parts_total += metadata.len().div_ceil(multipart_chunk_bytes);
         }
     }
+    let client = build_client(&profile).await?;
     let concurrency = transfer_concurrency(&profile);
     let job_id = format!("upload-{}", short_uuid());
     let label = format!("Upload {} file(s) to {bucket_name}", paths.len());
@@ -4601,6 +4626,71 @@ fn message_indicates_tls_failure(message: &str) -> bool {
 #[cfg(test)]
 mod advanced_regressions {
     use super::*;
+    #[test]
+    fn upload_part_sizes_are_clamped_to_s3_limits() {
+        let mib = 1024 * 1024;
+        for (input, expected) in [
+            (json!(-1), 5),
+            (json!(0), 5),
+            (json!(1), 5),
+            (json!(5), 5),
+            (json!(8), 8),
+            (json!(5120), 5120),
+            (json!(5121), 5120),
+            (json!(u64::MAX), 5120),
+            (Value::Null, 8),
+        ] {
+            assert_eq!(upload_part_size_bytes(&input), expected * mib);
+        }
+    }
+
+    #[test]
+    fn upload_size_validation_checks_object_and_part_boundaries() {
+        let chunk = 5 * 1024 * 1024;
+        let max_object = 50000 * 1024_u64.pow(3);
+        for size in [0, chunk - 1, chunk, chunk * 10000] {
+            validate_upload_size(size, 1, chunk).unwrap();
+        }
+        validate_upload_size(max_object, 1, 5 * 1024_u64.pow(3)).unwrap();
+        // The part-count limit only applies when multipart is selected.
+        validate_upload_size(chunk * 10000 + 1, max_object, chunk).unwrap();
+        for (size, threshold, part_size) in [
+            (chunk * 10000 + 1, 1, chunk),
+            (chunk * 10000 + 1, chunk * 10000 + 1, chunk),
+            (max_object + 1, u64::MAX, chunk),
+            (u64::MAX, 1, chunk),
+        ] {
+            let error = validate_upload_size(size, threshold, part_size).unwrap_err();
+            assert_eq!(error.code, "invalid_config");
+            assert!(error.message.contains("10,000-part limits"));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_upload_is_rejected_before_client_creation() {
+        let staged = StagedDownload::new(&std::env::temp_dir()).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&staged.0)
+            .unwrap()
+            .set_len(5 * 1024 * 1024 * 10000 + 1)
+            .unwrap();
+        let error = start_upload(json!({
+            "profile": {
+                "endpointUrl": "not a valid endpoint",
+                "accessKey": "test", "secretKey": "test"
+            },
+            "bucketName": "test",
+            "filePaths": [staged.0],
+            "multipartThresholdMiB": 1,
+            "multipartChunkMiB": 1
+        }))
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("10,000-part limits"));
+    }
+
     #[test]
     fn parallel_benchmark_does_not_reuse_an_inflight_key() {
         let mut state = json!({"config":{"workloadType":"write-only","objectCount":1,"objectSizes":[32]},"activeObjects":[{"key":"only-key","sizeBytes":32}],"processedCount":0});

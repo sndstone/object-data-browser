@@ -25,3 +25,16 @@ java {
         languageVersion.set(JavaLanguageVersion.of(21))
     }
 }
+
+// Dependency-free regression checks; no test framework is needed by this engine.
+val transferRegressionTest by tasks.registering(JavaExec::class) {
+    dependsOn(tasks.testClasses)
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.example.s3browser.TransferRegressionTest")
+}
+
+tasks.test {
+    dependsOn(transferRegressionTest)
+    // The executable harness is run above, rather than discovered as a JUnit test.
+    exclude("**/TransferRegressionTest*.class")
+}
