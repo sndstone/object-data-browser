@@ -1,6 +1,7 @@
 import 'dart:ui' show Tristate;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/rendering.dart' show RenderParagraph;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:s3_browser_crossplat/app/s3_browser_app.dart';
@@ -24,6 +25,7 @@ Future<void> _pumpApp(WidgetTester tester, dynamic controller,
 
 void main() {
   inspectorMain();
+  keyboardNavMain();
   phoneNavMain();
   listingErrorMain();
   footerMain();
@@ -402,6 +404,36 @@ void phoneNavMain() {
           reason: '$text stays inside the navigation bar');
       expect(rect.bottom, lessThanOrEqualTo(navRect.bottom + .5));
     }
+    expect(tester.takeException(), isNull);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    c.dispose();
+  });
+}
+
+void keyboardNavMain() {
+  testWidgets('arrow keys move between object rows and Enter selects',
+      (tester) async {
+    final c = fixture.controller(fixture.TestingEngine(), fixture.Repository());
+    await c.initialize();
+    c.clearBanner();
+    await _pumpApp(tester, c);
+    final rows = c.pagedVisibleObjects;
+    final target = rows.indexWhere((o) => !o.isFolder, 1);
+    expect(target, greaterThan(0));
+
+    // Focus the first row, as Tab traversal would.
+    Focus.of(tester.element(find.text(rows.first.name))).requestFocus();
+    await tester.pump();
+    for (var i = 0; i < target + 1; i++) {
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
+      await tester.pumpAndSettle();
+    }
+    await tester.sendKeyEvent(LogicalKeyboardKey.arrowUp);
+    await tester.pumpAndSettle();
+    await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+    await tester.pumpAndSettle();
+    expect(c.selectedObject?.key, rows[target].key);
     expect(tester.takeException(), isNull);
 
     await tester.pumpWidget(const SizedBox.shrink());
