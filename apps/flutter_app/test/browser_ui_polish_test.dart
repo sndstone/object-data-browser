@@ -23,6 +23,7 @@ Future<void> _pumpApp(WidgetTester tester, dynamic controller,
 
 void main() {
   inspectorMain();
+  previewReloadMain();
   inlinePreviewMain();
   detailsFailureMain();
   viewToolsMain();
@@ -233,6 +234,41 @@ void inlinePreviewMain() {
     }
     expect(find.textContaining('first 12,000 characters'), findsOneWidget);
     expect(find.byTooltip('Open preview'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    c.dispose();
+  });
+}
+
+void previewReloadMain() {
+  testWidgets('preview offers Load preview first and reload once loaded',
+      (tester) async {
+    final c = fixture.controller(fixture.TestingEngine(), fixture.Repository());
+    await c.initialize();
+    c.clearBanner();
+    await _pumpApp(tester, c);
+    final file = c.pagedVisibleObjects.firstWhere((o) => !o.isFolder);
+    await c.setSelectedObject(file);
+
+    c.selectedObjectPreview = null;
+    c.setInspectorTab(BrowserInspectorTab.objectPreview);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('object-preview-load')), findsOneWidget);
+    expect(find.byTooltip('Reload preview'), findsNothing);
+
+    c.selectedObjectPreview = ObjectPreview(
+        key: file.key,
+        kind: ObjectPreviewKind.text,
+        loading: false,
+        supported: true,
+        message: '',
+        text: 'hello');
+    c.setInspectorTab(BrowserInspectorTab.objectDetails);
+    c.setInspectorTab(BrowserInspectorTab.objectPreview);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('object-preview-load')), findsNothing);
+    expect(find.byTooltip('Reload preview'), findsOneWidget);
     expect(tester.takeException(), isNull);
 
     await tester.pumpWidget(const SizedBox.shrink());

@@ -1345,6 +1345,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         preview.supported &&
         (preview.kind == ObjectPreviewKind.image ||
             preview.kind == ObjectPreviewKind.text);
+    final loaded =
+        preview != null && preview.key == object.key && !preview.loading;
     final titleRow = Row(
       children: [
         Text('Preview', style: theme.textTheme.titleMedium),
@@ -1355,11 +1357,13 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             onPressed: () => _showExpandedPreview(context, object, preview),
             icon: const Icon(Icons.open_in_full),
           ),
-        IconButton(
-          tooltip: 'Reload preview',
-          onPressed: controller.refreshSelectedObjectPreview,
-          icon: const Icon(Icons.refresh),
-        ),
+        // Before the first load the body offers 'Load preview' instead.
+        if (loaded)
+          IconButton(
+            tooltip: 'Reload preview',
+            onPressed: controller.refreshSelectedObjectPreview,
+            icon: const Icon(Icons.refresh),
+          ),
       ],
     );
     if (preview == null || preview.key != object.key) {
