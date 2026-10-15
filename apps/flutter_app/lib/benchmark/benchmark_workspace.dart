@@ -1115,8 +1115,9 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
 
   /// Terminal-styled live log that sticks to the newest entries.
   Widget _liveLogView(BuildContext context, BenchmarkRun run) {
-    const background = Color(0xFF0A1410);
-    const foreground = Color(0xFFC9DACF);
+    final terminal = AppTerminalColors.of(context);
+    final background = terminal.background;
+    final foreground = terminal.foreground;
     final logStyle = Theme.of(context).textTheme.bodySmall?.copyWith(
           color: foreground,
           fontFamily: 'Menlo',
@@ -1135,13 +1136,14 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(12),
         color: background,
+        border: Border.all(color: terminal.border),
       ),
       child: run.liveLog.isEmpty
           ? Center(
               child: Text(
                 'Waiting for benchmark log output...',
                 style: logStyle?.copyWith(
-                  color: foreground.withValues(alpha: 0.6),
+                  color: terminal.muted,
                 ),
               ),
             )

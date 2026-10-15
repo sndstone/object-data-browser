@@ -57,4 +57,20 @@ void main() {
         of: find.byType(AppRulerSlider), matching: find.byType(CustomPaint));
     expect(tester.getSize(ruler.last).height, greaterThanOrEqualTo(26));
   });
+
+  test('terminal log colours stay readable and distinct in both themes', () {
+    for (final theme in [
+      AppTheme.light(scalePercent: 100, desktopCompact: false),
+      AppTheme.dark(scalePercent: 100, desktopCompact: false),
+    ]) {
+      final t = theme.extension<AppTerminalColors>()!;
+      expect(_contrast(t.foreground, t.background), greaterThanOrEqualTo(7));
+      expect(_contrast(t.muted, t.background), greaterThanOrEqualTo(4.5));
+      if (theme.brightness == Brightness.dark) {
+        // The panel edge must be visible against the dark card surface.
+        expect(_contrast(t.border, theme.colorScheme.surface),
+            greaterThan(_contrast(t.background, theme.colorScheme.surface)));
+      }
+    }
+  });
 }

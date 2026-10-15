@@ -269,6 +269,9 @@ class AppTheme {
         scheme.brightness == Brightness.dark
             ? AppOperationColors.dark
             : AppOperationColors.light,
+        scheme.brightness == Brightness.dark
+            ? AppTerminalColors.dark
+            : AppTerminalColors.light,
       ],
       textTheme: textTheme,
       scaffoldBackgroundColor: scaffoldBackground,
@@ -627,5 +630,55 @@ class AppOperationColors extends ThemeExtension<AppOperationColors> {
         post: Color.lerp(post, other.post, t)!,
         head: Color.lerp(head, other.head, t)!,
         other: Color.lerp(this.other, other.other, t)!);
+  }
+}
+
+/// Colours for terminal-styled log panels. Both modes keep the dark
+/// terminal look; the dark variant adds a border so the panel does not
+/// dissolve into the near-black card surface.
+@immutable
+class AppTerminalColors extends ThemeExtension<AppTerminalColors> {
+  const AppTerminalColors({
+    required this.background,
+    required this.foreground,
+    required this.muted,
+    required this.border,
+  });
+  final Color background, foreground, muted, border;
+
+  static const light = AppTerminalColors(
+      background: Color(0xFF0A1410),
+      foreground: Color(0xFFC9DACF),
+      muted: Color(0xFF8FA89A),
+      border: Color(0x00000000));
+  static const dark = AppTerminalColors(
+      background: Color(0xFF060D0A),
+      foreground: Color(0xFFD3E3D8),
+      muted: Color(0xFF94AD9F),
+      border: AppTheme.darkBorder);
+
+  static AppTerminalColors of(BuildContext context) {
+    final theme = Theme.of(context);
+    return theme.extension<AppTerminalColors>() ??
+        (theme.brightness == Brightness.dark ? dark : light);
+  }
+
+  @override
+  AppTerminalColors copyWith(
+          {Color? background, Color? foreground, Color? muted, Color? border}) =>
+      AppTerminalColors(
+          background: background ?? this.background,
+          foreground: foreground ?? this.foreground,
+          muted: muted ?? this.muted,
+          border: border ?? this.border);
+
+  @override
+  AppTerminalColors lerp(covariant AppTerminalColors? other, double t) {
+    if (other == null) return this;
+    return AppTerminalColors(
+        background: Color.lerp(background, other.background, t)!,
+        foreground: Color.lerp(foreground, other.foreground, t)!,
+        muted: Color.lerp(muted, other.muted, t)!,
+        border: Color.lerp(border, other.border, t)!);
   }
 }
