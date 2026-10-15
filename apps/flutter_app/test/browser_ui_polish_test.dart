@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:s3_browser_crossplat/app/s3_browser_app.dart';
 import 'package:s3_browser_crossplat/models/domain_models.dart';
+import 'package:s3_browser_crossplat/utils/format.dart';
 import 'improvements_test.dart' as fixture;
 
 Future<void> _pumpApp(WidgetTester tester, dynamic controller,
@@ -42,12 +43,19 @@ void main() {
     expect(c.objectFilterValue, 'no-such-object-xyz');
     expect(clear, findsOneWidget);
     expect(find.text('No matching objects'), findsOneWidget);
+    final summary = find.byKey(const ValueKey('object-listing-summary'));
+    expect(tester.widget<Text>(summary).data,
+        startsWith('No matches · ${formatCount(c.objects.length)} loaded'));
 
     await tester.tap(clear);
     await tester.pumpAndSettle();
     expect(c.objectFilterValue, isEmpty);
     expect(clear, findsNothing);
     expect(find.text('No matching objects'), findsNothing);
+    expect(tester.widget<Text>(summary).data, isNot(contains('–0')),
+        reason: 'no empty 0–0 range once rows are visible');
+    expect(tester.widget<Text>(summary).data,
+        contains('${formatCount(c.objects.length)} loaded'));
     expect(tester.takeException(), isNull);
 
     await tester.pumpWidget(const SizedBox.shrink());

@@ -279,41 +279,69 @@ class _ObjectPanelState extends State<ObjectPanel> {
                                       contentTypeFor: c.objectContentType,
                                       onSelect: c.setSelectedObject,
                                       onShowContextMenu: widget.onContextMenu)),
-                      const Divider(height: 1),
-                      Wrap(
-                          spacing: 8,
-                          crossAxisAlignment: WrapCrossAlignment.center,
-                          children: [
-                            Text(
-                                '${c.currentObjectPageStart}–${c.currentObjectPageEnd} of ${c.visibleObjects.length} matching · ${c.objects.length} loaded${c.objectCursor.hasMore ? ' · more available' : ''}',
-                                style: Theme.of(context).textTheme.bodySmall),
-                            if (c.objectPageCount > 1 && !c.showAllObjects) ...[
-                              IconButton(
-                                  tooltip: 'Previous page',
-                                  onPressed: c.objectPage > 1
-                                      ? c.previousObjectPage
-                                      : null,
-                                  icon: const Icon(Icons.chevron_left)),
-                              Text('${c.objectPage}/${c.objectPageCount}'),
-                              IconButton(
-                                  tooltip: 'Next page',
-                                  onPressed: c.objectPage < c.objectPageCount
-                                      ? c.nextObjectPage
-                                      : null,
-                                  icon: const Icon(Icons.chevron_right)),
-                            ],
-                            if (c.objectCursor.hasMore)
-                              TextButton(
-                                  onPressed: busy
-                                      ? null
-                                      : () => c.listAllObjectsForCurrentBucket(
-                                          all: false,
-                                          nextWindow: c.listingBudgetReached),
-                                  child: Text(c.listingBudgetReached
-                                      ? 'Next window (clear loaded)'
-                                      : 'Load more')),
-                          ]),
+                      // The listing summary only means something once a
+                      // bucket is open.
+                      if (hasBucket) ...[
+                        const Divider(height: 1),
+                        Wrap(
+                            spacing: 8,
+                            crossAxisAlignment: WrapCrossAlignment.center,
+                            children: [
+                              Text(_listingSummary(c),
+                                  key: const ValueKey('object-listing-summary'),
+                                  style: Theme.of(context).textTheme.bodySmall),
+                              if (c.objectPageCount > 1 &&
+                                  !c.showAllObjects) ...[
+                                IconButton(
+                                    tooltip: 'Previous page',
+                                    onPressed: c.objectPage > 1
+                                        ? c.previousObjectPage
+                                        : null,
+                                    icon: const Icon(Icons.chevron_left)),
+                                Semantics(
+                                    label:
+                                        'Page ${c.objectPage} of ${c.objectPageCount}',
+                                    excludeSemantics: true,
+                                    child: Text(
+                                        '${c.objectPage}/${c.objectPageCount}')),
+                                IconButton(
+                                    tooltip: 'Next page',
+                                    onPressed: c.objectPage < c.objectPageCount
+                                        ? c.nextObjectPage
+                                        : null,
+                                    icon: const Icon(Icons.chevron_right)),
+                              ],
+                              if (c.objectCursor.hasMore)
+                                TextButton(
+                                    onPressed: busy
+                                        ? null
+                                        : () =>
+                                            c.listAllObjectsForCurrentBucket(
+                                                all: false,
+                                                nextWindow:
+                                                    c.listingBudgetReached),
+                                    child: Text(c.listingBudgetReached
+                                        ? 'Next window (clear loaded)'
+                                        : 'Load more')),
+                            ]),
+                      ],
                     ]))));
+  }
+
+  static String _listingSummary(AppController c) {
+    final matching = c.visibleObjects.length;
+    final loaded = '${formatCount(c.objects.length)} loaded'
+        '${c.objectCursor.hasMore ? ' · more available' : ''}';
+    if (matching == 0) return 'No matches · $loaded';
+    if (matching == c.objects.length &&
+        c.currentObjectPageStart == 1 &&
+        c.currentObjectPageEnd == matching) {
+      // Everything loaded is on screen; the range would only repeat it.
+      return loaded;
+    }
+    return '${formatCount(c.currentObjectPageStart)}–'
+        '${formatCount(c.currentObjectPageEnd)} of '
+        '${formatCount(matching)} matching · $loaded';
   }
 
   Widget _tool(String label, IconData icon, VoidCallback? action,

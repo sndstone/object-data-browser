@@ -1261,7 +1261,7 @@ void main() {
 
     expect(controller.objects.length, 2354);
     expect(controller.objectCursor.hasMore, isFalse);
-    expect(find.textContaining('2354 loaded'), findsOneWidget);
+    expect(find.textContaining('2,354 loaded'), findsOneWidget);
   });
 
   testWidgets(
