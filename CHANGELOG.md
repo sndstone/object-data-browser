@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.3.1 — macOS development prerelease
+
+### Transfers and engines
+- All four engines now limit manual multipart part sizes to 5 MiB–5 GiB and reject uploads over the S3 10,000-part or 50,000 GiB limits before any network work.
+- Download publication lists the destination folder once when choosing a collision-free name, keeping case-insensitive collision, symlink and overwrite protections.
+- The Python engine bounds queued upload parts, registers transfer jobs before the first progress event, and closes ranged responses on cancellation.
+
+### Reliability
+- Late inspector, version, preview, bucket-administration and version-page responses no longer overwrite a newer selection. Switching buckets during an administration refresh now loads the new bucket's settings.
+- Queued profile saves capture the profiles as they were when the save started. Delete-result validation is linear: a 40,000-key result now takes about 5 ms instead of 960 ms.
+- A failed object listing shows an error with Retry instead of an empty bucket.
+
+### Interface
+- Object browser: a clear-filter button, clearer inspector empty/loading/error states, a single-row list footer, an inline preview truncation notice, edge fades above the footer, and phone navigation labels that don't overflow.
+- Settings: profile Save shows progress, blocks repeat clicks and makes a session-only result actionable with Retry. Numeric fields accept digits only, and timeout errors open the section that contains them.
+- Benchmark and event log: theme-aware method and live-log colours with accessible contrast, shared empty states, screen-reader expanded states, larger switch and slider labels, and a time column that fits at 130% text scale.
+
 ## 2.3.0 — local development build
 
 - Added bucket-aware access/ACL presets and lifecycle tiering presets, preserving advanced lifecycle fields.

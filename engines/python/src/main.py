@@ -34,7 +34,7 @@ from typing import Any
 from urllib.parse import quote, urlparse, parse_qsl
 
 
-ENGINE_VERSION = "2.3.0"
+ENGINE_VERSION = "2.3.1"
 
 # Serialize every write to stdout so transferProgress events emitted from worker
 # threads never interleave with request/response lines.

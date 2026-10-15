@@ -208,7 +208,7 @@ class MainActivity : FlutterActivity() {
             "id" to id,
             "label" to label,
             "language" to language,
-            "version" to "2.3.0",
+            "version" to "2.3.1",
             "available" to true,
             "notes" to notes,
         )
@@ -217,7 +217,7 @@ class MainActivity : FlutterActivity() {
     private fun health(engineId: String): Map<String, Any?> {
         return mapOf(
             "engine" to engineId,
-            "version" to "2.3.0",
+            "version" to "2.3.1",
             "available" to true,
             "methods" to listOf(
                 "health",
