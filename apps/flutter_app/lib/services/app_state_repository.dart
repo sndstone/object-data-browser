@@ -100,12 +100,15 @@ class LocalAppStateRepository implements AppStateRepository {
     required List<EndpointProfile> profiles,
     required String? selectedProfileId,
     bool allowCredentialStoreRecovery = false,
-  }) =>
-      _metadata.serialize(() => _saveState(
-          settings: settings,
-          profiles: List.of(profiles),
-          selectedProfileId: selectedProfileId,
-          allowCredentialStoreRecovery: allowCredentialStoreRecovery));
+  }) {
+    // Capture the caller's state before waiting behind an earlier save.
+    final profileSnapshot = List<EndpointProfile>.of(profiles);
+    return _metadata.serialize(() => _saveState(
+        settings: settings,
+        profiles: profileSnapshot,
+        selectedProfileId: selectedProfileId,
+        allowCredentialStoreRecovery: allowCredentialStoreRecovery));
+  }
 
   Future<void> _saveState({
     required AppSettings settings,

@@ -38,7 +38,7 @@ class ObjectSelection {
     final failed = result.failures.map((f) => f.target).toSet();
     if (result.failureCount != failed.length ||
         result.successCount + result.failureCount != keys.length ||
-        !failed.every(keys.contains)) {
+        (failed.isNotEmpty && !keys.toSet().containsAll(failed))) {
       return {};
     }
     return keys.where((key) => !failed.contains(key)).toSet();

@@ -327,7 +327,10 @@ class AppController extends ChangeNotifier {
   }
 
   bool _benchmarkPollErrorReported = false;
+  int _selectionArtifactsSequence = 0;
   int _previewRequestSequence = 0;
+  int _bucketAdminRequestSequence = 0;
+  int _versionPageRequestSequence = 0;
   final Map<String, _PendingObjectRelist> _pendingUploadRelists =
       <String, _PendingObjectRelist>{};
 
@@ -3255,9 +3258,23 @@ class AppController extends ChangeNotifier {
 
   Future<void> _loadSelectionArtifacts(
       {bool cancellableListing = false}) async {
+    // Details and versions can finish after navigation or a newer refresh.
+    // The key alone is insufficient: different buckets may contain that key.
+    final requestId = ++_selectionArtifactsSequence;
+    // A fresh first page supersedes pagination, including for the same object.
+    _versionPageRequestSequence += 1;
+    final engineId = activeEngineId;
     final profile = selectedProfile;
     final bucket = selectedBucket;
     final object = selectedObject;
+    final prefix = currentPrefix;
+    bool isCurrent() =>
+        requestId == _selectionArtifactsSequence &&
+        activeEngineId == engineId &&
+        selectedProfile?.id == profile?.id &&
+        selectedBucket?.name == bucket?.name &&
+        selectedObject?.key == object?.key &&
+        currentPrefix == prefix;
     if (profile == null || bucket == null) {
       versions = const [];
       versionCursor = const ListCursor(value: null, hasMore: false);
@@ -3272,17 +3289,19 @@ class AppController extends ChangeNotifier {
       try {
         final versionResult =
             await read(() => _engineService.listObjectVersions(
-                  engineId: activeEngineId,
+                  engineId: engineId,
                   profile: profile,
                   bucketName: bucket.name,
                   key: object?.key,
                   options: versionBrowserOptions,
                 ));
+        if (!isCurrent()) return;
         versions = versionResult.items;
         versionCursor = versionResult.cursor;
       } on ListingCancelled {
         rethrow;
       } on EngineException catch (error) {
+        if (!isCurrent()) return;
         versions = const [];
         versionCursor = const ListCursor(value: null, hasMore: false);
         _addEvent(
@@ -3303,17 +3322,19 @@ class AppController extends ChangeNotifier {
         return;
       }
       try {
-        selectedObjectDetails = await read(() =>
-            _engineService.getObjectDetails(
-                engineId: activeEngineId,
-                profile: profile,
-                bucketName: bucket.name,
-                key: object.key));
+        final details = await read(() => _engineService.getObjectDetails(
+            engineId: engineId,
+            profile: profile,
+            bucketName: bucket.name,
+            key: object.key));
+        if (!isCurrent()) return;
+        selectedObjectDetails = details;
         _primeSelectedObjectPreview(object, notify: false);
         notifyListeners();
       } on ListingCancelled {
         rethrow;
       } on EngineException catch (error) {
+        if (!isCurrent()) return;
         selectedObjectDetails = null;
         _addEvent(
             level: 'WARN',
@@ -3326,6 +3347,7 @@ class AppController extends ChangeNotifier {
     }
 
     await Future.wait([readDetails(), readVersions()]);
+    if (!isCurrent()) return;
     if (object == null) {
       notifyListeners();
       return;
@@ -3408,27 +3430,33 @@ class AppController extends ChangeNotifier {
     String contentType,
     int requestId,
   ) async {
+    final engineId = activeEngineId;
     final profile = selectedProfile;
     final bucket = selectedBucket;
     if (profile == null || bucket == null) {
       return;
     }
+    bool isCurrent() =>
+        activeEngineId == engineId &&
+        selectedProfile?.id == profile.id &&
+        selectedBucket?.name == bucket.name &&
+        _isCurrentPreviewRequest(object.key, requestId);
     try {
       final expirationMinutes =
           settings.defaultPresignMinutes.clamp(1, 15).toInt();
       final url = await _engineService.generatePresignedUrl(
-        engineId: activeEngineId,
+        engineId: engineId,
         profile: profile,
         bucketName: bucket.name,
         key: object.key,
         expiration: Duration(minutes: expirationMinutes),
       );
-      if (!_isCurrentPreviewRequest(object.key, requestId)) {
+      if (!isCurrent()) {
         return;
       }
       if (kind == ObjectPreviewKind.text) {
         final preview = await _fetchPreviewText(url);
-        if (!_isCurrentPreviewRequest(object.key, requestId)) {
+        if (!isCurrent()) {
           return;
         }
         selectedObjectPreview = ObjectPreview.ready(
@@ -3455,7 +3483,7 @@ class AppController extends ChangeNotifier {
         );
       }
     } catch (error) {
-      if (!_isCurrentPreviewRequest(object.key, requestId)) {
+      if (!isCurrent()) {
         return;
       }
       selectedObjectPreview = ObjectPreview.unsupported(
@@ -3963,27 +3991,62 @@ class AppController extends ChangeNotifier {
 
   Future<void> refreshBucketAdminState(
       {bool cancellableListing = false}) async {
+    final engineId = activeEngineId;
     final profile = selectedProfile;
     final bucket = selectedBucket;
+    // A duplicate action does not supersede the request already in flight.
+    if (profile != null && bucket != null && isBusy('refresh-bucket-admin')) {
+      return;
+    }
+    final requestId = ++_bucketAdminRequestSequence;
+    bool isCurrent() =>
+        requestId == _bucketAdminRequestSequence &&
+        activeEngineId == engineId &&
+        selectedProfile?.id == profile?.id &&
+        selectedBucket?.name == bucket?.name;
     if (profile == null || bucket == null) {
       adminState = null;
       notifyListeners();
       return;
     }
+    var superseded = false;
     await _runBusy('refresh-bucket-admin', 'Loading bucket admin state...',
         () async {
       await _guard('Buckets', () async {
         Future<BucketAdminState> request() =>
             _engineService.getBucketAdminState(
-              engineId: activeEngineId,
+              engineId: engineId,
               profile: profile,
               bucketName: bucket.name,
             );
-        adminState =
-            cancellableListing ? await _awaitListing(request) : await request();
+        final BucketAdminState result;
+        try {
+          result = cancellableListing
+              ? await _awaitListing(request)
+              : await request();
+        } catch (_) {
+          if (!isCurrent()) {
+            superseded = true;
+            return;
+          }
+          rethrow;
+        }
+        if (!isCurrent()) {
+          superseded = true;
+          return;
+        }
+        adminState = result;
         notifyListeners();
       });
     });
+    // A refresh for the newly selected bucket was skipped while this one was
+    // in flight; load it now instead of leaving the previous bucket's state.
+    if (superseded &&
+        requestId == _bucketAdminRequestSequence &&
+        selectedProfile != null &&
+        selectedBucket != null) {
+      await refreshBucketAdminState(cancellableListing: cancellableListing);
+    }
   }
 
   Future<void> setBucketVersioning(bool enabled) async {
@@ -4115,18 +4178,40 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> loadMoreVersions() async {
+    if (isBusy('more-versions')) return;
+    final requestId = ++_versionPageRequestSequence;
+    final engineId = activeEngineId;
     final profile = selectedProfile;
     final bucket = selectedBucket;
+    final objectKey = selectedObject?.key;
+    final prefix = currentPrefix;
+    final cursor = versionCursor;
+    final options = versionBrowserOptions;
+    bool isCurrent() =>
+        requestId == _versionPageRequestSequence &&
+        activeEngineId == engineId &&
+        selectedProfile?.id == profile?.id &&
+        selectedBucket?.name == bucket?.name &&
+        selectedObject?.key == objectKey &&
+        currentPrefix == prefix &&
+        identical(versionBrowserOptions, options);
     if (profile == null || bucket == null || !versionCursor.hasMore) return;
     await _runBusy('more-versions', 'Loading more versions...', () async {
       await _guard('Versions', () async {
-        final page = await _engineService.listObjectVersions(
-            engineId: activeEngineId,
-            profile: profile,
-            bucketName: bucket.name,
-            key: selectedObject?.key,
-            cursor: versionCursor,
-            options: versionBrowserOptions);
+        final ObjectVersionListResult page;
+        try {
+          page = await _engineService.listObjectVersions(
+              engineId: engineId,
+              profile: profile,
+              bucketName: bucket.name,
+              key: objectKey,
+              cursor: cursor,
+              options: options);
+        } catch (_) {
+          if (!isCurrent()) return;
+          rethrow;
+        }
+        if (!isCurrent()) return;
         final seen = versions.map((v) => (v.key, v.versionId)).toSet();
         versions = [
           ...versions,

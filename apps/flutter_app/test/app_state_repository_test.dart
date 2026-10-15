@@ -181,6 +181,34 @@ const _profile = EndpointProfile(
 );
 
 void main() {
+  test('queued saves snapshot profiles before the caller mutates its list',
+      () async {
+    final tempDir = await Directory.systemTemp.createTemp('app-state-snapshot');
+    addTearDown(() => tempDir.delete(recursive: true));
+    final store = RecordingProfileSecretStore({});
+    final repository = LocalAppStateRepository(
+      secretStore: store,
+      applicationSupportDirectoryProvider: () async => tempDir,
+    );
+    final profiles = [_profile];
+    final save = repository.saveState(
+      settings: _settings,
+      profiles: profiles,
+      selectedProfileId: _profile.id,
+    );
+    profiles.clear();
+    await save;
+
+    final state = await repository.loadState();
+    expect(state!.profiles.single.id, _profile.id);
+    expect(state.profiles.single.secretKey, _profile.secretKey);
+    final metadata = await File(
+            '${tempDir.path}/object-data-browser-state.json')
+        .readAsString();
+    expect(metadata, isNot(contains('"secretKey"')));
+    expect(metadata, isNot(contains('"accessKey"')));
+  });
+
   test(
       'repository refuses to write plaintext secrets when secure storage is unavailable',
       () async {
