@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:s3_browser_crossplat/logs/structured_log_list.dart';
 import 'package:s3_browser_crossplat/models/domain_models.dart';
+import 'package:s3_browser_crossplat/widgets/empty_state.dart';
 
 Widget host(List<EventLogEntry> entries) => MaterialApp(
     home: Scaffold(
@@ -64,5 +65,23 @@ void main() {
     final icon = tester.widget<Icon>(find.byIcon(Icons.error_outline));
     expect(icon.color,
         Theme.of(tester.element(find.text('a.txt'))).colorScheme.error);
+  });
+
+  testWidgets('empty lists use the shared empty state', (tester) async {
+    await tester.pumpWidget(host(const []));
+    expect(find.byType(EmptyState), findsOneWidget);
+    expect(find.text('Empty'), findsOneWidget);
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: ListView(children: const [
+      StructuredLogList(
+          entries: [],
+          textScalePercent: 100,
+          embedded: true,
+          emptyMessage: 'No trace events yet.'),
+    ]))));
+    expect(find.byType(EmptyState), findsNothing);
+    expect(find.text('No trace events yet.'), findsOneWidget);
+    expect(tester.takeException(), isNull);
   });
 }

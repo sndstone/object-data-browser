@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 
 import '../models/domain_models.dart';
+import '../widgets/empty_state.dart';
 
 class StructuredLogList extends StatefulWidget {
   const StructuredLogList({
@@ -53,10 +54,24 @@ class _StructuredLogListState extends State<StructuredLogList> {
         textScaler: TextScaler.linear(widget.textScalePercent / 100),
       ),
       child: items.isEmpty
-          ? Padding(
-              padding: const EdgeInsets.symmetric(vertical: 12),
-              child: Text(widget.emptyMessage),
-            )
+          ? widget.embedded
+              // Embedded lists sit inside another scroll view; keep the
+              // empty notice compact and left-aligned with surrounding text.
+              ? Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  child: Row(children: [
+                    Icon(Icons.receipt_long_outlined,
+                        size: 18,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant),
+                    const SizedBox(width: 8),
+                    Expanded(
+                        child: Text(widget.emptyMessage,
+                            style: Theme.of(context).textTheme.bodySmall)),
+                  ]),
+                )
+              : EmptyState(
+                  icon: Icons.manage_search_outlined,
+                  title: widget.emptyMessage)
           : ListView.separated(
               shrinkWrap: widget.embedded,
               physics: widget.embedded
