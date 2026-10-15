@@ -814,6 +814,7 @@ class AppController extends ChangeNotifier {
       await _guard('Objects', () async {
         currentPrefix = nextPrefix;
         listAllKeys = listAll;
+        objectListingError = null;
         _syncObjectFilterWithPrefix();
         _addEvent(
           level: 'INFO',
@@ -833,7 +834,13 @@ class AppController extends ChangeNotifier {
           listAll: listAll,
           fetchFirstPageWithoutCursor: true,
         ).onError<EngineException>((error, stackTrace) {
-          objectListingError = '${error.code.displayLabel}: ${error.message}';
+          // Ignore late failures from a bucket or prefix the user has left.
+          if (selectedProfile?.id == profile.id &&
+              selectedBucket?.name == bucket.name &&
+              currentPrefix == nextPrefix) {
+            objectListingError =
+                '${error.code.displayLabel}: ${error.message}';
+          }
           Error.throwWithStackTrace(error, stackTrace);
         });
         if (selectedProfile?.id != profile.id ||
