@@ -124,7 +124,8 @@ class AppRulerSlider extends StatelessWidget {
         ),
         const SizedBox(height: 4),
         SizedBox(
-          height: 22,
+          // Tick marks (8px) + gap + one line of 12px labels.
+          height: 26,
           child: CustomPaint(
             painter: _RulerPainter(
               min: min,
@@ -137,7 +138,8 @@ class AppRulerSlider extends StatelessWidget {
               major: theme.colorScheme.onSurfaceVariant,
               active: theme.colorScheme.primary,
               textStyle: theme.textTheme.labelSmall!.copyWith(
-                fontSize: 10.5,
+                fontSize: 12,
+                height: 1.2,
                 fontWeight: FontWeight.w600,
                 fontFeatures: const [FontFeature.tabularFigures()],
               ),

@@ -23,7 +23,8 @@ class AppSwitch extends StatefulWidget {
   final bool focusable;
   final String? semanticLabel;
 
-  static const double width = 50;
+  // Wide enough for an 11px OFF label beside the thumb.
+  static const double width = 56;
   static const double height = 24;
   static const double _thumb = 18;
   static const double _inset = 2;
@@ -47,10 +48,10 @@ class _AppSwitchState extends State<AppSwitch> {
     const curve = Curves.easeOutCubic;
     const labelStyle = TextStyle(
       fontFamily: 'Inter',
-      fontSize: 9.5,
+      fontSize: 11,
       height: 1,
       fontWeight: FontWeight.w800,
-      letterSpacing: 0.6,
+      letterSpacing: 0.4,
     );
 
     Widget track = AnimatedContainer(
