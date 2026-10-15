@@ -3525,16 +3525,8 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
         .toList();
   }
 
-  Color _seriesColor(String operation) {
-    return switch (operation.toUpperCase()) {
-      'PUT' => const Color(0xFF0F766E),
-      'GET' => const Color(0xFF2563EB),
-      'DELETE' => const Color(0xFFDC2626),
-      'POST' => const Color(0xFFF59E0B),
-      'HEAD' => const Color(0xFF7C3AED),
-      _ => const Color(0xFF475569),
-    };
-  }
+  Color _seriesColor(String operation) =>
+      AppOperationColors.of(context).forOperation(operation);
 
   double _averageObjectSizeMiB(BenchmarkResultSummary summary) {
     if (summary.sizeLatencyBuckets.isEmpty) {

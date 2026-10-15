@@ -265,7 +265,10 @@ class AppTheme {
             : const Color(0xFF2B4F7A)),
         scheme.brightness == Brightness.dark
             ? AppRailTheme.dark
-            : AppRailTheme.light
+            : AppRailTheme.light,
+        scheme.brightness == Brightness.dark
+            ? AppOperationColors.dark
+            : AppOperationColors.light,
       ],
       textTheme: textTheme,
       scaffoldBackgroundColor: scaffoldBackground,
@@ -548,4 +551,81 @@ class AppStatusTheme extends ThemeExtension<AppStatusTheme> {
   @override
   AppStatusTheme lerp(covariant AppStatusTheme? other, double t) =>
       AppStatusTheme(Color.lerp(running, other?.running ?? running, t)!);
+}
+
+/// Per-request-method series colours for benchmark charts and legends.
+///
+/// Light variants keep at least 4.5:1 against white surfaces; dark variants
+/// use lighter tints so lines and labels stay legible on dark surfaces.
+@immutable
+class AppOperationColors extends ThemeExtension<AppOperationColors> {
+  const AppOperationColors({
+    required this.put,
+    required this.get,
+    required this.delete,
+    required this.post,
+    required this.head,
+    required this.other,
+  });
+  final Color put, get, delete, post, head, other;
+
+  static const light = AppOperationColors(
+      put: Color(0xFF0F766E),
+      get: Color(0xFF2563EB),
+      delete: Color(0xFFDC2626),
+      post: Color(0xFFB45309),
+      head: Color(0xFF7C3AED),
+      other: Color(0xFF475569));
+  static const dark = AppOperationColors(
+      put: Color(0xFF2DD4BF),
+      get: Color(0xFF60A5FA),
+      delete: Color(0xFFF87171),
+      post: Color(0xFFFBBF24),
+      head: Color(0xFFA78BFA),
+      other: Color(0xFF94A3B8));
+
+  /// Falls back to the light/dark palette when a theme lacks the extension.
+  static AppOperationColors of(BuildContext context) {
+    final theme = Theme.of(context);
+    return theme.extension<AppOperationColors>() ??
+        (theme.brightness == Brightness.dark ? dark : light);
+  }
+
+  Color forOperation(String operation) =>
+      switch (operation.toUpperCase()) {
+        'PUT' => put,
+        'GET' => get,
+        'DELETE' => delete,
+        'POST' => post,
+        'HEAD' => head,
+        _ => other,
+      };
+
+  @override
+  AppOperationColors copyWith(
+          {Color? put,
+          Color? get,
+          Color? delete,
+          Color? post,
+          Color? head,
+          Color? other}) =>
+      AppOperationColors(
+          put: put ?? this.put,
+          get: get ?? this.get,
+          delete: delete ?? this.delete,
+          post: post ?? this.post,
+          head: head ?? this.head,
+          other: other ?? this.other);
+
+  @override
+  AppOperationColors lerp(covariant AppOperationColors? other, double t) {
+    if (other == null) return this;
+    return AppOperationColors(
+        put: Color.lerp(put, other.put, t)!,
+        get: Color.lerp(get, other.get, t)!,
+        delete: Color.lerp(delete, other.delete, t)!,
+        post: Color.lerp(post, other.post, t)!,
+        head: Color.lerp(head, other.head, t)!,
+        other: Color.lerp(this.other, other.other, t)!);
+  }
 }
