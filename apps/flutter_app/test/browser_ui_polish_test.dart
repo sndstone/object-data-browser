@@ -1,3 +1,5 @@
+import 'dart:ui' show Tristate;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:s3_browser_crossplat/app/s3_browser_app.dart';
@@ -21,6 +23,7 @@ Future<void> _pumpApp(WidgetTester tester, dynamic controller,
 
 void main() {
   inspectorMain();
+  viewToolsMain();
   testWidgets('object filter shows a clear button that resets the filter',
       (tester) async {
     final c = fixture.controller(fixture.TestingEngine(), fixture.Repository());
@@ -108,5 +111,44 @@ void inspectorMain() {
 
     await tester.pumpWidget(const SizedBox.shrink());
     c.dispose();
+  });
+}
+
+void viewToolsMain() {
+  testWidgets('view tools expose expanded and toggled states', (tester) async {
+    final handle = tester.ensureSemantics();
+    final c = fixture.controller(fixture.TestingEngine(), fixture.Repository());
+    await c.initialize();
+    c.clearBanner();
+    await _pumpApp(tester, c);
+
+    final viewTools = find.byKey(const ValueKey('object-view-tools'));
+    Tristate expanded() => tester
+        .getSemantics(viewTools)
+        .getSemanticsData()
+        .flagsCollection
+        .isExpanded;
+    expect(expanded(), Tristate.isFalse);
+    await tester.tap(viewTools);
+    await tester.pumpAndSettle();
+    expect(expanded(), Tristate.isTrue);
+
+    final flatViewButton = find.widgetWithText(TextButton, 'Flat view');
+    Tristate flatView() => tester
+        .getSemantics(flatViewButton)
+        .getSemanticsData()
+        .flagsCollection
+        .isToggled;
+    final before = c.flatView;
+    expect(flatView(), before ? Tristate.isTrue : Tristate.isFalse);
+    await tester.tap(flatViewButton);
+    await tester.pumpAndSettle();
+    expect(c.flatView, !before);
+    expect(flatView(), before ? Tristate.isFalse : Tristate.isTrue);
+    expect(tester.takeException(), isNull);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    c.dispose();
+    handle.dispose();
   });
 }

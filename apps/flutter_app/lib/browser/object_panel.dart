@@ -178,7 +178,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
                                                     ? () => c.toggleFlatView(
                                                         !c.flatView)
                                                     : null,
-                                                selected: c.flatView),
+                                                toggled: c.flatView),
                                             _tool(
                                                 'Create prefix',
                                                 Icons
@@ -197,7 +197,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
                                                 Icons.view_agenda_outlined,
                                                 () => c.setShowAllObjects(
                                                     !c.showAllObjects),
-                                                selected: c.showAllObjects),
+                                                toggled: c.showAllObjects),
                                             _tool(
                                                 'List all',
                                                 Icons.cloud_download_outlined,
@@ -344,20 +344,24 @@ class _ObjectPanelState extends State<ObjectPanel> {
         '${formatCount(matching)} matching · $loaded';
   }
 
+  /// A labelled view tool. Toggles ([toggled] non-null) expose their state
+  /// to assistive technology as well as through the selected fill. The
+  /// visible label already names the action, so no tooltip repeats it.
   Widget _tool(String label, IconData icon, VoidCallback? action,
-          {bool selected = false}) =>
-      Tooltip(
-          message: label,
-          child: TextButton.icon(
-            onPressed: action,
-            style: selected
-                ? TextButton.styleFrom(
-                    backgroundColor:
-                        Theme.of(context).colorScheme.secondaryContainer)
-                : null,
-            icon: Icon(icon),
-            label: Text(label),
-          ));
+          {bool? toggled}) =>
+      MergeSemantics(
+          child: Semantics(
+              toggled: toggled,
+              child: TextButton.icon(
+                onPressed: action,
+                style: toggled == true
+                    ? TextButton.styleFrom(
+                        backgroundColor:
+                            Theme.of(context).colorScheme.secondaryContainer)
+                    : null,
+                icon: Icon(icon),
+                label: Text(label),
+              )));
 
   /// One toolbar row: location, filter and actions. When objects are
   /// selected the action cluster swaps in place for selection actions, so
@@ -475,11 +479,16 @@ class _ObjectPanelState extends State<ObjectPanel> {
           icon: const Icon(Icons.upload_file),
           label: const Text('Upload')),
       const SizedBox(width: 8),
-      OutlinedButton.icon(
-        onPressed: () => setState(() => _viewExpanded = !_viewExpanded),
-        icon: Icon(_viewExpanded ? Icons.expand_less : Icons.tune),
-        label: const Text('View tools'),
-      ),
+      MergeSemantics(
+          child: Semantics(
+        expanded: _viewExpanded,
+        child: OutlinedButton.icon(
+          key: const ValueKey('object-view-tools'),
+          onPressed: () => setState(() => _viewExpanded = !_viewExpanded),
+          icon: Icon(_viewExpanded ? Icons.expand_less : Icons.tune),
+          label: const Text('View tools'),
+        ),
+      )),
       IconButton(
           tooltip: busy ? 'Cancel listing' : 'Refresh object list',
           onPressed: busy
