@@ -85,6 +85,11 @@ class _SettingTextFieldState extends State<SettingTextField> {
               focusNode: _focus,
               keyboardType:
                   widget.numeric ? TextInputType.number : TextInputType.text,
+              // Numeric settings are non-negative whole numbers; reject other
+              // characters at entry instead of only on blur.
+              inputFormatters: widget.numeric
+                  ? [FilteringTextInputFormatter.digitsOnly]
+                  : null,
               decoration: InputDecoration(
                   labelText: widget.label,
                   helperText: widget.helper,

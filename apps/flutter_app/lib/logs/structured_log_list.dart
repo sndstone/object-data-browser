@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 
 import '../models/domain_models.dart';
+import '../widgets/empty_state.dart';
 
 class StructuredLogList extends StatefulWidget {
   const StructuredLogList({
@@ -53,10 +54,24 @@ class _StructuredLogListState extends State<StructuredLogList> {
         textScaler: TextScaler.linear(widget.textScalePercent / 100),
       ),
       child: items.isEmpty
-          ? Padding(
-              padding: const EdgeInsets.symmetric(vertical: 12),
-              child: Text(widget.emptyMessage),
-            )
+          ? widget.embedded
+              // Embedded lists sit inside another scroll view; keep the
+              // empty notice compact and left-aligned with surrounding text.
+              ? Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  child: Row(children: [
+                    Icon(Icons.receipt_long_outlined,
+                        size: 18,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant),
+                    const SizedBox(width: 8),
+                    Expanded(
+                        child: Text(widget.emptyMessage,
+                            style: Theme.of(context).textTheme.bodySmall)),
+                  ]),
+                )
+              : EmptyState(
+                  icon: Icons.manage_search_outlined,
+                  title: widget.emptyMessage)
           : ListView.separated(
               shrinkWrap: widget.embedded,
               physics: widget.embedded
@@ -151,16 +166,20 @@ class _UploadBatchCard extends StatelessWidget {
           'upload-log-${parent.parentRequestId ?? parent.requestId}'),
       leading: const Icon(Icons.upload_file),
       title: Text(parents.isEmpty ? 'Upload batch' : parent.message),
-      subtitle: Text(
-          '${parent.bucketName ?? ''} · ${parent.responseStatus ?? 'running'} · ${files.length} file records'),
+      subtitle: Text([
+        if ((parent.bucketName ?? '').isNotEmpty) parent.bucketName!,
+        parent.responseStatus ?? 'running',
+        files.length == 1 ? '1 file' : '${files.length} files',
+      ].join(' · ')),
       children: [
         for (final group in files.values)
           ExpansionTile(
             key: PageStorageKey('upload-file-${group.first.requestId}'),
-            leading: Icon(group.first.responseStatus == 'completed'
-                ? Icons.check_circle_outline
-                : group.first.responseStatus == 'failed'
-                    ? Icons.error_outline
+            leading: group.first.responseStatus == 'failed'
+                ? Icon(Icons.error_outline,
+                    color: Theme.of(context).colorScheme.error)
+                : Icon(group.first.responseStatus == 'completed'
+                    ? Icons.check_circle_outline
                     : Icons.insert_drive_file_outlined),
             title: Text(group.first.objectKey ?? 'File'),
             subtitle: Text(group.first.responseStatus ?? ''),
@@ -558,37 +577,43 @@ class _ExpandableLogRowState extends State<_ExpandableLogRow> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        InkWell(
-          onTap: () => setState(() => _expanded = !_expanded),
-          child: Row(children: [
-            Expanded(
-              child: _LogRow(
-                entry: widget.entry,
-                category: widget.category,
-                extraContext: widget.extraContext,
-                message: Wrap(
-                  spacing: 8,
-                  crossAxisAlignment: WrapCrossAlignment.center,
-                  children: [
-                    Text(widget.title,
-                        style: theme.textTheme.bodyMedium
-                            ?.copyWith(fontWeight: FontWeight.w600)),
-                    if (widget.detail.isNotEmpty)
-                      Text(widget.detail,
-                          style: theme.textTheme.bodySmall?.copyWith(
-                              color: theme.colorScheme.onSurfaceVariant)),
-                  ],
+        // Expose the disclosure state so screen readers announce whether
+        // the trace payload is showing; InkWell already handles focus and
+        // Enter/Space activation.
+        Semantics(
+            button: true,
+            expanded: _expanded,
+            onTapHint: _expanded ? 'Hide details' : 'Show details',
+            child: InkWell(
+              onTap: () => setState(() => _expanded = !_expanded),
+              child: Row(children: [
+                Expanded(
+                  child: _LogRow(
+                    entry: widget.entry,
+                    category: widget.category,
+                    extraContext: widget.extraContext,
+                    message: Wrap(
+                      spacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Text(widget.title,
+                            style: theme.textTheme.bodyMedium
+                                ?.copyWith(fontWeight: FontWeight.w600)),
+                        if (widget.detail.isNotEmpty)
+                          Text(widget.detail,
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                  color: theme.colorScheme.onSurfaceVariant)),
+                      ],
+                    ),
+                  ),
                 ),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.only(right: 8),
-              child: Icon(_expanded ? Icons.expand_less : Icons.expand_more,
-                  semanticLabel: _expanded ? 'Hide details' : 'Show details',
-                  color: theme.colorScheme.onSurfaceVariant),
-            ),
-          ]),
-        ),
+                Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: Icon(_expanded ? Icons.expand_less : Icons.expand_more,
+                      color: theme.colorScheme.onSurfaceVariant),
+                ),
+              ]),
+            )),
         if (_expanded)
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),

@@ -7,6 +7,7 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../app/version_details.dart';
@@ -958,6 +959,9 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   late bool _verifyTls;
   late bool _expanded;
   bool _revealSecret = false, _revealToken = false;
+  // Secure persistence can block on a Keychain prompt; guard against repeat
+  // submissions and show progress until the controller reports the outcome.
+  bool _saving = false;
   Timer? _revealTimer;
   void _reveal(bool token) {
     setState(() {
@@ -1274,6 +1278,9 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
     final readError = timeoutError(_readTimeoutController.text);
     final valid = connectError == null && readError == null;
     final isDirty = _buildProfile() != widget.profile;
+    final persistenceStatus =
+        widget.controller.profilePersistenceStatusFor(widget.profile.id);
+    final sessionOnly = persistenceStatus != 'Saved';
     final isSelected =
         widget.controller.selectedProfile?.id == widget.profile.id;
     final isTesting =
@@ -1287,6 +1294,9 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
         child: ExpansionTile(
           controller: _editorExpansion,
           initiallyExpanded: _expanded,
+          // Form rows and the action bar align with the field edges instead
+          // of ExpansionTile's default centring.
+          expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
           onExpansionChanged: (value) => setState(() {
             _expanded = value;
             if (!value) {
@@ -1313,14 +1323,32 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
               crossAxisAlignment: WrapCrossAlignment.center,
               children: [
                 if (isSelected) const Chip(label: Text('Active')),
-                Chip(
-                    backgroundColor: isDirty
-                        ? Theme.of(context).colorScheme.tertiaryContainer
-                        : null,
-                    label: Text(isDirty
-                        ? 'Unsaved edits'
-                        : widget.controller
-                            .profilePersistenceStatusFor(widget.profile.id))),
+                if (isDirty)
+                  Chip(
+                      backgroundColor:
+                          Theme.of(context).colorScheme.tertiaryContainer,
+                      label: const Text('Unsaved edits'))
+                else if (sessionOnly)
+                  Tooltip(
+                    message:
+                        'Credentials could not be saved securely. This profile '
+                        'works for the current session only; save again to retry.',
+                    child: Chip(
+                        avatar: Icon(Icons.warning_amber_rounded,
+                            size: 16,
+                            color: Theme.of(context)
+                                .colorScheme
+                                .onErrorContainer),
+                        backgroundColor:
+                            Theme.of(context).colorScheme.errorContainer,
+                        label: Text(persistenceStatus,
+                            style: TextStyle(
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .onErrorContainer))),
+                  )
+                else
+                  Chip(label: Text(persistenceStatus)),
                 if (widget.controller.settings.defaultProfileId ==
                     widget.profile.id)
                   const Chip(label: Text('Startup default')),
@@ -1567,7 +1595,18 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                       : null,
                 ),
               ),
-            ExpansionTile(title: const Text('Advanced transport'), children: [
+            ExpansionTile(
+                title: const Text('Advanced transport'),
+                expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
+                // Timeout errors live here; never hide the reason Save is
+                // disabled inside a collapsed section.
+                initiallyExpanded: !valid,
+                subtitle: valid
+                    ? null
+                    : Text('Fix the highlighted timeouts to save.',
+                        style: TextStyle(
+                            color: Theme.of(context).colorScheme.error)),
+                children: [
               if (!AppPlatform.isMobile) ...[
                 SettingNumberField(
                     label: 'Connection pool limit (part workers capped at 8)',
@@ -1623,6 +1662,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         TextField(
                           controller: _connectTimeoutController,
                           keyboardType: TextInputType.number,
+                          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                           decoration: InputDecoration(
                             errorText: connectError,
                             labelText: 'Connect timeout (s)',
@@ -1632,6 +1672,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         TextField(
                           controller: _readTimeoutController,
                           keyboardType: TextInputType.number,
+                          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                           decoration: InputDecoration(
                             errorText: readError,
                             labelText: 'Read timeout (s)',
@@ -1645,6 +1686,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                           child: TextField(
                             controller: _connectTimeoutController,
                             keyboardType: TextInputType.number,
+                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                             decoration: InputDecoration(
                               errorText: connectError,
                               labelText: 'Connect timeout (s)',
@@ -1656,6 +1698,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                           child: TextField(
                             controller: _readTimeoutController,
                             keyboardType: TextInputType.number,
+                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                             decoration: InputDecoration(
                               errorText: readError,
                               labelText: 'Read timeout (s)',
@@ -1677,18 +1720,27 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
               runSpacing: 8,
               children: [
                 FilledButton.icon(
-                  onPressed: !valid ||
-                          !isDirty &&
-                              widget.controller.profilePersistenceStatusFor(
-                                      widget.profile.id) ==
-                                  'Saved'
+                  onPressed: _saving || !valid || !isDirty && !sessionOnly
                       ? null
                       : () async {
                           final profile = _buildProfile();
-                          await widget.controller.saveProfile(profile);
+                          setState(() => _saving = true);
+                          try {
+                            await widget.controller.saveProfile(profile);
+                          } finally {
+                            if (mounted) setState(() => _saving = false);
+                          }
                         },
-                  icon: const Icon(Icons.save_outlined),
-                  label: const Text('Save'),
+                  icon: _saving
+                      ? const SizedBox.square(
+                          dimension: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.save_outlined),
+                  label: Text(_saving
+                      ? 'Saving…'
+                      : sessionOnly && !isDirty
+                          ? 'Retry save'
+                          : 'Save'),
                 ),
                 OutlinedButton.icon(
                   onPressed: !valid ||

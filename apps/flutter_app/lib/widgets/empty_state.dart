@@ -5,7 +5,7 @@ class EmptyState extends StatelessWidget {
       {super.key,
       required this.icon,
       required this.title,
-      required this.message,
+      this.message = '',
       this.action});
   final IconData icon;
   final String title, message;
@@ -23,8 +23,10 @@ class EmptyState extends StatelessWidget {
                 Text(title,
                     style: Theme.of(context).textTheme.titleMedium,
                     textAlign: TextAlign.center),
-                const SizedBox(height: 8),
-                Text(message, textAlign: TextAlign.center),
+                if (message.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(message, textAlign: TextAlign.center),
+                ],
                 if (action != null)
                   Padding(
                       padding: const EdgeInsets.only(top: 12), child: action!),

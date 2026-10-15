@@ -14,6 +14,7 @@ import '../theme/app_theme.dart';
 import '../widgets/app_select_field.dart';
 import '../widgets/app_switch.dart';
 import '../widgets/compact_selector.dart';
+import '../widgets/edge_fade_scroll.dart';
 
 enum _BenchmarkPreviewSection {
   latency,
@@ -311,8 +312,12 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
 
     return Card(
       clipBehavior: Clip.antiAlias,
-      child: ListView(
-        padding: EdgeInsets.all(panelPadding),
+      // Short windows clip this panel mid-field; fade the clipped edge and
+      // leave bottom room so the last field never sits flush on the border.
+      child: VerticalEdgeFade(
+          child: ListView(
+        padding: EdgeInsets.fromLTRB(
+            panelPadding, panelPadding, panelPadding, panelPadding + 12),
         children: [
           _sectionHeader(context, Icons.tune, 'Benchmark control'),
           const SizedBox(height: 10),
@@ -336,11 +341,9 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                       ? const SizedBox(
                           width: 14,
                           height: 14,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            valueColor:
-                                AlwaysStoppedAnimation<Color>(Colors.white),
-                          ),
+                          // Inherit the button's disabled foreground instead
+                          // of white, which vanishes on light disabled fills.
+                          child: CircularProgressIndicator(strokeWidth: 2),
                         )
                       : const Icon(Icons.play_arrow),
                   label: Text(starting ? 'Starting…' : 'Start benchmark'),
@@ -737,7 +740,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             },
           ),
         ],
-      ),
+      )),
     );
   }
 
@@ -1112,8 +1115,9 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
 
   /// Terminal-styled live log that sticks to the newest entries.
   Widget _liveLogView(BuildContext context, BenchmarkRun run) {
-    const background = Color(0xFF0A1410);
-    const foreground = Color(0xFFC9DACF);
+    final terminal = AppTerminalColors.of(context);
+    final background = terminal.background;
+    final foreground = terminal.foreground;
     final logStyle = Theme.of(context).textTheme.bodySmall?.copyWith(
           color: foreground,
           fontFamily: 'Menlo',
@@ -1132,13 +1136,14 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(12),
         color: background,
+        border: Border.all(color: terminal.border),
       ),
       child: run.liveLog.isEmpty
           ? Center(
               child: Text(
                 'Waiting for benchmark log output...',
                 style: logStyle?.copyWith(
-                  color: foreground.withValues(alpha: 0.6),
+                  color: terminal.muted,
                 ),
               ),
             )
@@ -1276,16 +1281,18 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
   }
 
   Widget _statusChip(BuildContext context, String status) {
+    final scheme = Theme.of(context).colorScheme;
+    // Light shades keep the label readable on dark surfaces; darker shades
+    // keep AA contrast on the light tinted chip background.
+    final dark = scheme.brightness == Brightness.dark;
+    Color tone(MaterialColor c) => dark ? c.shade300 : c.shade800;
     final (color, icon) = switch (status) {
-      'starting' => (
-          Theme.of(context).colorScheme.primary,
-          Icons.hourglass_top,
-        ),
-      'running' => (Colors.green.shade600, Icons.play_circle_filled),
-      'paused' => (Colors.orange.shade600, Icons.pause_circle_filled),
-      'stopped' => (Colors.red.shade600, Icons.stop_circle),
-      'completed' => (Colors.blue.shade600, Icons.check_circle),
-      _ => (Colors.grey.shade500, Icons.circle_outlined),
+      'starting' => (scheme.primary, Icons.hourglass_top),
+      'running' => (tone(Colors.green), Icons.play_circle_filled),
+      'paused' => (tone(Colors.orange), Icons.pause_circle_filled),
+      'stopped' => (scheme.error, Icons.stop_circle),
+      'completed' => (tone(Colors.blue), Icons.check_circle),
+      _ => (scheme.onSurfaceVariant, Icons.circle_outlined),
     };
     final labelStyle = Theme.of(context).textTheme.labelSmall?.copyWith(
           color: color,
@@ -3525,16 +3532,8 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
         .toList();
   }
 
-  Color _seriesColor(String operation) {
-    return switch (operation.toUpperCase()) {
-      'PUT' => const Color(0xFF0F766E),
-      'GET' => const Color(0xFF2563EB),
-      'DELETE' => const Color(0xFFDC2626),
-      'POST' => const Color(0xFFF59E0B),
-      'HEAD' => const Color(0xFF7C3AED),
-      _ => const Color(0xFF475569),
-    };
-  }
+  Color _seriesColor(String operation) =>
+      AppOperationColors.of(context).forOperation(operation);
 
   double _averageObjectSizeMiB(BenchmarkResultSummary summary) {
     if (summary.sizeLatencyBuckets.isEmpty) {

@@ -73,3 +73,64 @@ class _EdgeFadeScrollState extends State<EdgeFadeScroll> {
     );
   }
 }
+
+/// Fades the top/bottom edge of a vertical scrollable [child] while more
+/// content lies beyond it, so a panel clipped mid-row reads as scrollable
+/// instead of cut off.
+class VerticalEdgeFade extends StatefulWidget {
+  const VerticalEdgeFade({super.key, required this.child, this.extent = 24});
+  final Widget child;
+  final double extent;
+  @override
+  State<VerticalEdgeFade> createState() => VerticalEdgeFadeState();
+}
+
+class VerticalEdgeFadeState extends State<VerticalEdgeFade> {
+  bool _before = false, _after = false;
+
+  @visibleForTesting
+  bool get fadesTop => _before;
+  @visibleForTesting
+  bool get fadesBottom => _after;
+
+  bool _onMetrics(ScrollMetrics metrics) {
+    if (metrics.axis != Axis.vertical) return false;
+    final before = metrics.extentBefore > 0.5;
+    final after = metrics.extentAfter > 0.5;
+    if (before != _before || after != _after) {
+      setState(() {
+        _before = before;
+        _after = after;
+      });
+    }
+    return false;
+  }
+
+  @override
+  Widget build(BuildContext context) => ShaderMask(
+        blendMode: BlendMode.dstIn,
+        shaderCallback: (bounds) {
+          final fade = bounds.height == 0
+              ? 0.0
+              : (widget.extent / bounds.height).clamp(0.0, .3);
+          return LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              _before ? Colors.transparent : Colors.black,
+              Colors.black,
+              Colors.black,
+              _after ? Colors.transparent : Colors.black,
+            ],
+            stops: [0, fade, 1 - fade, 1],
+          ).createShader(bounds);
+        },
+        child: NotificationListener<ScrollMetricsNotification>(
+          onNotification: (n) => n.depth == 0 && _onMetrics(n.metrics),
+          child: NotificationListener<ScrollNotification>(
+            onNotification: (n) => n.depth == 0 && _onMetrics(n.metrics),
+            child: widget.child,
+          ),
+        ),
+      );
+}
