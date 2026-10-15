@@ -21,6 +21,7 @@ import 'package:s3_browser_crossplat/widgets/copyable_value.dart';
 import 'package:s3_browser_crossplat/widgets/danger_button.dart';
 import 'package:s3_browser_crossplat/widgets/setting_fields.dart';
 import 'package:s3_browser_crossplat/widgets/compact_selector.dart';
+import 'package:s3_browser_crossplat/widgets/edge_fade_scroll.dart';
 
 class ProgressEngine extends MockEngineService {
   TransferJobCallback? sink;
@@ -110,6 +111,62 @@ Future<GuiController> frame(WidgetTester tester,
 Future<void> closeFrame(WidgetTester tester) async =>
     tester.pumpWidget(const SizedBox());
 void main() {
+  testWidgets('object rows fade above the fixed footer at 800x600', (
+    tester,
+  ) async {
+    final c = await frame(tester, width: 800);
+    tester.view.physicalSize = const Size(800, 600);
+    await tester.binding.setSurfaceSize(const Size(800, 600));
+    c.objects = List.generate(
+      1000,
+      (i) => ObjectEntry(
+        key: 'row-$i',
+        name: 'row-$i',
+        size: 10,
+        storageClass: 'STANDARD',
+        modifiedAt: DateTime(2026),
+        isFolder: false,
+      ),
+    );
+    c.clearBanner();
+    c.changed();
+    await tester.pumpAndSettle();
+    final table = find.byType(ObjectTable);
+    final fade = find.descendant(
+      of: table,
+      matching: find.byType(VerticalEdgeFade),
+    );
+    final state = tester.state<VerticalEdgeFadeState>(fade);
+    final list = find.byKey(const ValueKey('object-panel-list'));
+    final summary = find.byKey(const ValueKey('object-listing-summary'));
+    final footer = find
+        .ancestor(
+          of: summary,
+          matching: find.byWidgetPredicate(
+            (widget) => widget is SizedBox && widget.height == 44,
+          ),
+        )
+        .first;
+    final footerRect = tester.getRect(footer);
+    expect(tester.getRect(list).bottom, lessThanOrEqualTo(footerRect.top));
+    expect(footerRect.height, 44);
+    expect(state.fadesTop, isFalse);
+    expect(state.fadesBottom, isTrue);
+    final scrollable = tester.state<ScrollableState>(
+      find.descendant(of: list, matching: find.byType(Scrollable)),
+    );
+    scrollable.position.jumpTo(scrollable.position.maxScrollExtent);
+    await tester.pumpAndSettle();
+    expect(state.fadesTop, isTrue);
+    expect(state.fadesBottom, isFalse);
+    expect(
+      tester.getRect(find.text(c.pagedVisibleObjects.last.name)).bottom,
+      lessThanOrEqualTo(footerRect.top),
+    );
+    expect(tester.getRect(footer), footerRect);
+    expect(tester.takeException(), isNull);
+    await closeFrame(tester);
+  });
   test('transfer rates, exact retry destination and cleanup', () async {
     final engine = ProgressEngine();
     final c = GuiController(engine: engine);
