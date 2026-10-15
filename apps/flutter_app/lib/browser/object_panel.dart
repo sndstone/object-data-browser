@@ -79,6 +79,18 @@ class _ObjectPanelState extends State<ObjectPanel> {
     controller.applyObjectFilter(value);
   }
 
+  /// Clears the field and, when a filter is active, the applied filter too,
+  /// keeping focus in the field so typing can continue.
+  void _clearSearch() {
+    _debounce?.cancel();
+    _search.clear();
+    if (controller.objectFilterValue.isNotEmpty ||
+        controller.objectFilterError != null) {
+      _apply('');
+    }
+    _searchFocus.requestFocus();
+  }
+
   @override
   void dispose() {
     _debounce?.cancel();
@@ -236,7 +248,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
                                                   ? c.refreshBuckets
                                                   : c.objects.isEmpty
                                                       ? onUpload
-                                                      : () => _apply(''),
+                                                      : _clearSearch,
                                           child: Text(c.selectedProfile == null
                                               ? 'Create profile'
                                               : !hasBucket
@@ -612,18 +624,31 @@ class _ObjectPanelState extends State<ObjectPanel> {
               BrowserFilterMode.regex => 'Regular expression',
             },
             errorText: c.objectFilterError,
-            suffixIcon: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: Center(
-                widthFactor: 1,
-                heightFactor: 1,
-                child: Text(
-                  Theme.of(context).platform == TargetPlatform.macOS
-                      ? '⌘K'
-                      : 'Ctrl K',
-                  style: Theme.of(context).textTheme.labelSmall,
-                ),
-              ),
+            // The shortcut hint gives way to a clear button once there is
+            // something to clear.
+            suffixIcon: ValueListenableBuilder<TextEditingValue>(
+              valueListenable: _search,
+              builder: (context, value, _) => value.text.isNotEmpty && hasBucket
+                  ? IconButton(
+                      key: const ValueKey('object-search-clear'),
+                      tooltip: 'Clear filter',
+                      onPressed: _clearSearch,
+                      icon: const Icon(Icons.close, size: 18))
+                  : Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      child: Center(
+                        widthFactor: 1,
+                        heightFactor: 1,
+                        child: ExcludeSemantics(
+                          child: Text(
+                            Theme.of(context).platform == TargetPlatform.macOS
+                                ? '⌘K'
+                                : 'Ctrl K',
+                            style: Theme.of(context).textTheme.labelSmall,
+                          ),
+                        ),
+                      ),
+                    ),
             ),
             prefixIconConstraints: const BoxConstraints(minHeight: 48),
             prefixIcon: Padding(
