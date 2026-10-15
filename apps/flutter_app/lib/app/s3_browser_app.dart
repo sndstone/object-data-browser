@@ -388,12 +388,21 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
           ? navTabs.indexOf(controller.activeTab)
           : 0,
       onDestinationSelected: (index) => controller.selectTab(navTabs[index]),
+      // Labels stay on one line and ellipsize at large text scales or
+      // narrow widths; the destination tooltip keeps the full name. The
+      // style is applied per destination because the bar's own Material
+      // resets DefaultTextStyle above them.
       destinations: navTabs
           .map(
-            (tab) => NavigationDestination(
-              icon: Icon(_tabIcon(tab, selected: false)),
-              selectedIcon: Icon(_tabIcon(tab, selected: true)),
-              label: _tabLabel(tab),
+            (tab) => DefaultTextStyle.merge(
+              maxLines: 1,
+              softWrap: false,
+              overflow: TextOverflow.ellipsis,
+              child: NavigationDestination(
+                icon: Icon(_tabIcon(tab, selected: false)),
+                selectedIcon: Icon(_tabIcon(tab, selected: true)),
+                label: _tabLabel(tab),
+              ),
             ),
           )
           .toList(),

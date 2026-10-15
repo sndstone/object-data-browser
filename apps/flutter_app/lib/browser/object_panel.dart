@@ -79,6 +79,18 @@ class _ObjectPanelState extends State<ObjectPanel> {
     controller.applyObjectFilter(value);
   }
 
+  /// Clears the field and, when a filter is active, the applied filter too,
+  /// keeping focus in the field so typing can continue.
+  void _clearSearch() {
+    _debounce?.cancel();
+    _search.clear();
+    if (controller.objectFilterValue.isNotEmpty ||
+        controller.objectFilterError != null) {
+      _apply('');
+    }
+    _searchFocus.requestFocus();
+  }
+
   @override
   void dispose() {
     _debounce?.cancel();
@@ -166,7 +178,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
                                                     ? () => c.toggleFlatView(
                                                         !c.flatView)
                                                     : null,
-                                                selected: c.flatView),
+                                                toggled: c.flatView),
                                             _tool(
                                                 'Create prefix',
                                                 Icons
@@ -185,7 +197,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
                                                 Icons.view_agenda_outlined,
                                                 () => c.setShowAllObjects(
                                                     !c.showAllObjects),
-                                                selected: c.showAllObjects),
+                                                toggled: c.showAllObjects),
                                             _tool(
                                                 'List all',
                                                 Icons.cloud_download_outlined,
@@ -199,125 +211,189 @@ class _ObjectPanelState extends State<ObjectPanel> {
                       if (busy || c.filteringObjects)
                         const LinearProgressIndicator(minHeight: 2),
                       Expanded(
-                          child: objects.isEmpty &&
-                                  hasBucket &&
+                          child: hasBucket &&
                                   c.objects.isEmpty &&
                                   !busy &&
-                                  c.objectFilterError == null
-                              ? EmptyBucketState(
-                                  destination:
-                                      '${c.selectedBucket!.name}/${c.currentPrefix}',
-                                  isRoot: c.currentPrefix.isEmpty,
-                                  onUpload:
-                                      c.isBusy('upload') ? null : onUpload,
-                                )
-                              : objects.isEmpty
-                                  ? EmptyState(
-                                      icon: Icons.folder_open_outlined,
-                                      title: c.selectedProfile == null
-                                          ? 'No connection configured'
-                                          : !hasBucket
-                                              ? 'No bucket open'
-                                              : c.objects.isEmpty
-                                                  ? 'No objects in this prefix'
-                                                  : 'No matching objects',
-                                      message: c.selectedProfile == null
-                                          ? 'Create an endpoint profile to connect to your storage.'
-                                          : !hasBucket
-                                              ? 'Pick a bucket or refresh the list for this endpoint.'
-                                              : c.objects.isEmpty
-                                                  ? 'Upload files to get started.'
-                                                  : 'Change the filter or load more keys.',
-                                      action: TextButton(
-                                          onPressed: c.selectedProfile == null
-                                              ? () => c.selectTab(
-                                                  WorkspaceTab.settings)
+                                  c.objectListingError != null
+                              // A failed listing is not an empty bucket.
+                              ? EmptyState(
+                                  key: const ValueKey('object-listing-error'),
+                                  icon: Icons.cloud_off_outlined,
+                                  title: 'Could not list objects',
+                                  message: c.objectListingError!,
+                                  action: TextButton.icon(
+                                      key: const ValueKey(
+                                          'object-listing-retry'),
+                                      onPressed: c.refreshObjects,
+                                      icon: const Icon(Icons.refresh),
+                                      label: const Text('Retry')))
+                              : objects.isEmpty &&
+                                      hasBucket &&
+                                      c.objects.isEmpty &&
+                                      !busy &&
+                                      c.objectFilterError == null
+                                  ? EmptyBucketState(
+                                      destination:
+                                          '${c.selectedBucket!.name}/${c.currentPrefix}',
+                                      isRoot: c.currentPrefix.isEmpty,
+                                      onUpload:
+                                          c.isBusy('upload') ? null : onUpload,
+                                    )
+                                  : objects.isEmpty
+                                      ? EmptyState(
+                                          icon: Icons.folder_open_outlined,
+                                          title: c.selectedProfile == null
+                                              ? 'No connection configured'
                                               : !hasBucket
-                                                  ? c.refreshBuckets
+                                                  ? 'No bucket open'
                                                   : c.objects.isEmpty
-                                                      ? onUpload
-                                                      : () => _apply(''),
-                                          child: Text(c.selectedProfile == null
-                                              ? 'Create profile'
+                                                      ? 'No objects in this prefix'
+                                                      : 'No matching objects',
+                                          message: c.selectedProfile == null
+                                              ? 'Create an endpoint profile to connect to your storage.'
                                               : !hasBucket
-                                                  ? 'Refresh buckets'
+                                                  ? 'Pick a bucket or refresh the list for this endpoint.'
                                                   : c.objects.isEmpty
-                                                      ? 'Upload files'
-                                                      : 'Clear filter')))
-                                  : ObjectTable(
-                                      objects: objects,
-                                      selectedKey: c.selectedObject?.key,
-                                      selectedKeys: c.objectSelection.keys,
-                                      compactRows: c.settings.compactRows,
-                                      sortField: c.objectSortField,
-                                      descending: c.objectSortDescending,
-                                      onSort: (field) {
-                                        if (field == c.objectSortField) {
-                                          c.toggleObjectSortDirection();
-                                        } else {
-                                          if (c.objectSortDescending) {
-                                            c.toggleObjectSortDirection();
-                                          }
-                                          c.setObjectSortField(field);
-                                        }
-                                      },
-                                      onToggle: (o, range) =>
-                                          c.toggleObjectSelection(o,
-                                              range: range),
-                                      contentTypeFor: c.objectContentType,
-                                      onSelect: c.setSelectedObject,
-                                      onShowContextMenu: widget.onContextMenu)),
-                      const Divider(height: 1),
-                      Wrap(
-                          spacing: 8,
-                          crossAxisAlignment: WrapCrossAlignment.center,
-                          children: [
-                            Text(
-                                '${c.currentObjectPageStart}–${c.currentObjectPageEnd} of ${c.visibleObjects.length} matching · ${c.objects.length} loaded${c.objectCursor.hasMore ? ' · more available' : ''}',
-                                style: Theme.of(context).textTheme.bodySmall),
-                            if (c.objectPageCount > 1 && !c.showAllObjects) ...[
-                              IconButton(
-                                  tooltip: 'Previous page',
-                                  onPressed: c.objectPage > 1
-                                      ? c.previousObjectPage
-                                      : null,
-                                  icon: const Icon(Icons.chevron_left)),
-                              Text('${c.objectPage}/${c.objectPageCount}'),
-                              IconButton(
-                                  tooltip: 'Next page',
-                                  onPressed: c.objectPage < c.objectPageCount
-                                      ? c.nextObjectPage
-                                      : null,
-                                  icon: const Icon(Icons.chevron_right)),
-                            ],
-                            if (c.objectCursor.hasMore)
-                              TextButton(
-                                  onPressed: busy
-                                      ? null
-                                      : () => c.listAllObjectsForCurrentBucket(
-                                          all: false,
-                                          nextWindow: c.listingBudgetReached),
-                                  child: Text(c.listingBudgetReached
-                                      ? 'Next window (clear loaded)'
-                                      : 'Load more')),
-                          ]),
+                                                      ? 'Upload files to get started.'
+                                                      : 'Change the filter or load more keys.',
+                                          action: TextButton(
+                                              onPressed:
+                                                  c.selectedProfile == null
+                                                      ? () => c.selectTab(
+                                                          WorkspaceTab.settings)
+                                                      : !hasBucket
+                                                          ? c.refreshBuckets
+                                                          : c.objects.isEmpty
+                                                              ? onUpload
+                                                              : _clearSearch,
+                                              child: Text(c.selectedProfile ==
+                                                      null
+                                                  ? 'Create profile'
+                                                  : !hasBucket
+                                                      ? 'Refresh buckets'
+                                                      : c.objects.isEmpty
+                                                          ? 'Upload files'
+                                                          : 'Clear filter')))
+                                      : ObjectTable(
+                                          objects: objects,
+                                          selectedKey: c.selectedObject?.key,
+                                          selectedKeys: c.objectSelection.keys,
+                                          compactRows: c.settings.compactRows,
+                                          sortField: c.objectSortField,
+                                          descending: c.objectSortDescending,
+                                          onSort: (field) {
+                                            if (field == c.objectSortField) {
+                                              c.toggleObjectSortDirection();
+                                            } else {
+                                              if (c.objectSortDescending) {
+                                                c.toggleObjectSortDirection();
+                                              }
+                                              c.setObjectSortField(field);
+                                            }
+                                          },
+                                          onToggle: (o, range) =>
+                                              c.toggleObjectSelection(o,
+                                                  range: range),
+                                          contentTypeFor: c.objectContentType,
+                                          onSelect: c.setSelectedObject,
+                                          onShowContextMenu:
+                                              widget.onContextMenu)),
+                      // The listing summary only means something once a
+                      // bucket is open.
+                      if (hasBucket) ...[
+                        const Divider(height: 1),
+                        _footer(context, busy: busy),
+                      ],
                     ]))));
   }
 
+  /// One footer row: the summary takes the remaining width and ellipsizes
+  /// (full text on hover) so the pager and Load more never wrap.
+  Widget _footer(BuildContext context, {required bool busy}) {
+    final c = controller;
+    final summary = _listingSummary(c);
+    const compact = VisualDensity.compact;
+    return SizedBox(
+        height: 44,
+        child: Row(children: [
+          Expanded(
+              child: Tooltip(
+                  message: summary,
+                  child: Text(summary,
+                      key: const ValueKey('object-listing-summary'),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall))),
+          if (c.objectPageCount > 1 && !c.showAllObjects) ...[
+            IconButton(
+                key: const ValueKey('object-page-previous'),
+                tooltip: 'Previous page',
+                visualDensity: compact,
+                onPressed: c.objectPage > 1 ? c.previousObjectPage : null,
+                icon: const Icon(Icons.chevron_left)),
+            Semantics(
+                label: 'Page ${c.objectPage} of ${c.objectPageCount}',
+                excludeSemantics: true,
+                child: Text('${c.objectPage}/${c.objectPageCount}',
+                    style: Theme.of(context).textTheme.labelMedium)),
+            IconButton(
+                key: const ValueKey('object-page-next'),
+                tooltip: 'Next page',
+                visualDensity: compact,
+                onPressed:
+                    c.objectPage < c.objectPageCount ? c.nextObjectPage : null,
+                icon: const Icon(Icons.chevron_right)),
+          ],
+          if (c.objectCursor.hasMore) ...[
+            const SizedBox(width: 4),
+            TextButton(
+                key: const ValueKey('object-load-more'),
+                style: TextButton.styleFrom(visualDensity: compact),
+                onPressed: busy
+                    ? null
+                    : () => c.listAllObjectsForCurrentBucket(
+                        all: false, nextWindow: c.listingBudgetReached),
+                child: Text(c.listingBudgetReached
+                    ? 'Next window (clear loaded)'
+                    : 'Load more')),
+          ],
+        ]));
+  }
+
+  static String _listingSummary(AppController c) {
+    final matching = c.visibleObjects.length;
+    // 'Load more' beside the summary already signals that more exist.
+    final loaded = '${formatCount(c.objects.length)} loaded';
+    if (matching == 0) return 'No matches · $loaded';
+    if (matching == c.objects.length &&
+        c.currentObjectPageStart == 1 &&
+        c.currentObjectPageEnd == matching) {
+      // Everything loaded is on screen; the range would only repeat it.
+      return loaded;
+    }
+    return '${formatCount(c.currentObjectPageStart)}–'
+        '${formatCount(c.currentObjectPageEnd)} of '
+        '${formatCount(matching)} matching · $loaded';
+  }
+
+  /// A labelled view tool. Toggles ([toggled] non-null) expose their state
+  /// to assistive technology as well as through the selected fill. The
+  /// visible label already names the action, so no tooltip repeats it.
   Widget _tool(String label, IconData icon, VoidCallback? action,
-          {bool selected = false}) =>
-      Tooltip(
-          message: label,
-          child: TextButton.icon(
-            onPressed: action,
-            style: selected
-                ? TextButton.styleFrom(
-                    backgroundColor:
-                        Theme.of(context).colorScheme.secondaryContainer)
-                : null,
-            icon: Icon(icon),
-            label: Text(label),
-          ));
+          {bool? toggled}) =>
+      MergeSemantics(
+          child: Semantics(
+              toggled: toggled,
+              child: TextButton.icon(
+                onPressed: action,
+                style: toggled == true
+                    ? TextButton.styleFrom(
+                        backgroundColor:
+                            Theme.of(context).colorScheme.secondaryContainer)
+                    : null,
+                icon: Icon(icon),
+                label: Text(label),
+              )));
 
   /// One toolbar row: location, filter and actions. When objects are
   /// selected the action cluster swaps in place for selection actions, so
@@ -435,11 +511,16 @@ class _ObjectPanelState extends State<ObjectPanel> {
           icon: const Icon(Icons.upload_file),
           label: const Text('Upload')),
       const SizedBox(width: 8),
-      OutlinedButton.icon(
-        onPressed: () => setState(() => _viewExpanded = !_viewExpanded),
-        icon: Icon(_viewExpanded ? Icons.expand_less : Icons.tune),
-        label: const Text('View tools'),
-      ),
+      MergeSemantics(
+          child: Semantics(
+        expanded: _viewExpanded,
+        child: OutlinedButton.icon(
+          key: const ValueKey('object-view-tools'),
+          onPressed: () => setState(() => _viewExpanded = !_viewExpanded),
+          icon: Icon(_viewExpanded ? Icons.expand_less : Icons.tune),
+          label: const Text('View tools'),
+        ),
+      )),
       IconButton(
           tooltip: busy ? 'Cancel listing' : 'Refresh object list',
           onPressed: busy
@@ -612,18 +693,31 @@ class _ObjectPanelState extends State<ObjectPanel> {
               BrowserFilterMode.regex => 'Regular expression',
             },
             errorText: c.objectFilterError,
-            suffixIcon: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: Center(
-                widthFactor: 1,
-                heightFactor: 1,
-                child: Text(
-                  Theme.of(context).platform == TargetPlatform.macOS
-                      ? '⌘K'
-                      : 'Ctrl K',
-                  style: Theme.of(context).textTheme.labelSmall,
-                ),
-              ),
+            // The shortcut hint gives way to a clear button once there is
+            // something to clear.
+            suffixIcon: ValueListenableBuilder<TextEditingValue>(
+              valueListenable: _search,
+              builder: (context, value, _) => value.text.isNotEmpty && hasBucket
+                  ? IconButton(
+                      key: const ValueKey('object-search-clear'),
+                      tooltip: 'Clear filter',
+                      onPressed: _clearSearch,
+                      icon: const Icon(Icons.close, size: 18))
+                  : Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      child: Center(
+                        widthFactor: 1,
+                        heightFactor: 1,
+                        child: ExcludeSemantics(
+                          child: Text(
+                            Theme.of(context).platform == TargetPlatform.macOS
+                                ? '⌘K'
+                                : 'Ctrl K',
+                            style: Theme.of(context).textTheme.labelSmall,
+                          ),
+                        ),
+                      ),
+                    ),
             ),
             prefixIconConstraints: const BoxConstraints(minHeight: 48),
             prefixIcon: Padding(

@@ -1242,10 +1242,43 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   Widget _objectDetailsView(BuildContext context) {
     final details = controller.selectedObjectDetails;
     final object = controller.selectedObject;
-    if (details == null || object == null) {
-      return const Center(
-          child:
-              Text('Select an object to inspect metadata, headers, and tags.'));
+    if (object == null) {
+      return const EmptyState(
+          icon: Icons.info_outline,
+          title: 'No object selected',
+          message:
+              'Select an object to inspect its metadata, headers and tags.');
+    }
+    if (details == null) {
+      if (controller.isBusy('select-object')) {
+        return const Center(
+            key: ValueKey('object-details-loading'),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 12),
+              Text('Loading object details…'),
+            ]));
+      }
+      if (object.isFolder) {
+        return const EmptyState(
+            icon: Icons.folder_outlined,
+            title: 'Prefix selected',
+            message:
+                'Prefixes have no metadata, headers or tags of their own.');
+      }
+      // Loading finished without details: the read failed and the error is
+      // in the event log.
+      return EmptyState(
+          icon: Icons.error_outline,
+          title: 'Details unavailable',
+          message: 'The object details could not be read. '
+              'Events & Debug has the error.',
+          action: TextButton.icon(
+              key: const ValueKey('object-details-retry'),
+              onPressed: () => controller.setSelectedObject(object,
+                  openFolderOnSelect: false),
+              icon: const Icon(Icons.refresh),
+              label: const Text('Retry')));
     }
 
     return _adaptivePanelListView(
@@ -1268,29 +1301,41 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         if (object.etag != null && object.etag!.isNotEmpty)
           _inlineStat('ETag', object.etag!),
         const Divider(height: 16),
-        Text('Metadata', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        ...details.metadata.entries.map(
-          (entry) => CopyableValue(
-              label: entry.key, value: entry.value, controller: controller),
-        ),
+        ..._detailSection(context, 'Metadata', details.metadata,
+            empty: 'No user metadata'),
         const Divider(height: 16),
-        Text('Headers', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        ...details.headers.entries.map(
-          (entry) => CopyableValue(
-              label: entry.key, value: entry.value, controller: controller),
-        ),
+        ..._detailSection(context, 'Headers', details.headers,
+            empty: 'No headers returned'),
         const Divider(height: 16),
-        Text('Tags', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        ...details.tags.entries.map(
-          (entry) => CopyableValue(
-              label: entry.key, value: entry.value, controller: controller),
-        ),
+        ..._detailSection(context, 'Tags', details.tags, empty: 'No tags'),
       ],
     );
   }
+
+  /// A titled key/value section that says so when it has no entries, so an
+  /// empty section is not mistaken for one that failed to load.
+  List<Widget> _detailSection(
+      BuildContext context, String title, Map<String, String> entries,
+      {required String empty}) {
+    final theme = Theme.of(context);
+    return [
+      Text(title, style: theme.textTheme.titleMedium),
+      const SizedBox(height: 8),
+      if (entries.isEmpty)
+        Text(empty,
+            style: theme.textTheme.bodySmall
+                ?.copyWith(color: theme.colorScheme.onSurfaceVariant))
+      else
+        ...entries.entries.map(
+          (entry) => CopyableValue(
+              label: entry.key, value: entry.value, controller: controller),
+        ),
+    ];
+  }
+
+  /// The inline text preview stops here to keep the inspector responsive;
+  /// the expanded preview shows all loaded text.
+  static const _inlinePreviewCharLimit = 12000;
 
   Widget _objectPreviewSection(BuildContext context, ObjectEntry object) {
     final preview = controller.selectedObjectPreview;
@@ -1300,6 +1345,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         preview.supported &&
         (preview.kind == ObjectPreviewKind.image ||
             preview.kind == ObjectPreviewKind.text);
+    final loaded =
+        preview != null && preview.key == object.key && !preview.loading;
     final titleRow = Row(
       children: [
         Text('Preview', style: theme.textTheme.titleMedium),
@@ -1310,11 +1357,13 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             onPressed: () => _showExpandedPreview(context, object, preview),
             icon: const Icon(Icons.open_in_full),
           ),
-        IconButton(
-          tooltip: 'Reload preview',
-          onPressed: controller.refreshSelectedObjectPreview,
-          icon: const Icon(Icons.refresh),
-        ),
+        // Before the first load the body offers 'Load preview' instead.
+        if (loaded)
+          IconButton(
+            tooltip: 'Reload preview',
+            onPressed: controller.refreshSelectedObjectPreview,
+            icon: const Icon(Icons.refresh),
+          ),
       ],
     );
     if (preview == null || preview.key != object.key) {
@@ -1323,7 +1372,13 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         children: [
           titleRow,
           const SizedBox(height: 8),
-          const Text('Preview not loaded.'),
+          Text('Preview not loaded yet.', style: theme.textTheme.bodyMedium),
+          const SizedBox(height: 4),
+          TextButton.icon(
+              key: const ValueKey('object-preview-load'),
+              onPressed: controller.refreshSelectedObjectPreview,
+              icon: const Icon(Icons.visibility_outlined),
+              label: const Text('Load preview')),
         ],
       );
     }
@@ -1341,6 +1396,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     }
 
     final Widget body;
+    var inlineCut = false;
     if (!preview.supported || preview.kind == ObjectPreviewKind.unsupported) {
       body = Text(preview.message);
     } else if (preview.kind == ObjectPreviewKind.image && preview.url != null) {
@@ -1359,15 +1415,18 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               }
               return const Center(child: CircularProgressIndicator());
             },
-            errorBuilder: (context, error, stackTrace) =>
-                const Center(child: Text('Not supported.')),
+            errorBuilder: (context, error, stackTrace) => const Padding(
+                padding: EdgeInsets.all(16),
+                child: Center(child: Text('Could not load image preview.'))),
           ),
         ),
       );
     } else if (preview.kind == ObjectPreviewKind.text) {
       final text = preview.text ?? '';
-      final visibleText =
-          text.length > 12000 ? '${text.substring(0, 12000)}\n...' : text;
+      inlineCut = text.length > _inlinePreviewCharLimit;
+      final visibleText = inlineCut
+          ? '${text.substring(0, _inlinePreviewCharLimit)}\n...'
+          : text;
       final language = sourcePreviewLanguage(object.key, preview.contentType);
       body = Container(
         width: double.infinity,
@@ -1432,6 +1491,22 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         ],
         const SizedBox(height: 8),
         body,
+        if (inlineCut)
+          Container(
+            key: const ValueKey('inline-preview-truncated'),
+            width: double.infinity,
+            margin: const EdgeInsets.only(top: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerHigh,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              'Showing the first ${formatCount(_inlinePreviewCharLimit)} '
+              'characters here. Open preview to read all loaded text.',
+              style: theme.textTheme.bodySmall,
+            ),
+          ),
         if (preview.message.isNotEmpty) ...[
           const SizedBox(height: 8),
           Text(
@@ -1482,15 +1557,22 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Text(
-                                  object.key,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: theme.textTheme.titleMedium,
+                                // Long keys ellipsize; the full key stays
+                                // available on hover and to screen readers.
+                                Tooltip(
+                                  message: object.key,
+                                  child: Text(
+                                    object.key,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: theme.textTheme.titleMedium,
+                                  ),
                                 ),
                                 if (preview.contentType != null)
                                   Text(
                                     preview.contentType!,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
                                     style: theme.textTheme.bodySmall,
                                   ),
                               ],
@@ -1569,7 +1651,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                         ),
                         color: theme.colorScheme.surfaceContainerHigh,
                         child: Text(
-                          'Preview is limited to the first ${preview.loadedBytes} bytes.',
+                          'Preview is limited to the first ${formatBytes(preview.loadedBytes)} of this object.',
                           style: theme.textTheme.bodySmall,
                         ),
                       ),
@@ -1769,7 +1851,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           ),
         ),
         const Divider(height: 20),
-        const Text('Select a version below to inspect, download, share, restore or delete that exact version.'),
+        const Text(
+            'Select a version below to inspect, download, share, restore or delete that exact version.'),
         ...versions.map(
           (version) => ListTile(
             contentPadding: EdgeInsets.zero,
