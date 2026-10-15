@@ -1336,9 +1336,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                     child: Chip(
                         avatar: Icon(Icons.warning_amber_rounded,
                             size: 16,
-                            color: Theme.of(context)
-                                .colorScheme
-                                .onErrorContainer),
+                            color:
+                                Theme.of(context).colorScheme.onErrorContainer),
                         backgroundColor:
                             Theme.of(context).colorScheme.errorContainer,
                         label: Text(persistenceStatus,
@@ -1607,107 +1606,117 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         style: TextStyle(
                             color: Theme.of(context).colorScheme.error)),
                 children: [
-              if (!AppPlatform.isMobile) ...[
-                SettingNumberField(
-                    label: 'Connection pool limit (part workers capped at 8)',
-                    value: _connectionLimit,
-                    min: 1,
-                    max: 256,
-                    onCommit: (value) =>
-                        setState(() => _connectionLimit = value)),
-                const SizedBox(height: 12),
-                SettingNumberField(
-                    label: 'Maximum attempts',
-                    value: _maxAttempts,
-                    min: 1,
-                    max: 100,
-                    onCommit: (value) => setState(() => _maxAttempts = value)),
-                const SizedBox(height: 12),
-              ] else
-                const Text(
-                    'This engine manages connection pools and retry limits.'),
-              AppSwitchTile(
-                value: _pathStyle,
-                onChanged: _endpointType == EndpointProfileType.s3Compatible
-                    ? (value) => setState(() => _pathStyle = value)
-                    : null,
-                title: const Text('Force path-style requests'),
-                subtitle: Text(switch (_endpointType) {
-                  EndpointProfileType.awsS3 =>
-                    'AWS S3 uses the standard virtual-hosted endpoint layout.',
-                  EndpointProfileType.azureBlob =>
-                    'Not applicable to Azure Blob Storage.',
-                  EndpointProfileType.s3Compatible =>
-                    'Useful for MinIO and other S3-compatible endpoints.',
-                }),
-              ),
-              AppSwitchTile(
-                value: _verifyTls,
-                onChanged:
-                    (_endpointType != EndpointProfileType.awsS3 && _useHttps)
+                  if (!AppPlatform.isMobile) ...[
+                    SettingNumberField(
+                        label:
+                            'Connection pool limit (part workers capped at 8)',
+                        value: _connectionLimit,
+                        min: 1,
+                        max: 256,
+                        onCommit: (value) =>
+                            setState(() => _connectionLimit = value)),
+                    const SizedBox(height: 12),
+                    SettingNumberField(
+                        label: 'Maximum attempts',
+                        value: _maxAttempts,
+                        min: 1,
+                        max: 100,
+                        onCommit: (value) =>
+                            setState(() => _maxAttempts = value)),
+                    const SizedBox(height: 12),
+                  ] else
+                    const Text(
+                        'This engine manages connection pools and retry limits.'),
+                  AppSwitchTile(
+                    value: _pathStyle,
+                    onChanged: _endpointType == EndpointProfileType.s3Compatible
+                        ? (value) => setState(() => _pathStyle = value)
+                        : null,
+                    title: const Text('Force path-style requests'),
+                    subtitle: Text(switch (_endpointType) {
+                      EndpointProfileType.awsS3 =>
+                        'AWS S3 uses the standard virtual-hosted endpoint layout.',
+                      EndpointProfileType.azureBlob =>
+                        'Not applicable to Azure Blob Storage.',
+                      EndpointProfileType.s3Compatible =>
+                        'Useful for MinIO and other S3-compatible endpoints.',
+                    }),
+                  ),
+                  AppSwitchTile(
+                    value: _verifyTls,
+                    onChanged: (_endpointType != EndpointProfileType.awsS3 &&
+                            _useHttps)
                         ? (value) => setState(() => _verifyTls = value)
                         : null,
-                title: const Text('Verify TLS certificates'),
-                subtitle: Text(
-                  _endpointType == EndpointProfileType.awsS3
-                      ? 'AWS S3 always uses HTTPS with certificate verification enabled.'
-                      : (_useHttps
-                          ? 'Disable this only for self-signed or lab endpoints.'
-                          : 'TLS verification is off because this endpoint uses HTTP.'),
-                ),
-              ),
-              phone
-                  ? Column(
-                      children: [
-                        TextField(
-                          controller: _connectTimeoutController,
-                          keyboardType: TextInputType.number,
-                          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                          decoration: InputDecoration(
-                            errorText: connectError,
-                            labelText: 'Connect timeout (s)',
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        TextField(
-                          controller: _readTimeoutController,
-                          keyboardType: TextInputType.number,
-                          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                          decoration: InputDecoration(
-                            errorText: readError,
-                            labelText: 'Read timeout (s)',
-                          ),
-                        ),
-                      ],
-                    )
-                  : Row(
-                      children: [
-                        Expanded(
-                          child: TextField(
-                            controller: _connectTimeoutController,
-                            keyboardType: TextInputType.number,
-                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                            decoration: InputDecoration(
-                              errorText: connectError,
-                              labelText: 'Connect timeout (s)',
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: TextField(
-                            controller: _readTimeoutController,
-                            keyboardType: TextInputType.number,
-                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                            decoration: InputDecoration(
-                              errorText: readError,
-                              labelText: 'Read timeout (s)',
-                            ),
-                          ),
-                        ),
-                      ],
+                    title: const Text('Verify TLS certificates'),
+                    subtitle: Text(
+                      _endpointType == EndpointProfileType.awsS3
+                          ? 'AWS S3 always uses HTTPS with certificate verification enabled.'
+                          : (_useHttps
+                              ? 'Disable this only for self-signed or lab endpoints.'
+                              : 'TLS verification is off because this endpoint uses HTTP.'),
                     ),
-            ]),
+                  ),
+                  phone
+                      ? Column(
+                          children: [
+                            TextField(
+                              controller: _connectTimeoutController,
+                              keyboardType: TextInputType.number,
+                              inputFormatters: [
+                                FilteringTextInputFormatter.digitsOnly
+                              ],
+                              decoration: InputDecoration(
+                                errorText: connectError,
+                                labelText: 'Connect timeout (s)',
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            TextField(
+                              controller: _readTimeoutController,
+                              keyboardType: TextInputType.number,
+                              inputFormatters: [
+                                FilteringTextInputFormatter.digitsOnly
+                              ],
+                              decoration: InputDecoration(
+                                errorText: readError,
+                                labelText: 'Read timeout (s)',
+                              ),
+                            ),
+                          ],
+                        )
+                      : Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: _connectTimeoutController,
+                                keyboardType: TextInputType.number,
+                                inputFormatters: [
+                                  FilteringTextInputFormatter.digitsOnly
+                                ],
+                                decoration: InputDecoration(
+                                  errorText: connectError,
+                                  labelText: 'Connect timeout (s)',
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: TextField(
+                                controller: _readTimeoutController,
+                                keyboardType: TextInputType.number,
+                                inputFormatters: [
+                                  FilteringTextInputFormatter.digitsOnly
+                                ],
+                                decoration: InputDecoration(
+                                  errorText: readError,
+                                  labelText: 'Read timeout (s)',
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                ]),
             const SizedBox(height: 8),
             TextField(
               controller: _notesController,
