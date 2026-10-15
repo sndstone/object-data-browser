@@ -1242,10 +1242,43 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   Widget _objectDetailsView(BuildContext context) {
     final details = controller.selectedObjectDetails;
     final object = controller.selectedObject;
-    if (details == null || object == null) {
-      return const Center(
-          child:
-              Text('Select an object to inspect metadata, headers, and tags.'));
+    if (object == null) {
+      return const EmptyState(
+          icon: Icons.info_outline,
+          title: 'No object selected',
+          message:
+              'Select an object to inspect its metadata, headers and tags.');
+    }
+    if (details == null) {
+      if (controller.isBusy('select-object')) {
+        return const Center(
+            key: ValueKey('object-details-loading'),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 12),
+              Text('Loading object details…'),
+            ]));
+      }
+      if (object.isFolder) {
+        return const EmptyState(
+            icon: Icons.folder_outlined,
+            title: 'Prefix selected',
+            message:
+                'Prefixes have no metadata, headers or tags of their own.');
+      }
+      // Loading finished without details: the read failed and the error is
+      // in the event log.
+      return EmptyState(
+          icon: Icons.error_outline,
+          title: 'Details unavailable',
+          message: 'The object details could not be read. '
+              'Events & Debug has the error.',
+          action: TextButton.icon(
+              key: const ValueKey('object-details-retry'),
+              onPressed: () => controller.setSelectedObject(object,
+                  openFolderOnSelect: false),
+              icon: const Icon(Icons.refresh),
+              label: const Text('Retry')));
     }
 
     return _adaptivePanelListView(
@@ -1331,7 +1364,13 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         children: [
           titleRow,
           const SizedBox(height: 8),
-          const Text('Preview not loaded.'),
+          Text('Preview not loaded yet.', style: theme.textTheme.bodyMedium),
+          const SizedBox(height: 4),
+          TextButton.icon(
+              key: const ValueKey('object-preview-load'),
+              onPressed: controller.refreshSelectedObjectPreview,
+              icon: const Icon(Icons.visibility_outlined),
+              label: const Text('Load preview')),
         ],
       );
     }

@@ -23,6 +23,7 @@ Future<void> _pumpApp(WidgetTester tester, dynamic controller,
 
 void main() {
   inspectorMain();
+  detailsFailureMain();
   viewToolsMain();
   testWidgets('object filter shows a clear button that resets the filter',
       (tester) async {
@@ -150,5 +151,52 @@ void viewToolsMain() {
     await tester.pumpWidget(const SizedBox.shrink());
     c.dispose();
     handle.dispose();
+  });
+}
+
+class _FailingDetailsEngine extends fixture.TestingEngine {
+  bool fail = true;
+  @override
+  Future<ObjectDetails> getObjectDetails(
+      {required String engineId,
+      required EndpointProfile profile,
+      required String bucketName,
+      required String key}) async {
+    if (fail) {
+      throw const EngineException(
+          code: ErrorCode.unknown, message: 'Fixture details failure');
+    }
+    return super.getObjectDetails(
+        engineId: engineId, profile: profile, bucketName: bucketName, key: key);
+  }
+}
+
+void detailsFailureMain() {
+  testWidgets('failed object details offer a retry instead of a select hint',
+      (tester) async {
+    final engine = _FailingDetailsEngine();
+    final c = fixture.controller(engine, fixture.Repository());
+    await c.initialize();
+    c.clearBanner();
+    await _pumpApp(tester, c);
+
+    final file = c.pagedVisibleObjects.firstWhere((o) => !o.isFolder);
+    await tester.tap(find.text(file.name));
+    await tester.pumpAndSettle();
+    expect(c.selectedObject?.key, file.key);
+    expect(c.selectedObjectDetails, isNull);
+    expect(find.text('Details unavailable'), findsOneWidget);
+    expect(find.textContaining('Select an object'), findsNothing);
+
+    engine.fail = false;
+    await tester.tap(find.byKey(const ValueKey('object-details-retry')));
+    await tester.pumpAndSettle();
+    expect(c.selectedObjectDetails, isNotNull);
+    expect(find.text('Details unavailable'), findsNothing);
+    expect(find.text('Metadata'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    c.dispose();
   });
 }
