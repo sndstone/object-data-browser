@@ -1268,28 +1268,36 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         if (object.etag != null && object.etag!.isNotEmpty)
           _inlineStat('ETag', object.etag!),
         const Divider(height: 16),
-        Text('Metadata', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        ...details.metadata.entries.map(
-          (entry) => CopyableValue(
-              label: entry.key, value: entry.value, controller: controller),
-        ),
+        ..._detailSection(context, 'Metadata', details.metadata,
+            empty: 'No user metadata'),
         const Divider(height: 16),
-        Text('Headers', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        ...details.headers.entries.map(
-          (entry) => CopyableValue(
-              label: entry.key, value: entry.value, controller: controller),
-        ),
+        ..._detailSection(context, 'Headers', details.headers,
+            empty: 'No headers returned'),
         const Divider(height: 16),
-        Text('Tags', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        ...details.tags.entries.map(
-          (entry) => CopyableValue(
-              label: entry.key, value: entry.value, controller: controller),
-        ),
+        ..._detailSection(context, 'Tags', details.tags, empty: 'No tags'),
       ],
     );
+  }
+
+  /// A titled key/value section that says so when it has no entries, so an
+  /// empty section is not mistaken for one that failed to load.
+  List<Widget> _detailSection(
+      BuildContext context, String title, Map<String, String> entries,
+      {required String empty}) {
+    final theme = Theme.of(context);
+    return [
+      Text(title, style: theme.textTheme.titleMedium),
+      const SizedBox(height: 8),
+      if (entries.isEmpty)
+        Text(empty,
+            style: theme.textTheme.bodySmall
+                ?.copyWith(color: theme.colorScheme.onSurfaceVariant))
+      else
+        ...entries.entries.map(
+          (entry) => CopyableValue(
+              label: entry.key, value: entry.value, controller: controller),
+        ),
+    ];
   }
 
   Widget _objectPreviewSection(BuildContext context, ObjectEntry object) {
@@ -1359,8 +1367,9 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               }
               return const Center(child: CircularProgressIndicator());
             },
-            errorBuilder: (context, error, stackTrace) =>
-                const Center(child: Text('Not supported.')),
+            errorBuilder: (context, error, stackTrace) => const Padding(
+                padding: EdgeInsets.all(16),
+                child: Center(child: Text('Could not load image preview.'))),
           ),
         ),
       );
@@ -1482,15 +1491,22 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Text(
-                                  object.key,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: theme.textTheme.titleMedium,
+                                // Long keys ellipsize; the full key stays
+                                // available on hover and to screen readers.
+                                Tooltip(
+                                  message: object.key,
+                                  child: Text(
+                                    object.key,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: theme.textTheme.titleMedium,
+                                  ),
                                 ),
                                 if (preview.contentType != null)
                                   Text(
                                     preview.contentType!,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
                                     style: theme.textTheme.bodySmall,
                                   ),
                               ],
@@ -1569,7 +1585,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                         ),
                         color: theme.colorScheme.surfaceContainerHigh,
                         child: Text(
-                          'Preview is limited to the first ${preview.loadedBytes} bytes.',
+                          'Preview is limited to the first ${formatBytes(preview.loadedBytes)} of this object.',
                           style: theme.textTheme.bodySmall,
                         ),
                       ),
@@ -1769,7 +1785,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           ),
         ),
         const Divider(height: 20),
-        const Text('Select a version below to inspect, download, share, restore or delete that exact version.'),
+        const Text(
+            'Select a version below to inspect, download, share, restore or delete that exact version.'),
         ...versions.map(
           (version) => ListTile(
             contentPadding: EdgeInsets.zero,
