@@ -40,6 +40,11 @@ Java use this distinction. Go and Rust still do not advertise interactive
 transfer controls. Cancellation of a multi-file parent stops queued files even
 when its active engine cannot interrupt the current file.
 
+Engines advertising interactive transfer controls must register a job before
+emitting its first `transferProgress` event, so that the event's job ID is
+immediately usable by pause, resume, and cancel requests. A cancelled download's
+terminal response follows response-body closure and staged-file cleanup.
+
 The Flutter host owns per-action cancellation scopes. Read cancellation stops
 only the owning request and discards late results. Desktop mutation cancellation
 may terminate its exclusively owned sidecar; it then records `unknown` because

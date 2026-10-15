@@ -5,7 +5,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 )
+
+// Use the same Unicode simple-fold equivalence as strings.EqualFold.
+func downloadNameFold(name string) string {
+	return strings.Map(func(r rune) rune {
+		folded := r
+		for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
+			if next < folded {
+				folded = next
+			}
+		}
+		return folded
+	}, name)
+}
 
 // A staged file is linked into place only after validation. Link fails rather
 // than replacing a destination created concurrently (including a symlink).
@@ -32,26 +46,27 @@ func publishDownload(temporary, directory, key, policy string) (string, error) {
 		name = "_" + name
 	}
 	ext := filepath.Ext(name)
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return "", err
+	}
+	occupied := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		folded := downloadNameFold(entry.Name())
+		if _, exists := occupied[folded]; !exists {
+			occupied[folded] = entry.Name()
+		}
+	}
 	for i := 0; i < 100000; i++ {
 		candidate := name
 		if i > 0 {
 			candidate = fmt.Sprintf("%s (%d)%s", strings.TrimSuffix(name, ext), i, ext)
 		}
-		entries, err := os.ReadDir(directory)
-		if err != nil {
-			return "", err
-		}
-		conflict := false
-		for _, entry := range entries {
-			if strings.EqualFold(entry.Name(), candidate) {
-				if policy == "replace" {
-					candidate = entry.Name()
-				}
-				conflict = true
-				break
-			}
-		}
+		existing, conflict := occupied[downloadNameFold(candidate)]
 		if policy == "replace" {
+			if conflict {
+				candidate = existing
+			}
 			target := filepath.Join(directory, candidate)
 			if err := os.Rename(temporary, target); err != nil {
 				return "", err
