@@ -327,6 +327,7 @@ class AppController extends ChangeNotifier {
   }
 
   bool _benchmarkPollErrorReported = false;
+  int _selectionArtifactsSequence = 0;
   int _previewRequestSequence = 0;
   final Map<String, _PendingObjectRelist> _pendingUploadRelists =
       <String, _PendingObjectRelist>{};
@@ -3255,9 +3256,21 @@ class AppController extends ChangeNotifier {
 
   Future<void> _loadSelectionArtifacts(
       {bool cancellableListing = false}) async {
+    // Details and versions can finish after navigation or a newer refresh.
+    // The key alone is insufficient: different buckets may contain that key.
+    final requestId = ++_selectionArtifactsSequence;
+    final engineId = activeEngineId;
     final profile = selectedProfile;
     final bucket = selectedBucket;
     final object = selectedObject;
+    final prefix = currentPrefix;
+    bool isCurrent() =>
+        requestId == _selectionArtifactsSequence &&
+        activeEngineId == engineId &&
+        selectedProfile?.id == profile?.id &&
+        selectedBucket?.name == bucket?.name &&
+        selectedObject?.key == object?.key &&
+        currentPrefix == prefix;
     if (profile == null || bucket == null) {
       versions = const [];
       versionCursor = const ListCursor(value: null, hasMore: false);
@@ -3272,17 +3285,19 @@ class AppController extends ChangeNotifier {
       try {
         final versionResult =
             await read(() => _engineService.listObjectVersions(
-                  engineId: activeEngineId,
+                  engineId: engineId,
                   profile: profile,
                   bucketName: bucket.name,
                   key: object?.key,
                   options: versionBrowserOptions,
                 ));
+        if (!isCurrent()) return;
         versions = versionResult.items;
         versionCursor = versionResult.cursor;
       } on ListingCancelled {
         rethrow;
       } on EngineException catch (error) {
+        if (!isCurrent()) return;
         versions = const [];
         versionCursor = const ListCursor(value: null, hasMore: false);
         _addEvent(
@@ -3303,17 +3318,20 @@ class AppController extends ChangeNotifier {
         return;
       }
       try {
-        selectedObjectDetails = await read(() =>
+        final details = await read(() =>
             _engineService.getObjectDetails(
-                engineId: activeEngineId,
+                engineId: engineId,
                 profile: profile,
                 bucketName: bucket.name,
                 key: object.key));
+        if (!isCurrent()) return;
+        selectedObjectDetails = details;
         _primeSelectedObjectPreview(object, notify: false);
         notifyListeners();
       } on ListingCancelled {
         rethrow;
       } on EngineException catch (error) {
+        if (!isCurrent()) return;
         selectedObjectDetails = null;
         _addEvent(
             level: 'WARN',
@@ -3326,6 +3344,7 @@ class AppController extends ChangeNotifier {
     }
 
     await Future.wait([readDetails(), readVersions()]);
+    if (!isCurrent()) return;
     if (object == null) {
       notifyListeners();
       return;
@@ -3408,27 +3427,33 @@ class AppController extends ChangeNotifier {
     String contentType,
     int requestId,
   ) async {
+    final engineId = activeEngineId;
     final profile = selectedProfile;
     final bucket = selectedBucket;
     if (profile == null || bucket == null) {
       return;
     }
+    bool isCurrent() =>
+        activeEngineId == engineId &&
+        selectedProfile?.id == profile.id &&
+        selectedBucket?.name == bucket.name &&
+        _isCurrentPreviewRequest(object.key, requestId);
     try {
       final expirationMinutes =
           settings.defaultPresignMinutes.clamp(1, 15).toInt();
       final url = await _engineService.generatePresignedUrl(
-        engineId: activeEngineId,
+        engineId: engineId,
         profile: profile,
         bucketName: bucket.name,
         key: object.key,
         expiration: Duration(minutes: expirationMinutes),
       );
-      if (!_isCurrentPreviewRequest(object.key, requestId)) {
+      if (!isCurrent()) {
         return;
       }
       if (kind == ObjectPreviewKind.text) {
         final preview = await _fetchPreviewText(url);
-        if (!_isCurrentPreviewRequest(object.key, requestId)) {
+        if (!isCurrent()) {
           return;
         }
         selectedObjectPreview = ObjectPreview.ready(
@@ -3455,7 +3480,7 @@ class AppController extends ChangeNotifier {
         );
       }
     } catch (error) {
-      if (!_isCurrentPreviewRequest(object.key, requestId)) {
+      if (!isCurrent()) {
         return;
       }
       selectedObjectPreview = ObjectPreview.unsupported(
