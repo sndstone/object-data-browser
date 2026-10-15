@@ -1,6 +1,7 @@
 import 'dart:ui' show Tristate;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show RenderParagraph;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:s3_browser_crossplat/app/s3_browser_app.dart';
 import 'package:s3_browser_crossplat/models/domain_models.dart';
@@ -23,6 +24,7 @@ Future<void> _pumpApp(WidgetTester tester, dynamic controller,
 
 void main() {
   inspectorMain();
+  phoneNavMain();
   listingErrorMain();
   footerMain();
   previewReloadMain();
@@ -360,6 +362,46 @@ void listingErrorMain() {
     expect(c.objectListingError, isNull);
     expect(c.objects, isNotEmpty);
     expect(find.byKey(const ValueKey('object-listing-error')), findsNothing);
+    expect(tester.takeException(), isNull);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    c.dispose();
+  });
+}
+
+void phoneNavMain() {
+  testWidgets('phone navigation labels fit at 390 px with 130% text',
+      (tester) async {
+    tester.platformDispatcher.textScaleFactorTestValue = 1.3;
+    addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
+    final c = fixture.controller(fixture.TestingEngine(), fixture.Repository());
+    await c.initialize();
+    c.clearBanner();
+    await _pumpApp(tester, c, size: const Size(390, 844));
+
+    final nav = find.byType(NavigationBar);
+    expect(nav, findsOneWidget);
+    expect(tester.takeException(), isNull);
+    final navRect = tester.getRect(nav);
+    // Icons are RichText too; only the destination labels matter here.
+    final labels = find.descendant(
+        of: nav,
+        matching: find.byWidgetPredicate((w) =>
+            w is RichText &&
+            const {'Jobs', 'Buckets', 'Benchmark', 'Event Log', 'Settings'}
+                .contains(w.text.toPlainText())));
+    expect(labels.evaluate().length, greaterThanOrEqualTo(3));
+    for (final element in labels.evaluate()) {
+      final paragraph = element.renderObject! as RenderParagraph;
+      final text = paragraph.text.toPlainText();
+      expect(paragraph.maxLines, 1, reason: '$text cannot wrap');
+      expect(paragraph.overflow, TextOverflow.ellipsis);
+      final rect = tester.getRect(find.byElementPredicate((e) => e == element));
+      expect(rect.left >= navRect.left - .5 && rect.right <= navRect.right + .5,
+          isTrue,
+          reason: '$text stays inside the navigation bar');
+      expect(rect.bottom, lessThanOrEqualTo(navRect.bottom + .5));
+    }
     expect(tester.takeException(), isNull);
 
     await tester.pumpWidget(const SizedBox.shrink());
