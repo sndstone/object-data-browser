@@ -23,6 +23,7 @@ Future<void> _pumpApp(WidgetTester tester, dynamic controller,
 
 void main() {
   inspectorMain();
+  footerMain();
   previewReloadMain();
   inlinePreviewMain();
   detailsFailureMain();
@@ -274,4 +275,39 @@ void previewReloadMain() {
     await tester.pumpWidget(const SizedBox.shrink());
     c.dispose();
   });
+}
+
+void footerMain() {
+  for (final width in const [1000.0, 1440.0]) {
+    testWidgets('object list footer stays on one row at ${width.toInt()} px',
+        (tester) async {
+      final c =
+          fixture.controller(fixture.TestingEngine(), fixture.Repository());
+      await c.initialize();
+      // A second listing page gives more rows than one page shows.
+      await c.listAllObjectsForCurrentBucket(all: false);
+      c.clearBanner();
+      await _pumpApp(tester, c, size: Size(width, 640));
+      expect(c.objectPageCount, greaterThan(1));
+      expect(c.objectCursor.hasMore, isTrue);
+
+      final summary = find.byKey(const ValueKey('object-listing-summary'));
+      final row = [
+        summary,
+        find.byKey(const ValueKey('object-page-previous')),
+        find.byKey(const ValueKey('object-page-next')),
+        find.byKey(const ValueKey('object-load-more')),
+      ];
+      final centerY = tester.getCenter(summary).dy;
+      for (final item in row) {
+        expect(item, findsOneWidget);
+        expect(tester.getCenter(item).dy, moreOrLessEquals(centerY, epsilon: 1),
+            reason: '$item shares the footer row');
+      }
+      expect(tester.takeException(), isNull);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      c.dispose();
+    });
+  }
 }
