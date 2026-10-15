@@ -6,6 +6,7 @@ import 'package:s3_browser_crossplat/app/s3_browser_app.dart';
 import 'package:s3_browser_crossplat/controllers/app_controller.dart';
 import 'package:s3_browser_crossplat/models/domain_models.dart';
 import 'package:s3_browser_crossplat/services/mock_engine_service.dart';
+import 'package:s3_browser_crossplat/widgets/setting_fields.dart';
 
 class SaveController extends AppController {
   SaveController()
@@ -121,6 +122,40 @@ void main() {
             .widget<FilledButton>(find.widgetWithText(FilledButton, 'Save'))
             .onPressed,
         isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('numeric settings reject non-digit input', (tester) async {
+    int? committed;
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: SettingNumberField(
+                label: 'Workers',
+                value: 4,
+                max: 64,
+                onCommit: (v) => committed = v))));
+    final field = find.widgetWithText(TextFormField, 'Workers');
+    await tester.enterText(field, '1a2-');
+    await tester.pump();
+    expect(find.text('12'), findsOneWidget);
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pump();
+    expect(committed, 12);
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('profile timeouts accept digits only', (tester) async {
+    await openEditor(tester);
+    final advanced = find.text('Advanced transport');
+    await tester.ensureVisible(advanced);
+    await tester.pumpAndSettle();
+    await tester.tap(advanced);
+    await tester.pumpAndSettle();
+    final read = find.widgetWithText(TextField, 'Read timeout (s)');
+    await tester.ensureVisible(read);
+    await tester.enterText(read, '4x5');
+    await tester.pump();
+    expect(tester.widget<TextField>(read).controller!.text, '45');
     await tester.pumpWidget(const SizedBox());
   });
 }

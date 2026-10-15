@@ -7,6 +7,7 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../app/version_details.dart';
@@ -1657,6 +1658,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         TextField(
                           controller: _connectTimeoutController,
                           keyboardType: TextInputType.number,
+                          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                           decoration: InputDecoration(
                             errorText: connectError,
                             labelText: 'Connect timeout (s)',
@@ -1666,6 +1668,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         TextField(
                           controller: _readTimeoutController,
                           keyboardType: TextInputType.number,
+                          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                           decoration: InputDecoration(
                             errorText: readError,
                             labelText: 'Read timeout (s)',
@@ -1679,6 +1682,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                           child: TextField(
                             controller: _connectTimeoutController,
                             keyboardType: TextInputType.number,
+                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                             decoration: InputDecoration(
                               errorText: connectError,
                               labelText: 'Connect timeout (s)',
@@ -1690,6 +1694,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                           child: TextField(
                             controller: _readTimeoutController,
                             keyboardType: TextInputType.number,
+                            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                             decoration: InputDecoration(
                               errorText: readError,
                               labelText: 'Read timeout (s)',
