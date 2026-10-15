@@ -336,11 +336,9 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                       ? const SizedBox(
                           width: 14,
                           height: 14,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            valueColor:
-                                AlwaysStoppedAnimation<Color>(Colors.white),
-                          ),
+                          // Inherit the button's disabled foreground instead
+                          // of white, which vanishes on light disabled fills.
+                          child: CircularProgressIndicator(strokeWidth: 2),
                         )
                       : const Icon(Icons.play_arrow),
                   label: Text(starting ? 'Starting…' : 'Start benchmark'),
@@ -1276,16 +1274,18 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
   }
 
   Widget _statusChip(BuildContext context, String status) {
+    final scheme = Theme.of(context).colorScheme;
+    // Light shades keep the label readable on dark surfaces; darker shades
+    // keep AA contrast on the light tinted chip background.
+    final dark = scheme.brightness == Brightness.dark;
+    Color tone(MaterialColor c) => dark ? c.shade300 : c.shade800;
     final (color, icon) = switch (status) {
-      'starting' => (
-          Theme.of(context).colorScheme.primary,
-          Icons.hourglass_top,
-        ),
-      'running' => (Colors.green.shade600, Icons.play_circle_filled),
-      'paused' => (Colors.orange.shade600, Icons.pause_circle_filled),
-      'stopped' => (Colors.red.shade600, Icons.stop_circle),
-      'completed' => (Colors.blue.shade600, Icons.check_circle),
-      _ => (Colors.grey.shade500, Icons.circle_outlined),
+      'starting' => (scheme.primary, Icons.hourglass_top),
+      'running' => (tone(Colors.green), Icons.play_circle_filled),
+      'paused' => (tone(Colors.orange), Icons.pause_circle_filled),
+      'stopped' => (scheme.error, Icons.stop_circle),
+      'completed' => (tone(Colors.blue), Icons.check_circle),
+      _ => (scheme.onSurfaceVariant, Icons.circle_outlined),
     };
     final labelStyle = Theme.of(context).textTheme.labelSmall?.copyWith(
           color: color,
