@@ -14,6 +14,7 @@ import '../theme/app_theme.dart';
 import '../widgets/app_select_field.dart';
 import '../widgets/app_switch.dart';
 import '../widgets/compact_selector.dart';
+import '../widgets/edge_fade_scroll.dart';
 
 enum _BenchmarkPreviewSection {
   latency,
@@ -311,8 +312,12 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
 
     return Card(
       clipBehavior: Clip.antiAlias,
-      child: ListView(
-        padding: EdgeInsets.all(panelPadding),
+      // Short windows clip this panel mid-field; fade the clipped edge and
+      // leave bottom room so the last field never sits flush on the border.
+      child: VerticalEdgeFade(
+          child: ListView(
+        padding: EdgeInsets.fromLTRB(
+            panelPadding, panelPadding, panelPadding, panelPadding + 12),
         children: [
           _sectionHeader(context, Icons.tune, 'Benchmark control'),
           const SizedBox(height: 10),
@@ -735,7 +740,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             },
           ),
         ],
-      ),
+      )),
     );
   }
 
