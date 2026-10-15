@@ -356,6 +356,9 @@ class AppController extends ChangeNotifier {
   ObjectEntry? selectedObject;
   final ObjectSelection objectSelection = ObjectSelection();
   String? objectFilterError;
+
+  /// Set when the latest object listing failed; cleared when one succeeds.
+  String? objectListingError;
   static const int objectListingBudget = 100000;
   bool listingBudgetReached = false;
   void toggleObjectSelection(ObjectEntry object, {bool range = false}) {
@@ -794,6 +797,7 @@ class AppController extends ChangeNotifier {
       selectedObject = null;
       selectedObjectDetails = null;
       selectedObjectPreview = null;
+      objectListingError = null;
       notifyListeners();
       return;
     }
@@ -828,7 +832,10 @@ class AppController extends ChangeNotifier {
           initialPageNumber: 0,
           listAll: listAll,
           fetchFirstPageWithoutCursor: true,
-        );
+        ).onError<EngineException>((error, stackTrace) {
+          objectListingError = '${error.code.displayLabel}: ${error.message}';
+          Error.throwWithStackTrace(error, stackTrace);
+        });
         if (selectedProfile?.id != profile.id ||
             selectedBucket?.name != bucket.name ||
             currentPrefix != nextPrefix) {
@@ -841,6 +848,7 @@ class AppController extends ChangeNotifier {
           return;
         }
         objects = page.items;
+        objectListingError = null;
         objectSelection.retain(objects.map((o) => o.key));
         objectCursor = page.cursor;
         final pageNumber = page.pageNumber;

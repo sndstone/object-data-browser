@@ -211,74 +211,93 @@ class _ObjectPanelState extends State<ObjectPanel> {
                       if (busy || c.filteringObjects)
                         const LinearProgressIndicator(minHeight: 2),
                       Expanded(
-                          child: objects.isEmpty &&
-                                  hasBucket &&
+                          child: hasBucket &&
                                   c.objects.isEmpty &&
                                   !busy &&
-                                  c.objectFilterError == null
-                              ? EmptyBucketState(
-                                  destination:
-                                      '${c.selectedBucket!.name}/${c.currentPrefix}',
-                                  isRoot: c.currentPrefix.isEmpty,
-                                  onUpload:
-                                      c.isBusy('upload') ? null : onUpload,
-                                )
-                              : objects.isEmpty
-                                  ? EmptyState(
-                                      icon: Icons.folder_open_outlined,
-                                      title: c.selectedProfile == null
-                                          ? 'No connection configured'
-                                          : !hasBucket
-                                              ? 'No bucket open'
-                                              : c.objects.isEmpty
-                                                  ? 'No objects in this prefix'
-                                                  : 'No matching objects',
-                                      message: c.selectedProfile == null
-                                          ? 'Create an endpoint profile to connect to your storage.'
-                                          : !hasBucket
-                                              ? 'Pick a bucket or refresh the list for this endpoint.'
-                                              : c.objects.isEmpty
-                                                  ? 'Upload files to get started.'
-                                                  : 'Change the filter or load more keys.',
-                                      action: TextButton(
-                                          onPressed: c.selectedProfile == null
-                                              ? () => c.selectTab(
-                                                  WorkspaceTab.settings)
+                                  c.objectListingError != null
+                              // A failed listing is not an empty bucket.
+                              ? EmptyState(
+                                  key: const ValueKey('object-listing-error'),
+                                  icon: Icons.cloud_off_outlined,
+                                  title: 'Could not list objects',
+                                  message: c.objectListingError!,
+                                  action: TextButton.icon(
+                                      key: const ValueKey(
+                                          'object-listing-retry'),
+                                      onPressed: c.refreshObjects,
+                                      icon: const Icon(Icons.refresh),
+                                      label: const Text('Retry')))
+                              : objects.isEmpty &&
+                                      hasBucket &&
+                                      c.objects.isEmpty &&
+                                      !busy &&
+                                      c.objectFilterError == null
+                                  ? EmptyBucketState(
+                                      destination:
+                                          '${c.selectedBucket!.name}/${c.currentPrefix}',
+                                      isRoot: c.currentPrefix.isEmpty,
+                                      onUpload:
+                                          c.isBusy('upload') ? null : onUpload,
+                                    )
+                                  : objects.isEmpty
+                                      ? EmptyState(
+                                          icon: Icons.folder_open_outlined,
+                                          title: c.selectedProfile == null
+                                              ? 'No connection configured'
                                               : !hasBucket
-                                                  ? c.refreshBuckets
+                                                  ? 'No bucket open'
                                                   : c.objects.isEmpty
-                                                      ? onUpload
-                                                      : _clearSearch,
-                                          child: Text(c.selectedProfile == null
-                                              ? 'Create profile'
+                                                      ? 'No objects in this prefix'
+                                                      : 'No matching objects',
+                                          message: c.selectedProfile == null
+                                              ? 'Create an endpoint profile to connect to your storage.'
                                               : !hasBucket
-                                                  ? 'Refresh buckets'
+                                                  ? 'Pick a bucket or refresh the list for this endpoint.'
                                                   : c.objects.isEmpty
-                                                      ? 'Upload files'
-                                                      : 'Clear filter')))
-                                  : ObjectTable(
-                                      objects: objects,
-                                      selectedKey: c.selectedObject?.key,
-                                      selectedKeys: c.objectSelection.keys,
-                                      compactRows: c.settings.compactRows,
-                                      sortField: c.objectSortField,
-                                      descending: c.objectSortDescending,
-                                      onSort: (field) {
-                                        if (field == c.objectSortField) {
-                                          c.toggleObjectSortDirection();
-                                        } else {
-                                          if (c.objectSortDescending) {
-                                            c.toggleObjectSortDirection();
-                                          }
-                                          c.setObjectSortField(field);
-                                        }
-                                      },
-                                      onToggle: (o, range) =>
-                                          c.toggleObjectSelection(o,
-                                              range: range),
-                                      contentTypeFor: c.objectContentType,
-                                      onSelect: c.setSelectedObject,
-                                      onShowContextMenu: widget.onContextMenu)),
+                                                      ? 'Upload files to get started.'
+                                                      : 'Change the filter or load more keys.',
+                                          action: TextButton(
+                                              onPressed:
+                                                  c.selectedProfile == null
+                                                      ? () => c.selectTab(
+                                                          WorkspaceTab.settings)
+                                                      : !hasBucket
+                                                          ? c.refreshBuckets
+                                                          : c.objects.isEmpty
+                                                              ? onUpload
+                                                              : _clearSearch,
+                                              child: Text(c.selectedProfile ==
+                                                      null
+                                                  ? 'Create profile'
+                                                  : !hasBucket
+                                                      ? 'Refresh buckets'
+                                                      : c.objects.isEmpty
+                                                          ? 'Upload files'
+                                                          : 'Clear filter')))
+                                      : ObjectTable(
+                                          objects: objects,
+                                          selectedKey: c.selectedObject?.key,
+                                          selectedKeys: c.objectSelection.keys,
+                                          compactRows: c.settings.compactRows,
+                                          sortField: c.objectSortField,
+                                          descending: c.objectSortDescending,
+                                          onSort: (field) {
+                                            if (field == c.objectSortField) {
+                                              c.toggleObjectSortDirection();
+                                            } else {
+                                              if (c.objectSortDescending) {
+                                                c.toggleObjectSortDirection();
+                                              }
+                                              c.setObjectSortField(field);
+                                            }
+                                          },
+                                          onToggle: (o, range) =>
+                                              c.toggleObjectSelection(o,
+                                                  range: range),
+                                          contentTypeFor: c.objectContentType,
+                                          onSelect: c.setSelectedObject,
+                                          onShowContextMenu:
+                                              widget.onContextMenu)),
                       // The listing summary only means something once a
                       // bucket is open.
                       if (hasBucket) ...[

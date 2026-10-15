@@ -23,6 +23,7 @@ Future<void> _pumpApp(WidgetTester tester, dynamic controller,
 
 void main() {
   inspectorMain();
+  listingErrorMain();
   footerMain();
   previewReloadMain();
   inlinePreviewMain();
@@ -310,4 +311,58 @@ void footerMain() {
       c.dispose();
     });
   }
+}
+
+class _FailingListingEngine extends fixture.TestingEngine {
+  bool fail = true;
+  @override
+  Future<ObjectListResult> listObjects(
+      {required String engineId,
+      required EndpointProfile profile,
+      required String bucketName,
+      required String prefix,
+      required bool flat,
+      ListCursor? cursor}) async {
+    if (fail) {
+      throw const EngineException(
+          code: ErrorCode.authFailed, message: 'Fixture listing denied');
+    }
+    return super.listObjects(
+        engineId: engineId,
+        profile: profile,
+        bucketName: bucketName,
+        prefix: prefix,
+        flat: flat,
+        cursor: cursor);
+  }
+}
+
+void listingErrorMain() {
+  testWidgets('a failed listing shows an error with retry, not an empty bucket',
+      (tester) async {
+    final engine = _FailingListingEngine();
+    final c = fixture.controller(engine, fixture.Repository());
+    await c.initialize();
+    c.clearBanner();
+    await _pumpApp(tester, c);
+
+    expect(c.selectedBucket, isNotNull);
+    expect(c.objects, isEmpty);
+    expect(c.objectListingError, contains('Fixture listing denied'));
+    expect(find.byKey(const ValueKey('object-listing-error')), findsOneWidget);
+    expect(find.text('Could not list objects'), findsOneWidget);
+    expect(find.textContaining('Fixture listing denied'), findsWidgets);
+    expect(find.textContaining('empty'), findsNothing);
+
+    engine.fail = false;
+    await tester.tap(find.byKey(const ValueKey('object-listing-retry')));
+    await tester.pumpAndSettle();
+    expect(c.objectListingError, isNull);
+    expect(c.objects, isNotEmpty);
+    expect(find.byKey(const ValueKey('object-listing-error')), findsNothing);
+    expect(tester.takeException(), isNull);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    c.dispose();
+  });
 }
