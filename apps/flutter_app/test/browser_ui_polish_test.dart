@@ -23,6 +23,7 @@ Future<void> _pumpApp(WidgetTester tester, dynamic controller,
 
 void main() {
   inspectorMain();
+  inlinePreviewMain();
   detailsFailureMain();
   viewToolsMain();
   testWidgets('object filter shows a clear button that resets the filter',
@@ -194,6 +195,44 @@ void detailsFailureMain() {
     expect(c.selectedObjectDetails, isNotNull);
     expect(find.text('Details unavailable'), findsNothing);
     expect(find.text('Metadata'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    c.dispose();
+  });
+}
+
+void inlinePreviewMain() {
+  testWidgets('inline text preview says when it cuts long text short',
+      (tester) async {
+    final c = fixture.controller(fixture.TestingEngine(), fixture.Repository());
+    await c.initialize();
+    c.clearBanner();
+    await _pumpApp(tester, c);
+    final file = c.pagedVisibleObjects.firstWhere((o) => !o.isFolder);
+    await c.setSelectedObject(file);
+    final notice = find.byKey(const ValueKey('inline-preview-truncated'));
+
+    for (final (length, expected) in [
+      (12000, findsNothing),
+      (12001, findsOneWidget)
+    ]) {
+      c.selectedObjectPreview = ObjectPreview(
+          key: file.key,
+          kind: ObjectPreviewKind.text,
+          loading: false,
+          supported: true,
+          message: '',
+          contentType: 'text/plain',
+          text: 'a' * length,
+          loadedBytes: length);
+      c.setInspectorTab(BrowserInspectorTab.objectDetails);
+      c.setInspectorTab(BrowserInspectorTab.objectPreview);
+      await tester.pumpAndSettle();
+      expect(notice, expected, reason: '$length characters');
+    }
+    expect(find.textContaining('first 12,000 characters'), findsOneWidget);
+    expect(find.byTooltip('Open preview'), findsOneWidget);
     expect(tester.takeException(), isNull);
 
     await tester.pumpWidget(const SizedBox.shrink());

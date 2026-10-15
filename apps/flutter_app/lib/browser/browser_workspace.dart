@@ -1333,6 +1333,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     ];
   }
 
+  /// The inline text preview stops here to keep the inspector responsive;
+  /// the expanded preview shows all loaded text.
+  static const _inlinePreviewCharLimit = 12000;
+
   Widget _objectPreviewSection(BuildContext context, ObjectEntry object) {
     final preview = controller.selectedObjectPreview;
     final theme = Theme.of(context);
@@ -1388,6 +1392,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     }
 
     final Widget body;
+    var inlineCut = false;
     if (!preview.supported || preview.kind == ObjectPreviewKind.unsupported) {
       body = Text(preview.message);
     } else if (preview.kind == ObjectPreviewKind.image && preview.url != null) {
@@ -1414,8 +1419,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       );
     } else if (preview.kind == ObjectPreviewKind.text) {
       final text = preview.text ?? '';
-      final visibleText =
-          text.length > 12000 ? '${text.substring(0, 12000)}\n...' : text;
+      inlineCut = text.length > _inlinePreviewCharLimit;
+      final visibleText = inlineCut
+          ? '${text.substring(0, _inlinePreviewCharLimit)}\n...'
+          : text;
       final language = sourcePreviewLanguage(object.key, preview.contentType);
       body = Container(
         width: double.infinity,
@@ -1480,6 +1487,22 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         ],
         const SizedBox(height: 8),
         body,
+        if (inlineCut)
+          Container(
+            key: const ValueKey('inline-preview-truncated'),
+            width: double.infinity,
+            margin: const EdgeInsets.only(top: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerHigh,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              'Showing the first ${formatCount(_inlinePreviewCharLimit)} '
+              'characters here. Open preview to read all loaded text.',
+              style: theme.textTheme.bodySmall,
+            ),
+          ),
         if (preview.message.isNotEmpty) ...[
           const SizedBox(height: 8),
           Text(
