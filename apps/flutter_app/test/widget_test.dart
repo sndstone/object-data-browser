@@ -911,8 +911,8 @@ void main() {
 
     expect(find.text('Jobs'), findsWidgets);
     expect(find.text('Running'), findsWidgets);
-    expect(find.text('Upload 1 file'), findsOneWidget);
-    await tester.tap(find.text('Upload 1 file'));
+    expect(find.text('Upload 1 file'), findsNWidgets(2));
+    await tester.tap(find.text('Upload 1 file').first);
     await tester.pumpAndSettle();
     expect(find.textContaining('Multipart upload'), findsOneWidget);
     expect(find.textContaining('Items: 1/2'), findsOneWidget);
@@ -945,7 +945,7 @@ void main() {
     await tester.pumpWidget(S3BrowserApp(controller: controller));
     await tester.pump();
 
-    await tester.tap(find.text('Listing objects for bucket-0...'));
+    await tester.tap(find.text('Listing objects for bucket-0...').first);
     await tester.pump(const Duration(milliseconds: 600));
     final cancelButton = tester
         .widget<OutlinedButton>(find.widgetWithText(OutlinedButton, 'Cancel'));
@@ -1037,7 +1037,7 @@ void main() {
     expect(controller.activeTab, WorkspaceTab.tasks);
     expect(controller.taskView, BrowserTaskView.all);
     expect(controller.selectedTaskId, 'refresh-objects-1');
-    expect(find.text('Listing objects for bucket-0...'), findsOneWidget);
+    expect(find.text('Listed objects for bucket-0.'), findsNWidgets(2));
     expect(
       find.byWidgetPredicate(
         (widget) =>

@@ -14,7 +14,6 @@ import 'dart:math' as math;
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_widget_from_html_core/flutter_widget_from_html_core.dart';
 
 import '../controllers/app_controller.dart';
 import '../logs/structured_log_list.dart';
@@ -30,6 +29,9 @@ import '../widgets/compact_selector.dart';
 import '../widgets/underline_tabs.dart';
 import '../widgets/source_code_preview.dart';
 import 'object_panel.dart';
+import 'object_table.dart' show ObjectTable;
+import 'object_preview_dialog.dart';
+import 'preview_source_view.dart';
 import '../theme/app_motion.dart';
 
 const _bucketActionBarKey = ValueKey('bucket-panel-actions');
@@ -57,6 +59,7 @@ class BrowserWorkspace extends StatefulWidget {
 
 class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   AppController get controller => widget.controller;
+  final Set<String> _expandedDetailSections = {};
   double? _pendingInspectorSize;
   _MobileBrowserSection _mobileSection = _MobileBrowserSection.buckets;
   bool _dragging = false;
@@ -429,10 +432,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             _resolveInspectorSize(context, constraints, inspectorOnRight);
         final roomy = width >= Breakpoints.desktopWide;
         final outerPadding =
-            tablet ? 10.0 : (desktopCompact && !roomy ? 10.0 : 12.0);
+            tablet ? 8.0 : (desktopCompact && !roomy ? 8.0 : 10.0);
         const panelGap = 8.0;
         final bucketPanelWidth =
-            tablet ? 252.0 : (desktopCompact && !roomy ? 264.0 : 272.0);
+            tablet ? 252.0 : (desktopCompact && !roomy ? 256.0 : 264.0);
         final Widget objectAndInspector;
         if (tablet) {
           objectAndInspector = _objectPanel(context, compact: true);
@@ -913,7 +916,6 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             BrowserInspectorTab.objectDetails,
             BrowserInspectorTab.objectPreview,
             BrowserInspectorTab.versions,
-            BrowserInspectorTab.presign,
           ];
     final desktopCompact = _desktopCompact(context);
     final panelBody = DirectionalSwitcher(
@@ -926,15 +928,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             BrowserInspectorTab.bucketAdmin => _bucketAdminView(context),
             BrowserInspectorTab.bucketInfo => _bucketInfoView(context),
             BrowserInspectorTab.objectDetails => _objectDetailsView(context),
-            BrowserInspectorTab.objectPreview => controller.selectedObject ==
-                    null
-                ? const Center(child: Text('Select an object to preview.'))
-                : _adaptivePanelListView(context,
-                    key: const ValueKey('object-preview'),
-                    children: [
-                        _objectPreviewSection(
-                            context, controller.selectedObject!)
-                      ]),
+            BrowserInspectorTab.objectPreview =>
+              controller.selectedObject == null
+                  ? const Center(child: Text('Select an object to preview.'))
+                  : _objectPreviewSection(context, controller.selectedObject!),
             BrowserInspectorTab.versions => _versionsView(context),
             BrowserInspectorTab.presign => _presignView(context),
             BrowserInspectorTab.tools => _toolsView(context),
@@ -945,17 +942,29 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     return Card(
       clipBehavior: Clip.antiAlias,
       child: Padding(
-        padding: EdgeInsets.all(desktopCompact && !phone ? 12 : 16),
+        padding: EdgeInsets.all(desktopCompact && !phone ? 10 : 16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(children: [
+              if (controller.selectedObject != null) ...[
+                Icon(
+                    ObjectTable.objectTypeIcon(
+                        controller.selectedObject!.key,
+                        controller
+                            .objectContentType(controller.selectedObject!)),
+                    size: 18,
+                    color: Theme.of(context).colorScheme.primary),
+                const SizedBox(width: 8),
+              ],
               Expanded(
                   child: Text(
                       controller.selectedObject?.name ?? 'Bucket inspector',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.titleLarge)),
+                      style: controller.selectedObject == null
+                          ? Theme.of(context).textTheme.titleLarge
+                          : Theme.of(context).textTheme.titleMedium)),
               if (controller.selectedObject != null)
                 IconButton(
                     tooltip: 'Back to bucket',
@@ -976,7 +985,17 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                   },
                   icon: const Icon(Icons.close)),
             ]),
-            const SizedBox(height: 8),
+            if (controller.selectedObject != null)
+              Padding(
+                  padding: const EdgeInsets.only(bottom: 4),
+                  child: Text(
+                      '${controller.objectContentType(controller.selectedObject!)} · ${formatBytes(controller.selectedObject!.size)}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color:
+                              Theme.of(context).colorScheme.onSurfaceVariant))),
+            const SizedBox(height: 4),
             UnderlineTabs<BrowserInspectorTab>(
               selected: tab,
               onChanged: controller.setInspectorTab,
@@ -992,8 +1011,15 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                     UnderlineTab(value: entry, label: _inspectorLabel(entry)),
               ],
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 6),
             Expanded(child: panelBody),
+            if (controller.selectedObject != null &&
+                !controller.selectedObject!.isFolder &&
+                const [
+                  BrowserInspectorTab.objectDetails,
+                  BrowserInspectorTab.objectPreview
+                ].contains(tab))
+              _objectPreviewFooter(context, controller.selectedObject!),
           ],
         ),
       ),
@@ -1285,14 +1311,6 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       context,
       key: const ValueKey('object-details'),
       children: [
-        Align(
-            alignment: Alignment.centerLeft,
-            child: OutlinedButton(
-                onPressed: () => showDialog<void>(
-                    context: context,
-                    builder: (_) => StorageAdminDialog(
-                        controller: controller, objectKey: object.key)),
-                child: const Text('Manage object'))),
         _inlineStat('Key', object.key),
         _inlineStat('Size', formatBytes(object.size)),
         _inlineStat('Last modified', formatDateTime(object.modifiedAt)),
@@ -1300,423 +1318,223 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         _inlineStat('Storage class', object.storageClass),
         if (object.etag != null && object.etag!.isNotEmpty)
           _inlineStat('ETag', object.etag!),
-        const Divider(height: 16),
-        ..._detailSection(context, 'Metadata', details.metadata,
+        const Divider(height: 12),
+        _detailSection(context, object, 'Metadata', details.metadata,
             empty: 'No user metadata'),
-        const Divider(height: 16),
-        ..._detailSection(context, 'Headers', details.headers,
+        _detailSection(context, object, 'Headers', details.headers,
             empty: 'No headers returned'),
-        const Divider(height: 16),
-        ..._detailSection(context, 'Tags', details.tags, empty: 'No tags'),
+        _detailSection(context, object, 'Tags', details.tags, empty: 'No tags'),
+        const SizedBox(height: 12),
+        Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+                onPressed: () => showDialog<void>(
+                    context: context,
+                    builder: (_) => StorageAdminDialog(
+                        controller: controller, objectKey: object.key)),
+                icon: const Icon(Icons.tune, size: 16),
+                label: const Text('Manage object'))),
       ],
     );
   }
 
-  /// A titled key/value section that says so when it has no entries, so an
-  /// empty section is not mistaken for one that failed to load.
-  List<Widget> _detailSection(
-      BuildContext context, String title, Map<String, String> entries,
-      {required String empty}) {
-    final theme = Theme.of(context);
-    return [
-      Text(title, style: theme.textTheme.titleMedium),
-      const SizedBox(height: 8),
-      if (entries.isEmpty)
-        Text(empty,
-            style: theme.textTheme.bodySmall
-                ?.copyWith(color: theme.colorScheme.onSurfaceVariant))
-      else
-        ...entries.entries.map(
-          (entry) => CopyableValue(
-              label: entry.key, value: entry.value, controller: controller),
-        ),
-    ];
-  }
+  Widget _detailSection(BuildContext context, ObjectEntry object, String title,
+          Map<String, String> entries, {required String empty}) =>
+      ExpansionTile(
+          key: ValueKey(
+              'object-section-${controller.selectedProfile?.id}-${controller.selectedBucket?.name}-${object.key}-$title'),
+          initiallyExpanded: _expandedDetailSections.contains(title),
+          onExpansionChanged: (expanded) {
+            // ExpansionTile owns its animation. Remember only these three
+            // presentation choices, without notifying/rebuilding during restore.
+            if (expanded) {
+              _expandedDetailSections.add(title);
+            } else {
+              _expandedDetailSections.remove(title);
+            }
+          },
+          dense: true,
+          tilePadding: EdgeInsets.zero,
+          childrenPadding: const EdgeInsets.only(bottom: 8),
+          expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
+          title: Row(children: [
+            Text(title, style: Theme.of(context).textTheme.bodyMedium),
+            const SizedBox(width: 6),
+            Text('· ${formatCount(entries.length)}',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant)),
+          ]),
+          children: entries.isEmpty
+              ? [
+                  Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      child: Text(empty,
+                          style: Theme.of(context).textTheme.bodySmall))
+                ]
+              : entries.entries
+                  .map((entry) => CopyableValue(
+                      label: entry.key,
+                      value: entry.value,
+                      controller: controller,
+                      monospace: title == 'Headers'))
+                  .toList());
 
   /// The inline text preview stops here to keep the inspector responsive;
   /// the expanded preview shows all loaded text.
   static const _inlinePreviewCharLimit = 12000;
 
+  Widget _objectPreviewFooter(BuildContext context, ObjectEntry object) {
+    final preview = controller.selectedObjectPreview;
+    final matching = preview != null && preview.key == object.key;
+    final loading = matching && preview.loading;
+    final ready = matching &&
+        !preview.loading &&
+        preview.supported &&
+        const [ObjectPreviewKind.text, ObjectPreviewKind.image]
+            .contains(preview.kind);
+    if (matching && !loading && !ready) return const SizedBox.shrink();
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      const Divider(height: 1),
+      Tooltip(
+          message: ready ? 'Open preview' : 'Load preview',
+          child: TextButton.icon(
+              key: ready || loading
+                  ? null
+                  : const ValueKey('object-preview-load'),
+              onPressed: loading
+                  ? null
+                  : ready
+                      ? () => _showExpandedPreview(context, object, preview)
+                      : () {
+                          controller.setInspectorTab(
+                              BrowserInspectorTab.objectPreview);
+                          controller.refreshSelectedObjectPreview();
+                        },
+              icon: loading
+                  ? const SizedBox(
+                      width: 15,
+                      height: 15,
+                      child: CircularProgressIndicator(strokeWidth: 2))
+                  : Icon(ready ? Icons.open_in_full : Icons.visibility_outlined,
+                      size: 17),
+              label: Text(loading
+                  ? 'Loading preview…'
+                  : ready
+                      ? 'Open preview'
+                      : 'Load preview'))),
+    ]);
+  }
+
   Widget _objectPreviewSection(BuildContext context, ObjectEntry object) {
     final preview = controller.selectedObjectPreview;
     final theme = Theme.of(context);
-    final canExpand = preview != null &&
-        !preview.loading &&
-        preview.supported &&
-        (preview.kind == ObjectPreviewKind.image ||
-            preview.kind == ObjectPreviewKind.text);
-    final loaded =
-        preview != null && preview.key == object.key && !preview.loading;
-    final titleRow = Row(
-      children: [
-        Text('Preview', style: theme.textTheme.titleMedium),
-        const Spacer(),
-        if (canExpand)
-          IconButton(
-            tooltip: 'Open preview',
-            onPressed: () => _showExpandedPreview(context, object, preview),
-            icon: const Icon(Icons.open_in_full),
-          ),
-        // Before the first load the body offers 'Load preview' instead.
-        if (loaded)
-          IconButton(
-            tooltip: 'Reload preview',
-            onPressed: controller.refreshSelectedObjectPreview,
-            icon: const Icon(Icons.refresh),
-          ),
-      ],
-    );
     if (preview == null || preview.key != object.key) {
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          titleRow,
-          const SizedBox(height: 8),
-          Text('Preview not loaded yet.', style: theme.textTheme.bodyMedium),
-          const SizedBox(height: 4),
-          TextButton.icon(
-              key: const ValueKey('object-preview-load'),
-              onPressed: controller.refreshSelectedObjectPreview,
-              icon: const Icon(Icons.visibility_outlined),
-              label: const Text('Load preview')),
-        ],
-      );
+      return const Center(
+          key: ValueKey('object-preview'),
+          child: Text('Preview not loaded yet.'));
     }
     if (preview.loading) {
       return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          titleRow,
-          const SizedBox(height: 8),
-          const LinearProgressIndicator(),
-          const SizedBox(height: 8),
-          Text(preview.message),
-        ],
-      );
-    }
-
-    final Widget body;
-    var inlineCut = false;
-    if (!preview.supported || preview.kind == ObjectPreviewKind.unsupported) {
-      body = Text(preview.message);
-    } else if (preview.kind == ObjectPreviewKind.image && preview.url != null) {
-      body = ClipRRect(
-        borderRadius: BorderRadius.circular(8),
-        child: Container(
-          constraints: const BoxConstraints(maxHeight: 260),
-          width: double.infinity,
-          color: theme.colorScheme.surfaceContainerHighest,
-          child: Image.network(
-            preview.url!,
-            fit: BoxFit.contain,
-            loadingBuilder: (context, child, loadingProgress) {
-              if (loadingProgress == null) {
-                return child;
-              }
-              return const Center(child: CircularProgressIndicator());
-            },
-            errorBuilder: (context, error, stackTrace) => const Padding(
-                padding: EdgeInsets.all(16),
-                child: Center(child: Text('Could not load image preview.'))),
-          ),
-        ),
-      );
-    } else if (preview.kind == ObjectPreviewKind.text) {
-      final text = preview.text ?? '';
-      inlineCut = text.length > _inlinePreviewCharLimit;
-      final visibleText = inlineCut
-          ? '${text.substring(0, _inlinePreviewCharLimit)}\n...'
-          : text;
-      final language = sourcePreviewLanguage(object.key, preview.contentType);
-      body = Container(
-        width: double.infinity,
-        constraints: const BoxConstraints(maxHeight: 280),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: theme.colorScheme.outlineVariant),
-          color: theme.colorScheme.surface,
-        ),
-        child: SingleChildScrollView(
-          child: language == null
-              ? SelectableText(
-                  visibleText.isEmpty ? '(empty file)' : visibleText,
-                  style: theme.textTheme.bodySmall?.copyWith(
-                    fontFamily: 'monospace',
-                  ),
-                )
-              : SourceCodePreview(
-                  source: visibleText.isEmpty ? '(empty file)' : visibleText,
-                  language: language,
-                  textStyle: theme.textTheme.bodySmall,
-                ),
-        ),
-      );
-    } else if (preview.kind == ObjectPreviewKind.video && preview.url != null) {
-      body = Container(
-        width: double.infinity,
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: theme.colorScheme.outlineVariant),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+          key: const ValueKey('object-preview'),
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            const Icon(Icons.play_circle_outline, size: 32),
+            const LinearProgressIndicator(),
+            const SizedBox(height: 12),
+            Text(preview.message)
+          ]);
+    }
+    final text = preview.text ?? '';
+    final inlineCut = preview.kind == ObjectPreviewKind.text &&
+        text.length > _inlinePreviewCharLimit;
+    final visibleText =
+        inlineCut ? '${text.substring(0, _inlinePreviewCharLimit)}\n…' : text;
+    final Widget body;
+    if (!preview.supported || preview.kind == ObjectPreviewKind.unsupported) {
+      body = Center(
+          child: Padding(
+              padding: const EdgeInsets.all(12), child: Text(preview.message)));
+    } else if (preview.kind == ObjectPreviewKind.image && preview.url != null) {
+      body = Image.network(preview.url!,
+          fit: BoxFit.contain,
+          loadingBuilder: (context, child, progress) => progress == null
+              ? child
+              : const Center(child: CircularProgressIndicator()),
+          errorBuilder: (context, error, stack) =>
+              const Center(child: Text('Could not load image preview.')));
+    } else if (preview.kind == ObjectPreviewKind.text) {
+      body = PreviewSourceView(
+          source: visibleText,
+          objectKey: object.key,
+          contentType: preview.contentType,
+          compact: true);
+    } else if (preview.kind == ObjectPreviewKind.video && preview.url != null) {
+      body = SingleChildScrollView(
+          padding: const EdgeInsets.all(12),
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Icon(Icons.play_circle_outline, size: 28),
             const SizedBox(height: 8),
             const Text('Video preview URL generated.'),
             const SizedBox(height: 8),
-            SelectableText(
-              preview.url!,
-              maxLines: 3,
-            ),
-          ],
-        ),
-      );
+            SelectableText(preview.url!),
+          ]));
     } else {
-      body = const Text('Not supported.');
+      body = const Center(child: Text('Not supported.'));
     }
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        titleRow,
-        if (preview.contentType != null) ...[
-          const SizedBox(height: 4),
-          Text(
-            preview.contentType!,
-            style: theme.textTheme.bodySmall,
-          ),
-        ],
-        const SizedBox(height: 8),
-        body,
-        if (inlineCut)
-          Container(
-            key: const ValueKey('inline-preview-truncated'),
-            width: double.infinity,
-            margin: const EdgeInsets.only(top: 8),
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: BoxDecoration(
-              color: theme.colorScheme.surfaceContainerHigh,
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Text(
-              'Showing the first ${formatCount(_inlinePreviewCharLimit)} '
-              'characters here. Open preview to read all loaded text.',
-              style: theme.textTheme.bodySmall,
-            ),
-          ),
-        if (preview.message.isNotEmpty) ...[
-          const SizedBox(height: 8),
-          Text(
-            preview.message,
-            style: theme.textTheme.bodySmall,
-          ),
-        ],
-      ],
-    );
+    Widget content(Widget? copyAction) => Column(
+            key: const ValueKey('object-preview'),
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(children: [
+                Expanded(
+                    child: Text(
+                        sourcePreviewLanguage(object.key, preview.contentType)
+                                ?.toUpperCase() ??
+                            preview.contentType ??
+                            'Preview',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant))),
+                if (copyAction != null) copyAction,
+                IconButton(
+                    tooltip: 'Reload preview',
+                    onPressed: controller.refreshSelectedObjectPreview,
+                    icon: const Icon(Icons.refresh, size: 18)),
+              ]),
+              const Divider(height: 1),
+              Expanded(
+                  child: ColoredBox(
+                      color: theme.colorScheme.surfaceContainerLowest,
+                      child: body)),
+              if (inlineCut || preview.truncated)
+                Padding(
+                    key: ValueKey(inlineCut
+                        ? 'inline-preview-truncated'
+                        : 'inline-preview-byte-limit'),
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Text(
+                        inlineCut
+                            ? 'Showing the first ${formatCount(_inlinePreviewCharLimit)} characters. Open preview for all loaded text.'
+                            : 'Limited to the first ${formatBytes(preview.loadedBytes)} of this object.',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant))),
+            ]);
+    return preview.kind == ObjectPreviewKind.text && preview.supported
+        ? HoverCopyRegion(
+            label: 'loaded text',
+            value: text,
+            controller: controller,
+            builder: (context, copyAction) => content(copyAction))
+        : content(null);
   }
 
   Future<void> _showExpandedPreview(
-    BuildContext context,
-    ObjectEntry object,
-    ObjectPreview preview,
-  ) async {
-    final mediaSize = MediaQuery.sizeOf(context);
-    final canRenderHtml = preview.kind == ObjectPreviewKind.text &&
-        isHtmlPreview(object.key, preview.contentType);
-    var renderHtml = false;
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (dialogContext, setDialogState) {
-            final theme = Theme.of(dialogContext);
-            return Dialog(
-              insetPadding: const EdgeInsets.all(24),
-              clipBehavior: Clip.antiAlias,
-              child: ConstrainedBox(
-                constraints: BoxConstraints(
-                  maxWidth: math.min(mediaSize.width - 48, 1100),
-                  maxHeight: mediaSize.height * 0.88,
-                ),
-                child: Column(
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(20, 14, 10, 12),
-                      child: Row(
-                        children: [
-                          Icon(
-                            preview.kind == ObjectPreviewKind.image
-                                ? Icons.image_outlined
-                                : Icons.description_outlined,
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                // Long keys ellipsize; the full key stays
-                                // available on hover and to screen readers.
-                                Tooltip(
-                                  message: object.key,
-                                  child: Text(
-                                    object.key,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: theme.textTheme.titleMedium,
-                                  ),
-                                ),
-                                if (preview.contentType != null)
-                                  Text(
-                                    preview.contentType!,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: theme.textTheme.bodySmall,
-                                  ),
-                              ],
-                            ),
-                          ),
-                          if (canRenderHtml) ...[
-                            OutlinedButton.icon(
-                              key: const ValueKey('html-render-toggle'),
-                              onPressed: () => setDialogState(
-                                () => renderHtml = !renderHtml,
-                              ),
-                              icon: Icon(renderHtml
-                                  ? Icons.code
-                                  : Icons.web_asset_outlined),
-                              label: Text(
-                                renderHtml ? 'View source' : 'Render page',
-                              ),
-                            ),
-                            const SizedBox(width: 4),
-                          ],
-                          IconButton(
-                            tooltip: 'Close preview',
-                            onPressed: () => Navigator.of(dialogContext).pop(),
-                            icon: const Icon(Icons.close),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const Divider(height: 1),
-                    Expanded(
-                      child: preview.kind == ObjectPreviewKind.image &&
-                              preview.url != null
-                          ? ColoredBox(
-                              color: theme.colorScheme.surfaceContainerHighest,
-                              child: InteractiveViewer(
-                                minScale: 0.5,
-                                maxScale: 5,
-                                child: Center(
-                                  child: Image.network(
-                                    preview.url!,
-                                    fit: BoxFit.contain,
-                                    loadingBuilder:
-                                        (context, child, loadingProgress) {
-                                      if (loadingProgress == null) return child;
-                                      return const CircularProgressIndicator();
-                                    },
-                                    errorBuilder:
-                                        (context, error, stackTrace) =>
-                                            const Text(
-                                      'Could not load image preview.',
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            )
-                          : DirectionalSwitcher(
-                              position: renderHtml ? 1 : 0,
-                              duration: AppMotion.duration(dialogContext,
-                                  enabled: controller.settings.enableAnimations,
-                                  milliseconds: 220),
-                              child: renderHtml
-                                  ? _expandedHtmlPreview(preview)
-                                  : _expandedSourcePreview(
-                                      dialogContext,
-                                      object,
-                                      preview,
-                                    ),
-                            ),
-                    ),
-                    if (preview.truncated)
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 20,
-                          vertical: 10,
-                        ),
-                        color: theme.colorScheme.surfaceContainerHigh,
-                        child: Text(
-                          'Preview is limited to the first ${formatBytes(preview.loadedBytes)} of this object.',
-                          style: theme.textTheme.bodySmall,
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            );
-          },
-        );
-      },
-    );
-  }
-
-  Widget _expandedSourcePreview(
-    BuildContext context,
-    ObjectEntry object,
-    ObjectPreview preview,
-  ) {
-    final theme = Theme.of(context);
-    final source =
-        (preview.text ?? '').isEmpty ? '(empty file)' : preview.text!;
-    final language = sourcePreviewLanguage(object.key, preview.contentType);
-    return Scrollbar(
-      key: const ValueKey('expanded-source-preview'),
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(20),
-        child: SizedBox(
-          width: double.infinity,
-          child: language == null
-              ? SelectableText(
-                  source,
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    fontFamily: 'monospace',
-                  ),
-                )
-              : SourceCodePreview(
-                  source: source,
-                  language: language,
-                  textStyle: theme.textTheme.bodyMedium,
-                ),
-        ),
-      ),
-    );
-  }
-
-  Widget _expandedHtmlPreview(ObjectPreview preview) {
-    final previewUri = Uri.tryParse(preview.url ?? '');
-    return ColoredBox(
-      key: const ValueKey('expanded-html-preview'),
-      color: Colors.white,
-      child: Scrollbar(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: SelectionArea(
-            child: HtmlWidget(
-              preview.text ?? '',
-              key: const ValueKey('rendered-html-page'),
-              baseUrl: previewUri?.resolve('.'),
-              onTapUrl: (_) async => true,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
+          BuildContext context, ObjectEntry object, ObjectPreview preview) =>
+      showDialog<void>(
+          context: context,
+          builder: (_) => ObjectPreviewDialog(
+              controller: controller, object: object, preview: preview));
 
   Widget _versionsView(BuildContext context) {
     final options = controller.versionBrowserOptions;
@@ -2231,12 +2049,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     return ListView(key: key, primary: false, children: children);
   }
 
-  Widget _inlineStat(String label, String value) {
-    if (['Key', 'ETag', 'Bucket', 'Bucket name'].contains(label)) {
-      return CopyableValue(label: label, value: value, controller: controller);
-    }
-    return LabeledValue(label: label, child: SelectableText(value));
-  }
+  Widget _inlineStat(String label, String value) => CopyableValue(
+      label: label,
+      value: value,
+      controller: controller,
+      monospace: label == 'ETag');
 
   Widget _pill(String label, bool enabled) {
     return Chip(
@@ -2751,7 +2568,7 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
                                       horizontal: 10),
                                   minLeadingWidth: 20,
                                   horizontalTitleGap: 10,
-                                  minVerticalPadding: 8,
+                                  minVerticalPadding: desktopCompact ? 4 : 8,
                                   leading: Icon(
                                     Icons.folder_rounded,
                                     color: selected
@@ -2847,7 +2664,7 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
     return Card(
       clipBehavior: Clip.antiAlias,
       child: Padding(
-        padding: EdgeInsets.all(desktopCompact ? 12 : 16),
+        padding: EdgeInsets.all(desktopCompact ? 10 : 16),
         child: Column(
           mainAxisSize: MainAxisSize.max,
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -2900,7 +2717,7 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
               decoration: const InputDecoration(
                 hintText: 'Search buckets...',
                 prefixIcon: Icon(Icons.search),
-                contentPadding: EdgeInsets.fromLTRB(12, 12, 12, 10),
+                contentPadding: EdgeInsets.fromLTRB(10, 8, 10, 8),
               ),
               onChanged: (value) {
                 setState(() {

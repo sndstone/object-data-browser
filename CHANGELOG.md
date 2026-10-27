@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.3.2 — workspace and object preview redesign
+
+### Object previews
+- Added the Split preview: a compact object-details rail beside selectable source or image content, with collapsible file details on narrow windows and at larger text sizes.
+- Simplified the inspector with counted Metadata, Headers and Tags disclosures, hover/focus copy actions, and a persistent Open preview action for loaded text and images.
+- Added line numbers and horizontal scrolling for highlighted source, image zoom/fit controls, and retained bounded loading, truncation notices and the animated HTML source/static-page switch.
+- Expanded previews retain the object identity and loaded content they opened, even if the selection behind the popup changes.
+
+### Workspaces
+- Reorganized Benchmark into Configure, Run, Results and History views so results no longer sit several screens below configuration on laptop windows.
+- Show only benchmark controls that apply to the current run. Completed results cannot be overwritten by Pause, Resume or Stop.
+- Reworked Jobs into a compact list with explicit selection, details and applicable actions. Fixed selection changes during rebuilds, clearer elapsed/remaining times, profile names and completed-task labels.
+- Reorganized Settings navigation and descriptions, surfaced startup defaults, retained profile and engine selectors, and stopped empty legacy notes from appearing as unsaved edits.
+- Tightened bucket and object layouts while preserving the existing visual style, left-menu icons, bucket search/add/refresh controls, and reduced-motion-aware transitions.
+
 ## 2.3.1 — macOS development prerelease
 
 ### Transfers and engines

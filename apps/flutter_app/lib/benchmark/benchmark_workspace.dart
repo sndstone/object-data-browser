@@ -11,10 +11,13 @@ import 'package:flutter/rendering.dart';
 import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
 import '../theme/app_theme.dart';
+import '../theme/app_motion.dart';
 import '../widgets/app_select_field.dart';
 import '../widgets/app_switch.dart';
 import '../widgets/compact_selector.dart';
 import '../widgets/edge_fade_scroll.dart';
+
+enum _BenchmarkSection { configure, run, results, history }
 
 enum _BenchmarkPreviewSection {
   latency,
@@ -186,6 +189,19 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
   bool _overlapOperationMix = true;
   final Set<String> _enabledOperations = <String>{};
 
+  late _BenchmarkSection _section;
+
+  @override
+  void initState() {
+    super.initState();
+    final run = controller.benchmarkRun;
+    _section = run == null
+        ? _BenchmarkSection.configure
+        : const ['completed', 'stopped', 'failed'].contains(run.status)
+            ? _BenchmarkSection.results
+            : _BenchmarkSection.run;
+  }
+
   AppController get controller => widget.controller;
 
   @override
@@ -201,105 +217,164 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
 
   @override
   Widget build(BuildContext context) {
+    return LayoutBuilder(builder: (context, constraints) {
+      final duration = AppMotion.duration(context,
+          enabled: controller.settings.enableAnimations, milliseconds: 200);
+      final wide = constraints.maxWidth >= 1180 &&
+          MediaQuery.textScalerOf(context).scale(14) < 22;
+      final run = controller.benchmarkRun;
+      final preview = controller.selectedBenchmarkRun;
+      Widget panel = switch (_section) {
+        _BenchmarkSection.configure => wide
+            ? Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                Expanded(
+                    flex: 7,
+                    child: _configPanel(context, controller.benchmarkDraft)),
+                const SizedBox(width: 10),
+                Expanded(flex: 4, child: _runPanel(context, run)),
+              ])
+            : _configPanel(context, controller.benchmarkDraft),
+        _BenchmarkSection.run => _runPanel(context, run),
+        _BenchmarkSection.results => wide
+            ? Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                Expanded(flex: 8, child: _resultsPanel(context, preview)),
+                const SizedBox(width: 10),
+                Expanded(
+                    flex: 3,
+                    child: Column(children: [
+                      if (preview != null) ...[
+                        SizedBox(
+                            height: 220,
+                            child: Padding(
+                                padding: const EdgeInsets.all(4),
+                                child: _liveLogView(context, preview))),
+                        const SizedBox(height: 10),
+                      ],
+                      Expanded(
+                          child: _historyPanel(
+                              context, controller.benchmarkHistory)),
+                    ])),
+              ])
+            : _resultsPanel(context, preview),
+        _BenchmarkSection.history =>
+          _historyPanel(context, controller.benchmarkHistory),
+      };
+      return Padding(
+          padding: const EdgeInsets.all(10),
+          child:
+              Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            CompactSelector<_BenchmarkSection>(
+                selected: _section,
+                onChanged: (value) {
+                  _flushBenchmarkEditors();
+                  setState(() => _section = value);
+                },
+                options: const [
+                  CompactSelectorOption(
+                      value: _BenchmarkSection.configure,
+                      label: 'Configure',
+                      icon: Icons.tune),
+                  CompactSelectorOption(
+                      value: _BenchmarkSection.run,
+                      label: 'Run',
+                      icon: Icons.play_circle_outline),
+                  CompactSelectorOption(
+                      value: _BenchmarkSection.results,
+                      label: 'Results',
+                      icon: Icons.query_stats),
+                  CompactSelectorOption(
+                      value: _BenchmarkSection.history,
+                      label: 'History',
+                      icon: Icons.history),
+                ]),
+            const SizedBox(height: 8),
+            _runControls(context),
+            const SizedBox(height: 10),
+            Expanded(
+                child: DirectionalSwitcher(
+                    position: _section.index,
+                    duration: duration,
+                    layoutBuilder: (current, previous) =>
+                        current ?? const SizedBox.shrink(),
+                    child: KeyedSubtree(
+                        key: ValueKey('benchmark-section-${_section.name}'),
+                        child: panel))),
+          ]));
+    });
+  }
+
+  Widget _runControls(BuildContext context) {
     final run = controller.benchmarkRun;
-    final history = controller.benchmarkHistory;
-    final config = controller.benchmarkDraft;
-    final previewRun = controller.selectedBenchmarkRun;
-
-    final isDesktopCompact =
-        AppTheme.isDesktopPlatform(Theme.of(context).platform);
-    final outerPad = isDesktopCompact ? 10.0 : 14.0;
-    final gap = isDesktopCompact ? 10.0 : 14.0;
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final useStackedLayout =
-            constraints.maxWidth < 1180 || constraints.maxHeight < 920;
-        if (useStackedLayout) {
-          final configHeight =
-              (constraints.maxHeight * 0.62).clamp(420.0, 800.0).toDouble();
-          final panelHeight =
-              (constraints.maxHeight * 0.5).clamp(340.0, 680.0).toDouble();
-          return ListView(
-            padding: EdgeInsets.all(outerPad),
-            children: [
-              SizedBox(
-                  height: configHeight, child: _configPanel(context, config)),
-              SizedBox(height: gap),
-              SizedBox(height: panelHeight, child: _runPanel(context, run)),
-              SizedBox(height: gap),
-              SizedBox(
-                  height: panelHeight, child: _historyPanel(context, history)),
-              SizedBox(height: gap),
-              SizedBox(
-                height: math.max(panelHeight + 80, 520),
-                child: _resultsPanel(context, previewRun),
-              ),
-            ],
-          );
-        }
-
-        return Padding(
-          padding: EdgeInsets.all(outerPad),
-          child: Column(
-            children: [
-              Expanded(
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Expanded(
-                      flex: 7,
-                      child: _configPanel(context, config),
-                    ),
-                    SizedBox(width: gap),
-                    Expanded(
-                      flex: 4,
-                      child: _runPanel(context, run),
-                    ),
-                  ],
-                ),
-              ),
-              SizedBox(height: gap),
-              Expanded(
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Expanded(flex: 3, child: _historyPanel(context, history)),
-                    SizedBox(width: gap),
-                    Expanded(
-                        flex: 7, child: _resultsPanel(context, previewRun)),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _adaptiveFieldPair({
-    required BuildContext context,
-    required Widget leading,
-    required Widget trailing,
-  }) {
-    final phone = MediaQuery.sizeOf(context).width < 700;
-    if (phone) {
-      return Column(
+    final starting = controller.isBusy('benchmark-start');
+    final active = run != null &&
+        const [
+          'starting',
+          'running',
+          'paused',
+          'pausing',
+          'resuming',
+          'stopping'
+        ].contains(run.status);
+    return Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
         children: [
-          leading,
-          const SizedBox(height: 12),
-          trailing,
-        ],
-      );
-    }
-    return Row(
-      children: [
-        Expanded(child: leading),
-        const SizedBox(width: 12),
-        Expanded(child: trailing),
-      ],
-    );
+          FilledButton.icon(
+              onPressed:
+                  controller.selectedProfile == null || starting || active
+                      ? null
+                      : () async {
+                          _flushBenchmarkEditors();
+                          await controller.startBenchmark();
+                          if (mounted && controller.benchmarkRun != null) {
+                            setState(() => _section = _BenchmarkSection.run);
+                          }
+                        },
+              icon: starting
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.play_arrow),
+              label: Text(starting ? 'Starting…' : 'Start benchmark')),
+          if (run?.status == 'running')
+            OutlinedButton.icon(
+                onPressed: controller.pauseBenchmark,
+                icon: const Icon(Icons.pause),
+                label: const Text('Pause')),
+          if (run?.status == 'paused')
+            OutlinedButton.icon(
+                onPressed: controller.resumeBenchmark,
+                icon: const Icon(Icons.play_circle_outline),
+                label: const Text('Resume')),
+          if (run != null && const ['running', 'paused'].contains(run.status))
+            OutlinedButton.icon(
+                onPressed: controller.stopBenchmark,
+                icon: const Icon(Icons.stop),
+                label: const Text('Stop')),
+          if (run != null)
+            OutlinedButton.icon(
+                onPressed: starting ? null : controller.pollBenchmark,
+                icon: const Icon(Icons.sync),
+                label: const Text('Refresh status')),
+          if (run != null) _statusChip(context, run.status),
+        ]);
   }
+
+  Widget _adaptiveFieldPair(
+          {required BuildContext context,
+          required Widget leading,
+          required Widget trailing}) =>
+      LayoutBuilder(
+          builder: (context, constraints) => constraints.maxWidth < 520
+              ? Column(
+                  children: [leading, const SizedBox(height: 12), trailing])
+              : Row(children: [
+                  Expanded(child: leading),
+                  const SizedBox(width: 12),
+                  Expanded(child: trailing)
+                ]));
 
   Widget _configPanel(BuildContext context, BenchmarkConfig config) {
     final selectedProfile = controller.selectedProfile;
@@ -321,60 +396,6 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
         children: [
           _sectionHeader(context, Icons.tune, 'Benchmark control'),
           const SizedBox(height: 10),
-          Builder(builder: (context) {
-            final starting = controller.isBusy('benchmark-start');
-            final activeRun = controller.benchmarkRun;
-            final runReady =
-                activeRun != null && activeRun.status != 'starting';
-            return Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                FilledButton.icon(
-                  onPressed: selectedProfile == null || starting
-                      ? null
-                      : () {
-                          _flushBenchmarkEditors();
-                          controller.startBenchmark();
-                        },
-                  icon: starting
-                      ? const SizedBox(
-                          width: 14,
-                          height: 14,
-                          // Inherit the button's disabled foreground instead
-                          // of white, which vanishes on light disabled fills.
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.play_arrow),
-                  label: Text(starting ? 'Starting…' : 'Start benchmark'),
-                ),
-                OutlinedButton.icon(
-                  onPressed:
-                      !runReady || starting ? null : controller.pauseBenchmark,
-                  icon: const Icon(Icons.pause),
-                  label: const Text('Pause'),
-                ),
-                OutlinedButton.icon(
-                  onPressed:
-                      !runReady || starting ? null : controller.resumeBenchmark,
-                  icon: const Icon(Icons.play_circle_outline),
-                  label: const Text('Resume'),
-                ),
-                OutlinedButton.icon(
-                  onPressed:
-                      !runReady || starting ? null : controller.stopBenchmark,
-                  icon: const Icon(Icons.stop),
-                  label: const Text('Stop'),
-                ),
-                OutlinedButton.icon(
-                  onPressed: starting ? null : controller.pollBenchmark,
-                  icon: const Icon(Icons.sync),
-                  label: const Text('Refresh status'),
-                ),
-              ],
-            );
-          }),
-          const SizedBox(height: 12),
           ListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('Active endpoint profile'),
@@ -1017,11 +1038,23 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
       _runStatTile(
         context,
         icon: Icons.sync_alt,
-        label: 'Data rate',
-        value: controller.estimatedMibsForRun(run).toStringAsFixed(2),
+        label: run.resultSummary == null
+            ? 'Estimated data rate'
+            : 'Measured bandwidth',
+        value: run.resultSummary == null
+            ? controller.estimatedMibsForRun(run).toStringAsFixed(2)
+            : formatMeasuredMetric(
+                run.resultSummary!.detailMetrics['averageBytesPerSecond'] is num
+                    ? (run.resultSummary!.detailMetrics['averageBytesPerSecond']
+                                as num)
+                            .toDouble() /
+                        1048576
+                    : null,
+                decimals: 2),
         caption: 'MiB/s',
-        tooltip:
-            'Current ops/s × average configured object size. Approximate because the workload mix can vary by size.',
+        tooltip: run.resultSummary == null
+            ? 'Estimate from ops/s × configured average size; the operation mix can change this.'
+            : 'Measured transferred bytes over active elapsed time, supplied by the engine.',
       ),
     ];
     return LayoutBuilder(
@@ -1269,7 +1302,11 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
                             overflow: TextOverflow.ellipsis,
                           ),
                           trailing: _statusChip(context, item.status),
-                          onTap: () => controller.selectBenchmarkRun(item.id),
+                          onTap: () {
+                            controller.selectBenchmarkRun(item.id);
+                            setState(
+                                () => _section = _BenchmarkSection.results);
+                          },
                         );
                       },
                     ),
@@ -1311,165 +1348,76 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
 
   Widget _resultsPanel(BuildContext context, BenchmarkRun? run) {
     final summary = controller.benchmarkSummaryForRun(run);
-    final operations =
-        summary == null ? const <String>[] : _availableOperations(summary);
-    _syncOperationFilter(operations);
-    final isDesktopCompact =
-        AppTheme.isDesktopPlatform(Theme.of(context).platform);
-
+    if (summary != null) _syncOperationFilter(_availableOperations(summary));
     return Card(
-      clipBehavior: Clip.antiAlias,
-      child: Padding(
-        padding: EdgeInsets.all(isDesktopCompact ? 12.0 : 16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      _sectionHeader(
-                          context, Icons.query_stats, 'Results preview'),
-                      const SizedBox(height: 8),
-                      if (run != null) ...[
-                        Text(
-                          'Viewing ${run.id}',
-                          style: Theme.of(context).textTheme.bodySmall,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        const SizedBox(height: 4),
-                        if (run.resultSummary == null)
-                          Text(
-                            'Detailed measurements have not been supplied by the engine.',
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                      ],
-                    ],
-                  ),
-                ),
+        clipBehavior: Clip.antiAlias,
+        child: ListView(
+            key: const PageStorageKey('benchmark-results-scroll'),
+            padding: const EdgeInsets.all(16),
+            children: [
+              _sectionHeader(context, Icons.query_stats, 'Results preview'),
+              const SizedBox(height: 8),
+              if (run != null)
+                Text('Viewing ${run.id}',
+                    style: Theme.of(context).textTheme.bodySmall),
+              const SizedBox(height: 12),
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                if (run != null) ...[
+                  OutlinedButton.icon(
+                      onPressed: () =>
+                          controller.exportBenchmarkResults('csv', run: run),
+                      icon: const Icon(Icons.table_chart_outlined),
+                      label: const Text('Export selected CSV')),
+                  OutlinedButton.icon(
+                      onPressed: () =>
+                          controller.exportBenchmarkResults('json', run: run),
+                      icon: const Icon(Icons.data_object),
+                      label: const Text('Export selected JSON')),
+                ],
                 FilledButton.tonalIcon(
-                  onPressed:
-                      summary == null ? null : () => _openResultsWorkspace(run),
-                  icon: const Icon(Icons.open_in_full, size: 16),
-                  label: const Text('Open detailed view'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Text(
-              summary == null
-                  ? 'Charts, deep metrics, and output artifacts will appear in the detailed workspace once summary data is available.'
-                  : 'This preview stays focused on final summary numbers. Open detailed view for charts, deep metrics, and output files.',
-              style: Theme.of(context).textTheme.bodyMedium,
-            ),
-            const SizedBox(height: 16),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                if (run != null)
-                  OutlinedButton.icon(
-                    onPressed: () => controller.exportBenchmarkResults(
-                      'csv',
-                      run: run,
-                    ),
-                    icon: const Icon(Icons.table_chart_outlined),
-                    label: const Text('Export selected CSV'),
-                  ),
-                if (run != null)
-                  OutlinedButton.icon(
-                    onPressed: () => controller.exportBenchmarkResults(
-                      'json',
-                      run: run,
-                    ),
-                    icon: const Icon(Icons.data_object),
-                    label: const Text('Export selected JSON'),
-                  ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            if (summary == null)
-              Expanded(
-                child: Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(18),
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(18),
-                    color: Theme.of(context).colorScheme.surfaceContainerLowest,
-                  ),
-                  child: const Center(
-                    child: Text(
-                      'Results will populate here as the benchmark writes summary data.',
-                    ),
-                  ),
-                ),
-              )
-            else ...[
-              _metricCards(context, summary),
+                    onPressed: summary == null
+                        ? null
+                        : () => _openResultsWorkspace(run),
+                    icon: const Icon(Icons.open_in_full, size: 16),
+                    label: const Text('Open detailed view')),
+              ]),
               const SizedBox(height: 16),
-              Expanded(
-                child: Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(18),
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(18),
-                    color: Theme.of(context).colorScheme.surfaceContainerLowest,
-                  ),
-                  child: ListView(
-                    children: [
-                      _summaryListTile(
-                        context,
-                        'Run status',
-                        run?.status ?? 'completed',
-                      ),
-                      _summaryListTile(
-                        context,
-                        'Operation mix',
-                        summary.operationsByType.entries
-                            .map((entry) => '${entry.key} ${entry.value}')
-                            .join(' - '),
-                      ),
-                      _summaryListTile(
-                        context,
-                        'Latency percentiles',
-                        _sortedPercentiles(summary)
-                            .map(
-                              (entry) =>
-                                  '${entry.key.toUpperCase()} ${entry.value.toStringAsFixed(1)} ms',
-                            )
-                            .join(' - '),
-                      ),
-                      _summaryListTile(
-                        context,
-                        'Average bandwidth',
-                        _formatBytesPerSecond(
-                          summary.detailMetrics['averageBytesPerSecond'],
-                        ),
-                      ),
-                      _summaryListTile(
-                        context,
-                        'Peak bandwidth',
-                        _formatBytesPerSecond(
-                          summary.detailMetrics['peakBytesPerSecond'],
-                        ),
-                      ),
-                      _summaryListTile(
-                        context,
-                        'Sample windows',
-                        '${summary.throughputSeries.length} recorded',
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
+              if (summary == null)
+                const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 40),
+                    child: Text(
+                        'Results will populate here as the benchmark writes summary data.'))
+              else ...[
+                _metricCards(context, summary),
+                const SizedBox(height: 16),
+                _summaryListTile(
+                    context,
+                    'Average bandwidth · measured',
+                    _formatBytesPerSecond(
+                        summary.detailMetrics['averageBytesPerSecond'])),
+                _timeSeriesSection(context,
+                    title: 'Throughput over time',
+                    subtitle:
+                        'Filter by operation or view the combined series.',
+                    series: _throughputSeries(summary),
+                    chartHeight: 260,
+                    style: _throughputStyle),
+                const SizedBox(height: 16),
+                _summaryListTile(
+                    context,
+                    'Operation mix',
+                    summary.operationsByType.entries
+                        .map((e) => '${e.key} ${e.value}')
+                        .join(' · ')),
+                _summaryListTile(
+                    context,
+                    'Latency percentiles',
+                    _sortedPercentiles(summary)
+                        .map((e) =>
+                            '${e.key.toUpperCase()} ${e.value.toStringAsFixed(1)} ms')
+                        .join(' · ')),
+              ],
+            ]));
   }
 
   Widget _summaryListTile(BuildContext context, String label, String value) {
@@ -3918,6 +3866,7 @@ class _LineChartPainter extends CustomPainter {
       ..color = textColor.withValues(alpha: 0.35)
       ..strokeWidth = 1;
     final textStyle = TextStyle(
+      fontFamily: 'Inter',
       color: textColor.withValues(alpha: 0.72),
       fontSize: 11,
       fontWeight: FontWeight.w600,

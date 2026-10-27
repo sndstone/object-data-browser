@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
 import '../services/app_platform.dart';
+import '../theme/app_motion.dart';
 
 Future<void> copyValue(
     AppController controller, String label, String value) async {
@@ -27,13 +28,13 @@ class LabeledValue extends StatelessWidget {
     final labelText = Tooltip(
         message: label,
         child: Text(label,
-            maxLines: 1,
+            maxLines: 2,
             overflow: TextOverflow.ellipsis,
             style: theme.textTheme.bodyMedium?.copyWith(
                 color: theme.colorScheme.onSurfaceVariant,
                 fontWeight: FontWeight.w600)));
     return LayoutBuilder(builder: (context, constraints) {
-      final stacked = constraints.maxWidth < 300;
+      final stacked = constraints.maxWidth < 280;
       final value = DefaultTextStyle.merge(
           style: theme.textTheme.bodyMedium, child: child);
       final body = stacked
@@ -42,13 +43,14 @@ class LabeledValue extends StatelessWidget {
               children: [labelText, const SizedBox(height: 2), value])
           : Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
               SizedBox(
-                  width: (constraints.maxWidth * .34).clamp(84.0, 140.0),
+                  width: (constraints.maxWidth * .38).clamp(84.0, 148.0),
                   child: labelText),
               const SizedBox(width: 12),
               Expanded(child: value),
             ]);
       return ConstrainedBox(
-          constraints: const BoxConstraints(minHeight: 40),
+          constraints:
+              BoxConstraints(minHeight: AppPlatform.isMobile ? 44 : 32),
           child: Padding(
               padding: const EdgeInsets.symmetric(vertical: 4),
               child: Row(children: [
@@ -57,6 +59,55 @@ class LabeledValue extends StatelessWidget {
               ])));
     });
   }
+}
+
+/// Reveals a copy action over its content, including keyboard focus.
+/// The action keeps its space so labels never jump on hover.
+class HoverCopyRegion extends StatefulWidget {
+  const HoverCopyRegion(
+      {super.key,
+      required this.label,
+      required this.value,
+      required this.controller,
+      required this.builder});
+  final String label, value;
+  final AppController controller;
+  final Widget Function(BuildContext context, Widget copyAction) builder;
+  @override
+  State<HoverCopyRegion> createState() => _HoverCopyRegionState();
+}
+
+class _HoverCopyRegionState extends State<HoverCopyRegion> {
+  bool _hovered = false;
+  bool _focused = false;
+  @override
+  Widget build(BuildContext context) => MouseRegion(
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      child: Focus(
+          canRequestFocus: false,
+          skipTraversal: true,
+          onFocusChange: (value) => setState(() => _focused = value),
+          child: widget.builder(
+              context,
+              AnimatedOpacity(
+                  opacity: AppPlatform.isMobile || _hovered || _focused ? 1 : 0,
+                  duration: AppMotion.duration(context,
+                      enabled: widget.controller.settings.enableAnimations,
+                      milliseconds: 120),
+                  child: IconButton(
+                      tooltip: 'Copy ${widget.label}',
+                      constraints: BoxConstraints.tightFor(
+                          width: AppPlatform.isMobile ? 44 : 32,
+                          height: AppPlatform.isMobile ? 44 : 32),
+                      padding: EdgeInsets.zero,
+                      style: IconButton.styleFrom(
+                          tapTargetSize: AppPlatform.isMobile
+                              ? MaterialTapTargetSize.padded
+                              : MaterialTapTargetSize.shrinkWrap),
+                      onPressed: () => copyValue(
+                          widget.controller, widget.label, widget.value),
+                      icon: const Icon(Icons.copy_outlined, size: 16))))));
 }
 
 class CopyableValue extends StatelessWidget {
@@ -71,26 +122,24 @@ class CopyableValue extends StatelessWidget {
   final AppController controller;
   final bool monospace, shorten;
   @override
-  Widget build(BuildContext context) => LabeledValue(
+  Widget build(BuildContext context) => HoverCopyRegion(
       label: label,
-      trailing: IconButton(
-          tooltip: 'Copy $label',
-          constraints: const BoxConstraints.tightFor(width: 32, height: 32),
-          padding: EdgeInsets.zero,
-          // Desktop rows keep an even rhythm; touch keeps a full-size target.
-          style: IconButton.styleFrom(
-              tapTargetSize: AppPlatform.isMobile
-                  ? MaterialTapTargetSize.padded
-                  : MaterialTapTargetSize.shrinkWrap),
-          onPressed: () => copyValue(controller, label, value),
-          icon: const Icon(Icons.copy_outlined, size: 18)),
-      child: Tooltip(
-          message: value,
-          child: SelectableText(
-              shorten && value.length > 24
-                  ? '${value.substring(0, 12)}…${value.substring(value.length - 6)}'
-                  : value,
-              style: monospace
-                  ? const TextStyle(fontFamily: 'monospace')
-                  : null)));
+      value: value,
+      controller: controller,
+      builder: (context, copyAction) => LabeledValue(
+          label: label,
+          trailing: copyAction,
+          child: Tooltip(
+              message: value,
+              child: SelectableText(
+                  monospace &&
+                          label.toLowerCase() == 'last-modified' &&
+                          value.contains('T')
+                      ? value.replaceFirst('T', '\n')
+                      : shorten && value.length > 24
+                          ? '${value.substring(0, 12)}…${value.substring(value.length - 6)}'
+                          : value,
+                  style: monospace
+                      ? const TextStyle(fontFamily: 'monospace')
+                      : null))));
 }

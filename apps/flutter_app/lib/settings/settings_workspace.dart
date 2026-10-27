@@ -13,6 +13,7 @@ import 'package:share_plus/share_plus.dart';
 import '../app/version_details.dart';
 import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
+import '../theme/app_motion.dart';
 import '../services/app_platform.dart';
 import '../widgets/app_select_field.dart';
 import '../widgets/app_slider.dart';
@@ -45,6 +46,14 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
     'Transfers': 'Upload sizing, concurrency and retry behavior.',
     'Appearance': 'Theme, text size and row density.',
     'Diagnostics': 'Choose which engine activity is recorded.',
+    'Transfers & Storage':
+        'Upload sizing, concurrency and retries, plus download and temporary storage locations.',
+    'Safety & Recovery':
+        'Understand secure storage, safe downloads and recovery boundaries.',
+    'Benchmark':
+        'Resource limits, transport defaults and logging for benchmark runs.',
+    'About & Diagnostics':
+        'Application and engine versions, licenses and diagnostic recording.',
   };
   static const _sections = settingsSections;
 
@@ -66,7 +75,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
 
     return LayoutBuilder(builder: (context, constraints) {
       final navigationWidth =
-          236 * MediaQuery.textScalerOf(context).scale(14) / 14;
+          220 * MediaQuery.textScalerOf(context).scale(14) / 14;
       final wide = constraints.maxWidth >= navigationWidth + 650;
       final rawSections = <_SettingsSection>[
         _SettingsSection(
@@ -77,51 +86,64 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                   context,
                   title: 'General',
                   children: () => [
-                    AppSelectField<String>(
-                      value: settings.defaultEngineId,
-                      decoration:
-                          const InputDecoration(labelText: 'Default engine'),
-                      items: controller.engines
-                          .map(
-                            (engine) => AppSelectItem(
-                              value: engine.id,
-                              label: engine.label,
-                            ),
-                          )
-                          .toList(),
-                      onChanged: controller.engines.isEmpty
-                          ? null
-                          : (value) async {
-                              if (value != null) {
-                                await controller.setDefaultEngine(value);
-                              }
-                            },
-                    ),
-                    const SizedBox(height: 12),
-                    AppSelectField<String>(
-                      value: controller.profiles.any(
-                        (profile) => profile.id == settings.defaultProfileId,
-                      )
-                          ? settings.defaultProfileId
-                          : null,
-                      decoration:
-                          const InputDecoration(labelText: 'Default endpoint'),
-                      items: controller.profiles
-                          .map(
-                            (profile) => AppSelectItem(
-                              value: profile.id,
-                              label: profile.name,
-                            ),
-                          )
-                          .toList(),
-                      onChanged: controller.profiles.isEmpty
-                          ? null
-                          : (value) async {
-                              if (value != null) {
-                                await controller.setDefaultProfile(value);
-                              }
-                            },
-                    ),
+                    LayoutBuilder(builder: (context, constraints) {
+                      final engine = AppSelectField<String>(
+                        value: settings.defaultEngineId,
+                        decoration:
+                            const InputDecoration(labelText: 'Default engine'),
+                        items: controller.engines
+                            .map(
+                              (engine) => AppSelectItem(
+                                value: engine.id,
+                                label: engine.label,
+                              ),
+                            )
+                            .toList(),
+                        onChanged: controller.engines.isEmpty
+                            ? null
+                            : (value) async {
+                                if (value != null) {
+                                  await controller.setDefaultEngine(value);
+                                }
+                              },
+                      );
+                      final endpoint = AppSelectField<String>(
+                        value: controller.profiles.any(
+                          (profile) => profile.id == settings.defaultProfileId,
+                        )
+                            ? settings.defaultProfileId
+                            : null,
+                        decoration: const InputDecoration(
+                            labelText: 'Default endpoint'),
+                        items: controller.profiles
+                            .map(
+                              (profile) => AppSelectItem(
+                                value: profile.id,
+                                label: profile.name,
+                              ),
+                            )
+                            .toList(),
+                        onChanged: controller.profiles.isEmpty
+                            ? null
+                            : (value) async {
+                                if (value != null) {
+                                  await controller.setDefaultProfile(value);
+                                }
+                              },
+                      );
+                      if (constraints.maxWidth < 560) {
+                        return Column(children: [
+                          engine,
+                          const SizedBox(height: 12),
+                          endpoint
+                        ]);
+                      }
+                      return Row(children: [
+                        Expanded(child: engine),
+                        const SizedBox(width: 12),
+                        Expanded(child: endpoint)
+                      ]);
+                    }),
                   ],
                 )),
         _SettingsSection(
@@ -276,104 +298,93 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
         _SettingsSection(
             'Transfers',
             Icons.swap_vert,
-            _sectionDescriptions['Transfers'] ??
-                'Configure Transfers preferences.',
-            () => _section(
-                  context,
-                  title: 'Transfers',
-                  children: () => [
-                    Text(!isMobile &&
-                            controller.selectedProfile?.endpointType !=
-                                EndpointProfileType.azureBlob
-                        ? 'Files: one at a time. Parallel S3 parts: up to ${(controller.selectedProfile?.maxConcurrentRequests ?? 8).clamp(1, 8)}. Change the limit in connection settings.'
-                        : 'Files: one at a time. Parallel parts are managed by this engine.'),
-                    const SizedBox(height: 12),
-                    if (!isMobile)
-                      AppSelectField<String>(
-                        value: settings.downloadConflictPolicy,
-                        decoration:
-                            const InputDecoration(labelText: 'Existing files'),
-                        items: const [
-                          AppSelectItem(value: 'keepBoth', label: 'Keep both'),
-                          AppSelectItem(
-                              value: 'replace', label: 'Replace on success')
-                        ],
-                        onChanged: (value) {
-                          if (value != null) {
-                            controller.updateSettings(settings.copyWith(
-                                downloadConflictPolicy: value));
-                          }
-                        },
-                      ),
-                    const Text(
-                        'Downloads are validated before publishing. Failed downloads preserve existing files.'),
-                    const SizedBox(height: 12),
-                    _numberField(
-                      label: 'Multipart threshold (MiB)',
-                      initialValue: settings.multipartThresholdMiB,
-                      onSubmitted: (value) => controller.updateSettings(
-                        settings.copyWith(multipartThresholdMiB: value),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    AppSwitchTile(
-                      value: settings.dynamicMultipartSizing,
-                      onChanged: (value) => controller.updateSettings(
-                        settings.copyWith(dynamicMultipartSizing: value),
-                      ),
-                      title: const Text('Automatically size upload parts'),
-                      subtitle: const Text(
-                        'Choose an S3-compliant part size independently for each file. Files share one upload job, while each file has its own multipart schedule. Disable this to use manual part sizes.',
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    _numberField(
-                      label: settings.dynamicMultipartSizing
-                          ? 'Manual chunk size (MiB, downloads and fallback)'
-                          : 'Manual multipart chunk size (MiB)',
-                      min: 5,
-                      max: 5120,
-                      initialValue: settings.multipartChunkMiB,
-                      onSubmitted: (value) => controller.updateSettings(
-                        settings.copyWith(multipartChunkMiB: value),
-                      ),
-                    ),
-                    AppSwitchTile(
-                      value: settings.relistObjectsAfterMutation,
-                      onChanged: (value) => controller.updateSettings(
-                        settings.copyWith(relistObjectsAfterMutation: value),
-                      ),
-                      title: const Text('Refresh object list after uploads'),
-                      subtitle: const Text(
-                        'Relist the current object view after prefix creation or a completed upload.',
-                      ),
-                    ),
-                  ],
-                )),
+            _sectionDescriptions['Transfers']!,
+            () => _section(context,
+                title: 'Transfers',
+                children: () => [
+                      AppSwitchTile(
+                          value: settings.dynamicMultipartSizing,
+                          onChanged: (value) => controller.updateSettings(
+                              settings.copyWith(dynamicMultipartSizing: value)),
+                          title: const Text('Automatically size upload parts'),
+                          subtitle: const Text(
+                              'Choose an S3-compliant part size for each file. Disable this to use manual upload parts.')),
+                      const SizedBox(height: 12),
+                      _pairedFields(
+                          context,
+                          _numberField(
+                              label: 'Multipart threshold (MiB)',
+                              initialValue: settings.multipartThresholdMiB,
+                              onSubmitted: (value) => controller.updateSettings(
+                                  settings.copyWith(
+                                      multipartThresholdMiB: value))),
+                          _numberField(
+                              label: settings.dynamicMultipartSizing
+                                  ? 'Manual chunk size (MiB, downloads and fallback)'
+                                  : 'Manual multipart chunk size (MiB)',
+                              min: 5,
+                              max: 5120,
+                              initialValue: settings.multipartChunkMiB,
+                              onSubmitted: (value) => controller.updateSettings(
+                                  settings.copyWith(
+                                      multipartChunkMiB: value)))),
+                      const SizedBox(height: 12),
+                      Text(controller.selectedProfile?.endpointType !=
+                              EndpointProfileType.azureBlob
+                          ? 'Files: one at a time. Parallel S3 parts: up to ${(controller.selectedProfile?.maxConcurrentRequests ?? 8).clamp(1, 8)}. Change the limit in connection settings.'
+                          : 'Files: one at a time. Parallel parts are managed by this engine.'),
+                      const SizedBox(height: 8),
+                      AppSwitchTile(
+                          value: settings.relistObjectsAfterMutation,
+                          onChanged: (value) => controller.updateSettings(
+                              settings.copyWith(
+                                  relistObjectsAfterMutation: value)),
+                          title:
+                              const Text('Refresh object list after uploads'),
+                          subtitle: const Text(
+                              'Relist the current view after prefix creation or a completed upload.')),
+                    ])),
         _SettingsSection(
             'Downloads & Temp Storage',
             Icons.download_outlined,
-            _sectionDescriptions['Downloads & Temp Storage'] ??
-                'Configure Downloads & Temp Storage preferences.',
-            () => _section(
-                  context,
-                  title: 'Downloads & Temp Storage',
-                  children: () => [
-                    _textField(
-                      label: 'Default download path',
-                      initialValue: settings.downloadPath,
-                      onSubmitted: (value) => controller.updateSettings(
-                          settings.copyWith(downloadPath: value)),
-                    ),
-                    const SizedBox(height: 12),
-                    _textField(
-                      label: 'Temp path override',
-                      initialValue: settings.tempPath,
-                      onSubmitted: (value) => controller
-                          .updateSettings(settings.copyWith(tempPath: value)),
-                    ),
-                  ],
-                )),
+            'Download publication and local storage locations.',
+            () => _section(context,
+                title: 'Downloads & Temp Storage',
+                children: () => [
+                      if (!isMobile)
+                        AppSelectField<String>(
+                            value: settings.downloadConflictPolicy,
+                            decoration: const InputDecoration(
+                                labelText: 'Existing files'),
+                            items: const [
+                              AppSelectItem(
+                                  value: 'keepBoth', label: 'Keep both'),
+                              AppSelectItem(
+                                  value: 'replace', label: 'Replace on success')
+                            ],
+                            onChanged: (value) {
+                              if (value != null) {
+                                controller.updateSettings(settings.copyWith(
+                                    downloadConflictPolicy: value));
+                              }
+                            }),
+                      const SizedBox(height: 8),
+                      const Text(
+                          'Downloads are validated before publishing. Failed downloads preserve existing files.'),
+                      const SizedBox(height: 16),
+                      _pairedFields(
+                          context,
+                          _textField(
+                              label: 'Default download path',
+                              initialValue: settings.downloadPath,
+                              onSubmitted: (value) => controller.updateSettings(
+                                  settings.copyWith(downloadPath: value))),
+                          _textField(
+                              label: 'Temp path override',
+                              initialValue: settings.tempPath,
+                              onSubmitted: (value) => controller.updateSettings(
+                                  settings.copyWith(tempPath: value)))),
+                    ])),
         _SettingsSection(
             'Appearance',
             Icons.palette_outlined,
@@ -732,24 +743,20 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                   ],
                 )),
       ];
-      rawSections.sort((a, b) => a.title == 'General'
-          ? 1
-          : b.title == 'General'
-              ? -1
-              : 0);
+      // Startup defaults lead Connections; the remaining groups retain their order.
       final sections = <_SettingsSection>[
         for (final name in settingsSections)
           if (rawSections.any(
               (section) => canonicalSettingsSection(section.title) == name))
             _SettingsSection(
                 name,
-                rawSections
-                    .firstWhere((section) =>
-                        canonicalSettingsSection(section.title) == name)
-                    .icon,
                 name == 'Connections'
-                    ? 'Test drafts, save credentials, and activate connections independently.'
-                    : 'Configure $name.',
+                    ? Icons.cable
+                    : rawSections
+                        .firstWhere((section) =>
+                            canonicalSettingsSection(section.title) == name)
+                        .icon,
+                _sectionDescriptions[name] ?? name,
                 () => Column(
                         crossAxisAlignment: CrossAxisAlignment.stretch,
                         children: [
@@ -760,24 +767,47 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
       ];
       final active = sections.firstWhere((s) => s.title == _sectionName,
           orElse: () => sections.first);
-      final content = ListView(padding: const EdgeInsets.all(16), children: [
-        _sectionIntro(context,
-            title: active.title, description: active.description, wide: wide),
-        const SizedBox(height: 16),
-        if (controller.persistenceState.warning != null)
-          Card(
-              child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(controller.persistenceState.warning!),
-                        TextButton(
-                            onPressed: controller.retrySaveSettings,
-                            child: const Text('Retry saving')),
-                      ]))),
-        active.builder(),
-      ]);
+      final content = DirectionalSwitcher(
+          position: settingsSections.indexOf(active.title),
+          duration: AppMotion.duration(context,
+              enabled: settings.enableAnimations, milliseconds: 180),
+          layoutBuilder: (current, previous) =>
+              current ?? const SizedBox.shrink(),
+          child: ListView(
+              key: ValueKey('settings-content-${active.title}'),
+              padding: const EdgeInsets.all(12),
+              children: [
+                _sectionIntro(context,
+                    title: active.title,
+                    description: active.description,
+                    wide: wide),
+                const SizedBox(height: 16),
+                if (controller.persistenceState.warning != null)
+                  Card(
+                      child: Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Icon(Icons.warning_amber_rounded,
+                                          color: Theme.of(context)
+                                              .colorScheme
+                                              .error),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                          child: Text(controller
+                                              .persistenceState.warning!)),
+                                    ]),
+                                TextButton(
+                                    onPressed: controller.retrySaveSettings,
+                                    child: const Text('Retry saving')),
+                              ]))),
+                active.builder(),
+              ]));
       if (!wide) return content;
       return Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         SizedBox(
@@ -811,6 +841,18 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
     });
   }
 
+  Widget _pairedFields(BuildContext context, Widget leading, Widget trailing) =>
+      LayoutBuilder(builder: (context, constraints) {
+        final scale = MediaQuery.textScalerOf(context).scale(14) / 14;
+        return constraints.maxWidth < 560 * (scale < 1 ? 1 : scale)
+            ? Column(children: [leading, const SizedBox(height: 12), trailing])
+            : Row(children: [
+                Expanded(child: leading),
+                const SizedBox(width: 12),
+                Expanded(child: trailing)
+              ]);
+      });
+
   Widget _section(
     BuildContext context, {
     required String title,
@@ -842,7 +884,15 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                     children: [
                       // The page intro already names the active section.
                       if (title != _sectionName) ...[
-                        Text(title, style: theme.textTheme.titleLarge),
+                        Text(
+                            switch (title) {
+                              'General' => 'Startup defaults',
+                              'Transfers' => 'Uploads',
+                              'Downloads & Temp Storage' =>
+                                'Downloads & temporary storage',
+                              _ => title
+                            },
+                            style: theme.textTheme.titleMedium),
                         const SizedBox(height: 8),
                       ],
                       ...children(),
@@ -861,7 +911,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
   }) {
     final theme = Theme.of(context);
     return Container(
-      padding: const EdgeInsets.all(18),
+      padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(8),
         color: theme.colorScheme.surface,
@@ -871,9 +921,9 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(title, style: theme.textTheme.headlineSmall),
-          const SizedBox(height: 10),
-          Text(description, style: theme.textTheme.bodyLarge),
-          const SizedBox(height: 16),
+          const SizedBox(height: 6),
+          Text(description, style: theme.textTheme.bodyMedium),
+          if (!wide) const SizedBox(height: 12),
           if (!wide)
             AppSelectField<String>(
                 value: _sectionName,
@@ -1277,7 +1327,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
     final connectError = timeoutError(_connectTimeoutController.text);
     final readError = timeoutError(_readTimeoutController.text);
     final valid = connectError == null && readError == null;
-    final isDirty = _buildProfile() != widget.profile;
+    final isDirty = _buildProfile() !=
+        widget.profile.copyWith(notes: widget.profile.notes ?? '');
     final persistenceStatus =
         widget.controller.profilePersistenceStatusFor(widget.profile.id);
     final sessionOnly = persistenceStatus != 'Saved';

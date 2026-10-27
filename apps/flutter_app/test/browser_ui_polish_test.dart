@@ -102,20 +102,23 @@ void inspectorMain() {
     await tester.pumpAndSettle();
     final details = c.selectedObjectDetails!;
     expect(details.tags, isEmpty);
-    await tester.dragUntilVisible(find.text('No tags'),
-        find.byKey(const ValueKey('object-details')), const Offset(0, -200));
-    await tester.pumpAndSettle();
-    for (final (entries, placeholder) in [
-      (details.metadata, 'No user metadata'),
-      (details.headers, 'No headers returned'),
-      (details.tags, 'No tags'),
+    for (final (section, entries, placeholder) in [
+      ('Metadata', details.metadata, 'No user metadata'),
+      ('Headers', details.headers, 'No headers returned'),
+      ('Tags', details.tags, 'No tags'),
     ]) {
+      expect(find.text(placeholder), findsNothing);
+      await tester.dragUntilVisible(find.text(section),
+          find.byKey(const ValueKey('object-details')), const Offset(0, -120));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(section));
+      await tester.pumpAndSettle();
       expect(find.text(placeholder),
           entries.isEmpty ? findsOneWidget : findsNothing);
+      await tester.tap(find.text(section));
+      await tester.pumpAndSettle();
     }
     expect(details.headers, isNotEmpty);
-    expect(find.text('No user metadata'), findsOneWidget);
-    expect(find.text('No tags'), findsOneWidget);
     expect(tester.takeException(), isNull);
 
     await tester.pumpWidget(const SizedBox.shrink());

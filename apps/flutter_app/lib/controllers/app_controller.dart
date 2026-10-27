@@ -2272,7 +2272,7 @@ class AppController extends ChangeNotifier {
 
   Future<void> pauseBenchmark() async {
     final run = benchmarkRun;
-    if (run == null) {
+    if (run == null || run.status != 'running') {
       return;
     }
     benchmarkRun = run.copyWith(
@@ -2307,7 +2307,7 @@ class AppController extends ChangeNotifier {
 
   Future<void> resumeBenchmark() async {
     final run = benchmarkRun;
-    if (run == null) {
+    if (run == null || run.status != 'paused') {
       return;
     }
     benchmarkRun = run.copyWith(
@@ -2340,7 +2340,7 @@ class AppController extends ChangeNotifier {
 
   Future<void> stopBenchmark() async {
     final run = benchmarkRun;
-    if (run == null) {
+    if (run == null || !const ['running', 'paused'].contains(run.status)) {
       return;
     }
     benchmarkRun = run.copyWith(
@@ -3143,7 +3143,7 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void selectTask(String taskId) {
+  void selectTask(String? taskId) {
     selectedTaskId = taskId;
     notifyListeners();
   }

@@ -17,14 +17,20 @@ class SourceCodePreview extends StatelessWidget {
   Widget build(BuildContext context) {
     final baseStyle = (textStyle ?? Theme.of(context).textTheme.bodyMedium)
         ?.copyWith(fontFamily: 'monospace');
-    final nodes = highlight.parse(source, language: language).nodes ?? const [];
     return SelectableText.rich(
-      TextSpan(
-        style: baseStyle,
-        children: nodes.map((node) => _spanForNode(context, node)).toList(),
-      ),
+      highlightedSpan(context),
       key: ValueKey('source-code-$language'),
       style: baseStyle,
+    );
+  }
+
+  TextSpan highlightedSpan(BuildContext context) {
+    final baseStyle = (textStyle ?? Theme.of(context).textTheme.bodyMedium)
+        ?.copyWith(fontFamily: 'monospace');
+    final nodes = highlight.parse(source, language: language).nodes ?? const [];
+    return TextSpan(
+      style: baseStyle,
+      children: nodes.map((node) => _spanForNode(context, node)).toList(),
     );
   }
 

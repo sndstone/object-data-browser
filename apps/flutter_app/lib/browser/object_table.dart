@@ -41,13 +41,15 @@ class ObjectTable extends StatelessWidget {
   Widget build(BuildContext context) =>
       LayoutBuilder(builder: (context, constraints) {
         final narrow = constraints.maxWidth < 520;
+        final checkSlot = AppPlatform.isMobile ? 48.0 : _checkSlot;
+        final actionSlot = AppPlatform.isMobile ? 48.0 : _actionSlot;
         final height = math.max(
             AppPlatform.isMobile
                 ? 52.0
                 : compactRows
-                    ? 38.0
-                    : 44.0,
-            MediaQuery.textScalerOf(context).scale(16) + 22);
+                    ? 32.0
+                    : 36.0,
+            MediaQuery.textScalerOf(context).scale(14) + 18);
         return Column(children: [
           Padding(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -61,7 +63,7 @@ class ObjectTable extends StatelessWidget {
                   // Header cells share the row's fixed leading slots and
                   // column widths so labels sit directly over their values.
                   : Row(children: [
-                      const SizedBox(width: _checkSlot + _iconSlot),
+                      SizedBox(width: checkSlot + _iconSlot),
                       Expanded(
                           child: Align(
                               alignment: Alignment.centerLeft,
@@ -80,7 +82,7 @@ class ObjectTable extends StatelessWidget {
                               child: _sortHeader(
                                   'Size', BrowserObjectSortField.size,
                                   trailingAligned: true))),
-                      const SizedBox(width: _actionSlot)
+                      SizedBox(width: actionSlot)
                     ])),
           const Divider(height: 1),
           Expanded(
@@ -117,9 +119,9 @@ class ObjectTable extends StatelessWidget {
                                     final box = rowContext.findRenderObject()
                                         as RenderBox;
                                     final slot = Rect.fromLTWH(
-                                        box.size.width - 8 - _actionSlot,
+                                        box.size.width - 8 - actionSlot,
                                         0,
-                                        _actionSlot,
+                                        actionSlot,
                                         box.size.height);
                                     onShowContextMenu(
                                         object,
@@ -161,7 +163,7 @@ class ObjectTable extends StatelessWidget {
                                                 // Fixed checkbox and icon slots keep
                                                 // folder and file names aligned.
                                                 SizedBox(
-                                                    width: _checkSlot,
+                                                    width: checkSlot,
                                                     child: object.isFolder
                                                         ? null
                                                         : Checkbox(
@@ -226,7 +228,7 @@ class ObjectTable extends StatelessWidget {
                                                                   .tabularFigures()
                                                             ]))),
                                                 SizedBox(
-                                                    width: _actionSlot,
+                                                    width: actionSlot,
                                                     child: Visibility(
                                                         visible: (AppPlatform
                                                                     .isMobile ||
@@ -255,11 +257,11 @@ class ObjectTable extends StatelessWidget {
                   }))),
         ]);
       });
-  static const double _checkSlot = 48;
-  static const double _iconSlot = 26;
-  static const double _modifiedWidth = 165;
-  static const double _sizeWidth = 96;
-  static const double _actionSlot = 48;
+  static const double _checkSlot = 40;
+  static const double _iconSlot = 24;
+  static const double _modifiedWidth = 154;
+  static const double _sizeWidth = 80;
+  static const double _actionSlot = 36;
 
   Widget _sortHeader(String label, BrowserObjectSortField field,
       {bool trailingAligned = false}) {
