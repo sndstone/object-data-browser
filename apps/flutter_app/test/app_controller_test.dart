@@ -7,6 +7,7 @@ import 'package:s3_browser_crossplat/models/domain_models.dart';
 import 'package:s3_browser_crossplat/services/app_state_repository.dart';
 import 'package:s3_browser_crossplat/services/engine_service.dart';
 import 'package:s3_browser_crossplat/services/mock_engine_service.dart';
+import 'package:s3_browser_crossplat/widgets/transfer_status/transfer_status_spec.dart';
 
 class MemoryAppStateRepository implements AppStateRepository {
   StoredAppState? storedState;
@@ -630,7 +631,13 @@ void main() {
     expect(runningTransfer.strategyLabel, isNotNull);
     expect(runningTransfer.outputLines, isNotEmpty);
     expect(controller.bannerTaskId, runningTransfer.id);
-    expect(controller.bannerMessage, contains('%'));
+    // The banner indicator carries the percent; the message no longer does.
+    expect(controller.bannerMessage, isNot(contains('%')));
+    expect(controller.bannerTransferStatus?.direction,
+        TransferStatusDirection.upload);
+    expect(controller.bannerTransferStatus?.itemCount, 1);
+    expect(controller.bannerTransferStatus?.phase,
+        anyOf(TransferStatusPhase.preparing, TransferStatusPhase.transferring));
 
     await uploadFuture;
 
@@ -640,7 +647,9 @@ void main() {
     expect(completedTransfer.status, 'completed');
     expect(completedTransfer.progress, 1);
     expect(controller.bannerTaskId, completedTransfer.id);
-    expect(controller.bannerMessage, 'Upload complete - 100%');
+    expect(controller.bannerMessage, 'Upload complete');
+    expect(
+        controller.bannerTransferStatus?.phase, TransferStatusPhase.completed);
   });
 
   test('controller cancels running listing action tasks', () async {

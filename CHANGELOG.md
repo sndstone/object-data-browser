@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.3.3 — animated status banner
+
+### Transfers
+- The status banner now animates while a transfer is working. Single-file uploads and downloads, including multipart files, use a document that is scanned while it is being prepared and then fills with progress. Transfers with several files or objects use a row of multipart segments.
+- The long preparation stage before the first bytes move is shown as its own animated state from the moment an upload or download starts, instead of a static icon with "Starting upload...".
+- The banner keeps one indicator from preparation through completion. The percent appears inside it with fixed-width figures, consistent spacing replaces the cramped icon and percent label, and messages no longer repeat the percent.
+- Pausing, resuming or cancelling a transfer keeps the transfer indicator in the banner and then shows the transfer's real state, instead of a generic action message and a green "Transfer paused." notice.
+- After an upload's automatic object-list refresh, the banner returns to the completed transfer.
+
+### Other banner activity
+- Listing, deleting, quick changes and plain messages use animated glyphs. Listing shows how many objects have loaded, and deleting shows the object count.
+- Benchmarks and exports use a bordered tile: benchmarks show their progress, and exports trace the tile border while the file is written.
+- Bucket copies use the multipart segments with a copy icon until the copy ends.
+- Working states change in place to done, failed, cancelled or partial results. All indicators respect reduced motion and stop animating when paused or finished.
+
 ## 2.3.2 — workspace and object preview redesign
 
 ### Object previews

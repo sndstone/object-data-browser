@@ -1,4 +1,8 @@
 import '../widgets/navigation_item.dart';
+import '../widgets/banner_activity/banner_activity_indicator.dart';
+import '../widgets/banner_activity/banner_activity_spec.dart';
+import '../widgets/transfer_status/transfer_status_indicator.dart';
+import '../widgets/transfer_status/transfer_status_spec.dart';
 import 'app_shortcuts.dart';
 import 'dart:async';
 
@@ -1143,6 +1147,11 @@ class _BannerOverlayState extends State<_BannerOverlay> {
       BannerSeverity.success => colors.primaryContainer,
       BannerSeverity.info => colors.inverseSurface,
     };
+    final transfer = c.bannerTransferStatus;
+    final activity = c.bannerActivity;
+    final animate =
+        AppMotion.duration(context, enabled: c.settings.enableAnimations) >
+            Duration.zero;
     final foreground = switch (c.bannerSeverity) {
       BannerSeverity.error => colors.onErrorContainer,
       BannerSeverity.warning => colors.onTertiaryContainer,
@@ -1155,7 +1164,9 @@ class _BannerOverlayState extends State<_BannerOverlay> {
       child: c.bannerMessage == null
           ? const SizedBox.shrink(key: ValueKey('banner-empty'))
           : Align(
-              key: ValueKey('banner-${c.bannerTaskId ?? 'message'}'),
+              key: ValueKey(transfer != null
+                  ? 'banner-transfer'
+                  : 'banner-${c.bannerTaskId ?? 'message'}'),
               alignment: Alignment.bottomRight,
               child: Semantics(
                   liveRegion: true,
@@ -1164,22 +1175,30 @@ class _BannerOverlayState extends State<_BannerOverlay> {
                     borderRadius: BorderRadius.circular(10),
                     child: Container(
                         constraints: const BoxConstraints(maxWidth: 480),
-                        padding: const EdgeInsets.all(8),
+                        padding: const EdgeInsets.fromLTRB(12, 6, 4, 6),
                         child: Row(mainAxisSize: MainAxisSize.min, children: [
-                          Icon(
-                              switch (c.bannerSeverity) {
-                                BannerSeverity.error => Icons.error_outline,
-                                BannerSeverity.warning => Icons.warning_amber,
-                                BannerSeverity.success =>
-                                  Icons.check_circle_outline,
-                                BannerSeverity.info => Icons.info_outline
-                              },
-                              color: foreground),
-                          if (c.bannerTask?.kind == BrowserTaskKind.transfer)
-                            Text(
-                                '${(c.bannerTask!.progress.clamp(0, 1) * 100).round()}%',
-                                style: TextStyle(color: foreground)),
-                          const SizedBox(width: 8),
+                          if (transfer != null)
+                            TransferStatusIndicator(
+                                spec: TransferStatusSpec(
+                                    phase: transfer.phase,
+                                    direction: transfer.direction,
+                                    progress: transfer.progress,
+                                    itemCount: transfer.itemCount,
+                                    copy: transfer.copy,
+                                    animate: animate,
+                                    foreground: foreground,
+                                    background: background))
+                          else if (activity != null)
+                            BannerActivityIndicator(
+                                spec: BannerActivitySpec(
+                                    kind: activity.kind,
+                                    phase: activity.phase,
+                                    progress: activity.progress,
+                                    count: activity.count,
+                                    animate: animate,
+                                    foreground: foreground,
+                                    background: background)),
+                          const SizedBox(width: 12),
                           Flexible(
                               child: InkWell(
                                   onTap: c.bannerTaskId != null

@@ -1,5 +1,7 @@
 import '../services/bucket_copy_journal.dart';
 import 'transfer_presentation.dart';
+import '../widgets/banner_activity/banner_activity_spec.dart';
+import '../widgets/transfer_status/transfer_status_spec.dart';
 import 'action_scope.dart';
 import 'persistence_state.dart';
 import 'dart:async';
@@ -402,6 +404,7 @@ class AppController extends ChangeNotifier {
   set bannerMessage(String? value) {
     _bannerMessage = value;
     bannerSeverity = BannerSeverity.info;
+    if (value == null) _bannerActivity = null;
   }
 
   BannerSeverity bannerSeverity = BannerSeverity.info;
@@ -1030,6 +1033,7 @@ class AppController extends ChangeNotifier {
       isFirstIteration = false;
       pageNumber += 1;
       allItems.addAll(objectResult.items);
+      _listingLoadedCount = allItems.length;
       keyCharacters +=
           objectResult.items.fold<int>(0, (n, o) => n + o.key.length);
       cursor = objectResult.cursor;
@@ -1405,7 +1409,7 @@ class AppController extends ChangeNotifier {
       return;
     }
     await _runBusy('delete-object', 'Deleting ${keys.length} object(s)...',
-        () async {
+        itemCount: keys.length, () async {
       await _guard('Objects', () async {
         final result = await _engineService.deleteObjects(
           engineId: activeEngineId,
@@ -1453,7 +1457,8 @@ class AppController extends ChangeNotifier {
     if (profile == null || bucket == null || filePaths.isEmpty) {
       return;
     }
-    await _runBusy('upload', 'Starting upload...', () async {
+    await _runPreparingTransfer(
+        TransferStatusDirection.upload, filePaths.length, () async {
       await _guard('Transfers', () async {
         if (filePaths.length > 1) {
           await _startUploadBatch(
@@ -1485,7 +1490,7 @@ class AppController extends ChangeNotifier {
         _trackTransferJob(job);
         _maybeRelistAfterUpload(job);
         bannerTaskId = job.id;
-        bannerMessage = _transferBannerMessage(job);
+        bannerMessage = transferBannerMessage(job);
         bannerSeverity = job.status == 'failed'
             ? BannerSeverity.error
             : job.status == 'completed'
@@ -1634,7 +1639,8 @@ class AppController extends ChangeNotifier {
     if (profile == null || bucket == null || keys.isEmpty) {
       return;
     }
-    await _runBusy('download', 'Starting download...', () async {
+    await _runPreparingTransfer(TransferStatusDirection.download, keys.length,
+        () async {
       await _guard('Transfers', () async {
         final retryEngine = activeEngineId;
         final retryDestination = settings.downloadPath;
@@ -1683,7 +1689,7 @@ class AppController extends ChangeNotifier {
         transferJobs = [job, ...transferJobs];
         _trackTransferJob(job);
         bannerTaskId = job.id;
-        bannerMessage = _transferBannerMessage(job);
+        bannerMessage = transferBannerMessage(job);
         bannerSeverity = job.status == 'failed'
             ? BannerSeverity.error
             : job.status == 'completed'
@@ -1705,7 +1711,7 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> pauseTransfer(String jobId) async {
-    await _runBusy('control-$jobId', 'Pause transfer', () async {
+    await _runTransferControl(jobId, 'pause', () async {
       if (_uploadBatch?.id == jobId) {
         await _uploadBatch!.control('pause');
         return;
@@ -1726,11 +1732,11 @@ class AppController extends ChangeNotifier {
         source: 'task-tray',
       );
       notifyListeners();
-    }, trackTask: false, doneMessage: 'Transfer paused.');
+    }, doneMessage: 'Transfer paused.');
   }
 
   Future<void> resumeTransfer(String jobId) async {
-    await _runBusy('control-$jobId', 'Resume transfer', () async {
+    await _runTransferControl(jobId, 'resume', () async {
       if (_uploadBatch?.id == jobId) {
         await _uploadBatch!.control('resume');
         return;
@@ -1751,13 +1757,13 @@ class AppController extends ChangeNotifier {
       );
       _trackTransferJob(job);
       notifyListeners();
-    }, trackTask: false, doneMessage: 'Transfer resumed.');
+    }, doneMessage: 'Transfer resumed.');
   }
 
   Future<void> cancelTransfer(String jobId) async {
-    await _runBusy(
-        'control-$jobId',
-        'Cancel transfer',
+    await _runTransferControl(
+        jobId,
+        'cancel',
         () => _guard('Transfers', () async {
               if (_uploadBatch?.id == jobId) {
                 await _uploadBatch!.control('cancel');
@@ -1780,8 +1786,49 @@ class AppController extends ChangeNotifier {
               );
               _trackTransferJob(job);
               notifyListeners();
-            }),
-        trackTask: false);
+            }));
+  }
+
+  /// Pause/resume/cancel. When the banner shows this transfer it stays
+  /// attached (indicator and all) instead of switching to a generic action
+  /// message, and afterwards reflects the job's own state.
+  Future<void> _runTransferControl(
+      String jobId, String action, Future<void> Function() operation,
+      {String? doneMessage}) async {
+    final job = transferJobs.where((job) => job.id == jobId).firstOrNull;
+    final follows = bannerTaskId == jobId && job != null;
+    final verb = job?.direction == 'download' ? 'download' : 'upload';
+    final busyMessage = !follows
+        ? switch (action) {
+            'pause' => 'Pause transfer',
+            'resume' => 'Resume transfer',
+            _ => 'Cancel transfer',
+          }
+        : switch (action) {
+            'pause' => 'Pausing $verb…',
+            'resume' => 'Resuming $verb…',
+            _ => 'Stopping $verb…',
+          };
+    final errors = _guardErrorSequence;
+    await _runBusy('control-$jobId', busyMessage, operation,
+        trackTask: false,
+        doneMessage: follows ? (doneMessage ?? busyMessage) : doneMessage,
+        keepBannerTaskId: follows ? jobId : null);
+    final current = transferJobs.where((job) => job.id == jobId).firstOrNull;
+    if (!follows ||
+        current == null ||
+        bannerTaskId != jobId ||
+        _guardErrorSequence != errors) {
+      return;
+    }
+    bannerMessage = transferBannerMessage(current);
+    bannerSeverity =
+        switch (transferStatusPhase(current.status, current.progress, 0)) {
+      TransferStatusPhase.failed => BannerSeverity.error,
+      TransferStatusPhase.completed => BannerSeverity.success,
+      _ => BannerSeverity.info,
+    };
+    notifyListeners();
   }
 
   Future<void> cancelToolTask(BrowserTaskRecord task) async {
@@ -2280,7 +2327,7 @@ class AppController extends ChangeNotifier {
       liveLog: [...run.liveLog, 'Pause requested...'],
     );
     _upsertBenchmarkHistory(benchmarkRun!);
-    bannerMessage = 'Pausing benchmark ${run.id}...';
+    _showBenchmarkBanner('Pausing benchmark ${run.id}...');
     notifyListeners();
     _benchmarkLifecycleActionInFlight = true;
     try {
@@ -2315,7 +2362,7 @@ class AppController extends ChangeNotifier {
       liveLog: [...run.liveLog, 'Resume requested...'],
     );
     _upsertBenchmarkHistory(benchmarkRun!);
-    bannerMessage = 'Resuming benchmark ${run.id}...';
+    _showBenchmarkBanner('Resuming benchmark ${run.id}...');
     notifyListeners();
     _benchmarkLifecycleActionInFlight = true;
     try {
@@ -2348,7 +2395,7 @@ class AppController extends ChangeNotifier {
       liveLog: [...run.liveLog, 'Stop requested...'],
     );
     _upsertBenchmarkHistory(benchmarkRun!);
-    bannerMessage = 'Stopping benchmark ${run.id}...';
+    _showBenchmarkBanner('Stopping benchmark ${run.id}...');
     notifyListeners();
     _benchmarkLifecycleActionInFlight = true;
     try {
@@ -2848,6 +2895,7 @@ class AppController extends ChangeNotifier {
     bannerMessage = message;
     bannerSeverity = severity;
     bannerTaskId = null;
+    _bannerActivity = null;
     _addEvent(
       level: severity == BannerSeverity.error
           ? 'ERROR'
@@ -3176,6 +3224,212 @@ class AppController extends ChangeNotifier {
   BrowserTaskRecord? get bannerTask {
     final taskId = bannerTaskId;
     return taskId == null ? null : _taskById(taskId);
+  }
+
+  ({
+    TransferStatusDirection direction,
+    int itemCount,
+    String message
+  })? _preparingTransfer;
+
+  /// Indicator state when the banner reports a transfer, including the
+  /// preparation before the engine reports the first job update.
+  ({
+    TransferStatusPhase phase,
+    TransferStatusDirection direction,
+    double? progress,
+    int itemCount,
+    bool copy
+  })? get bannerTransferStatus {
+    final activity = _bannerActivity;
+    if (activity != null &&
+        activity.actionKey == 'copy-bucket' &&
+        bannerMessage != null &&
+        (!activity.done || activity.message == bannerMessage)) {
+      // A bucket copy pages through objects without a known total, so it
+      // stays in the segments' indeterminate wave until it ends.
+      return (
+        phase: !activity.done
+            ? (bannerSeverity == BannerSeverity.error
+                ? TransferStatusPhase.failed
+                : TransferStatusPhase.preparing)
+            : activity.cancelled
+                ? TransferStatusPhase.cancelled
+                : switch (bannerSeverity) {
+                    BannerSeverity.error ||
+                    BannerSeverity.warning =>
+                      TransferStatusPhase.failed,
+                    _ => TransferStatusPhase.completed,
+                  },
+        direction: TransferStatusDirection.upload,
+        progress: null,
+        itemCount: 2,
+        copy: true,
+      );
+    }
+    final task = bannerTask;
+    if (task != null && task.kind == BrowserTaskKind.transfer) {
+      final job = transferJobs.where((job) => job.id == task.id).firstOrNull;
+      final download = job != null
+          ? job.direction == 'download'
+          : task.label.startsWith('Download');
+      final phase = transferStatusPhase(
+          task.status, task.progress, task.bytesTransferred);
+      return (
+        phase: phase,
+        direction: download
+            ? TransferStatusDirection.download
+            : TransferStatusDirection.upload,
+        progress: phase == TransferStatusPhase.preparing ? null : task.progress,
+        itemCount: task.itemCount ?? job?.itemCount ?? 1,
+        copy: false,
+      );
+    }
+    final preparing = _preparingTransfer;
+    if (preparing == null || bannerMessage != preparing.message) return null;
+    return (
+      phase: TransferStatusPhase.preparing,
+      direction: preparing.direction,
+      progress: null,
+      itemCount: preparing.itemCount,
+      copy: false,
+    );
+  }
+
+  ({
+    BannerActivityKind kind,
+    String actionKey,
+    int? count,
+    bool done,
+    bool cancelled,
+    String? message
+  })? _bannerActivity;
+  String? _benchmarkBannerMessage;
+  int _listingLoadedCount = 0;
+
+  static BannerActivityKind _activityKind(String actionKey) =>
+      switch (actionKey) {
+        'refresh-objects' ||
+        'refresh-buckets' ||
+        'select-bucket' ||
+        'select-object' ||
+        'more-versions' ||
+        'refresh-bucket-admin' =>
+          BannerActivityKind.listing,
+        'delete-object' ||
+        'delete-bucket' ||
+        'force-delete-bucket' =>
+          BannerActivityKind.deleting,
+        'benchmark-start' => BannerActivityKind.benchmark,
+        'export-event-log' ||
+        'export-diagnostics' =>
+          BannerActivityKind.exporting,
+        _ => BannerActivityKind.action,
+      };
+
+  void _showBenchmarkBanner(String message) {
+    bannerMessage = message;
+    _benchmarkBannerMessage = message;
+  }
+
+  BannerActivityPhase get _severityPhase => switch (bannerSeverity) {
+        BannerSeverity.success => BannerActivityPhase.succeeded,
+        BannerSeverity.error => BannerActivityPhase.failed,
+        BannerSeverity.warning => BannerActivityPhase.warning,
+        BannerSeverity.info => BannerActivityPhase.info,
+      };
+
+  static BannerActivityPhase _runPhase(String status) =>
+      switch (status.toLowerCase()) {
+        'paused' => BannerActivityPhase.paused,
+        'stopping' ||
+        'cancelling' ||
+        'canceling' =>
+          BannerActivityPhase.stopping,
+        'completed' => BannerActivityPhase.succeeded,
+        'failed' || 'error' => BannerActivityPhase.failed,
+        'cancelled' || 'canceled' || 'stopped' => BannerActivityPhase.cancelled,
+        _ => BannerActivityPhase.working,
+      };
+
+  /// Indicator state for every banner that is not a file transfer.
+  ({
+    BannerActivityKind kind,
+    BannerActivityPhase phase,
+    double? progress,
+    int? count
+  })? get bannerActivity {
+    if (bannerMessage == null || bannerTransferStatus != null) return null;
+    final task = bannerTask;
+    if (task != null &&
+        (task.kind == BrowserTaskKind.benchmark ||
+            task.kind == BrowserTaskKind.tool)) {
+      return (
+        kind: BannerActivityKind.benchmark,
+        phase: bannerSeverity == BannerSeverity.error
+            ? BannerActivityPhase.failed
+            : _runPhase(task.status),
+        progress: task.progress > 0 ? task.progress.clamp(0.0, 1.0) : null,
+        count: null,
+      );
+    }
+    final run = benchmarkRun;
+    if (run != null && bannerMessage == _benchmarkBannerMessage) {
+      final progress = _benchmarkProgressForRun(run);
+      return (
+        kind: BannerActivityKind.benchmark,
+        phase: _runPhase(run.status),
+        progress: progress > 0 ? progress.clamp(0.0, 1.0) : null,
+        count: null,
+      );
+    }
+    final activity = _bannerActivity;
+    if (activity != null &&
+        (!activity.done || activity.message == bannerMessage)) {
+      final phase = !activity.done
+          ? (bannerSeverity == BannerSeverity.error
+              ? BannerActivityPhase.failed
+              : BannerActivityPhase.working)
+          : activity.cancelled
+              ? BannerActivityPhase.cancelled
+              : _severityPhase;
+      final count = activity.kind == BannerActivityKind.listing
+          ? (_listingLoadedCount > 0 ? _listingLoadedCount : null)
+          : activity.count;
+      return (
+        kind: activity.kind,
+        phase: phase,
+        progress: null,
+        count: count,
+      );
+    }
+    return (
+      kind: BannerActivityKind.message,
+      phase: _severityPhase,
+      progress: null,
+      count: null,
+    );
+  }
+
+  /// Runs a transfer start as a busy action whose banner already shows the
+  /// preparing indicator while local files are sized and the engine starts.
+  Future<void> _runPreparingTransfer(TransferStatusDirection direction,
+      int itemCount, Future<void> Function() operation,
+      {bool trackTask = true}) async {
+    final actionKey = direction.name;
+    if (_busyActions.contains(actionKey)) return;
+    final upload = direction == TransferStatusDirection.upload;
+    final message = itemCount > 1
+        ? 'Preparing $actionKey of $itemCount ${upload ? 'files' : 'objects'}…'
+        : 'Preparing $actionKey…';
+    final preparing =
+        (direction: direction, itemCount: itemCount, message: message);
+    _preparingTransfer = preparing;
+    try {
+      await _runBusy(actionKey, message, operation, trackTask: trackTask);
+    } finally {
+      if (identical(_preparingTransfer, preparing)) _preparingTransfer = null;
+    }
   }
 
   String get benchmarkExportSummary {
@@ -3616,7 +3870,10 @@ class AppController extends ChangeNotifier {
   /// loading already show their result in place.
   Future<void> _runBusy(
       String actionKey, String busyMessage, Future<void> Function() operation,
-      {bool trackTask = true, String? doneMessage}) async {
+      {bool trackTask = true,
+      String? doneMessage,
+      String? keepBannerTaskId,
+      int? itemCount}) async {
     // Guard against the same action running twice concurrently. There is no
     // handle to await the in-flight run, so short-circuiting is the safe UX:
     // it avoids double execution and never clobbers the shared busy
@@ -3639,7 +3896,18 @@ class AppController extends ChangeNotifier {
     _busyActions.add(actionKey);
     _busyTaskIds[actionKey] = taskId;
     bannerMessage = busyMessage;
-    bannerTaskId = trackTask ? taskId : null;
+    bannerTaskId = trackTask ? taskId : keepBannerTaskId;
+    _bannerActivity = (
+      kind: _activityKind(actionKey),
+      actionKey: actionKey,
+      count: itemCount,
+      done: false,
+      cancelled: false,
+      message: null,
+    );
+    if (_activityKind(actionKey) == BannerActivityKind.listing) {
+      _listingLoadedCount = 0;
+    }
     if (trackTask) {
       _upsertTask(
         BrowserTaskRecord(
@@ -3727,6 +3995,21 @@ class AppController extends ChangeNotifier {
       if (_busyActions.isEmpty) {
         _busyLineNotifyTimer?.cancel();
         _busyLineNotifyTimer = null;
+      }
+      // The activity keeps the banner only for the message it ended with.
+      final activity = _bannerActivity;
+      if (activity != null &&
+          activity.actionKey == actionKey &&
+          !activity.done &&
+          bannerMessage != null) {
+        _bannerActivity = (
+          kind: activity.kind,
+          actionKey: actionKey,
+          count: activity.count,
+          done: true,
+          cancelled: scope.isCancelled || scope.listingCancelled,
+          message: bannerMessage,
+        );
       }
       notifyListeners();
     }
@@ -4730,7 +5013,7 @@ class AppController extends ChangeNotifier {
       ),
     );
     if (bannerTaskId == job.id) {
-      bannerMessage = _transferBannerMessage(job);
+      bannerMessage = transferBannerMessage(job);
       bannerSeverity = job.status == 'failed'
           ? BannerSeverity.error
           : job.status == 'completed'
@@ -4738,27 +5021,6 @@ class AppController extends ChangeNotifier {
               : BannerSeverity.info;
     }
     notifyListeners();
-  }
-
-  String _transferBannerMessage(TransferJob job) {
-    final percent = (job.progress.clamp(0, 1) * 100).round();
-    final direction = job.direction == 'download' ? 'Download' : 'Upload';
-    if (job.status == 'cancelled' || job.status == 'canceled') {
-      return '$direction cancelled - $percent%';
-    }
-    if (job.status == 'cancelling') {
-      return 'Stopping $direction after in-flight work - $percent%';
-    }
-    if (job.status == 'completed') {
-      return '$direction complete - 100%';
-    }
-    if (job.status == 'failed') {
-      return '$direction failed - $percent%';
-    }
-    if (job.status == 'paused') {
-      return '$direction paused - $percent%';
-    }
-    return '$direction in progress - $percent%';
   }
 
   void _handleTransferJobUpdate(TransferJob job) {
@@ -4813,7 +5075,11 @@ class AppController extends ChangeNotifier {
       source: 'object-browser',
     );
     await refreshObjects(prefix: pending.prefix, listAll: pending.listAll);
-    bannerMessage = 'Upload complete. Object list refreshed.';
+    // Return the banner to the finished transfer so its completed indicator
+    // stays in place after the listing replaced it.
+    bannerTaskId = job.id;
+    bannerMessage = '${transferBannerMessage(job)} · object list refreshed';
+    bannerSeverity = BannerSeverity.success;
     notifyListeners();
   }
 

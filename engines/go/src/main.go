@@ -35,7 +35,7 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
-const engineVersion = "2.3.2"
+const engineVersion = "2.3.3"
 
 var supportedMethods = []string{
 	"health", "getCapabilities", "testProfile", "listBuckets",

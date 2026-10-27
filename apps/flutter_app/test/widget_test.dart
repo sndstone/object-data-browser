@@ -1069,7 +1069,7 @@ void main() {
         itemsCompleted: 0,
       ),
     ];
-    controller.bannerMessage = 'Upload in progress - 40%';
+    controller.bannerMessage = 'Upload in progress';
     controller.bannerTaskId = 'upload-1';
     controller.emitChange();
 
@@ -1077,10 +1077,10 @@ void main() {
     await tester.pump();
 
     expect(find.text('40%'), findsOneWidget);
-    expect(find.byKey(const ValueKey('banner-upload-1')), findsOneWidget);
+    expect(find.byKey(const ValueKey('banner-transfer')), findsOneWidget);
     expect(
       find.descendant(
-        of: find.byKey(const ValueKey('banner-upload-1')),
+        of: find.byKey(const ValueKey('banner-transfer')),
         matching: find.byType(CircularProgressIndicator),
       ),
       findsNothing,
@@ -1089,14 +1089,16 @@ void main() {
     controller.browserTasks = [
       controller.browserTasks.first.copyWith(progress: 0.76),
     ];
-    controller.bannerMessage = 'Upload in progress - 76%';
+    controller.bannerMessage = 'Upload in progress';
     controller.emitChange();
+    // The indicator eases its percent toward the new value.
     await tester.pump();
+    await tester.pump(const Duration(milliseconds: 800));
 
-    expect(find.byKey(const ValueKey('banner-upload-1')), findsOneWidget);
+    expect(find.byKey(const ValueKey('banner-transfer')), findsOneWidget);
     expect(find.text('76%'), findsOneWidget);
 
-    await tester.tap(find.text('Upload in progress - 76%'));
+    await tester.tap(find.text('Upload in progress'));
     await tester.pumpAndSettle();
 
     expect(controller.activeTab, WorkspaceTab.tasks);
