@@ -38,7 +38,8 @@ function Install-Msi {
 # This probe makes filesystem regressions mandatory rather than skipping them
 # when a runner lacks the privilege required by the Windows symlink fixtures.
 $Probe = Join-Path $Logs 'symlink-probe'
-New-Item -ItemType SymbolicLink -Path $Probe -Target $RootDir | Out-Null
+New-Item -ItemType SymbolicLink -Path $Probe -Target (Join-Path $RootDir 'README.md') | Out-Null
+Remove-Item -LiteralPath $Probe -Force
 Push-Location engines\go
 try {
     Invoke-Check 'go-vet' 'go.exe' @('vet','./...')
