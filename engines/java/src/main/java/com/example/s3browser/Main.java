@@ -279,7 +279,9 @@ public final class Main {
 
     private static void writeLine(String json) {
         synchronized (STDOUT_LOCK) {
-            System.out.println(json);
+            // PrintStream's Windows encoding can differ from the UTF-8 input
+            // and corrupt keys, cursors and request IDs in JSON responses.
+            System.out.writeBytes((json + "\n").getBytes(StandardCharsets.UTF_8));
             System.out.flush();
         }
     }

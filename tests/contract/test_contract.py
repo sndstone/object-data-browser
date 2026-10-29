@@ -36,6 +36,13 @@ def test_health_ok_and_methods_subset_of_contract(engine, contract_methods):
     )
 
 
+def test_unicode_request_id_survives_transport(engine):
+    request_id = "transport-\u96ea-\u00e9-\U0001f680"
+    response = engine.request("health", request_id=request_id)
+    assert response.get("ok") is True, response
+    assert response.get("requestId") == request_id, response
+
+
 def test_get_capabilities_returns_items(engine):
     response = engine.request("getCapabilities")
     assert response.get("ok") is True, response

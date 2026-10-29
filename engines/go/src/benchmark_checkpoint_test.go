@@ -12,7 +12,7 @@ import (
 func checkpointTestState(t *testing.T) map[string]interface{} {
 	t.Helper()
 	dir := t.TempDir()
-	return map[string]interface{}{
+	state := map[string]interface{}{
 		"id": strings.ReplaceAll(t.Name(), "/", "-"), "status": "running", "profile": testProfilePayload("http://localhost"),
 		"processedCount": 0, "history": []map[string]interface{}{},
 		"_benchmarkClock": time.Now(), "_benchmarkCheckpoint": time.Now(),
@@ -23,6 +23,8 @@ func checkpointTestState(t *testing.T) map[string]interface{} {
 			"logFilePath":    filepath.Join(dir, "benchmark.log"),
 		},
 	}
+	t.Cleanup(func() { closeBenchmarkCSV(state) })
+	return state
 }
 
 func checkpointTestAddResult(state map[string]interface{}) {
@@ -48,9 +50,7 @@ func assertCheckpointCounts(t *testing.T, state map[string]interface{}, expected
 		t.Fatalf("disk counts disagree with %d: %v", expected, disk)
 	}
 	info, err := os.Stat(benchmarkStatePath(asString(state["id"])))
-	if err != nil || info.Mode().Perm() != 0600 {
-		t.Fatalf("state must remain private: %v, %v", info, err)
-	}
+	assertPrivateBenchmarkFile(t, info, err)
 	config := asMap(state["config"])
 	data, err = os.ReadFile(asString(config["jsonOutputPath"]))
 	if err != nil {
@@ -77,7 +77,7 @@ func assertCheckpointCounts(t *testing.T, state map[string]interface{}, expected
 }
 
 func TestBenchmarkCheckpointThrottlesWritesWithoutLosingFinalCounts(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
+	isolateBenchmarkTempDir(t)
 	state := checkpointTestState(t)
 	if err := checkpointBenchmarkState(state, true); err != nil {
 		t.Fatal(err)
@@ -116,7 +116,7 @@ func TestBenchmarkCheckpointThrottlesWritesWithoutLosingFinalCounts(t *testing.T
 func TestBenchmarkControlsFlushPendingResults(t *testing.T) {
 	for _, action := range []string{"status", "paused", "stopped", "export"} {
 		t.Run(action, func(t *testing.T) {
-			t.Setenv("TMPDIR", t.TempDir())
+			isolateBenchmarkTempDir(t)
 			state := checkpointTestState(t)
 			if err := checkpointBenchmarkState(state, true); err != nil {
 				t.Fatal(err)
@@ -164,7 +164,7 @@ func TestBenchmarkControlsFlushPendingResults(t *testing.T) {
 }
 
 func TestBenchmarkCheckpointFailureKeepsRecoveryStateCurrent(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
+	isolateBenchmarkTempDir(t)
 	state := checkpointTestState(t)
 	checkpointTestAddResult(state)
 	// Writing a JSON output over a directory must fail, while the separate
