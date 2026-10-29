@@ -2,7 +2,7 @@
 
 ## Desktop
 
-- Request/response: line-delimited JSON on stdin/stdout
+- Request/response: UTF-8 line-delimited JSON on stdin/stdout, independent of the host locale
 - Progress/events: line-delimited JSON on stdout with `event`
 - Transfer progress events use `{"event":"transferProgress","job":{...}}` with the same transfer job shape returned by the final response
 - Fatal diagnostics: stderr

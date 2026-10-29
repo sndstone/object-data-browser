@@ -47,7 +47,7 @@ func TestBenchmarkGeneratedReaderSeeksAndMatchesExistingPayload(t *testing.T) {
 }
 
 func TestBenchmarkPayloadCacheAndPrivateDiskSpooling(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
+	isolateBenchmarkTempDir(t)
 	store, err := newBenchmarkPayloadStore(map[string]interface{}{"inMemoryData": true, "dataCacheMb": 1})
 	if err != nil {
 		t.Fatal(err)
@@ -93,14 +93,13 @@ func TestBenchmarkPayloadCacheAndPrivateDiskSpooling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer cleanup()
 	file, ok := reader.(*os.File)
 	if !ok {
 		t.Fatal("disk mode did not spool")
 	}
 	info, err := file.Stat()
-	if err != nil || info.Mode().Perm() != 0600 {
-		t.Fatal("spool is not private")
-	}
+	assertPrivateBenchmarkFile(t, info, err)
 	data, err := io.ReadAll(reader)
 	if err != nil || !bytes.Equal(data, benchmarkPayload("run", "disk", len(data), true)) {
 		t.Fatal("spooling changed data")
@@ -116,7 +115,7 @@ func TestBenchmarkPayloadCacheAndPrivateDiskSpooling(t *testing.T) {
 }
 
 func TestBenchmarkActualSDKRetriesAndErrorsAreCounted(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
+	isolateBenchmarkTempDir(t)
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		data, _ := io.ReadAll(r.Body)

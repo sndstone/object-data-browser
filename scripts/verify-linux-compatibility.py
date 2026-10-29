@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Reject bundled ELF objects newer than the Mint 20 / Ubuntu 20.04 ABI floor."""
+import os
 import re
 import subprocess
 import sys
@@ -38,7 +39,13 @@ def check(bundle):
         raise RuntimeError('Newer than GLIBC_2.31:\n' + '\n'.join(failures))
     # App and GTK plugins must resolve against the baseline system libraries.
     for path in [bundle / 's3_browser_crossplat', *sorted((bundle / 'lib').glob('*.so'))]:
-        result = subprocess.run(['ldd', str(path)], capture_output=True, text=True)
+        env = os.environ.copy()
+        if path.parent == bundle / 'lib':
+            # Standalone ldd does not inherit the app's $ORIGIN/lib runpath.
+            # Resolve the private Flutter library just as the running app does.
+            env['LD_LIBRARY_PATH'] = str(bundle / 'lib') + (
+                ':' + env['LD_LIBRARY_PATH'] if env.get('LD_LIBRARY_PATH') else '')
+        result = subprocess.run(['ldd', str(path)], capture_output=True, text=True, env=env)
         if result.returncode or 'not found' in result.stdout + result.stderr:
             raise RuntimeError(f'Unresolved runtime dependencies for {path}:\n{result.stdout}{result.stderr}')
     print('App and GTK plugin runtime dependencies resolve on the build baseline.')

@@ -104,7 +104,7 @@ func TestBenchmarkActiveTimeExcludesPausedAndTerminalTime(t *testing.T) {
 }
 
 func TestBenchmarkDurationOverrunIsNotClampedForRateReporting(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
+	isolateBenchmarkTempDir(t)
 	state := checkpointTestState(t)
 	t.Cleanup(func() { closeBenchmarkCSV(state) })
 	asMap(state["config"])["testMode"] = "duration"
@@ -123,7 +123,7 @@ func TestBenchmarkDurationOverrunIsNotClampedForRateReporting(t *testing.T) {
 }
 
 func TestBenchmarkBoundedHistoryRetainsCumulativeMetricsAndFullCSVAfterRestart(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
+	isolateBenchmarkTempDir(t)
 	state := checkpointTestState(t)
 	asMap(state["config"])["reducedLogging"] = true
 	state["errorCount"], state["retryCount"] = 3, 17
@@ -228,7 +228,7 @@ func TestBenchmarkBoundedHistoryRetainsCumulativeMetricsAndFullCSVAfterRestart(t
 }
 
 func TestBenchmarkRecoveryRejectsTruncatedCSV(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
+	isolateBenchmarkTempDir(t)
 	state := checkpointTestState(t)
 	checkpointTestAddResult(state)
 	if err := checkpointBenchmarkState(state, true); err != nil {
@@ -248,7 +248,7 @@ func TestBenchmarkRecoveryRejectsTruncatedCSV(t *testing.T) {
 }
 
 func TestBenchmarkLegacyUnboundedRecoveryUpgradesWithoutLosingCSV(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
+	isolateBenchmarkTempDir(t)
 	state := checkpointTestState(t)
 	const count = benchmarkHistoryLimit + 2
 	history := make([]map[string]interface{}, count)

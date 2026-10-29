@@ -13,12 +13,16 @@ overrides:
     depends:
       - libc6 (>= 2.31)
       - libgtk-3-0
+      - libegl1
+      - libgles2
       - libsecret-1-0
       - libstdc++6
   rpm:
     depends:
       - glibc >= 2.31
       - gtk3
+      - libEGL.so.1()(64bit)
+      - libGLESv2.so.2()(64bit)
       - libsecret
       - libstdc++
 contents:

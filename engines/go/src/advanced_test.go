@@ -64,7 +64,7 @@ func TestBenchmarkCapabilityIsSupportedAcrossProviders(t *testing.T) {
 }
 
 func TestBenchmarkStateNeverStoresProfile(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
+	isolateBenchmarkTempDir(t)
 	state := map[string]interface{}{"id": "bench-test", "status": "paused", "profile": testProfilePayload("http://localhost"), "config": map[string]interface{}{"bucketName": "test"}}
 	if err := writeBenchmarkState(state); err != nil {
 		t.Fatal(err)
@@ -338,7 +338,7 @@ func TestMultipartCopyUsesSourceIdentityAndRetainsMetadata(t *testing.T) {
 	}
 }
 func TestBenchmarkRunsWithoutStatusPolls(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
+	isolateBenchmarkTempDir(t)
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "PUT" {
@@ -378,7 +378,7 @@ func TestBenchmarkRunsWithoutStatusPolls(t *testing.T) {
 }
 
 func TestBenchmarkClockUsesMonotonicElapsedAndStaysPrivate(t *testing.T) {
-	t.Setenv("TMPDIR", t.TempDir())
+	isolateBenchmarkTempDir(t)
 	state := map[string]interface{}{"id": "bench-clock", "activeElapsedSeconds": 0.0, "lastUpdatedAt": "2000-01-01T00:00:00Z", "_benchmarkClock": time.Now().Add(-500 * time.Millisecond)}
 	for i := 0; i < 100; i++ {
 		advanceBenchmarkClock(state)
