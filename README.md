@@ -1,158 +1,100 @@
-# Object Data Browser
+﻿# Object Data Browser
 
-`object-data-browser` is a cross-platform object storage browser monorepo. It contains:
+A Flutter app for browsing S3-compatible storage, AWS S3, and Azure Blob Storage. Runs on Windows, macOS, Linux, Android, and iOS, with Python, Go, Rust, and Java engines on desktop.
 
-- A Flutter app shell for Windows, macOS, Linux, Android, and iOS
-- A versioned engine contract shared by Python, Go, Rust, and Java backends
-- Packaging and bootstrap scripts that fetch toolchains into a local temp cache
-- Contract fixtures and implementation documentation
+![Object browser in dark mode, with buckets, object listing, and a JSON object's details](docs/screenshots/browser-dark.png)
 
-## Layout
+## What it does
 
-```text
-object-data-browser/
-├── apps/flutter_app
-├── contracts
-├── docs
-├── engines
-├── packaging
-├── scripts
-└── tests
-```
+- Browse buckets, folders, objects, and version history. Search, filter, and sort listings.
+- Upload and download files with multipart transfers; copy, move, rename, and delete objects.
+- Inspect metadata, headers, and tags. Preview highlighted source, images, and static HTML.
+- Manage bucket policies, lifecycle rules, versioning, Object Lock, retention, and legal holds where supported.
+- Run storage benchmarks, export results to CSV, and inspect jobs and request logs.
+- Save endpoint profiles, choose startup defaults, and switch between light and dark themes.
 
-## Current Status
+Support varies by provider and engine. On desktop, Azure data operations require Python or Go; advanced administration uses the bundled Python adapter. Live pause, resume, and cancel require Python or Java. See the [feature matrix](docs/FEATURE_MATRIX.md) for details.
 
-This repository now includes:
+<details>
+<summary>More screenshots: source preview and connection settings</summary>
 
-- The initial Flutter application scaffold with adaptive Browser, Benchmark, and Settings workspaces
-- Endpoint profiles for S3-compatible targets, AWS S3, and Azure Blob Storage (account name + access key; implemented in the Go and Python engines, see `docs/FEATURE_MATRIX.md`)
-- Unified responsive breakpoints (phone < 700 px, tablet < 1 000 px, compact desktop < 1 360 px, desktop >= 1 360 px) that apply equally to resized desktop windows
-- Bounded persistent sidecar pools (four processes globally, two per engine, with a cancellable 64-request queue)
-- The shared domain models and engine interface expected by all backends
-- Fully implemented Python, Go, Rust, and Java engines behind a shared contract, with parallel multipart transfers and native inspector tools (see `CHANGELOG.md` 2.1.0-2.2.4)
-- Dynamic S3 upload part sizing that keeps parallel uploads within the 5 MiB–5 GiB part range and 10 000-part limit, with a manual override in Settings
-- Update-stable, Developer ID-backed macOS credential persistence with a migration path from older Keychain items, plus expandable previews with selectable syntax highlighting, image pan/zoom, and static HTML page rendering
-- Build/bootstrap scripts that stage dependencies into `.tmp` under the repo root
-- An iOS 13+ target backed by the official AWS SDK for Swift, with S3 browsing,
-  object operations, transfers, Files.app downloads, profile export sharing,
-  local-network access, and Keychain credential storage
+![Expanded JSON preview with line numbers and object details](docs/screenshots/source-preview-light.png)
 
-## 2.2.7 cancellation and settings review
+![Connection settings with startup defaults and an endpoint profile editor](docs/screenshots/settings-light.png)
 
-Cancel now releases a stuck bucket/object listing immediately, preserves completed
-pages, and prevents late responses from changing a newer listing. Desktop read
-processes are stopped without terminating active transfers. See the
-[cancellation implementation and tests](docs/listing-cancellation-fix.md).
+</details>
 
-The [backend and Settings improvement plan](docs/backend-settings-improvement-plan.html)
-includes interactive before/after mockups and prioritized findings. The proposed
-Settings redesign and other backend findings were not part of that release;
-their 2.2.8 implementation is recorded in the
-[September ledger](docs/improvements-implementation-2026-09.md).
+Screenshots show the Windows layout with fictional data. [Regenerate them](docs/screenshots/README.md).
 
-Linux packaging targets Ubuntu 20.04 / glibc 2.31 for Linux Mint 20 and newer.
-Release CI checks bundled ELF requirements and runs a headless GTK startup test
-on that baseline. This does not replace installation testing on each Mint version.
-Use the DEB package for Mint; RPM packages target distributions providing GTK 3,
-libsecret, libstdc++, and glibc 2.31 or newer.
+## Download
 
-## Bootstrap
+Get installers and checksums from [GitHub Releases](https://github.com/sndstone/object-data-browser/releases).
 
-Linux/macOS:
+The [2.3.3 desktop prerelease](https://github.com/sndstone/object-data-browser/releases/tag/v2.3.3) includes:
 
-```bash
-./scripts/bootstrap.sh
-./scripts/build.sh linux
-./scripts/build.sh ios arm64
+| Platform | Package |
+| --- | --- |
+| Windows x64 | MSI, unsigned development build |
+| Linux x64 / ARM64 | DEB and RPM; glibc 2.31 or newer |
+| macOS Apple Silicon, 12+ | Development DMG, ad-hoc signed and not notarized |
+
+Use the DEB on Linux Mint 20 or newer. After updating the macOS development build, you may need to re-enter credentials. Version 2.3.3 has no Windows ARM64, Android, or iOS package; older Android test builds are listed in earlier releases.
+
+## Connect
+
+1. Open **Settings > Connections** and create a profile.
+2. Choose S3-compatible, AWS S3, or Azure Blob. Enter the endpoint, region where applicable, and credentials. For Azure account-key authentication, use the account name and access key.
+3. **Test**, **Save**, then **Use profile** to browse its buckets or containers. Set the default endpoint separately if you want it selected at startup.
+
+Credentials use the platform's secure store. Profile exports contain endpoint settings only. If secure storage fails, the app marks the profile **Session only** and offers a retry.
+
+## Build from source
+
+Clone the repository and run the build script for your platform:
+
+```sh
+git clone https://github.com/sndstone/object-data-browser.git
+cd object-data-browser
 ```
 
 Windows PowerShell:
 
 ```powershell
-.\scripts\build.ps1
 .\scripts\build.ps1 -Platform windows
-.\scripts\build.ps1 -Platform windows -IncludeEngineToolchains
+# Or build an Android test APK:
 .\scripts\build.ps1 -Platform android
 ```
 
-The bootstrap scripts do not rely on system-installed Flutter, Go, Rust, or Java. They create a repo-local cache under `.tmp/toolchains` and reuse it across builds.
+Linux / macOS:
 
-Windows builds now handle the symlink prerequisite in the same script. If Developer Mode is off, `build.ps1` will prompt for elevation and rerun itself automatically.
+```sh
+./scripts/build.sh linux
+# On macOS with Xcode:
+./scripts/build.sh macos
+```
 
-Windows desktop packaging also stages the Python, Go, Rust, and Java sidecars into the app bundle, so those toolchains are bootstrapped during a Windows build by default. Use `-IncludeEngineToolchains` when you want those extra backend toolchains staged for other targets too.
+Scripts cache Flutter and engine toolchains under `.tmp/toolchains` and put packages in `dist/`. Flutter is pinned in [`.flutter-version`](.flutter-version). Native platform build tools are still required: Visual Studio with Desktop development with C++ on Windows, Xcode on macOS, or the Flutter Linux desktop dependencies on Linux. Windows builds may request elevation to enable symlinks.
 
-Windows Android builds also stage an Android SDK under `.tmp/toolchains/android-sdk`, accept licenses, sign the release output with the debug key for sideloading, and copy the primary arm64 APK to `dist/android/object-data-browser-android-<version>-arm64.apk`. The Android App Bundle remains available as a secondary artifact in `dist/android/`.
+For Android builds on Linux, install the Android SDK and set `ANDROID_HOME` or `ANDROID_SDK_ROOT` first. Windows scripts provision it automatically. See [Android packaging](packaging/android/README.md), [macOS signing](packaging/macos/README.md), and [iOS builds and signing](packaging/ios/README.md) for platform details.
 
-Linux Android builds (`./scripts/build.sh android`) do not provision an Android SDK — `scripts/bootstrap.sh` only stages Flutter, Python, Go, Rust, Java, and nfpm. You must have a preinstalled Android SDK with `ANDROID_HOME` or `ANDROID_SDK_ROOT` set before running a Linux Android build; the script fails fast with an actionable error if neither is set. CI relies on the GitHub-hosted runner image's preinstalled SDK.
+## Development
 
-iOS builds require macOS and Xcode. Without Apple signing configuration,
-`./scripts/build.sh ios arm64` produces an unsigned device bundle for compile
-verification. Set `IOS_SIGNING_IDENTITY` and `IOS_TEAM_ID` after installing the
-matching distribution certificate and provisioning profile to export an IPA.
-The first iOS release supports the Browser and Settings workflows; benchmark
-and bucket-encryption mutations remain capability-gated.
+After bootstrapping, add `.tmp/toolchains/flutter/bin` to your `PATH`. From `apps/flutter_app`:
 
-For simulator testing, open `apps/flutter_app/ios/Runner.xcworkspace` and run
-the `Runner` scheme from Xcode. Directly launching an unsigned simulator `.app`
-does not supply a usable Keychain entitlement on current iOS runtimes, so it is
-suitable for compile/UI checks but cannot persist endpoint credentials.
+```sh
+flutter pub get
+flutter analyze
+flutter test
+```
 
-## 2.2.5 architecture and verification
+The [engine contract tests](tests/contract/README.md) run against each backend. Local MinIO/Azurite checks and their limits are documented in [2.3.0 verification](docs/2.3.0-verification.md); they do not establish live-cloud or physical-device qualification.
 
-The desktop adapter uses real Python, Go, Rust, and Java sidecars. Python and
-Java route live transfer controls to the job-owning process; sequential Go and
-Rust engines deliberately report those controls as unsupported. MockEngineService
-is a test/demo implementation, not a production storage fallback.
+| Directory | Contents |
+| --- | --- |
+| `apps/flutter_app` | Flutter UI and platform adapters |
+| `engines` | Python, Go, Rust, and Java backends |
+| `contracts` | Shared engine API and transport schema |
+| `tests` | Engine contract tests and fixtures |
+| `scripts`, `packaging` | Toolchain setup, builds, and installers |
 
-Browser rows are lazy, with separate inspection focus and batch selection.
-Column headers sort and toggle direction; less frequent view tools expand into
-an icon tray. Multi-file uploads appear as one parent job, but dispatch each file
-separately with its own part size and bounded part workers. Per-file outcomes are
-nested in Event Log; cancelling stops queued files and requests cancellation of
-the active file when its engine supports it.
-ObjectSelection, ObjectQuery, AtomicMetadataStore, and BrowserWorkspaceFrame
-separate selection, isolated filtering, metadata persistence, and rebuild scope.
-Listing windows stop at 100,000 keys or 16 million key characters. Large queries
-and regex run off the UI isolate with a two-second execution deadline. Density
-is independent of text scale; short slide/fade transitions respect reduced motion.
-
-Run `flutter analyze` and `flutter test` from `apps/flutter_app`. Run
-`REQUIRE_ENGINE=1 ENGINE_CMD="<engine command>" python -m pytest tests/contract -q`
-for each desktop engine. CI builds all four engines and runs loopback S3/Azure
-failure and pagination fixtures; missing required binaries fail verification.
-These deterministic fixtures do not replace real-provider integration testing.
-
-See [implementation and validation details](docs/2.2.5-implementation.md) and
-the [visual improvement plan](docs/improvement-plan.html). Public Apple releases
-still require the documented signing, provisioning, notarization, and physical
-device Keychain/local-network checks.
-
-### 2.2.6 GUI improvements
-
-The GUI plan implementation and verification notes are recorded in
-[the 2.2.6 ledger](docs/2.2.6-gui-implementation.md). The application is 2.2.8+1;
-bundled desktop engines are version 2.2.8.
-
-The [2.2.6 release](https://github.com/sndstone/object-data-browser/releases/tag/v2.2.6)
-provides Windows x64/ARM64 MSI installers, Linux x64/ARM64 DEB and RPM packages,
-and an Android ARM64 **test** APK for sideloading on Android 7.0+ (API 24+). Android artifacts use a debug
-signing key; a different build may require reinstallation rather than an in-place
-upgrade. The test AAB is a secondary build artifact, not directly installable.
-Public macOS and iOS packages still require the Apple release configuration above.
-
-The Release Matrix workflow can select Windows/Linux with `build_desktop` and
-Android independently with `build_android`; `build_mobile` includes both Android
-and iOS. Mobile builds bootstrap tools for the host architecture and cross-compile
-the ARM64 app. Release checksums are supplied in `SHA256SUMS`.
-
-## September reliability and Settings changes
-
-The [implementation ledger](docs/improvements-implementation-2026-09.md) tracks
-the [September improvement plan](docs/improvement-plan-2026-09.md): staged and
-validated downloads, confirmed Azure moves, action-specific cancellation,
-measured benchmark results, independent profile actions, and six Settings groups.
-
-Flutter is pinned in `.flutter-version`. Bootstrap and CI use that release;
-bootstrap rejects a mismatched existing cache with instructions to replace it.
-Update the pin in a dedicated change and run Flutter analysis/tests, desktop
-contract checks, and affected native builds before adopting a new version.
+See the [changelog](CHANGELOG.md) for release history and [report an issue](https://github.com/sndstone/object-data-browser/issues) for bugs.
