@@ -15,6 +15,16 @@ A Flutter app for browsing S3-compatible storage, AWS S3, and Azure Blob Storage
 
 Support varies by provider and engine. On desktop, Azure data operations require Python or Go; advanced administration uses the bundled Python adapter. Live pause, resume, and cancel require Python or Java. See the [feature matrix](docs/FEATURE_MATRIX.md) for details.
 
+## Screenshots
+
+| Benchmark setup | Benchmark results |
+| --- | --- |
+| [![Benchmark configuration with presets, a custom workload mix, and run controls](docs/screenshots/benchmark-configure-light.png)](docs/screenshots/benchmark-configure-light.png) | [![Demo benchmark results with throughput chart, latency metrics, and run history](docs/screenshots/benchmark-results-light.png)](docs/screenshots/benchmark-results-light.png) |
+
+| Jobs and transfer status | Event Log |
+| --- | --- |
+| [![Jobs with running, paused, completed, and failed statuses, plus multipart upload progress](docs/screenshots/jobs-status-dark.png)](docs/screenshots/jobs-status-dark.png) | [![Event Log with severity filters, retries, and errors](docs/screenshots/event-log-dark.png)](docs/screenshots/event-log-dark.png) |
+
 <details>
 <summary>More screenshots: source preview and connection settings</summary>
 
@@ -24,7 +34,7 @@ Support varies by provider and engine. On desktop, Azure data operations require
 
 </details>
 
-Screenshots show the Windows layout with fictional data. [Regenerate them](docs/screenshots/README.md).
+Screenshots show the Windows layout with fictional data. Benchmark figures illustrate the UI; they are not performance measurements. [Regenerate them](docs/screenshots/README.md).
 
 ## Download
 
