@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Object Data Browser 2.3.3</title>
+    <title>Object Data Browser 2.3.4</title>
     <meta
       name="description"
       content="Object Data Browser is a Flutter-based object data browser for Windows, macOS, Linux, Android, and iOS with pluggable backend engines."
@@ -171,7 +171,7 @@
   </head>
   <body>
     <main>
-      <p class="eyebrow">Version 2.3.3</p>
+      <p class="eyebrow">Version 2.3.4</p>
       <h1>Object Data Browser</h1>
       <p class="intro">
         A cross-platform object data browser with a Flutter interface, real desktop
@@ -179,7 +179,7 @@
         inspection tools, and benchmark workflows.
       </p>
       <div class="actions">
-        <a class="button" href="https://github.com/sndstone/object-data-browser/releases/tag/v2.3.3">View 2.3.3 release</a>
+        <a class="button" href="https://github.com/sndstone/object-data-browser/releases/tag/v2.3.4">View 2.3.4 release</a>
         <a class="secondary" href="https://github.com/sndstone/object-data-browser">View source</a>
       </div>
 
@@ -199,19 +199,19 @@
       </div>
 
       <section class="version">
-        <h2>What changed in 2.3.3</h2>
+        <h2>What changed in 2.3.4</h2>
         <ul>
-          <li>The status banner animates while a transfer works. Single files show a document that is scanned while it is prepared and then fills with progress; transfers with several files or objects show multipart segments.</li>
-          <li>The long preparation before an upload or download sends data now has its own animated state from the moment the transfer starts.</li>
-          <li>The percent sits inside the indicator with even spacing, and pausing, resuming or cancelling keeps the transfer in the banner.</li>
-          <li>Listing, deleting, quick changes and messages use animated glyphs with loaded and deleted object counts. Benchmarks and exports use a bordered tile, and bucket copies use the multipart segments.</li>
-          <li>Indicators change smoothly to their result, respect reduced motion and stop animating once paused or finished.</li>
+          <li>Bucket refresh, create-bucket and presign controls show their busy state again while the work runs.</li>
+          <li>The inspector button and Cmd/Ctrl+I open the inspector at every window width, including windows just above 1,000 px.</li>
+          <li>Settings fields say "Saved" only after the write succeeds. Profile edits are marked as drafts, with an unsaved-change count by Save.</li>
+          <li>Unsaved profile drafts survive leaving Settings, and leaving with unsaved changes asks whether to discard, keep editing or save.</li>
+          <li>Log text follows the system text size, expanded API traces stay with their request, and compact controls have 48 px touch targets on phones.</li>
         </ul>
         <p>
-          The 2.3.3 macOS package is an Apple Silicon development build for macOS 12 or later,
-          ad-hoc signed and not notarized. No new Windows, Linux, Android or iOS packages
-          are included in this release.
-          <a href="https://github.com/sndstone/object-data-browser/blob/v2.3.3/docs/2.3.3-verification.md">Verification details</a>.
+          The 2.3.4 macOS package is an Apple Silicon development build for macOS 12 or later,
+          ad-hoc signed and not notarized. Windows and Linux packages remain available in the
+          <a href="https://github.com/sndstone/object-data-browser/releases/tag/v2.3.3">2.3.3 release</a>.
+          <a href="https://github.com/sndstone/object-data-browser/blob/v2.3.4/docs/2.3.4-verification.md">Verification details</a>.
         </p>
       </section>
     </main>
