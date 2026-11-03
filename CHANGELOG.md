@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.3.4 — GUI review fixes
+
+### Browser
+- The bucket refresh, create-bucket and presign controls show their busy state again. The browser now rebuilds whenever any action starts or finishes, instead of watching a hand-maintained list that had fallen behind.
+- The inspector button, Cmd/Ctrl+I and the object context menu decide how to show the inspector from the browser's own width. Windows of about 1,000–1,070 px, where the navigation rail leaves a tablet-width browser, now open the inspector dialog instead of silently changing a hidden setting.
+
+### Settings and profiles
+- Settings fields show "Saved" only after the write succeeds and report a failed write. Profile fields that only change the unsaved draft say "Draft", and the profile editor shows how many changes are unsaved.
+- Unsaved profile drafts stay in memory when you leave Settings, so returning to Settings keeps them. Leaving Settings with unsaved changes asks whether to discard, keep editing or save them; a failed save keeps you in Settings. Drafts are never written to the state file.
+- Keyboard shortcuts that open the Browser or Event Log from Settings take effect only if you confirm leaving, so choosing Keep editing does not leave a delayed action behind.
+
+### Logs and accessibility
+- The log text-size preference now multiplies the system text size instead of replacing it, so enlarged macOS or mobile text also enlarges log rows.
+- Expanded API traces stay attached to their own request when new requests arrive above them.
+- The compact section selector and ruler sliders keep their appearance but have 48 px touch targets on Android, iOS and phone-width windows.
+
 ## 2.3.3 — animated status banner
 
 ### Transfers
