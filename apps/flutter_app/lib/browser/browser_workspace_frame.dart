@@ -60,12 +60,7 @@ class _BrowserWorkspaceFrameState extends State<BrowserWorkspaceFrame> {
       c.testDataConfig,
       c.deleteAllConfig,
       c.inspectorTab == BrowserInspectorTab.eventsAndDebug ? c.eventLog : null,
-      c.isBusy('refresh-objects'),
-      c.isBusy('select-object'),
-      c.isBusy('upload'),
-      c.isBusy('download'),
-      c.isBusy('delete-object'),
-      c.isBusy('select-bucket'),
+      c.busyVersion,
     );
     if (_signature != signature || _child == null) {
       _signature = signature;

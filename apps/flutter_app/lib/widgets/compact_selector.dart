@@ -1,4 +1,5 @@
 import 'edge_fade_scroll.dart';
+import 'touch_targets.dart';
 import 'navigation_item.dart';
 import 'package:flutter/material.dart';
 
@@ -82,6 +83,7 @@ class CompactSelector<T> extends StatelessWidget {
         ? const EdgeInsets.symmetric(horizontal: 9, vertical: 6)
         : const EdgeInsets.symmetric(horizontal: 12, vertical: 7);
 
+    final touch = usesTouchTargets(context);
     return NavigationItem(
         label:
             '${option.label}, tab ${options.indexOf(option) + 1} of ${options.length}',
@@ -91,40 +93,49 @@ class CompactSelector<T> extends StatelessWidget {
           message: option.label,
           waitDuration: const Duration(milliseconds: 550),
           child: Material(
-            color: background,
+            color: Colors.transparent,
             borderRadius: BorderRadius.circular(6),
             child: InkWell(
               borderRadius: BorderRadius.circular(6),
               onTap: () => onChanged(option.value),
               child: Container(
-                constraints: BoxConstraints(minHeight: dense ? 30 : 34),
-                padding: padding,
-                child: Row(
-                  mainAxisSize: expand ? MainAxisSize.max : MainAxisSize.min,
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    if (option.icon != null &&
-                        !(expand &&
-                            MediaQuery.textScalerOf(context).scale(14) >
-                                18)) ...[
-                      Icon(option.icon,
-                          size: dense ? 10 : 11, color: foreground),
-                      SizedBox(width: dense ? 4 : 5),
-                    ],
-                    Flexible(
-                      child: Text(
-                        option.label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        textAlign: TextAlign.center,
-                        style: theme.textTheme.labelLarge?.copyWith(
-                          color: foreground,
-                          fontWeight:
-                              isSelected ? FontWeight.w800 : FontWeight.w700,
+                constraints: BoxConstraints(
+                    minWidth: touch ? 48 : 0,
+                    minHeight: touch ? 48 : (dense ? 30 : 34)),
+                alignment: Alignment.center,
+                child: Container(
+                  constraints: BoxConstraints(minHeight: dense ? 30 : 34),
+                  padding: padding,
+                  decoration: BoxDecoration(
+                      color: background,
+                      borderRadius: BorderRadius.circular(6)),
+                  child: Row(
+                    mainAxisSize: expand ? MainAxisSize.max : MainAxisSize.min,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      if (option.icon != null &&
+                          !(expand &&
+                              MediaQuery.textScalerOf(context).scale(14) >
+                                  18)) ...[
+                        Icon(option.icon,
+                            size: dense ? 10 : 11, color: foreground),
+                        SizedBox(width: dense ? 4 : 5),
+                      ],
+                      Flexible(
+                        child: Text(
+                          option.label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          textAlign: TextAlign.center,
+                          style: theme.textTheme.labelLarge?.copyWith(
+                            color: foreground,
+                            fontWeight:
+                                isSelected ? FontWeight.w800 : FontWeight.w700,
+                          ),
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),

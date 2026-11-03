@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../theme/app_motion.dart';
+import 'touch_targets.dart';
 
 /// A slim vertical bar thumb with a ring in the surface colour, used by the
 /// app-wide slider theme and [AppRulerSlider].
@@ -106,7 +107,7 @@ class AppRulerSlider extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         SizedBox(
-          height: 24,
+          height: usesTouchTargets(context) ? 48 : 24,
           child: Semantics(
             label: semanticLabel,
             child: SliderTheme(

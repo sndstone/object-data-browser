@@ -352,6 +352,17 @@ class AppController extends ChangeNotifier {
   List<BenchmarkRun> benchmarkHistory = const [];
   List<EventLogEntry> eventLog = const [];
   final Set<String> _busyActions = <String>{};
+  int _busyVersion = 0;
+
+  /// Changes whenever any action enters or leaves the busy set.
+  int get busyVersion => _busyVersion;
+
+  /// Session-only editor state. Never included in persisted application state.
+  final Map<String, EndpointProfile> profileDrafts = {};
+  final Map<String, EndpointProfile> profileDraftBases = {};
+  final Set<String> invalidProfileDrafts = {};
+  Future<bool> Function()? confirmLeavingSettings;
+  bool _checkingSettingsExit = false;
   BucketAdminState? adminState;
   ObjectDetails? selectedObjectDetails;
   ObjectPreview? selectedObjectPreview;
@@ -424,9 +435,11 @@ class AppController extends ChangeNotifier {
   final inspectorToggleRequest = ValueNotifier<int>(0);
   final deleteSelectionRequest = ValueNotifier<int>(0);
   bool pendingInspectorToggle = false;
-  void requestInspectorToggle() {
+  Future<void> requestInspectorToggle() async {
+    // Only arm the request once the Browser is actually shown; a declined
+    // unsaved-changes prompt must not leave it pending for a later visit.
+    if (!await selectTab(WorkspaceTab.browser)) return;
     pendingInspectorToggle = true;
-    selectTab(WorkspaceTab.browser);
     inspectorToggleRequest.value++;
   }
 
@@ -435,15 +448,15 @@ class AppController extends ChangeNotifier {
   }
 
   bool pendingObjectSearchFocus = false;
-  void requestObjectSearchFocus() {
+  Future<void> requestObjectSearchFocus() async {
+    if (!await selectTab(WorkspaceTab.browser)) return;
     pendingObjectSearchFocus = true;
-    selectTab(WorkspaceTab.browser);
     objectSearchFocus.value++;
   }
 
-  void openErrorDetails() {
+  Future<void> openErrorDetails() async {
     pendingEventLogFilter = 'ERROR';
-    selectTab(WorkspaceTab.eventLog);
+    if (!await selectTab(WorkspaceTab.eventLog)) pendingEventLogFilter = null;
   }
 
   String? bannerTaskId;
@@ -590,7 +603,19 @@ class AppController extends ChangeNotifier {
     );
   }
 
-  void selectTab(WorkspaceTab tab) {
+  /// Switches workspace. Returns false when leaving Settings was declined.
+  Future<bool> selectTab(WorkspaceTab tab) async {
+    if (activeTab == WorkspaceTab.settings &&
+        tab != activeTab &&
+        confirmLeavingSettings != null) {
+      if (_checkingSettingsExit) return false;
+      _checkingSettingsExit = true;
+      try {
+        if (!await confirmLeavingSettings!()) return false;
+      } finally {
+        _checkingSettingsExit = false;
+      }
+    }
     activeTab = tab;
     // Opening Jobs on an empty filter hides existing history; fall back to
     // the most useful non-empty view. A chosen view that has jobs is kept.
@@ -608,6 +633,7 @@ class AppController extends ChangeNotifier {
       source: 'navigation',
     );
     notifyListeners();
+    return true;
   }
 
   final Map<InspectorGroup, BrowserInspectorTab> inspectorGroupTabs = {};
@@ -2421,7 +2447,7 @@ class AppController extends ChangeNotifier {
     await pollBenchmark();
   }
 
-  Future<void> updateSettings(AppSettings value) async {
+  Future<bool> updateSettings(AppSettings value) async {
     settings = value;
     _syncDiagnosticsOptions();
     benchmarkDraft = benchmarkDraft.copyWith(
@@ -2444,8 +2470,9 @@ class AppController extends ChangeNotifier {
       message: 'Updated application settings.',
       source: 'settings',
     );
-    await _persistState();
+    final persisted = await _persistState();
     notifyListeners();
+    return persisted;
   }
 
   void updateProfile(EndpointProfile profile) {
@@ -2553,6 +2580,9 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> deleteProfile(String profileId) async {
+    profileDrafts.remove(profileId);
+    profileDraftBases.remove(profileId);
+    invalidProfileDrafts.remove(profileId);
     profiles = profiles.where((item) => item.id != profileId).toList();
     if (selectedProfile?.id == profileId) {
       selectedProfile = profiles.isEmpty ? null : profiles.first;
@@ -3894,6 +3924,7 @@ class AppController extends ChangeNotifier {
     final startedAt = DateTime.now();
     final guardMarker = _guardErrorSequence;
     _busyActions.add(actionKey);
+    _busyVersion++;
     _busyTaskIds[actionKey] = taskId;
     bannerMessage = busyMessage;
     bannerTaskId = trackTask ? taskId : keepBannerTaskId;
@@ -3978,6 +4009,7 @@ class AppController extends ChangeNotifier {
       }
       _actionScopes.remove(taskId);
       _busyActions.remove(actionKey);
+      _busyVersion++;
       _busyTaskIds.remove(actionKey);
       if (!failed &&
           bannerSeverity == BannerSeverity.info &&

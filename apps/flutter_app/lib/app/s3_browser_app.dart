@@ -62,6 +62,7 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
   void initState() {
     super.initState();
     widget.controller.addListener(_handleControllerChange);
+    widget.controller.confirmLeavingSettings = _confirmLeavingSettings;
     // Shut down long-lived engine sidecar processes before the desktop app
     // exits so they do not outlive the UI process.
     _lifecycleListener = AppLifecycleListener(
@@ -80,7 +81,69 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
     _benchmarkTimer?.cancel();
     _lifecycleListener?.dispose();
     widget.controller.removeListener(_handleControllerChange);
+    widget.controller.confirmLeavingSettings = null;
     super.dispose();
+  }
+
+  BuildContext? _shellContext;
+
+  Future<bool> _confirmLeavingSettings() async {
+    final context = _shellContext;
+    if (context == null || !context.mounted) return false;
+    FocusManager.instance.primaryFocus?.unfocus();
+    FocusManager.instance.applyFocusChangesIfNeeded();
+    if (widget.controller.profileDrafts.isEmpty) return true;
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Unsaved profile changes'),
+        content:
+            const Text('Save your profile changes before leaving Settings?'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, 'discard'),
+              child: const Text('Discard')),
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Keep editing')),
+          FilledButton(
+              onPressed: () => Navigator.pop(context, 'save'),
+              child: const Text('Save')),
+        ],
+      ),
+    );
+    if (!mounted || choice == null) return false;
+    final controller = widget.controller;
+    if (choice == 'discard') {
+      // A failed explicit Save can have updated the session's active profile.
+      // Discard restores the editor's original baseline in that case too.
+      for (final base in controller.profileDraftBases.values) {
+        if (controller.profiles
+            .any((profile) => profile.id == base.id && profile != base)) {
+          controller.updateProfile(base);
+        }
+      }
+      controller.profileDrafts.clear();
+      controller.profileDraftBases.clear();
+      controller.invalidProfileDrafts.clear();
+      return true;
+    }
+    for (final draft
+        in List<EndpointProfile>.of(controller.profileDrafts.values)) {
+      if (controller.invalidProfileDrafts.contains(draft.id)) {
+        controller.showBannerMessage(
+            'Fix the highlighted timeouts before saving.',
+            category: 'Profiles',
+            source: 'profiles');
+        return false;
+      }
+      if (!await controller.saveProfile(draft)) {
+        return false;
+      }
+      controller.profileDrafts.remove(draft.id);
+      controller.profileDraftBases.remove(draft.id);
+    }
+    return true;
   }
 
   void _handleControllerChange() {
@@ -127,6 +190,7 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
           ),
           child: LayoutBuilder(
             builder: (context, constraints) {
+              _shellContext = context;
               final sizeClass = Breakpoints.sizeClass(constraints.maxWidth);
               final phone = sizeClass == WindowSizeClass.phone;
               final tablet = sizeClass == WindowSizeClass.tablet;

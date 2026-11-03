@@ -9,6 +9,7 @@ import '../utils/format.dart';
 import '../widgets/setting_fields.dart';
 import '../widgets/danger_button.dart';
 import 'dart:io';
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:desktop_drop/desktop_drop.dart';
@@ -81,10 +82,12 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     if (mounted) _confirmDeleteObjects(context);
   }
 
+  double _workspaceWidth = 0;
+
   void _toggleInspector() {
     if (!mounted) return;
     controller.pendingInspectorToggle = false;
-    if (MediaQuery.sizeOf(context).width >= 1000) {
+    if (_workspaceWidth >= Breakpoints.smallDesktop) {
       controller.updateSettings(controller.settings.copyWith(
           browserInspectorVisible:
               !controller.settings.browserInspectorVisible));
@@ -410,6 +413,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     final content = LayoutBuilder(
       builder: (context, constraints) {
         final width = constraints.maxWidth;
+        _workspaceWidth = width;
         final desktopCompact = _desktopCompact(context);
         final sizeClass = Breakpoints.sizeClass(width);
         if (sizeClass == WindowSizeClass.phone) {
@@ -632,7 +636,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         if (!mounted || !context.mounted) return;
         // Use the workspace width, which can be narrower than the window
         // because of the navigation rail or UI scaling.
-        final width = context.size?.width ?? MediaQuery.sizeOf(context).width;
+        final width = _workspaceWidth;
         if (Breakpoints.isPhone(width)) {
           setState(() => _mobileSection = _MobileBrowserSection.inspector);
         } else if (width < Breakpoints.smallDesktop) {
@@ -853,15 +857,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         onUpload: () => _showUploadPicker(context),
         onDelete: () => _confirmDeleteObjects(context),
         onCreatePrefix: () => _showCreatePrefixDialog(context),
-        onInspector: () {
-          if (MediaQuery.sizeOf(context).width >= 1000) {
-            controller.updateSettings(controller.settings.copyWith(
-                browserInspectorVisible:
-                    !controller.settings.browserInspectorVisible));
-          } else {
-            _showInspectorDialog(context);
-          }
-        },
+        onInspector: _toggleInspector,
         onContextMenu: (object, position) =>
             _showObjectContextMenu(context, object, position));
     return panel;
@@ -1726,7 +1722,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           max: 10080,
           initialValue: controller.settings.defaultPresignMinutes,
           onSubmitted: (value) {
-            controller.updateSettings(
+            return controller.updateSettings(
               controller.settings.copyWith(defaultPresignMinutes: value),
             );
           },
@@ -1778,6 +1774,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           onSubmitted: (value) {
             controller
                 .updateTestDataConfig(testData.copyWith(bucketName: value));
+            return null;
           },
         ),
         const SizedBox(height: 8),
@@ -1786,6 +1783,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           initialValue: testData.prefix,
           onSubmitted: (value) {
             controller.updateTestDataConfig(testData.copyWith(prefix: value));
+            return null;
           },
         ),
         const SizedBox(height: 8),
@@ -1798,6 +1796,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             controller.updateTestDataConfig(
               testData.copyWith(objectSizeBytes: value),
             );
+            return null;
           },
         ),
         const SizedBox(height: 8),
@@ -1810,6 +1809,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                 onSubmitted: (value) {
                   controller.updateTestDataConfig(
                       testData.copyWith(objectCount: value));
+                  return null;
                 },
               ),
             ),
@@ -1821,6 +1821,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                 onSubmitted: (value) {
                   controller
                       .updateTestDataConfig(testData.copyWith(versions: value));
+                  return null;
                 },
               ),
             ),
@@ -1832,6 +1833,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           initialValue: testData.threads,
           onSubmitted: (value) {
             controller.updateTestDataConfig(testData.copyWith(threads: value));
+            return null;
           },
         ),
         FilledButton.icon(
@@ -1858,6 +1860,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           onSubmitted: (value) {
             controller
                 .updateDeleteAllConfig(deleteAll.copyWith(bucketName: value));
+            return null;
           },
         ),
         const SizedBox(height: 8),
@@ -1872,6 +1875,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                 onSubmitted: (value) {
                   controller.updateDeleteAllConfig(
                       deleteAll.copyWith(batchSize: value));
+                  return null;
                 },
               ),
             ),
@@ -1883,6 +1887,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                 onSubmitted: (value) {
                   controller.updateDeleteAllConfig(
                       deleteAll.copyWith(maxWorkers: value));
+                  return null;
                 },
               ),
             ),
@@ -1899,6 +1904,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                   controller.updateDeleteAllConfig(
                     deleteAll.copyWith(maxConnections: value),
                   );
+                  return null;
                 },
               ),
             ),
@@ -1910,6 +1916,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                 onSubmitted: (value) {
                   controller.updateDeleteAllConfig(
                       deleteAll.copyWith(pipelineSize: value));
+                  return null;
                 },
               ),
             ),
@@ -1927,6 +1934,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                 onSubmitted: (value) {
                   controller.updateDeleteAllConfig(
                       deleteAll.copyWith(listMaxKeys: value));
+                  return null;
                 },
               ),
             ),
@@ -1941,6 +1949,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                   controller.updateDeleteAllConfig(
                     deleteAll.copyWith(deletionDelayMs: value),
                   );
+                  return null;
                 },
               ),
             ),
@@ -2104,7 +2113,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   Widget _textField({
     required String label,
     required String initialValue,
-    required ValueChanged<String> onSubmitted,
+    required FutureOr<Object?> Function(String) onSubmitted,
   }) {
     return SettingTextField(
         key: ValueKey(label),
@@ -2116,7 +2125,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   Widget _numberField(
       {required String label,
       required int initialValue,
-      required ValueChanged<int> onSubmitted,
+      required FutureOr<Object?> Function(int) onSubmitted,
       int min = 1,
       int max = 2147483647}) {
     return SettingNumberField(

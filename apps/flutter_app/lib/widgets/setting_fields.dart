@@ -11,9 +11,13 @@ class SettingTextField extends StatefulWidget {
       this.validate,
       this.helper,
       this.unit,
-      this.numeric = false});
+      this.numeric = false,
+      this.commitLabel = 'Saved'});
   final String label, value;
-  final ValueChanged<String> onCommit;
+
+  /// Awaited before showing feedback. Return false or throw when a write fails.
+  final FutureOr<Object?> Function(String) onCommit;
+  final String commitLabel;
   final String? Function(String)? validate;
   final String? helper, unit;
   final bool numeric;
@@ -28,6 +32,7 @@ class _SettingTextFieldState extends State<SettingTextField> {
   late String _saved = widget.value;
   String? _error;
   bool _showSaved = false;
+  bool _committing = false;
   Timer? _timer;
   @override
   void initState() {
@@ -43,23 +48,37 @@ class _SettingTextFieldState extends State<SettingTextField> {
   void didUpdateWidget(covariant SettingTextField oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.value != widget.value) {
-      _saved = widget.value;
+      if (!_committing) _saved = widget.value;
       if (!_focus.hasFocus) _text.text = widget.value;
     }
   }
 
-  void _commit() {
+  Future<void> _commit() async {
+    if (_committing) return;
     final value = _text.text.trim();
     final error = widget.validate?.call(value);
     setState(() => _error = error);
     if (error != null || value == _saved) return;
-    _saved = value;
-    widget.onCommit(value);
-    setState(() => _showSaved = true);
+    _committing = true;
     _timer?.cancel();
-    _timer = Timer(const Duration(milliseconds: 1200), () {
-      if (mounted) setState(() => _showSaved = false);
-    });
+    setState(() => _showSaved = false);
+    try {
+      final result = await widget.onCommit(value);
+      if (!mounted) return;
+      if (result == false) {
+        setState(() => _error = 'Could not save. Please retry.');
+        return;
+      }
+      _saved = value;
+      setState(() => _showSaved = true);
+      _timer = Timer(const Duration(milliseconds: 1200), () {
+        if (mounted) setState(() => _showSaved = false);
+      });
+    } catch (_) {
+      if (mounted) setState(() => _error = 'Could not save. Please retry.');
+    } finally {
+      _committing = false;
+    }
   }
 
   @override
@@ -94,7 +113,7 @@ class _SettingTextFieldState extends State<SettingTextField> {
                   labelText: widget.label,
                   helperText: widget.helper,
                   errorText: _error,
-                  suffixText: _showSaved ? 'Saved' : widget.unit),
+                  suffixText: _showSaved ? widget.commitLabel : widget.unit),
               onFieldSubmitted: (_) => _commit()));
 }
 
@@ -107,11 +126,13 @@ class SettingNumberField extends StatelessWidget {
       this.min = 1,
       this.max = 1000000,
       this.unit,
-      this.helper});
+      this.helper,
+      this.commitLabel = 'Saved'});
   final String label;
   final int value, min, max;
   final String? unit, helper;
-  final ValueChanged<int> onCommit;
+  final FutureOr<Object?> Function(int) onCommit;
+  final String commitLabel;
   @override
   Widget build(BuildContext context) => SettingTextField(
       label: label,
@@ -119,6 +140,7 @@ class SettingNumberField extends StatelessWidget {
       unit: unit,
       helper: helper,
       numeric: true,
+      commitLabel: commitLabel,
       onCommit: (v) => onCommit(int.parse(v)),
       validate: (v) {
         final n = int.tryParse(v);

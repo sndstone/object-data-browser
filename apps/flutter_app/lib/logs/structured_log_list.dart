@@ -1,4 +1,5 @@
 import '../utils/format.dart';
+import '../theme/app_motion.dart';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -51,7 +52,8 @@ class _StructuredLogListState extends State<StructuredLogList> {
     final items = _itemsFor(widget.entries);
     final scaledChild = MediaQuery(
       data: MediaQuery.of(context).copyWith(
-        textScaler: TextScaler.linear(widget.textScalePercent / 100),
+        textScaler: PreferenceTextScaler(
+            MediaQuery.textScalerOf(context), widget.textScalePercent / 100),
       ),
       child: items.isEmpty
           ? widget.embedded
@@ -78,10 +80,15 @@ class _StructuredLogListState extends State<StructuredLogList> {
                   ? const NeverScrollableScrollPhysics()
                   : const AlwaysScrollableScrollPhysics(),
               itemCount: items.length,
+              findItemIndexCallback: (key) {
+                final index = items.indexWhere((item) => item.key == key);
+                return index < 0 ? null : index;
+              },
               separatorBuilder: (_, __) => const Divider(height: 1),
               itemBuilder: (context, index) {
                 final item = items[index];
                 return _ProfileNames(
+                  key: item.key,
                   names: widget.profileNames,
                   child: item.upload != null
                       ? _UploadBatchCard(entries: item.upload!)
@@ -147,6 +154,24 @@ class _StructuredLogItem {
   final _ApiTraceGroup? group;
   final EventLogEntry? entry;
   final List<EventLogEntry>? upload;
+
+  Key get key => group != null
+      ? ValueKey(('request', group!.requestId))
+      : upload != null
+          ? ValueKey((
+              'upload',
+              upload!.first.parentRequestId ?? upload!.first.requestId
+            ))
+          : ValueKey((
+              'event',
+              entry!.timestamp,
+              entry!.requestId,
+              entry!.objectKey,
+              entry!.source,
+              entry!.category,
+              entry!.level,
+              entry!.message
+            ));
 }
 
 class _UploadBatchCard extends StatelessWidget {
@@ -402,7 +427,7 @@ class _ParsedApiEntryCard extends StatelessWidget {
 
 /// Supplies profile display names to log rows below it.
 class _ProfileNames extends InheritedWidget {
-  const _ProfileNames({required this.names, required super.child});
+  const _ProfileNames({super.key, required this.names, required super.child});
   final Map<String, String> names;
 
   static Map<String, String> of(BuildContext context) =>

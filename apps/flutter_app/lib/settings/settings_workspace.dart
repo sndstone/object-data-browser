@@ -7,6 +7,7 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'dart:convert';
 import 'package:flutter/services.dart';
 import 'package:share_plus/share_plus.dart';
 
@@ -38,7 +39,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
   String get _sectionName =>
       canonicalSettingsSection(controller.settingsSectionName);
   String? _editingProfileId;
-  final Map<String, EndpointProfile> _profileDrafts = {};
+  Map<String, EndpointProfile> get _profileDrafts => controller.profileDrafts;
   static const _sectionDescriptions = {
     'Connections':
         'Endpoint profiles and credentials. Exports never include secrets.',
@@ -279,7 +280,13 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                               onDraftChanged: (draft) {
                                 if (draft == null) {
                                   _profileDrafts.remove(profile.id);
+                                  controller.profileDraftBases
+                                      .remove(profile.id);
+                                  controller.invalidProfileDrafts
+                                      .remove(profile.id);
                                 } else {
+                                  controller.profileDraftBases
+                                      .putIfAbsent(profile.id, () => profile);
                                   _profileDrafts[profile.id] = draft;
                                 }
                               },
@@ -944,7 +951,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
   Widget _textField({
     required String label,
     required String initialValue,
-    required ValueChanged<String> onSubmitted,
+    required FutureOr<Object?> Function(String) onSubmitted,
   }) {
     return SettingTextField(
         key: ValueKey(label),
@@ -956,7 +963,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
   Widget _numberField(
       {required String label,
       required int initialValue,
-      required ValueChanged<int> onSubmitted,
+      required FutureOr<Object?> Function(int) onSubmitted,
       int min = 1,
       int max = 2147483647}) {
     return SettingNumberField(
@@ -1013,6 +1020,40 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   // submissions and show progress until the controller reports the outcome.
   bool _saving = false;
   Timer? _revealTimer;
+  bool _draftReady = false;
+  bool _syncingProfile = false;
+
+  EndpointProfile get _savedProfile =>
+      widget.controller.profileDraftBases[widget.profile.id] ??
+      widget.controller.profiles.firstWhere(
+          (profile) => profile.id == widget.profile.id,
+          orElse: () => widget.profile);
+
+  void _publishDraft() {
+    if (!_draftReady || _syncingProfile) return;
+    final draft = _buildProfile();
+    final valid = [_connectTimeoutController.text, _readTimeoutController.text]
+        .every((text) {
+      final value = int.tryParse(text.trim());
+      return value != null && value >= 1 && value <= 2147483647;
+    });
+    widget.onDraftChanged(valid &&
+            draft == _savedProfile.copyWith(notes: _savedProfile.notes ?? '')
+        ? null
+        : draft);
+    if (valid) {
+      widget.controller.invalidProfileDrafts.remove(widget.profile.id);
+    } else {
+      widget.controller.invalidProfileDrafts.add(widget.profile.id);
+    }
+  }
+
+  @override
+  void setState(VoidCallback fn) {
+    super.setState(fn);
+    _publishDraft();
+  }
+
   void _reveal(bool token) {
     setState(() {
       if (token) {
@@ -1040,6 +1081,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
         (widget.initialDraft ?? widget.profile).maxConcurrentRequests;
     _maxAttempts = (widget.initialDraft ?? widget.profile).maxAttempts;
     _expanded = widget.openEditor || !_looksConfigured(widget.profile);
+    _draftReady = true;
     for (final field in [
       _nameController,
       _endpointController,
@@ -1063,7 +1105,10 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
     if (widget.openEditor && !oldWidget.openEditor) {
       _editorExpansion.expand();
     }
-    if (oldWidget.profile != widget.profile) {
+    if (oldWidget.profile != widget.profile &&
+        !_saving &&
+        !widget.controller.profileDrafts.containsKey(widget.profile.id)) {
+      _syncingProfile = true;
       widget.onDraftChanged(null);
       _revealSecret = false;
       _revealToken = false;
@@ -1090,6 +1135,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
       );
       _verifyTls = widget.profile.verifyTls;
       _expanded = widget.openEditor || !_looksConfigured(widget.profile);
+      _syncingProfile = false;
     }
   }
 
@@ -1297,8 +1343,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
 
   @override
   void dispose() {
-    final draft = _buildProfile();
-    widget.onDraftChanged(draft == widget.profile ? null : draft);
+    _draftReady = false;
     _revealTimer?.cancel();
     _endpointController.removeListener(_handleEndpointInputChanged);
     _accessKeyController.removeListener(_handleAccessKeyChanged);
@@ -1327,11 +1372,20 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
     final connectError = timeoutError(_connectTimeoutController.text);
     final readError = timeoutError(_readTimeoutController.text);
     final valid = connectError == null && readError == null;
-    final isDirty = _buildProfile() !=
-        widget.profile.copyWith(notes: widget.profile.notes ?? '');
+    final draftJson = _buildProfile().toJson();
+    final savedJson =
+        _savedProfile.copyWith(notes: _savedProfile.notes ?? '').toJson();
+    final unsavedCount = draftJson.keys
+        .where(
+            (key) => jsonEncode(draftJson[key]) != jsonEncode(savedJson[key]))
+        .length;
+    final isDirty = unsavedCount > 0;
     final persistenceStatus =
         widget.controller.profilePersistenceStatusFor(widget.profile.id);
     final sessionOnly = persistenceStatus != 'Saved';
+    final retrySave = sessionOnly &&
+        _buildProfile() ==
+            widget.profile.copyWith(notes: widget.profile.notes ?? '');
     final isSelected =
         widget.controller.selectedProfile?.id == widget.profile.id;
     final isTesting =
@@ -1374,7 +1428,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
               crossAxisAlignment: WrapCrossAlignment.center,
               children: [
                 if (isSelected) const Chip(label: Text('Active')),
-                if (isDirty)
+                if (isDirty && !retrySave)
                   Chip(
                       backgroundColor:
                           Theme.of(context).colorScheme.tertiaryContainer,
@@ -1662,6 +1716,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         label:
                             'Connection pool limit (part workers capped at 8)',
                         value: _connectionLimit,
+                        commitLabel: 'Draft',
                         min: 1,
                         max: 256,
                         onCommit: (value) =>
@@ -1670,6 +1725,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                     SettingNumberField(
                         label: 'Maximum attempts',
                         value: _maxAttempts,
+                        commitLabel: 'Draft',
                         min: 1,
                         max: 100,
                         onCommit: (value) =>
@@ -1786,7 +1842,9 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                           final profile = _buildProfile();
                           setState(() => _saving = true);
                           try {
-                            await widget.controller.saveProfile(profile);
+                            if (await widget.controller.saveProfile(profile)) {
+                              widget.onDraftChanged(null);
+                            }
                           } finally {
                             if (mounted) setState(() => _saving = false);
                           }
@@ -1798,10 +1856,11 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                       : const Icon(Icons.save_outlined),
                   label: Text(_saving
                       ? 'Saving…'
-                      : sessionOnly && !isDirty
+                      : retrySave
                           ? 'Retry save'
                           : 'Save'),
                 ),
+                if (isDirty) Text('$unsavedCount unsaved changes'),
                 OutlinedButton.icon(
                   onPressed: !valid ||
                           !widget.controller.supportsProfile(_buildProfile()) ||
