@@ -202,9 +202,9 @@ void main() {
     final state = await repository.loadState();
     expect(state!.profiles.single.id, _profile.id);
     expect(state.profiles.single.secretKey, _profile.secretKey);
-    final metadata = await File(
-            '${tempDir.path}/object-data-browser-state.json')
-        .readAsString();
+    final metadata =
+        await File('${tempDir.path}/object-data-browser-state.json')
+            .readAsString();
     expect(metadata, isNot(contains('"secretKey"')));
     expect(metadata, isNot(contains('"accessKey"')));
   });
@@ -541,4 +541,104 @@ void main() {
     );
     expect(store.writeCalls, ['profiles.credentials.v2']);
   });
+  for (final bundle in [
+    <String, Object?>{},
+    {'version': 99, 'profiles': {}},
+    {'version': 2, 'profiles': null},
+    {
+      'version': 2,
+      'profiles': {'test': {}}
+    },
+    {
+      'version': 2,
+      'profiles': {
+        'test': {'accessKey': 42, 'secretKey': ''}
+      }
+    }
+  ]) {
+    test(
+        'malformed credential schema blocks ordinary secure persistence: $bundle',
+        () async {
+      final dir = await Directory.systemTemp.createTemp('credential-schema');
+      addTearDown(() => dir.delete(recursive: true));
+      final metadata = _profile.toJson()
+        ..remove('accessKey')
+        ..remove('secretKey')
+        ..remove('sessionToken');
+      await File('${dir.path}/object-data-browser-state.json')
+          .writeAsString(jsonEncode({
+        'settings': _settings.toJson(),
+        'profiles': [metadata],
+        'selectedProfileId': _profile.id
+      }));
+      final original = jsonEncode(bundle);
+      final store =
+          RecordingProfileSecretStore({'profiles.credentials.v2': original});
+      final repo = LocalAppStateRepository(
+          secretStore: store,
+          applicationSupportDirectoryProvider: () async => dir);
+      final state = (await repo.loadState())!;
+      expect(state.credentialStoreError, isNotNull);
+      await expectLater(
+          repo.saveState(
+              settings: state.settings,
+              profiles: state.profiles,
+              selectedProfileId: state.selectedProfileId),
+          throwsA(isA<CredentialStoreException>()));
+      expect(store.writeCalls, isEmpty);
+      expect(store.values['profiles.credentials.v2'], original);
+    });
+  }
+  test(
+      'semantically invalid metadata recovers last-good before reading secrets',
+      () async {
+    final dir = await Directory.systemTemp.createTemp('metadata-schema');
+    addTearDown(() => dir.delete(recursive: true));
+    final file = File('${dir.path}/object-data-browser-state.json');
+    await file.writeAsString(jsonEncode({
+      'settings': {},
+      'profiles': [42]
+    }));
+    await File('${file.path}.last-good').writeAsString(
+        jsonEncode({'settings': _settings.toJson(), 'profiles': []}));
+    final repo = LocalAppStateRepository(
+        secretStore: RecordingProfileSecretStore({}),
+        applicationSupportDirectoryProvider: () async => dir);
+    expect((await repo.loadState())!.profiles, isEmpty);
+    expect((jsonDecode(await file.readAsString()) as Map)['profiles'], isEmpty);
+    expect(
+        await dir.list().where((f) => f.path.contains('.corrupt-')).length, 1);
+  });
+  test(
+      'mac state migration ranks usable primaries rather than backup rotation times',
+      () async {
+    final home = await Directory.systemTemp.createTemp('state-locations');
+    addTearDown(() => home.delete(recursive: true));
+    final support = Directory(
+        '${home.path}/Library/Application Support/com.example.s3BrowserCrossplat');
+    final alternate = File(
+        '${home.path}/Library/Containers/com.example.s3BrowserCrossplat/Data/Library/Application Support/com.example.s3BrowserCrossplat/object-data-browser-state.json');
+    await support.create(recursive: true);
+    await alternate.parent.create(recursive: true);
+    final primary = File('${support.path}/object-data-browser-state.json');
+    Future<void> state(File file, String marker, int seconds) async {
+      await file.writeAsString(jsonEncode({
+        'settings': {..._settings.toJson(), 'downloadPath': marker},
+        'profiles': []
+      }));
+      await file
+          .setLastModified(DateTime.fromMillisecondsSinceEpoch(seconds * 1000));
+    }
+
+    await state(primary, 'old-primary', 10);
+    await state(File('${primary.path}.last-good'), 'previous-generation', 30);
+    await state(alternate, 'newest-primary', 20);
+    final repo = LocalAppStateRepository(
+        secretStore: RecordingProfileSecretStore({}),
+        applicationSupportDirectoryProvider: () async => support);
+    expect((await repo.loadState())!.settings.downloadPath, 'newest-primary');
+    await primary.writeAsString('{damaged');
+    expect(
+        (await repo.loadState())!.settings.downloadPath, 'previous-generation');
+  }, skip: !Platform.isMacOS);
 }

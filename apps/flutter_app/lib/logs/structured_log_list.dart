@@ -284,7 +284,7 @@ class _ApiTraceCard extends StatelessWidget {
       category: entry.category,
       title: entry.method ?? entry.category,
       detail: detail.join(' · '),
-      children: [
+      childrenBuilder: () => [
         _TracePayloadSection(
           title: 'Send',
           entry: group.send,
@@ -354,6 +354,8 @@ class _TracePayloadSection extends StatelessWidget {
   }
 }
 
+final _parsedMessages = Expando<_ParsedApiMessage>();
+
 class _EventEntryCard extends StatelessWidget {
   const _EventEntryCard({required this.entry});
 
@@ -361,7 +363,7 @@ class _EventEntryCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final parsedApi = _parseRawApiMessage(entry);
+    final parsedApi = _parsedMessages[entry] ??= _parseRawApiMessage(entry);
     if (parsedApi != null) {
       return _ParsedApiEntryCard(
         entry: entry,
@@ -406,7 +408,7 @@ class _ParsedApiEntryCard extends StatelessWidget {
       title: parsed.title,
       detail: detail.join(' · '),
       extraContext: parsed.url,
-      children: [
+      childrenBuilder: () => [
         if (parsed.headers != null) ...[
           Text('Headers', style: theme.textTheme.titleSmall),
           const SizedBox(height: 8),
@@ -579,7 +581,7 @@ class _ExpandableLogRow extends StatefulWidget {
     required this.entry,
     required this.category,
     required this.title,
-    required this.children,
+    required this.childrenBuilder,
     this.detail = '',
     this.extraContext,
   });
@@ -589,7 +591,7 @@ class _ExpandableLogRow extends StatefulWidget {
   final String title;
   final String detail;
   final String? extraContext;
-  final List<Widget> children;
+  final List<Widget> Function() childrenBuilder;
 
   @override
   State<_ExpandableLogRow> createState() => _ExpandableLogRowState();
@@ -646,7 +648,7 @@ class _ExpandableLogRowState extends State<_ExpandableLogRow> {
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              children: widget.children,
+              children: widget.childrenBuilder(),
             ),
           ),
       ],
@@ -694,7 +696,15 @@ class _CodeBlock extends StatelessWidget {
   }
 }
 
+class _LazyTraceValue {
+  _LazyTraceValue(this.raw);
+  final String raw;
+  late final Object? value = _decodeTraceValue(raw);
+  late final String formatted = _prettyJson(value);
+}
+
 String _prettyJson(Object? value) {
+  if (value is _LazyTraceValue) return value.formatted;
   const encoder = JsonEncoder.withIndent('  ');
   if (value == null) {
     return 'null';
@@ -730,8 +740,8 @@ _ParsedApiMessage? _parseRawApiMessage(EventLogEntry entry) {
       phaseLabel: 'Send',
       method: method.isEmpty ? null : method,
       url: url,
-      headers: _decodeTraceValue(headersRaw),
-      body: _decodeTraceValue(bodyRaw),
+      headers: headersRaw == 'null' ? null : _LazyTraceValue(headersRaw),
+      body: _LazyTraceValue(bodyRaw),
     );
   }
 
@@ -746,8 +756,8 @@ _ParsedApiMessage? _parseRawApiMessage(EventLogEntry entry) {
       title: operation.isEmpty ? entry.category : operation,
       phaseLabel: 'Response',
       status: status,
-      headers: _decodeTraceValue(headersRaw),
-      body: _decodeTraceValue(bodyRaw),
+      headers: headersRaw == 'null' ? null : _LazyTraceValue(headersRaw),
+      body: _LazyTraceValue(bodyRaw),
     );
   }
 

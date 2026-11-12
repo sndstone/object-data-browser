@@ -1,3 +1,5 @@
+import 'performance_settings.dart';
+export 'performance_settings.dart';
 import 'connection_options.dart';
 export 'connection_options.dart';
 
@@ -1525,6 +1527,7 @@ class AppSettings {
     required this.logTextScalePercent,
     this.compactRows = false,
     this.browserInspectorVisible = true,
+    this.performance = const PerformanceSettings(),
   });
 
   final bool darkMode;
@@ -1562,9 +1565,11 @@ class AppSettings {
   final int logTextScalePercent;
   final bool compactRows;
   final bool browserInspectorVisible;
+  final PerformanceSettings performance;
 
   Map<String, Object?> toJson() {
     return {
+      'performance': performance.toJson(),
       'darkMode': darkMode,
       'compactRows': compactRows,
       'browserInspectorVisible': browserInspectorVisible,
@@ -1608,6 +1613,8 @@ class AppSettings {
     final uiScalePercent =
         (json['uiScalePercent'] as num?)?.toInt() ?? defaultUiScalePercent;
     return AppSettings(
+      performance: PerformanceSettings.fromJson(
+          Map<String, Object?>.from(json['performance'] as Map? ?? const {})),
       darkMode: json['darkMode'] as bool? ?? false,
       defaultEngineId: (json['defaultEngineId'] as String?) ?? 'python',
       defaultProfileId: (json['defaultProfileId'] as String?) ?? '',
@@ -1707,9 +1714,11 @@ class AppSettings {
     int? uiScalePercent,
     bool? compactRows,
     bool? browserInspectorVisible,
+    PerformanceSettings? performance,
     int? logTextScalePercent,
   }) {
     return AppSettings(
+      performance: performance ?? this.performance,
       darkMode: darkMode ?? this.darkMode,
       defaultEngineId: defaultEngineId ?? this.defaultEngineId,
       defaultProfileId: defaultProfileId ?? this.defaultProfileId,

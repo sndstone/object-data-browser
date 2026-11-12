@@ -1,8 +1,13 @@
+import '../widgets/bounded_preview_image.dart';
 import 'storage_preset_dialog.dart';
 import 'bucket_copy_dialog.dart';
 import 'storage_admin_dialog.dart';
 import '../widgets/empty_state.dart';
 import 'json_editor_dialog.dart';
+import 'create_bucket_dialog.dart';
+import 'rename_dialog.dart';
+import '../widgets/app_form_dialog.dart';
+import 'dart:convert' show utf8;
 import 'tag_editor_dialog.dart';
 import '../widgets/copyable_value.dart';
 import '../utils/format.dart';
@@ -385,6 +390,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           const SizedBox(height: 14),
           Expanded(
               child: DirectionalSwitcher(
+            replaceContent: true,
             position: effectiveSection.index,
             duration: duration,
             layoutBuilder: (current, previous) => Stack(
@@ -440,35 +446,61 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         const panelGap = 8.0;
         final bucketPanelWidth =
             tablet ? 252.0 : (desktopCompact && !roomy ? 256.0 : 264.0);
-        final Widget objectAndInspector;
-        if (tablet) {
-          objectAndInspector = _objectPanel(context, compact: true);
-        } else if (!showDockedInspector) {
-          objectAndInspector = _objectPanel(context, compact: false);
-        } else if (inspectorOnRight) {
-          objectAndInspector = Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(child: _objectPanel(context, compact: false)),
-              _resizeHandle(Axis.horizontal),
-              SizedBox(
-                width: inspectorSize,
-                child: _inspectorPanel(context, compact: false),
+        // Keep the object panel in one element slot while docking changes.
+        // The inspector lays out at its final size while its viewport reveals
+        // it, avoiding reflowing its fields through tiny intermediate widths.
+        final axis = inspectorOnRight ? Axis.horizontal : Axis.vertical;
+        final objectAndInspector = Flex(
+          direction: axis,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(child: _objectPanel(context, compact: tablet)),
+            TweenAnimationBuilder<double>(
+              tween: Tween(end: showDockedInspector ? inspectorSize + 10 : 0),
+              duration: AppMotion.duration(context,
+                  enabled: controller.settings.enableAnimations,
+                  milliseconds: 220),
+              curve: Curves.easeInOutCubic,
+              builder: (context, extent, child) => SizedBox(
+                width: inspectorOnRight ? extent : null,
+                height: inspectorOnRight ? null : extent,
+                child: TickerMode(
+                  enabled: extent > 0,
+                  child: Offstage(
+                    offstage: extent == 0,
+                    child: ClipRect(
+                      child: OverflowBox(
+                        alignment: Alignment.topLeft,
+                        minWidth: inspectorOnRight ? inspectorSize + 10 : null,
+                        maxWidth: inspectorOnRight ? inspectorSize + 10 : null,
+                        minHeight: inspectorOnRight ? null : inspectorSize + 10,
+                        maxHeight: inspectorOnRight ? null : inspectorSize + 10,
+                        child: IgnorePointer(
+                          ignoring: !showDockedInspector,
+                          child: ExcludeFocus(
+                            excluding: !showDockedInspector,
+                            child: ExcludeSemantics(
+                              excluding: !showDockedInspector,
+                              child: Opacity(
+                                opacity:
+                                    (extent / (inspectorSize + 10)).clamp(0, 1),
+                                child: child,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
               ),
-            ],
-          );
-        } else {
-          objectAndInspector = Column(
-            children: [
-              Expanded(child: _objectPanel(context, compact: false)),
-              _resizeHandle(Axis.vertical),
-              SizedBox(
-                height: inspectorSize,
-                child: _inspectorPanel(context, compact: false),
-              ),
-            ],
-          );
-        }
+              child: Flex(direction: axis, children: [
+                _resizeHandle(axis),
+                Expanded(child: _inspectorPanel(context, compact: false)),
+              ]),
+            ),
+          ],
+        );
 
         return _responsiveLayout(context,
             phone: false,
@@ -535,16 +567,24 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       );
 
   Future<void> _showCreatePrefixDialog(BuildContext context) async {
-    final value = await showDialog<String>(
-      context: context,
-      builder: (context) => const _CreatePrefixDialog(),
-    );
-
-    final prefix = value?.trim();
-    if (prefix == null || prefix.isEmpty) {
-      return;
-    }
-    await controller.createFolderMarker(prefix);
+    final profile = controller.selectedProfile?.id,
+        bucket = controller.selectedBucket?.name;
+    final prefix = controller.currentPrefix, engine = controller.activeEngineId;
+    await showDialog<String>(
+        context: context,
+        builder: (_) => _CreatePrefixDialog(
+              parentPrefix: prefix,
+              onSave: (value) => controller.runFormAction(() async {
+                if (controller.selectedProfile?.id != profile ||
+                    controller.selectedBucket?.name != bucket ||
+                    controller.currentPrefix != prefix ||
+                    controller.activeEngineId != engine) {
+                  throw StateError(
+                      'The destination changed. Reopen this form in the target folder.');
+                }
+                await controller.createFolderMarker(value);
+              }),
+            ));
   }
 
   Future<void> _showObjectContextMenu(
@@ -552,6 +592,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     ObjectEntry object,
     Rect anchor,
   ) async {
+    final targetContext = (
+      controller.activeEngineId,
+      controller.selectedProfile,
+      controller.selectedBucket?.name
+    );
     controller.clearObjectSelection();
     await controller.setSelectedObject(
       object,
@@ -583,6 +628,13 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             label: 'Generate presigned URL',
           ),
         ],
+        if (!object.isFolder &&
+            controller.selectedProfile?.endpointType ==
+                EndpointProfileType.awsS3)
+          appMenuItem(
+              value: 'rename',
+              icon: Icons.drive_file_rename_outline,
+              label: 'Rename object'),
         appMenuDivider(),
         appMenuItem(
           value: 'copy-key',
@@ -612,7 +664,29 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       ],
     );
 
+    if (selected == null) return;
+    if (targetContext !=
+        (
+          controller.activeEngineId,
+          controller.selectedProfile,
+          controller.selectedBucket?.name
+        )) {
+      return;
+    }
+    // The popup owns its target even if another asynchronous selection completed.
+    await controller.setSelectedObject(object,
+        openFolderOnSelect: false, loadArtifacts: false);
     switch (selected) {
+      case 'rename':
+        if (!context.mounted) return;
+        await showDialog<String>(
+            context: context,
+            builder: (_) => RenameDialog(
+                  path: object.key,
+                  onSave: (target) =>
+                      controller.renameObject(object.key, target),
+                ));
+        return;
       case 'copy-key':
         await copyValue(controller, 'Key', object.key);
         return;
@@ -781,6 +855,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         context: context,
         builder: (context) => AlertDialog(
                 title: Text('Delete ${keys.length} object(s)?'),
+                scrollable: true,
                 content: Text(
                     'Bucket: $bucketName\n${keys.take(5).join('\n')}${keys.length > 5 ? '\n…' : ''}\n\nIn versioned buckets this may create delete markers. Permanent deletion cannot always be undone.'),
                 actions: [
@@ -915,11 +990,19 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           ];
     final desktopCompact = _desktopCompact(context);
     final panelBody = DirectionalSwitcher(
-      position: tab.index,
+      key: const ValueKey('inspector-content-replacement'),
+      axis: Axis.horizontal,
+      replacementBackground: Theme.of(context).cardTheme.color,
+      replaceContent: true,
+      position: availableTabs.indexOf(tab),
       duration: AppMotion.duration(context,
-          enabled: controller.settings.enableAnimations),
+          enabled: controller.settings.enableAnimations, milliseconds: 300),
+      layoutBuilder: (current, previous) => Stack(
+          fit: StackFit.expand,
+          alignment: Alignment.topLeft,
+          children: [...previous, if (current != null) current]),
       child: KeyedSubtree(
-          key: ValueKey(tab),
+          key: ValueKey((tab, controller.selectedObject?.key)),
           child: switch (tab) {
             BrowserInspectorTab.bucketAdmin => _bucketAdminView(context),
             BrowserInspectorTab.bucketInfo => _bucketInfoView(context),
@@ -1423,6 +1506,27 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
 
   Widget _objectPreviewSection(BuildContext context, ObjectEntry object) {
     final preview = controller.selectedObjectPreview;
+    final stage = preview == null || preview.key != object.key
+        ? 0
+        : preview.loading
+            ? 1
+            : 2;
+    return DirectionalSwitcher(
+      key: const ValueKey('preview-content-replacement'),
+      position: stage,
+      duration: AppMotion.duration(context,
+          enabled: controller.settings.enableAnimations, milliseconds: 260),
+      layoutBuilder: (current, previous) => Stack(
+          fit: StackFit.expand,
+          children: [...previous, if (current != null) current]),
+      child: KeyedSubtree(
+          key: ValueKey((object.key, stage)),
+          child: _objectPreviewContent(context, object)),
+    );
+  }
+
+  Widget _objectPreviewContent(BuildContext context, ObjectEntry object) {
+    final preview = controller.selectedObjectPreview;
     final theme = Theme.of(context);
     if (preview == null || preview.key != object.key) {
       return const Center(
@@ -1450,13 +1554,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
           child: Padding(
               padding: const EdgeInsets.all(12), child: Text(preview.message)));
     } else if (preview.kind == ObjectPreviewKind.image && preview.url != null) {
-      body = Image.network(preview.url!,
-          fit: BoxFit.contain,
-          loadingBuilder: (context, child, progress) => progress == null
-              ? child
-              : const Center(child: CircularProgressIndicator()),
-          errorBuilder: (context, error, stack) =>
-              const Center(child: Text('Could not load image preview.')));
+      body = BoundedPreviewImage(
+          url: preview.url!,
+          etag: object.etag,
+          maximumMegapixels:
+              controller.settings.performance.imagePreviewMegapixels);
     } else if (preview.kind == ObjectPreviewKind.text) {
       body = PreviewSourceView(
           source: visibleText,
@@ -1537,176 +1639,181 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     final versions = controller.visibleVersions;
     final hasSelectedObject = controller.selectedObject != null;
 
-    return _adaptivePanelListView(
-      context,
-      key: const ValueKey('versions'),
-      children: [
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            FilledButton.icon(
-              onPressed: () {
+    final controls = <Widget>[
+      Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          FilledButton.icon(
+            onPressed: () {
+              controller.updateVersionBrowserOptions(
+                options.copyWith(
+                  filterMode: BrowserFilterMode.prefix,
+                  filterValue: '',
+                ),
+              );
+            },
+            icon: const Icon(Icons.visibility_outlined),
+            label: const Text('Show all versions'),
+          ),
+          OutlinedButton.icon(
+            onPressed: controller.refreshObjects,
+            icon: const Icon(Icons.refresh),
+            label: const Text('Refresh versions'),
+          ),
+          OutlinedButton.icon(
+            onPressed:
+                hasSelectedObject ? controller.startSampleDownload : null,
+            icon: const Icon(Icons.download),
+            label: const Text('Download current object'),
+          ),
+          OutlinedButton.icon(
+            onPressed:
+                hasSelectedObject ? () => _confirmDeleteObjects(context) : null,
+            icon: const Icon(Icons.delete_outline),
+            label: const Text('Delete current object'),
+          ),
+        ],
+      ),
+      const SizedBox(height: 12),
+      if (!hasSelectedObject)
+        const Padding(
+          padding: EdgeInsets.only(bottom: 12),
+          child: Text('Showing all versioned objects in the selected bucket.'),
+        ),
+      Row(
+        children: [
+          Expanded(
+            flex: 2,
+            child: AppSelectField<BrowserFilterMode>(
+              value: options.filterMode,
+              decoration: const InputDecoration(labelText: 'Filter mode'),
+              items: const [
+                AppSelectItem(
+                  value: BrowserFilterMode.prefix,
+                  label: 'Prefix',
+                ),
+                AppSelectItem(
+                  value: BrowserFilterMode.text,
+                  label: 'Text',
+                ),
+                AppSelectItem(
+                  value: BrowserFilterMode.regex,
+                  label: 'Regex',
+                ),
+              ],
+              onChanged: (value) {
+                if (value != null) {
+                  controller.updateVersionBrowserOptions(
+                    options.copyWith(filterMode: value),
+                  );
+                }
+              },
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            flex: 3,
+            child: TextFormField(
+              key: ValueKey(
+                'version-filter-${options.filterMode.name}-${options.filterValue}',
+              ),
+              initialValue: options.filterValue,
+              decoration: InputDecoration(
+                labelText: switch (options.filterMode) {
+                  BrowserFilterMode.prefix => 'Version filter (prefix)',
+                  BrowserFilterMode.text => 'Version filter (text)',
+                  BrowserFilterMode.regex => 'Version filter (regex)',
+                },
+                prefixIcon: const Icon(Icons.filter_alt_outlined),
+              ),
+              onFieldSubmitted: (value) {
                 controller.updateVersionBrowserOptions(
-                  options.copyWith(
-                    filterMode: BrowserFilterMode.prefix,
-                    filterValue: '',
-                  ),
+                  options.copyWith(filterValue: value),
                 );
               },
-              icon: const Icon(Icons.visibility_outlined),
-              label: const Text('Show all versions'),
             ),
-            OutlinedButton.icon(
-              onPressed: controller.refreshObjects,
-              icon: const Icon(Icons.refresh),
-              label: const Text('Refresh versions'),
-            ),
-            OutlinedButton.icon(
-              onPressed:
-                  hasSelectedObject ? controller.startSampleDownload : null,
-              icon: const Icon(Icons.download),
-              label: const Text('Download current object'),
-            ),
-            OutlinedButton.icon(
-              onPressed: hasSelectedObject
-                  ? () => _confirmDeleteObjects(context)
-                  : null,
-              icon: const Icon(Icons.delete_outline),
-              label: const Text('Delete current object'),
-            ),
-          ],
-        ),
-        const SizedBox(height: 12),
-        if (!hasSelectedObject)
-          const Padding(
-            padding: EdgeInsets.only(bottom: 12),
-            child:
-                Text('Showing all versioned objects in the selected bucket.'),
           ),
-        Row(
-          children: [
-            Expanded(
-              flex: 2,
-              child: AppSelectField<BrowserFilterMode>(
-                value: options.filterMode,
-                decoration: const InputDecoration(labelText: 'Filter mode'),
-                items: const [
-                  AppSelectItem(
-                    value: BrowserFilterMode.prefix,
-                    label: 'Prefix',
-                  ),
-                  AppSelectItem(
-                    value: BrowserFilterMode.text,
-                    label: 'Text',
-                  ),
-                  AppSelectItem(
-                    value: BrowserFilterMode.regex,
-                    label: 'Regex',
-                  ),
-                ],
-                onChanged: (value) {
-                  if (value != null) {
-                    controller.updateVersionBrowserOptions(
-                      options.copyWith(filterMode: value),
-                    );
-                  }
-                },
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              flex: 3,
-              child: TextFormField(
-                key: ValueKey(
-                  'version-filter-${options.filterMode.name}-${options.filterValue}',
-                ),
-                initialValue: options.filterValue,
-                decoration: InputDecoration(
-                  labelText: switch (options.filterMode) {
-                    BrowserFilterMode.prefix => 'Version filter (prefix)',
-                    BrowserFilterMode.text => 'Version filter (text)',
-                    BrowserFilterMode.regex => 'Version filter (regex)',
-                  },
-                  prefixIcon: const Icon(Icons.filter_alt_outlined),
-                ),
-                onFieldSubmitted: (value) {
-                  controller.updateVersionBrowserOptions(
-                    options.copyWith(filterValue: value),
-                  );
-                },
-              ),
-            ),
-          ],
+        ],
+      ),
+      AppSwitchTile(
+        value: options.showVersions,
+        onChanged: (value) {
+          controller.updateVersionBrowserOptions(
+            options.copyWith(showVersions: value),
+          );
+        },
+        title: const Text('Show versions'),
+      ),
+      AppSwitchTile(
+        value: options.showDeleteMarkers,
+        onChanged: (value) {
+          controller.updateVersionBrowserOptions(
+            options.copyWith(showDeleteMarkers: value),
+          );
+        },
+        title: const Text('Show delete markers'),
+      ),
+      ListTile(
+        contentPadding: EdgeInsets.zero,
+        title: Text('Displayed entries: ${controller.displayedVersionCount}'),
+        subtitle: Text(
+          'Delete markers: ${controller.visibleDeleteMarkerCount}',
         ),
-        AppSwitchTile(
-          value: options.showVersions,
-          onChanged: (value) {
-            controller.updateVersionBrowserOptions(
-              options.copyWith(showVersions: value),
-            );
-          },
-          title: const Text('Show versions'),
-        ),
-        AppSwitchTile(
-          value: options.showDeleteMarkers,
-          onChanged: (value) {
-            controller.updateVersionBrowserOptions(
-              options.copyWith(showDeleteMarkers: value),
-            );
-          },
-          title: const Text('Show delete markers'),
-        ),
-        ListTile(
-          contentPadding: EdgeInsets.zero,
-          title: Text('Displayed entries: ${controller.displayedVersionCount}'),
-          subtitle: Text(
-            'Delete markers: ${controller.visibleDeleteMarkerCount}',
-          ),
-        ),
-        const Divider(height: 20),
-        const Text(
-            'Select a version below to inspect, download, share, restore or delete that exact version.'),
-        ...versions.map(
-          (version) => ListTile(
-            contentPadding: EdgeInsets.zero,
-            dense: true,
-            title:
-                Text(version.key, maxLines: 1, overflow: TextOverflow.ellipsis),
-            subtitle:
-                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(
-                  '${formatBytes(version.size)} · ${formatDateTime(version.modifiedAt)} · ${version.storageClass}'),
-              CopyableValue(
-                  label: 'Version ID',
-                  value: version.versionId,
-                  controller: controller,
-                  monospace: true,
-                  shorten: true),
-            ]),
-            onTap: () => showDialog<void>(
-                context: context,
-                builder: (_) => StorageAdminDialog(
-                    controller: controller,
-                    objectKey: version.key,
-                    versionId: version.versionId,
-                    deleteMarker: version.deleteMarker)),
-            trailing: Chip(
-                label: Text(version.deleteMarker
-                    ? 'Delete marker'
-                    : version.latest
-                        ? 'Latest'
-                        : 'Prior'),
-                backgroundColor: version.latest
-                    ? Theme.of(context).colorScheme.primaryContainer
-                    : null),
-          ),
-        ),
-        if (controller.versionCursor.hasMore)
-          OutlinedButton(
+      ),
+      const Divider(height: 20),
+      const Text(
+          'Select a version below to inspect, download, share, restore or delete that exact version.'),
+    ];
+    return ListView.builder(
+      key: const ValueKey('versions'),
+      primary: false,
+      itemCount: controls.length +
+          versions.length +
+          (controller.versionCursor.hasMore ? 1 : 0),
+      itemBuilder: (context, index) {
+        if (index < controls.length) return controls[index];
+        final versionIndex = index - controls.length;
+        if (versionIndex == versions.length) {
+          return OutlinedButton(
               onPressed: controller.loadMoreVersions,
-              child: const Text('Load more versions')),
-      ],
+              child: const Text('Load more versions'));
+        }
+        final version = versions[versionIndex];
+        return ListTile(
+          contentPadding: EdgeInsets.zero,
+          dense: true,
+          title:
+              Text(version.key, maxLines: 1, overflow: TextOverflow.ellipsis),
+          subtitle:
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(
+                '${formatBytes(version.size)} · ${formatDateTime(version.modifiedAt)} · ${version.storageClass}'),
+            CopyableValue(
+                label: 'Version ID',
+                value: version.versionId,
+                controller: controller,
+                monospace: true,
+                shorten: true),
+          ]),
+          onTap: () => showDialog<void>(
+              context: context,
+              builder: (_) => StorageAdminDialog(
+                  controller: controller,
+                  objectKey: version.key,
+                  versionId: version.versionId,
+                  deleteMarker: version.deleteMarker)),
+          trailing: Chip(
+              label: Text(version.deleteMarker
+                  ? 'Delete marker'
+                  : version.latest
+                      ? 'Latest'
+                      : 'Prior'),
+              backgroundColor: version.latest
+                  ? Theme.of(context).colorScheme.primaryContainer
+                  : null),
+        );
+      },
     );
   }
 
@@ -2138,78 +2245,26 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   Future<void> _showCreateBucketDialog(BuildContext context) async {
-    final nameController = TextEditingController();
-    var enableVersioning = false;
-    var enableObjectLock = false;
-
-    await showDialog<void>(
-      context: context,
-      builder: (context) {
-        return StatefulBuilder(
-          builder: (context, setState) {
-            return AlertDialog(
-              title: const Text('New bucket'),
-              content: SizedBox(
-                width: 420,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    TextField(
-                      controller: nameController,
-                      decoration: const InputDecoration(
-                        labelText: 'Bucket name',
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    AppSwitchTile(
-                      value: enableVersioning,
-                      onChanged: (value) =>
-                          setState(() => enableVersioning = value),
-                      title: const Text('Enable versioning'),
-                    ),
-                    AppSwitchTile(
-                      value: enableObjectLock,
-                      onChanged: (value) =>
-                          setState(() => enableObjectLock = value),
-                      title: const Text('Enable object lock'),
-                    ),
-                    const Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        'Object Lock enables versioning. Existing S3 buckets can also enable it through advanced administration when supported by the endpoint.',
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(context).pop(),
-                  child: const Text('Cancel'),
-                ),
-                FilledButton(
-                  onPressed: () async {
-                    final bucketName = nameController.text.trim();
-                    if (bucketName.isEmpty) {
-                      return;
-                    }
-                    Navigator.of(context).pop();
-                    await controller.createBucket(
-                      bucketName: bucketName,
-                      enableVersioning: enableVersioning,
-                      enableObjectLock: enableObjectLock,
-                    );
-                  },
-                  child: const Text('Create'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-
-    nameController.dispose();
+    final profile = controller.selectedProfile;
+    final engine = controller.activeEngineId;
+    if (profile == null) return;
+    await showDialog<String>(
+        context: context,
+        builder: (_) => CreateBucketDialog(
+              provider: profile.endpointType,
+              onSave: (name, versioning, lock) =>
+                  controller.runFormAction(() async {
+                if (controller.selectedProfile?.id != profile.id ||
+                    controller.activeEngineId != engine) {
+                  throw StateError(
+                      'The endpoint changed. Reopen this form for the selected endpoint.');
+                }
+                await controller.createBucket(
+                    bucketName: name,
+                    enableVersioning: versioning,
+                    enableObjectLock: lock);
+              }),
+            ));
   }
 
   Future<void> _confirmDeleteBucket(
@@ -2219,27 +2274,46 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }) async {
     final profileId = controller.selectedProfile?.id;
     final engineId = controller.activeEngineId;
+    final typed = TextEditingController();
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: Text(force ? 'Force delete bucket' : 'Delete bucket'),
-        content: Text(
-          force
-              ? 'Delete every object found in "$bucketName" with the delete-all tool, then delete the bucket itself?'
-              : 'Delete "$bucketName"? If the bucket is not empty, use Force delete instead.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('Cancel'),
-          ),
-          DangerButton(
-            onPressed: () => Navigator.of(context).pop(true),
-            child: Text(force ? 'Force delete' : 'Delete'),
-          ),
-        ],
-      ),
+      builder: (context) => StatefulBuilder(
+          builder: (context, update) => AlertDialog(
+                scrollable: true,
+                title: Text(force ? 'Force delete bucket' : 'Delete bucket'),
+                content: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SelectableText(force
+                          ? 'Delete every object and version in "$bucketName", then delete the bucket itself?'
+                          : 'Delete "$bucketName"? The bucket must be empty.'),
+                      if (force) ...[
+                        const SizedBox(height: 16),
+                        TextField(
+                            controller: typed,
+                            autocorrect: false,
+                            enableSuggestions: false,
+                            decoration: const InputDecoration(
+                                labelText: 'Type the bucket name to confirm'),
+                            onChanged: (_) => update(() {})),
+                      ]
+                    ]),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.of(context).pop(false),
+                    child: const Text('Cancel'),
+                  ),
+                  DangerButton(
+                    onPressed: force && typed.text != bucketName
+                        ? null
+                        : () => Navigator.of(context).pop(true),
+                    child: Text(force ? 'Force delete' : 'Delete'),
+                  ),
+                ],
+              )),
     );
+    typed.dispose();
     if (confirmed == true &&
         controller.selectedProfile?.id == profileId &&
         controller.activeEngineId == engineId) {
@@ -2263,24 +2337,52 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     required String initialValue,
     required Future<void> Function(String value) onSave,
   }) async {
-    final value = await showDialog<String>(
+    final profile = controller.selectedProfile?.id,
+        bucket = controller.selectedBucket?.name;
+    final engine = controller.activeEngineId;
+    await showDialog<String>(
         context: context,
-        builder: (_) =>
-            JsonEditorDialog(title: title, initialValue: initialValue));
-    if (value != null) await onSave(value);
+        builder: (_) => JsonEditorDialog(
+              title: title,
+              initialValue: initialValue,
+              onSave: (value) => controller.runFormAction(() async {
+                if (controller.selectedProfile?.id != profile ||
+                    controller.selectedBucket?.name != bucket ||
+                    controller.activeEngineId != engine) {
+                  throw StateError(
+                      'The target changed. Reopen this editor for the selected bucket.');
+                }
+                await onSave(value);
+              }),
+            ));
   }
 
   Future<void> _showTagEditorDialog(BuildContext context,
       {required Map<String, String> initialTags}) async {
-    final value = await showDialog<Map<String, String>>(
+    final profile = controller.selectedProfile?.id,
+        bucket = controller.selectedBucket?.name;
+    final engine = controller.activeEngineId;
+    await showDialog<Map<String, String>>(
         context: context,
-        builder: (_) => TagEditorDialog(initialTags: initialTags));
-    if (value != null) await controller.saveBucketTags(value);
+        builder: (_) => TagEditorDialog(
+              initialTags: initialTags,
+              onSave: (value) => controller.runFormAction(() async {
+                if (controller.selectedProfile?.id != profile ||
+                    controller.selectedBucket?.name != bucket ||
+                    controller.activeEngineId != engine) {
+                  throw StateError(
+                      'The target changed. Reopen this editor for the selected bucket.');
+                }
+                await controller.saveBucketTags(value);
+              }),
+            ));
   }
 }
 
 class _CreatePrefixDialog extends StatefulWidget {
-  const _CreatePrefixDialog();
+  const _CreatePrefixDialog({required this.parentPrefix, required this.onSave});
+  final String parentPrefix;
+  final Future<void> Function(String) onSave;
 
   @override
   State<_CreatePrefixDialog> createState() => _CreatePrefixDialogState();
@@ -2295,40 +2397,34 @@ class _CreatePrefixDialogState extends State<_CreatePrefixDialog> {
     super.dispose();
   }
 
-  void _submit() {
-    final value = _nameController.text.trim();
-    if (value.isEmpty) {
-      return;
-    }
-    Navigator.of(context).pop(value);
-  }
-
   @override
   Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('Create prefix'),
-      content: SizedBox(
-        width: 420,
-        child: TextField(
-          controller: _nameController,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: 'Prefix name',
-            hintText: 'reports/2026',
-          ),
-          onSubmitted: (_) => _submit(),
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Cancel'),
-        ),
-        FilledButton(
-          onPressed: _submit,
-          child: const Text('Create'),
-        ),
-      ],
+    final name = _nameController.text;
+    final key = '${widget.parentPrefix}$name${name.endsWith('/') ? '' : '/'}';
+    final tooLong = utf8.encode(key).length > 1024;
+    return AppFormDialog<String>(
+      title: 'Create prefix',
+      width: 420,
+      submitLabel: 'Create',
+      dirty: name.isNotEmpty,
+      valid: name.isNotEmpty && !tooLong,
+      value: () => name,
+      onSave: widget.onSave,
+      child: Builder(
+          builder: (context) => TextField(
+              controller: _nameController,
+              autofocus: true,
+              autocorrect: false,
+              enableSuggestions: false,
+              textInputAction: TextInputAction.done,
+              decoration: InputDecoration(
+                  labelText: 'Prefix name',
+                  hintText: 'reports/2026',
+                  errorText: tooLong
+                      ? 'The full key exceeds 1,024 UTF-8 bytes.'
+                      : null),
+              onChanged: (_) => setState(() {}),
+              onSubmitted: (_) => submitAppForm(context))),
     );
   }
 }
@@ -2735,12 +2831,13 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
               },
             ),
             if (!hasProfile)
-              const Padding(
+              const Flexible(
+                  child: SingleChildScrollView(
+                      child: Padding(
                 padding: EdgeInsets.only(top: 8),
                 child: Text(
-                  'No endpoint profile is selected. Create one in Settings, save it, then come back here to list buckets.',
-                ),
-              ),
+                    'No endpoint profile is selected. Create one in Settings, save it, then come back here to list buckets.'),
+              ))),
             const SizedBox(height: 12),
             Expanded(
               child: bucketListViewport,

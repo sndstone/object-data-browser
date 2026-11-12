@@ -84,15 +84,15 @@ final class ServerCopy {
                 throw new IllegalStateException("Multipart copy returned no upload ID.");
             ExecutorService executor =
                     Executors.newFixedThreadPool(Math.min(Math.max(workers, 1), 8));
-            List<Future<CompletedPart>> futures = new ArrayList<>();
-            try {
+            List<CompletedPart> parts = new ArrayList<>();
+            try (MultipartUploadSession session = new MultipartUploadSession(c, b, k, upload);
+                 BoundedTasks<CompletedPart> tasks = new BoundedTasks<>(executor,
+                     Math.min(Math.max(workers, 1), 8), parts::add)) {
                 long partSize = Math.max(128L * 1024 * 1024, (size + 9999) / 10000);
                 for (long offset = 0; offset < size; offset += partSize) {
                     long start = offset, end = Math.min(offset + partSize - 1, size - 1);
                     int part = (int) (offset / partSize) + 1;
-                    futures.add(
-                            executor.submit(
-                                    () -> {
+                    tasks.submit(() -> {
                                         var out =
                                                 c.uploadPartCopy(
                                                         UploadPartCopyRequest.builder()
@@ -114,39 +114,19 @@ final class ServerCopy {
                                                 .partNumber(part)
                                                 .eTag(out.copyPartResult().eTag())
                                                 .build();
-                                    }));
+                                    });
                 }
-                List<CompletedPart> parts = new ArrayList<>();
-                for (var future : futures) parts.add(future.get());
-                var out =
-                        c.completeMultipartUpload(
-                                CompleteMultipartUploadRequest.builder()
-                                        .bucket(b)
-                                        .key(k)
-                                        .uploadId(upload)
-                                        .multipartUpload(
-                                                CompletedMultipartUpload.builder()
-                                                        .parts(parts)
-                                                        .build())
-                                        .build());
+                tasks.finish();
+                parts.sort(Comparator.comparingInt(CompletedPart::partNumber));
+                var out = session.complete(CompletedMultipartUpload.builder().parts(parts).build());
                 destinationVersion = out.versionId();
                 etag = out.eTag();
             } catch (Exception error) {
-                for (var future : futures) future.cancel(true);
                 executor.shutdownNow();
                 try {
                     executor.awaitTermination(30, TimeUnit.SECONDS);
                 } catch (InterruptedException x) {
                     Thread.currentThread().interrupt();
-                }
-                try {
-                    c.abortMultipartUpload(
-                            AbortMultipartUploadRequest.builder()
-                                    .bucket(b)
-                                    .key(k)
-                                    .uploadId(upload)
-                                    .build());
-                } catch (Exception ignored) {
                 }
                 Throwable cause = error instanceof ExecutionException ? error.getCause() : error;
                 if (cause instanceof RuntimeException runtime) throw runtime;

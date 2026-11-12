@@ -84,14 +84,43 @@ jobs:
             java) bash apps/flutter_app/android/gradlew -p engines/java installDist --no-daemon; echo 'ENGINE_CMD=engines/java/build/install/s3-browser-java-engine/bin/s3-browser-java-engine' >> "$GITHUB_ENV" ;;
           esac
       - run: python -m pytest tests/contract -q
+      - name: Go unit and race tests
+        if: matrix.engine == 'go'
+        run: go test -race ./...
+        working-directory: engines/go
+      - name: Rust unit tests
+        if: matrix.engine == 'rust'
+        run: cargo test --locked --manifest-path engines/rust/Cargo.toml
+      - name: Java regression harness
+        if: matrix.engine == 'java'
+        run: bash apps/flutter_app/android/gradlew -p engines/java test --no-daemon
+
+  ios-simulator:
+    needs: preflight
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read Flutter version
+        id: flutter-version
+        run: echo "version=$(cat .flutter-version)" >> "$GITHUB_OUTPUT"
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.flutter-version.outputs.version }}
+          cache: true
+      - run: flutter pub get
+        working-directory: apps/flutter_app
+      - run: flutter build ios --simulator --debug
+        working-directory: apps/flutter_app
 
   download-filesystems:
     needs: preflight
-    timeout-minutes: 15
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
+        engine: [python, go, rust, java]
     runs-on: ${{ matrix.os }}
     env:
       REQUIRE_ENGINE: '1'
@@ -101,4 +130,27 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install pytest -r engines/python/requirements.txt
+      - uses: actions/setup-go@v5
+        if: matrix.engine == 'go'
+        with:
+          go-version-file: engines/go/go.mod
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.engine == 'rust'
+      - uses: actions/setup-java@v4
+        if: matrix.engine == 'java'
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Select required filesystem engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
+          case '${{ matrix.engine }}' in
+            python) echo 'ENGINE_CMD=python engines/python/src/main.py' >> "$GITHUB_ENV" ;;
+            go) (cd engines/go && go build -o ../../engine-test.exe ./src); echo 'ENGINE_CMD=./engine-test.exe' >> "$GITHUB_ENV" ;;
+            rust) cargo build --locked --manifest-path engines/rust/Cargo.toml; echo "ENGINE_CMD=engines/rust/target/debug/s3-browser-rust-engine$suffix" >> "$GITHUB_ENV" ;;
+            java) bash apps/flutter_app/android/gradlew -p engines/java installDist --no-daemon; echo 'ENGINE_CMD=engines/java/build/install/s3-browser-java-engine/bin/s3-browser-java-engine' >> "$GITHUB_ENV" ;;
+          esac
       - run: python -m pytest tests/contract/test_download_safety.py -q

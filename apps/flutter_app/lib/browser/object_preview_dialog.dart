@@ -1,9 +1,12 @@
+import '../widgets/bounded_preview_image.dart';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter_widget_from_html_core/flutter_widget_from_html_core.dart';
 import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
 import '../services/source_preview.dart';
+import '../services/preview_image_loader.dart';
+import '../widgets/bounded_html_image_factory.dart';
 import '../theme/app_motion.dart';
 import '../utils/format.dart';
 import '../widgets/copyable_value.dart';
@@ -26,12 +29,14 @@ class ObjectPreviewDialog extends StatefulWidget {
 
 class _ObjectPreviewDialogState extends State<ObjectPreviewDialog> {
   bool _renderHtml = false;
+  PreviewImageLoader _htmlImages = PreviewImageLoader(maximumResources: 8);
   final _imageTransform = TransformationController();
   ObjectPreview get preview => widget.preview;
   ObjectEntry get object => widget.object;
   bool get _image => preview.kind == ObjectPreviewKind.image;
   @override
   void dispose() {
+    _htmlImages.close();
     _imageTransform.dispose();
     super.dispose();
   }
@@ -240,15 +245,12 @@ class _ObjectPreviewDialogState extends State<ObjectPreviewDialog> {
                     child: Center(
                         child: preview.url == null
                             ? const Text('Image unavailable.')
-                            : Image.network(preview.url!,
-                                fit: BoxFit.contain,
-                                loadingBuilder: (context, child, progress) =>
-                                    progress == null
-                                        ? child
-                                        : const CircularProgressIndicator(),
-                                errorBuilder: (context, error, stack) =>
-                                    const Text(
-                                        'Could not load image preview.')))))),
+                            : BoundedPreviewImage(
+                                url: preview.url!,
+                                etag: object.etag,
+                                expanded: true,
+                                maximumMegapixels: widget.controller.settings
+                                    .performance.imagePreviewMegapixels))))),
         const Divider(height: 1),
         ValueListenableBuilder<Matrix4>(
             valueListenable: _imageTransform,
@@ -288,8 +290,12 @@ class _ObjectPreviewDialogState extends State<ObjectPreviewDialog> {
                                 alignment: Alignment.centerLeft,
                                 child: TextButton.icon(
                                     key: const ValueKey('html-render-toggle'),
-                                    onPressed: () => setState(
-                                        () => _renderHtml = !_renderHtml),
+                                    onPressed: () => setState(() {
+                                          _htmlImages.close();
+                                          _htmlImages = PreviewImageLoader(
+                                              maximumResources: 8);
+                                          _renderHtml = !_renderHtml;
+                                        }),
                                     icon: Icon(
                                         _renderHtml
                                             ? Icons.code
@@ -343,6 +349,8 @@ class _ObjectPreviewDialogState extends State<ObjectPreviewDialog> {
               padding: const EdgeInsets.all(20),
               child: SelectionArea(
                   child: HtmlWidget(preview.text ?? '',
+                      factoryBuilder: () =>
+                          BoundedHtmlImageFactory(_htmlImages),
                       key: const ValueKey('rendered-html-page'),
                       textStyle: const TextStyle(color: Colors.black),
                       baseUrl: Uri.tryParse(preview.url ?? '')?.resolve('.'),

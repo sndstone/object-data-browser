@@ -57,8 +57,13 @@ class IosEngineService
   @override
   bool get isMock => false;
 
+  bool _shutdown = false;
   @override
   void shutdown() {
+    if (_shutdown) return;
+    _shutdown = true;
+    unawaited(
+        _channel.invokeMethod<void>('shutdown').catchError((Object _) {}));
     _storage.close();
     unawaited(_benchmark.close());
     _benchmarkProfiles.clear();
@@ -72,6 +77,8 @@ class IosEngineService
 
   @override
   void setTransferSink(TransferJobCallback? sink) {
+    _storage.onTransfer =
+        sink == null ? null : (value) => sink(_transferJobFromJson(value));
     if (_fallback is TransferJobSinkRegistrant) {
       (_fallback as TransferJobSinkRegistrant).setTransferSink(sink);
     }
@@ -91,7 +98,7 @@ class IosEngineService
           id: value['id'] as String? ?? 'ios',
           label: value['label'] as String? ?? 'iOS Engine',
           language: value['language'] as String? ?? 'native',
-          version: value['version'] as String? ?? '2.3.4',
+          version: value['version'] as String? ?? '2.3.5',
           available: value['available'] as bool? ?? true,
           desktopSupported: false,
           mobileSupported: true,
@@ -963,10 +970,12 @@ class IosEngineService
     try {
       final scope = ActionScope.current;
       scope?.check();
+      final portable = _storage.handles(method, params);
       var completed = false;
+      void Function()? releaseCancellation;
       if (scope != null) {
-        unawaited(scope.whenCancelled.then((_) async {
-          if (!completed) {
+        releaseCancellation = scope.onCancel(() async {
+          if (!completed && !portable) {
             if (!isCancellableListingMethod(method)) {
               scope.outcomeUnknown = true;
             }
@@ -975,9 +984,9 @@ class IosEngineService
                   'cancelRequest', {'requestId': requestId});
             } catch (_) {}
           }
-        }));
+        });
       }
-      final pending = _storage.handles(method, params)
+      final pending = portable
           ? _storage.dispatch(method, params)
           : _channel.invokeMethod<Object?>(
               'dispatch',
@@ -994,6 +1003,7 @@ class IosEngineService
         scope?.check();
       } finally {
         completed = true;
+        releaseCancellation?.call();
       }
       final payload = _stringKeyedMap(result);
       final latencyMs = DateTime.now().difference(startedAt).inMilliseconds;

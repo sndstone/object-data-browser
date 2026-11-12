@@ -4,30 +4,56 @@ import '../models/domain_models.dart';
 class ObjectSelection {
   final Set<String> _keys = {};
   String? _anchor;
-  Set<String> get keys => Set.unmodifiable(_keys);
+  int revision = 0;
+  Set<String>? _snapshot;
+  Set<String> get keys => _snapshot ??= Set.unmodifiable(_keys);
   bool get isEmpty => _keys.isEmpty;
+  void _changed() {
+    revision++;
+    _snapshot = null;
+  }
+
   void clear() {
-    _keys.clear();
+    if (_keys.isNotEmpty) {
+      _keys.clear();
+      _changed();
+    }
     _anchor = null;
   }
 
-  void retain(Iterable<String> keys) => _keys.retainAll(keys);
-  void removeAll(Iterable<String> keys) => _keys.removeAll(keys);
+  void retain(Iterable<String> keys) {
+    final before = _keys.length;
+    _keys.retainAll(keys);
+    if (_keys.length != before) _changed();
+  }
+
+  void removeAll(Iterable<String> keys) {
+    final before = _keys.length;
+    _keys.removeAll(keys);
+    if (_keys.length != before) _changed();
+  }
+
   void selectAll(Iterable<ObjectEntry> objects) {
+    final before = _keys.length;
     _keys.addAll(objects.where((o) => !o.isFolder).map((o) => o.key));
+    if (_keys.length != before) _changed();
   }
 
   void toggle(ObjectEntry object, List<ObjectEntry> visible,
       {bool range = false}) {
     if (object.isFolder) return;
-    final start = visible.indexWhere((o) => o.key == _anchor);
-    final end = visible.indexWhere((o) => o.key == object.key);
-    if (range && start >= 0 && end >= 0) {
-      selectAll(visible.sublist(
-          start < end ? start : end, (start > end ? start : end) + 1));
-    } else if (!_keys.remove(object.key)) {
-      _keys.add(object.key);
+    if (range) {
+      final start = visible.indexWhere((o) => o.key == _anchor);
+      final end = visible.indexWhere((o) => o.key == object.key);
+      if (start >= 0 && end >= 0) {
+        selectAll(visible.sublist(
+            start < end ? start : end, (start > end ? start : end) + 1));
+        _anchor = object.key;
+        return;
+      }
     }
+    if (!_keys.remove(object.key)) _keys.add(object.key);
+    _changed();
     _anchor = object.key;
   }
 

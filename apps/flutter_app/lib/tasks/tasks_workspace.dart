@@ -79,6 +79,7 @@ class TasksWorkspace extends StatelessWidget {
                             Expanded(
                                 flex: split ? 4 : 1,
                                 child: DirectionalSwitcher(
+                                    replaceContent: true,
                                     position: view.index,
                                     duration: duration,
                                     layoutBuilder: (current, previous) =>
@@ -107,6 +108,10 @@ class TasksWorkspace extends StatelessWidget {
                                   child: Card(
                                       clipBehavior: Clip.antiAlias,
                                       child: DirectionalSwitcher(
+                                          replaceContent: true,
+                                          axis: Axis.vertical,
+                                          replacementBackground:
+                                              Theme.of(context).cardTheme.color,
                                           position: selectedIndex < 0
                                               ? 0
                                               : selectedIndex,
@@ -325,6 +330,7 @@ class _TaskActions extends StatelessWidget {
 }
 
 class _TaskDetails extends StatelessWidget {
+  static final _output = Expando<String>();
   const _TaskDetails(
       {super.key,
       required this.controller,
@@ -410,7 +416,8 @@ class _TaskDetails extends StatelessWidget {
             decoration: BoxDecoration(
                 color: Theme.of(context).colorScheme.surfaceContainerHighest,
                 borderRadius: BorderRadius.circular(8)),
-            child: SelectableText(task.outputLines.join('\n'),
+            child: SelectableText(
+                _output[task.outputLines] ??= task.outputLines.join('\n'),
                 key: PageStorageKey('output-${task.id}'))),
       ],
     ];

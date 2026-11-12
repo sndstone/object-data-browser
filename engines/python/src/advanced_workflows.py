@@ -66,31 +66,112 @@ class Workflows:
             self.fail('invalid_config', 'Invalid workflow identifier.')
         return self.e._recovery_dir() / (ident + '.json')
 
-    def write(self, state):
-        state['updatedAt'] = self.e._now_iso()
-        path = self.path(state['id'])
+    def _atomic_write(self, path, value):
         tmp = path.with_suffix('.' + uuid.uuid4().hex + '.tmp')
         try:
             with tmp.open('x', encoding='utf-8') as output:
                 os.chmod(tmp, 0o600)
-                json.dump(state, output, default=self.e._serialize_dt)
+                json.dump(value, output, default=self.e._serialize_dt)
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(tmp, path)
-            if os.name != 'nt':
-                directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
+            self._sync_directory(path.parent)
         finally:
             tmp.unlink(missing_ok=True)
 
+    @staticmethod
+    def _sync_directory(path):
+        if os.name != 'nt':
+            fd = os.open(path, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+    def write(self, state):
+        state['updatedAt'] = self.e._now_iso()
+        path = self.path(state['id'])
+        if state.get('kind') != 'historyCopy':
+            self._atomic_write(path, state)
+            return
+        # The reviewed source manifest is immutable. Keep pre/post-mutation
+        # durability, but append only changed metadata and new mappings.
+        journal = state.get('_historyJournal')
+        if journal is None:
+            generation = uuid.uuid4().hex
+            manifest = path.with_name(path.stem + '.' + generation + '.manifest')
+            events = path.with_name(path.stem + '.' + generation + '.events')
+            self._atomic_write(manifest, state)
+            with events.open('xb') as output:
+                os.chmod(events, 0o600)
+                output.flush()
+                os.fsync(output.fileno())
+            self._atomic_write(path, {'storageFormat': 2, 'id': state['id'],
+                                     'manifest': manifest.name, 'events': events.name})
+            journal = state['_historyJournal'] = {'events': events.name, 'sequence': 0,
+                                                  'mappingCount': len(state['mappings'])}
+            return
+        start = journal['mappingCount']
+        if len(state['mappings']) < start:
+            self.fail('conflict', 'History mapping journal cannot move backwards.')
+        record = {'sequence': journal['sequence'] + 1, 'mappingStart': start,
+                  'mappings': state['mappings'][start:],
+                  'state': {k: v for k, v in state.items() if k not in {'entries', 'mappings', '_historyJournal'}}}
+        data = json.dumps(record, default=self.e._serialize_dt, separators=(',', ':'))
+        envelope = json.dumps({'sha256': hashlib.sha256(data.encode()).hexdigest(), 'record': data}, separators=(',', ':')).encode() + b'\n'
+        with path.with_name(journal['events']).open('ab') as output:
+            output.write(envelope)
+            output.flush()
+            os.fsync(output.fileno())
+        journal.update(sequence=record['sequence'], mappingCount=len(state['mappings']))
+
     def read(self, ident):
+        path = self.path(ident)
         try:
-            return json.loads(self.path(ident).read_text())
+            pointer = json.loads(path.read_text())
         except FileNotFoundError:
             self.fail('invalid_config', 'Workflow checkpoint was not found.')
+        if pointer.get('storageFormat') != 2:
+            return pointer  # Migrate existing complete checkpoints on next write.
+        expected_prefix = path.stem + '.'
+        for field, suffix in [('manifest', '.manifest'), ('events', '.events')]:
+            name = pointer.get(field, '')
+            if Path(name).name != name or not name.startswith(expected_prefix) or not name.endswith(suffix):
+                self.fail('conflict', 'Invalid history journal identity.')
+        state = json.loads(path.with_name(pointer['manifest']).read_text())
+        if state.get('id') != ident or state.get('kind') != 'historyCopy':
+            self.fail('conflict', 'Invalid history manifest identity.')
+        sequence = 0
+        events = path.with_name(pointer['events'])
+        valid_offset = 0
+        with events.open('r+b') as stream:
+            for line in stream:
+                # A crash can leave an uncommitted tail. The previous durable
+                # inFlight record remains authoritative for an uncertain write.
+                if not line.endswith(b'\n'):
+                    stream.truncate(valid_offset)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    break
+                try:
+                    envelope = json.loads(line)
+                    data = envelope['record']
+                    if hashlib.sha256(data.encode()).hexdigest() != envelope['sha256']:
+                        raise ValueError('checksum mismatch')
+                    record = json.loads(data)
+                    if record['sequence'] != sequence + 1 or record['mappingStart'] != len(state['mappings']):
+                        raise ValueError('journal sequence mismatch')
+                    if any(key in record['state'] for key in ('entries', 'mappings', '_historyJournal')):
+                        raise ValueError('immutable manifest overwritten')
+                    state = {**record['state'], 'entries': state['entries'], 'mappings': state['mappings']}
+                    state['mappings'].extend(record['mappings'])
+                    sequence += 1
+                except (KeyError, TypeError, ValueError):
+                    self.fail('conflict', 'History journal is damaged; inspect remote state before recovery.')
+                valid_offset = stream.tell()
+        state['_historyJournal'] = {'events': pointer['events'], 'sequence': sequence,
+                                     'mappingCount': len(state['mappings'])}
+        return state
 
     @contextmanager
     def lock(self, ident):
@@ -159,12 +240,17 @@ class Workflows:
                     return
                 try:
                     root = ET.fromstring(http_response.content)
+                    encoded = any(n.tag.rsplit('}', 1)[-1] == 'EncodingType' and n.text == 'url' for n in root)
                     for child in root:
                         kind = child.tag.rsplit('}', 1)[-1]
                         if kind not in {'Version', 'DeleteMarker'}:
                             continue
                         fields = {n.tag.rsplit('}', 1)[-1]: n.text for n in child}
-                        raw_order.append((fields.get('Key'), fields.get('VersionId')))
+                        key = fields.get('Key')
+                        if encoded and key is not None:
+                            from urllib.parse import unquote
+                            key = unquote(key)
+                        raw_order.append((key, fields.get('VersionId')))
                 except (ET.ParseError, AttributeError, TypeError):
                     return
             events = getattr(getattr(client, 'meta', None), 'events', None)
@@ -209,8 +295,13 @@ class Workflows:
                 self.fail('invalid_response', 'Version listing did not advance its cursor.')
             cursor = next_cursor
 
-    def history_public(self, state):
-        return {k: v for k, v in state.items() if k not in {'entries'}}
+    def history_public(self, state, params=None):
+        result = {k: v for k, v in state.items() if k not in {'entries', '_historyJournal'}}
+        if params and params.get('action') == 'resumeHistoryCopy' and params.get('incrementalHistoryMappings'):
+            start = params.get('_mappingStart', 0)
+            result.update(mappings=state['mappings'][start:], mappingStart=start,
+                          mappingCount=len(state['mappings']))
+        return result
 
     def history(self, p):
         src, dst, a, b = self.clients(p)
@@ -246,18 +337,19 @@ class Workflows:
                                   'Object ACLs, retention, legal holds and bucket configuration are not copied by history replay.',
                                   'Use an idle destination prefix; cross-endpoint replay cannot atomically exclude outside writers.']}
             self.write(state)
-            return self.history_public(state)
+            return self.history_public(state, p)
         ident = p.get('recoveryId')
         with self.lock(ident):
             state = self.read(ident)
+            p = {**p, '_mappingStart': len(state['mappings'])}
             self.verify_refs(state, p)
             if action == 'inspectHistoryCopy' or state['status'] == 'completed':
-                return self.history_public(state)
+                return self.history_public(state, p)
             if state.get('inFlight'):
                 if action != 'resolveHistoryCopy':
                     state['status'] = 'outcomeUnknown'
                     self.write(state)
-                    return self.history_public(state)
+                    return self.history_public(state, p)
                 # Explicit operator-supplied destination version must exist and
                 # match the expected kind/content size; never infer a delete.
                 supplied = p.get('destinationVersionId')
@@ -275,7 +367,7 @@ class Workflows:
                     if (head.get('Metadata') or {}).get('object-browser-history-operation') != entry['operationId']:
                         self.fail('conflict', 'Destination version lacks this operation identity; cannot resolve it safely.')
                 self.history_finish(state, entry, str(supplied))
-                return self.history_public(state)
+                return self.history_public(state, p)
             if action == 'resolveHistoryCopy':
                 self.fail('invalid_config', 'No uncertain history operation requires resolution.')
             if dst.get_bucket_versioning(Bucket=b).get('Status') != 'Enabled':
@@ -324,7 +416,7 @@ class Workflows:
                     raise
             state['status'] = 'completed' if state['completedCount'] == len(state['entries']) else 'running'
             self.write(state)
-            return self.history_public(state)
+            return self.history_public(state, p)
 
     def history_finish(self, state, entry, version):
         state['mappings'].append({'key': entry['key'], 'sourceVersionId': entry['sourceVersionId'],

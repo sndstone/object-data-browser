@@ -364,6 +364,15 @@ func TestBenchmarkRunsWithoutStatusPolls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Status acknowledges immediately from an immutable snapshot while a batch
+	// or its checkpoint settles. Storage work already reached 120 without polls.
+	for status["status"] != "completed" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		status, err = getBenchmarkStatus(map[string]interface{}{"runId": id})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	if requests.Load() < 120 || asInt(status["processedCount"]) != 120 {
 		t.Fatalf("poll-dependent execution: %v requests=%d", status, requests.Load())
 	}

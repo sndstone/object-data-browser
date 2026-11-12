@@ -1,5 +1,8 @@
 # macOS Packaging
 
+The current application requires macOS 13 or later, matching its bundled
+Objective-C interop framework.
+
 `./scripts/build.sh macos` now produces:
 
 - A release `.app` bundle from `flutter build macos`

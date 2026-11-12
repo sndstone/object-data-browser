@@ -185,6 +185,34 @@ class _FileScanState extends State<FileScanIndicator>
 }
 
 class _DocumentPainter extends CustomPainter {
+  static final _page = Path()
+    ..moveTo(6, 2)
+    ..lineTo(18, 2)
+    ..lineTo(25, 9)
+    ..lineTo(25, 28)
+    ..quadraticBezierTo(25, 30, 23, 30)
+    ..lineTo(6, 30)
+    ..quadraticBezierTo(4, 30, 4, 28)
+    ..lineTo(4, 4)
+    ..quadraticBezierTo(4, 2, 6, 2)
+    ..close();
+  static final _fold = Path()
+    ..moveTo(18, 2)
+    ..lineTo(18, 9)
+    ..lineTo(25, 9);
+  static final _dottedOutline = _dotted();
+  static Path _dotted() {
+    final path = Path();
+    for (final outline in [_page, _fold]) {
+      for (final metric in outline.computeMetrics()) {
+        for (double offset = 0; offset < metric.length; offset += 4) {
+          path.addPath(metric.extractPath(offset, offset + 1.5), Offset.zero);
+        }
+      }
+    }
+    return path;
+  }
+
   _DocumentPainter({
     required this.spec,
     required this.progress,
@@ -208,21 +236,8 @@ class _DocumentPainter extends CustomPainter {
       ..strokeWidth = 1.5
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round;
-    final page = Path()
-      ..moveTo(6, 2)
-      ..lineTo(18, 2)
-      ..lineTo(25, 9)
-      ..lineTo(25, 28)
-      ..quadraticBezierTo(25, 30, 23, 30)
-      ..lineTo(6, 30)
-      ..quadraticBezierTo(4, 30, 4, 28)
-      ..lineTo(4, 4)
-      ..quadraticBezierTo(4, 2, 6, 2)
-      ..close();
-    final fold = Path()
-      ..moveTo(18, 2)
-      ..lineTo(18, 9)
-      ..lineTo(25, 9);
+    final page = _page;
+    final fold = _fold;
     final phase = spec.phase;
     final gauge = phase == TransferStatusPhase.transferring ||
         phase == TransferStatusPhase.paused;
@@ -253,13 +268,7 @@ class _DocumentPainter extends CustomPainter {
     if ((preparing || blending) && !upload) {
       // A destination takes shape from the top down. Dotted edges keep the
       // entire page legible at full contrast before the solid edge arrives.
-      for (final outline in [page, fold]) {
-        for (final metric in outline.computeMetrics()) {
-          for (double offset = 0; offset < metric.length; offset += 4) {
-            canvas.drawPath(metric.extractPath(offset, offset + 1.5), pen);
-          }
-        }
-      }
+      canvas.drawPath(_dottedOutline, pen);
       canvas.save();
       final revealedY = preparing ? startY : startY + (30 - startY) * handoff;
       canvas.clipRect(Rect.fromLTRB(0, 0, 30, revealedY));

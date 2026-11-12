@@ -92,13 +92,14 @@ stage_python_engine() {
     exit 1
   fi
 
+  local installer_python="$python_exe"
   local python_dest="$STAGE_ROOT/python"
   local site_packages_dir="$python_dest/site-packages"
   remove_directory_if_exists "$python_dest"
   mkdir -p "$python_dest/engine" "$site_packages_dir"
 
   if [[ -d "$TOOLS_DIR/python" ]]; then
-    copy_directory_content "$TOOLS_DIR/python" "$python_dest"
+    "$python_exe" "$ROOT_DIR/scripts/runtime-payload.py" python "$TOOLS_DIR/python" "$python_dest"
     site_packages_dir="$python_dest/site-packages"
     mkdir -p "$site_packages_dir"
     python_exe="$python_dest/bin/python3"
@@ -106,14 +107,14 @@ stage_python_engine() {
 
   cp "$ENGINE_SOURCE_DIR/python/src/"*.py "$python_dest/engine/"
 
-  "$python_exe" -m pip install \
+  "$installer_python" -m pip install \
     --disable-pip-version-check \
     --no-compile \
-    --upgrade \
     --target "$site_packages_dir" \
+    --constraint "$ENGINE_SOURCE_DIR/python/constraints.txt" \
     --requirement "$ENGINE_SOURCE_DIR/python/requirements.txt"
 
-  PYTHONPATH="$site_packages_dir" "$python_exe" -c \
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$site_packages_dir" "$python_exe" -c \
     'import boto3, urllib3; from azure.identity import DefaultAzureCredential'
 
   cat >"$python_dest/run-python-engine.sh" <<'EOF'
@@ -132,6 +133,8 @@ else
   exit 127
 fi
 export PYTHONDONTWRITEBYTECODE=1
+export PYTHONNOUSERSITE=1
+export SSL_CERT_FILE="${SSL_CERT_FILE:-$SCRIPT_DIR/site-packages/certifi/cacert.pem}"
 export PYTHONPATH="$SCRIPT_DIR/site-packages${PYTHONPATH:+:$PYTHONPATH}"
 exec "$PYTHON_CMD" "$SCRIPT_DIR/engine/main.py" "$@"
 EOF
@@ -237,7 +240,7 @@ stage_java_engine() {
     exit 1
   fi
 
-  copy_directory_content "$runtime_source" "$java_dest/runtime"
+  "$TOOLS_DIR/python/bin/python3" "$ROOT_DIR/scripts/runtime-payload.py" java "$runtime_source" "$java_dest/runtime"
 
   (
     cd "$ROOT_DIR/apps/flutter_app/android"
@@ -353,5 +356,6 @@ stage_go_engine
 stage_rust_engine
 stage_java_engine
 write_manifest
+"$TOOLS_DIR/python/bin/python3" "$ROOT_DIR/scripts/verify-staged-engines.py" "$STAGE_ROOT"
 
 echo "Staged desktop engine sidecars into $STAGE_ROOT"

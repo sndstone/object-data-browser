@@ -39,6 +39,7 @@ class MobileBenchmarkService {
   final StorageHttpClient Function(EndpointProfile) _clientFactory;
   Directory? _directory;
   final Map<String, _Run> _runs = {};
+  final LinkedHashMap<String, _Run> _restored = LinkedHashMap();
   bool _closed = false;
   int _starting = 0;
 
@@ -120,6 +121,7 @@ class MobileBenchmarkService {
         await run.worker;
         await File('${(await _root()).path}/$id.json').delete();
         _runs.remove(id);
+        _restored.remove(id);
         return {'discarded': true, 'remoteObjectsDeleted': false};
       case 'exportBenchmarkResults':
         await _save(run);
@@ -186,7 +188,7 @@ class MobileBenchmarkService {
     if (!RegExp(r'^bench-mobile-[A-Za-z0-9-]+$').hasMatch(id)) {
       _invalid('A valid benchmark run ID is required.');
     }
-    final existing = _runs[id];
+    final existing = _runs[id] ?? _restored[id];
     if (existing != null) {
       if (existing.owner != _owner(profile)) {
         _invalid('Use the endpoint that owns this benchmark.');
@@ -206,7 +208,14 @@ class MobileBenchmarkService {
       run.log(
           'Resume with the owning endpoint credentials after restarting the app.');
     }
+    _cacheRestored(run);
     return run;
+  }
+
+  void _cacheRestored(_Run run) {
+    _restored.remove(run.id);
+    if (_restored.length >= 2) _restored.remove(_restored.keys.first);
+    _restored[run.id] = run;
   }
 
   void _start(_Run run, EndpointProfile profile) {
@@ -214,6 +223,7 @@ class MobileBenchmarkService {
     if (!_runs.containsKey(run.id) && _runs.length >= 4) {
       _invalid('Maximum four live benchmark runs.');
     }
+    _restored.remove(run.id);
     _runs[run.id] = run;
     run.status = 'running';
     // Construct in a fresh zone: cancelling the Start button's action must not
@@ -236,7 +246,8 @@ class MobileBenchmarkService {
     try {
       client = _clientFactory(profile);
       final output = File(run.config['csvOutputPath'] as String);
-      final header = !await output.exists();
+      await _reconcileCsv(output, run);
+      final header = !await output.exists() || await output.length() == 0;
       csv = output.openWrite(mode: FileMode.append);
       if (header) {
         csv.writeln(
@@ -247,6 +258,7 @@ class MobileBenchmarkService {
           run.status = 'completed';
           break;
         }
+        run.csvPending = Completer<void>();
         final tasks = _plan(run);
         if (tasks.isEmpty) {
           run.status = 'completed';
@@ -261,11 +273,14 @@ class MobileBenchmarkService {
           _record(run, record);
           final key = '"${(record['key'] as String).replaceAll('"', '""')}"';
           csv.writeln(
-              '${record['second']},${record['operation']},${record['operationCount']},${record['latencyMs']},${record['sizeBytes']},${record['bytesTransferred']},true,${record['checksumState']},$key,${record['elapsedMs']}');
+              '${record['second']},${record['operation']},${record['operationCount']},${record['latencyMs']},${record['sizeBytes']},${record['bytesTransferred']},${record['success']},${record['checksumState']},$key,${record['elapsedMs']}');
         }
         run.requests = run.baseRequests + client.requestCount;
         run.retries = run.baseRetries + client.retryCount;
         await csv.flush();
+        run.csvCommittedBytes = await output.length();
+        run.csvPending?.complete();
+        run.csvPending = null;
         if (run.elapsed - lastPersist >= 1) {
           if (run.config['debugMode'] == true) {
             run.log(
@@ -300,6 +315,19 @@ class MobileBenchmarkService {
         run.status = 'failed';
         run.log('Benchmark CSV output could not be saved.');
       }
+      try {
+        if (csv != null) {
+          run.csvCommittedBytes =
+              await File(run.config['csvOutputPath'] as String).length();
+        }
+      } on FileSystemException {
+        run.errors++;
+        run.status = 'failed';
+        run.log('Benchmark CSV output is unavailable.');
+      } finally {
+        run.csvPending?.complete();
+        run.csvPending = null;
+      }
       run.baseRequests = run.requests;
       run.baseRetries = run.retries;
       run.cache.clear();
@@ -319,8 +347,12 @@ class MobileBenchmarkService {
             'Checkpoint persistence failed; these results are available for this session only.');
       } finally {
         run.worker = null;
+        run.scope?.dispose();
         run.scope = null;
-        if (saved) _runs.remove(run.id);
+        if (saved) {
+          _runs.remove(run.id);
+          _cacheRestored(run);
+        }
       }
     }
   }
@@ -329,6 +361,49 @@ class MobileBenchmarkService {
       ? run.processed >= _int(run.config, 'operationCount', 1000)
       : run.elapsed >= _int(run.config, 'durationSeconds', 60);
 
+  Future<void> _reconcileCsv(File file, _Run run) async {
+    final exists = await file.exists();
+    final length = exists ? await file.length() : 0;
+    var committed = run.csvCommittedBytes;
+    if (committed == null) {
+      // Legacy checkpoints have a record count but no byte boundary. Scan CSV
+      // quoting correctly, including embedded newlines in object keys.
+      if (run.recordCount == 0) {
+        committed = 0;
+      } else {
+        if (!exists) _invalid('Committed benchmark CSV is missing.');
+        var quoted = false, rows = 0, offset = 0;
+        await for (final chunk in file.openRead()) {
+          for (final byte in chunk) {
+            offset++;
+            if (byte == 34) quoted = !quoted;
+            if (byte == 10 && !quoted && ++rows == run.recordCount + 1) {
+              committed = offset;
+              break;
+            }
+          }
+          if (committed != null) break;
+        }
+        if (committed == null) {
+          _invalid('Benchmark CSV is shorter than its committed checkpoint.');
+        }
+      }
+    }
+    if (committed < 0 || length < committed) {
+      _invalid('Benchmark CSV is shorter than its committed checkpoint.');
+    }
+    if (exists && length > committed) {
+      final handle = await file.open(mode: FileMode.append);
+      try {
+        await handle.truncate(committed);
+        await handle.flush();
+      } finally {
+        await handle.close();
+      }
+    }
+    run.csvCommittedBytes = committed;
+  }
+
   List<_Task> _plan(_Run run) {
     final countMode = run.config['testMode'] == 'operation-count';
     var remaining = countMode
@@ -336,15 +411,13 @@ class MobileBenchmarkService {
         : 1 << 30;
     final workers = min(_int(run.config, 'concurrentThreads', 1),
         _int(run.config, 'maxPoolConnections', 10));
-    final reserved = <String>{};
+    final available = _CandidateKeys(run.objects.keys.toList(growable: false));
     final tasks = <_Task>[];
     final sizes = (run.config['objectSizes'] as List).cast<int>();
     var plannedObjects = run.objects.length;
     for (var i = 0; i < workers && remaining > 0; i++) {
       var operation = _operation(run.config,
           run.processed + tasks.fold<int>(0, (n, t) => n + t.keys.length));
-      final available =
-          run.objects.keys.where((k) => !reserved.contains(k)).toList();
       if (available.isEmpty && operation != 'PUT') {
         if (plannedObjects >= _int(run.config, 'objectCount', 100)) break;
         operation = 'PUT';
@@ -359,7 +432,7 @@ class MobileBenchmarkService {
           if (available.isEmpty) break;
           key = available[run.nextActive++ % available.length];
         }
-        reserved.add(key);
+        available.remove(key);
         tasks.add(_Task('PUT', [key], size));
         remaining--;
       } else {
@@ -372,7 +445,9 @@ class MobileBenchmarkService {
           selected.add(available[(run.nextActive + j) % available.length]);
         }
         run.nextActive += batch;
-        reserved.addAll(selected);
+        for (final key in selected) {
+          available.remove(key);
+        }
         tasks.add(_Task(operation, selected,
             _int(run.objects[selected.first]!, 'sizeBytes', size)));
         remaining -= batch;
@@ -510,7 +585,7 @@ class MobileBenchmarkService {
         'sizeBytes': task.operation == 'DELETE' ? 0 : task.size,
         'latencyMs': timer.elapsedMicroseconds / 1000,
         'bytesTransferred': bytes,
-        'success': true,
+        'success': checksumState != 'validated_failure',
         'checksumState': checksumState,
         'checksum': actualChecksum,
         'checksumAlgorithm': run.config['checksumAlgorithm'],
@@ -639,6 +714,25 @@ class MobileBenchmarkService {
   }
 
   Map<String, Object?> _summary(_Run run) {
+    final key = (
+      run.recordCount,
+      run.elapsed.ceil(),
+      run.errors,
+      run.retries,
+      run.requests,
+      run.cacheBytes
+    );
+    final previous = run.summary;
+    if (previous != null && key == run.summaryKey) {
+      return {
+        ...previous,
+        'detailMetrics': {
+          ...previous['detailMetrics'] as Map<String, Object?>,
+          'averageOpsPerSecond': run.processed / max(run.elapsed, .000001),
+          'averageBytesPerSecond': run.totalBytes / max(run.elapsed, .000001),
+        }
+      };
+    }
     final records = run.history.toList(growable: false),
         latencies = records
             .map((r) => (r['latencyMs'] as num).toDouble())
@@ -659,6 +753,13 @@ class MobileBenchmarkService {
       (bySecond[record['second'] as int] ??= []).add(latency);
       (byOperation[record['operation'] as String] ??= []).add(latency);
     }
+    for (final group in [
+      ...bySize.values,
+      ...bySecond.values,
+      ...byOperation.values
+    ]) {
+      group.sort();
+    }
     final end = max(max(1, run.elapsed.ceil()), run.windows.lastKey() ?? 0);
 
     final series = <Map<String, Object?>>[];
@@ -673,10 +774,10 @@ class MobileBenchmarkService {
             w == null ? 0 : (w['latency'] as num) / (w['records'] as int),
         'operations':
             Map<String, int>.from(w?['operations'] as Map? ?? const {}),
-        'p95LatencyMs': _percentile(bySecond[second] ?? [], 95)
+        'p95LatencyMs': _sortedPercentile(bySecond[second] ?? [], 95)
       });
     }
-    return {
+    final result = <String, Object?>{
       'totalOperations': run.processed,
       'operationsByType': Map<String, int>.of(run.operations),
       'latencyPercentilesMs': {
@@ -700,17 +801,17 @@ class MobileBenchmarkService {
               'sizeBytes': e.key,
               'count': e.value.length,
               'avgLatencyMs': e.value.reduce((a, b) => a + b) / e.value.length,
-              'p50LatencyMs': _percentile(e.value, 50),
-              'p95LatencyMs': _percentile(e.value, 95),
-              'p99LatencyMs': _percentile(e.value, 99)
+              'p50LatencyMs': _sortedPercentile(e.value, 50),
+              'p95LatencyMs': _sortedPercentile(e.value, 95),
+              'p99LatencyMs': _sortedPercentile(e.value, 99)
             }
       ],
       'latencyPercentilesByOperationMs': {
         for (final e in byOperation.entries)
           e.key: {
-            'p50': _percentile(e.value, 50),
-            'p95': _percentile(e.value, 95),
-            'p99': _percentile(e.value, 99)
+            'p50': _sortedPercentile(e.value, 50),
+            'p95': _sortedPercentile(e.value, 95),
+            'p99': _sortedPercentile(e.value, 99)
           }
       },
       'checksumStats': Map<String, int>.of(run.checksums),
@@ -739,6 +840,9 @@ class MobileBenchmarkService {
         'cacheBytes': run.cacheBytes
       }
     };
+    run.summaryKey = key;
+    run.summary = result;
+    return result;
   }
 
   Map<String, Object?> _snapshot(_Run run) => {
@@ -757,6 +861,7 @@ class MobileBenchmarkService {
       };
 
   Future<void> _save(_Run run) async {
+    await run.csvPending?.future;
     // Serialize the snapshot before awaiting, so concurrent status/control calls
     // cannot alter an in-progress JSON encoding or write endpoint credentials.
     final snapshot = _snapshot(run);
@@ -766,6 +871,7 @@ class MobileBenchmarkService {
       'activeObjects': run.objects,
       'history': run.history.toList(),
       'totalRecordCount': run.recordCount,
+      'csvCommittedBytes': run.csvCommittedBytes,
       'totalBytes': run.totalBytes,
       'totalLatency': run.totalLatency,
       'operations': run.operations,
@@ -790,6 +896,22 @@ class MobileBenchmarkService {
         // A fresh checkpoint write may recover from an earlier transient disk error.
       }
       final root = await _root();
+      final committedBytes = state['csvCommittedBytes'] as int?;
+      if (committedBytes != null && committedBytes > 0) {
+        // Flush the immutable CSV prefix before publishing the checkpoint that
+        // commits it. Subsequent batches may append, but cannot alter that prefix.
+        final handle = await File(run.config['csvOutputPath'] as String)
+            .open(mode: FileMode.append);
+        try {
+          if (await handle.length() < committedBytes) {
+            throw const FileSystemException(
+                'Committed benchmark CSV is missing or truncated.');
+          }
+          await handle.flush();
+        } finally {
+          await handle.close();
+        }
+      }
       final target = File('${root.path}/${run.id}.json'),
           temporary = File('${root.path}/${run.id}.json.next');
       await temporary.writeAsString(json, flush: true);
@@ -803,6 +925,7 @@ class MobileBenchmarkService {
 
   Future<void> close() async {
     _closed = true;
+    _restored.clear();
     final runs = _runs.values.toList();
     for (final run in runs) {
       if (run.status == 'running') run.status = 'paused';
@@ -811,11 +934,12 @@ class MobileBenchmarkService {
       await run.worker;
     }
     _runs.clear();
+    _restored.clear();
   }
 
-  static double _percentile(List<double> input, double p) {
+  static double _sortedPercentile(List<double> input, double p) {
     if (input.isEmpty) return 0;
-    final values = List<double>.of(input)..sort();
+    final values = input;
     final rank = (values.length - 1) * p / 100;
     return values[rank.floor()] +
         (values[rank.ceil()] - values[rank.floor()]) * (rank - rank.floor());
@@ -990,6 +1114,10 @@ class _Run {
   final SplayTreeMap<int, Map<String, Object?>> windows = SplayTreeMap();
   final ListQueue<String> logs = ListQueue.of(['Benchmark scheduled.']);
   final LinkedHashMap<String, _Payload> cache = LinkedHashMap();
+  Object? summaryKey;
+  Map<String, Object?>? summary;
+  int? csvCommittedBytes = 0;
+  Completer<void>? csvPending;
   Future<void>? worker;
   Future<void> persistence = Future.value();
   ActionScope? scope;
@@ -1009,6 +1137,7 @@ class _Run {
     int n(String k) => (s[k] as num?)?.toInt() ?? 0;
     r.processed = n('processedCount');
     r.recordCount = n('totalRecordCount');
+    r.csvCommittedBytes = (s['csvCommittedBytes'] as num?)?.toInt();
     r.totalBytes = n('totalBytes');
     r.errors = n('errors');
     r.retries = n('retries');
@@ -1140,5 +1269,48 @@ class _CrcSink extends ByteConversionSinkBase {
       crc & 255
     ]));
     output.close();
+  }
+}
+
+/// Order-statistic removal preserves the existing rotation over unreserved keys
+/// without copying/scanning all active keys once per worker.
+class _CandidateKeys {
+  _CandidateKeys(this.keys) : tree = List.filled(keys.length + 1, 0) {
+    for (var i = 1; i < tree.length; i++) {
+      tree[i] = i & -i;
+    }
+    for (var i = 0; i < keys.length; i++) {
+      indices[keys[i]] = i;
+    }
+    length = keys.length;
+  }
+  final List<String> keys;
+  final List<int> tree;
+  final Map<String, int> indices = {};
+  late int length;
+  bool get isEmpty => length == 0;
+  String operator [](int rank) {
+    if (rank < 0 || rank >= length) throw RangeError.index(rank, keys);
+    var index = 0, bit = 1;
+    while ((bit << 1) < tree.length) {
+      bit <<= 1;
+    }
+    for (; bit != 0; bit >>= 1) {
+      final next = index + bit;
+      if (next < tree.length && tree[next] <= rank) {
+        index = next;
+        rank -= tree[next];
+      }
+    }
+    return keys[index];
+  }
+
+  void remove(String key) {
+    final index = indices.remove(key);
+    if (index == null) return;
+    length--;
+    for (var i = index + 1; i < tree.length; i += i & -i) {
+      tree[i]--;
+    }
   }
 }

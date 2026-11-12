@@ -593,3 +593,139 @@ def test_benchmark_read_only_seeds_then_reads_without_deletes(pyengine):
     assert store.gets == 119
     assert pyengine._benchmark_operations_from_history(state['history']) == {'PUT': 1, 'GET': 119}
     assert all(row['checksumState'] == 'validated_success' for row in state['history'] if row['operation'] == 'GET')
+
+
+def test_same_account_aws_skip_copy_uses_conditional_multipart_server_copy(pyengine, monkeypatch, profile):
+    client = Mock()
+    client.head_object.side_effect = [
+        {'ContentLength': 7, 'ETag': '"source"', 'Metadata': {}},
+        error('404'), {'ContentLength': 7}]
+    client.get_object_tagging.return_value = {'TagSet': []}
+    client.create_multipart_upload.return_value = {'UploadId': 'copy-upload'}
+    client.upload_part_copy.return_value = {'CopyPartResult': {'ETag': '"part"'}}
+    client.complete_multipart_upload.return_value = {'VersionId': 'copied-version'}
+    monkeypatch.setattr(pyengine, '_build_client', lambda _: client)
+    result = pyengine._storage_copy({'profile': {**profile, 'endpointType': 'awsS3'},
+        'sourceBucketName': 'source', 'sourceKey': 'key', 'destinationBucketName': 'destination',
+        'destinationKey': 'key', 'conflictPolicy': 'skip'})
+    assert result['strategy'] == 'server-side-copy'
+    assert client.upload_part_copy.call_args.kwargs['CopySourceIfMatch'] == '"source"'
+    assert client.complete_multipart_upload.call_args.kwargs['IfNoneMatch'] == '*'
+    client.get_object.assert_not_called()
+    client.copy_object.assert_not_called()
+    client.abort_multipart_upload.assert_not_called()
+
+
+def test_same_account_aws_copy_keeps_racing_destination(pyengine, monkeypatch, profile):
+    client = Mock()
+    client.head_object.side_effect = [{'ContentLength': 7, 'ETag': '"source"', 'Metadata': {}}, error('404')]
+    client.get_object_tagging.return_value = {'TagSet': []}
+    client.create_multipart_upload.return_value = {'UploadId': 'copy-upload'}
+    client.upload_part_copy.return_value = {'CopyPartResult': {'ETag': '"part"'}}
+    client.complete_multipart_upload.side_effect = error('PreconditionFailed')
+    monkeypatch.setattr(pyengine, '_build_client', lambda _: client)
+    with pytest.raises(ClientError):
+        pyengine._storage_copy({'profile': {**profile, 'endpointType': 'awsS3'},
+            'sourceBucketName': 'source', 'sourceKey': 'key', 'destinationBucketName': 'destination',
+            'destinationKey': 'key', 'conflictPolicy': 'skip'})
+    assert client.complete_multipart_upload.call_args.kwargs['IfNoneMatch'] == '*'
+    client.abort_multipart_upload.assert_called_once()
+    client.get_object.assert_not_called()
+    client.put_object.assert_not_called()
+
+
+@pytest.mark.parametrize('selected', [None, 'null', 'v1'])
+def test_move_preserves_exact_key_and_ordinary_version_history(pyengine, monkeypatch, profile, selected):
+    client = Mock()
+    client.head_object.side_effect = [{'ContentLength': 3, 'ETag': '"copied"', 'VersionId': 'v2'}, {'ContentLength': 3}]
+    client.get_object_tagging.return_value = {'TagSet': []}
+    client.copy_object.return_value = {'CopyObjectResult': {'ETag': '"dest"'}}
+    monkeypatch.setattr(pyengine, '_build_client', lambda _: client)
+    result = pyengine._move_object({'profile': {**profile, 'endpointType': 'awsS3'},
+        'sourceBucketName': 'bucket', 'destinationBucketName': 'bucket',
+        'sourceKey': ' report ', 'destinationKey': 'renamed',
+        **({'sourceVersionId': selected} if selected is not None else {})})
+    assert result['successCount'] == 1
+    assert client.copy_object.call_args.kwargs['CopySource']['VersionId'] == (selected or 'v2')
+    assert client.delete_object.call_args.kwargs == {'Bucket': 'bucket', 'Key': ' report ', 'IfMatch': '"copied"',
+        **({'VersionId': selected} if selected is not None else {})}
+
+
+def test_move_reports_copy_when_source_delete_is_unconfirmed(pyengine, monkeypatch, profile):
+    client = Mock()
+    client.head_object.side_effect = [{'ContentLength': 3, 'ETag': 'old'}, {'ContentLength': 3}]
+    client.get_object_tagging.return_value = {'TagSet': []}
+    client.copy_object.return_value = {'CopyObjectResult': {'ETag': 'dest'}}
+    client.delete_object.side_effect = error('PreconditionFailed')
+    monkeypatch.setattr(pyengine, '_build_client', lambda _: client)
+    result = pyengine._move_object({'profile': {**profile, 'endpointType': 'awsS3'},
+        'sourceBucketName': 'bucket', 'destinationBucketName': 'bucket',
+        'sourceKey': 'key', 'destinationKey': 'renamed'})
+    assert result['sourceRetained'] and result['copiedCount'] == 1
+    assert result['failures'][0]['target'] == 'key'
+    assert result['failureCount'] == 1
+
+
+def test_property_copy_preserves_acl_and_lock_or_fails_before_write(pyengine):
+    client = Mock()
+    client.get_bucket_ownership_controls.return_value = {}
+    client.get_object_acl.return_value = {'Grants': [
+        {'Permission': 'FULL_CONTROL', 'Grantee': {'Type': 'CanonicalUser', 'ID': 'owner'}},
+        {'Permission': 'READ', 'Grantee': {'Type': 'Group', 'URI': 'http://acs.amazonaws.com/groups/global/AllUsers'}}]}
+    client.get_object_lock_configuration.return_value = {'ObjectLockConfiguration': {'ObjectLockEnabled': 'Enabled'}}
+    date = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    client.get_object_retention.return_value = {'Retention': {'Mode': 'COMPLIANCE', 'RetainUntilDate': date}}
+    client.get_object_legal_hold.return_value = {'LegalHold': {'Status': 'ON'}}
+    result = pyengine._property_copy_protection(client, {'Bucket': 'bucket', 'Key': 'key', 'VersionId': 'v1'})
+    assert result == {'GrantFullControl': 'id="owner"', 'GrantRead': 'uri="http://acs.amazonaws.com/groups/global/AllUsers"',
+        'ObjectLockMode': 'COMPLIANCE', 'ObjectLockRetainUntilDate': date, 'ObjectLockLegalHoldStatus': 'ON'}
+    client.get_object_acl.side_effect = error('AccessDenied')
+    with pytest.raises(pyengine.SidecarError, match='No property changes'):
+        pyengine._property_copy_protection(client, {'Bucket': 'bucket', 'Key': 'key'})
+    client.copy_object.assert_not_called()
+
+
+def test_property_copy_omits_acl_headers_for_bucket_owner_enforced(pyengine):
+    client = Mock()
+    client.get_bucket_ownership_controls.return_value = {'OwnershipControls': {'Rules': [{'ObjectOwnership': 'BucketOwnerEnforced'}]}}
+    client.get_object_lock_configuration.side_effect = error('ObjectLockConfigurationNotFoundError')
+    assert pyengine._property_copy_protection(client, {'Bucket': 'bucket', 'Key': 'key'}) == {}
+    client.get_object_acl.assert_not_called()
+
+
+@pytest.mark.parametrize('storage_class,days', [('INTELLIGENT_TIERING', False), ('GLACIER', True), ('DEEP_ARCHIVE', True)])
+def test_archive_restore_days_depend_on_storage_class(pyengine, monkeypatch, profile, storage_class, days):
+    client = Mock()
+    client.head_object.return_value = {'StorageClass': storage_class}
+    client.restore_object.return_value = {}
+    monkeypatch.setattr(pyengine, '_build_client', lambda _: client)
+    pyengine._storage_action({'profile': profile, 'action': 'restoreObject', 'bucketName': 'bucket', 'key': 'key', 'days': 9})
+    request = client.restore_object.call_args.kwargs['RestoreRequest']
+    assert ('Days' in request) is days
+
+
+def test_bucket_enumeration_is_explicitly_paginated(pyengine):
+    client = Mock()
+    client.list_buckets.side_effect = [{'Buckets': [{'Name': 'a'}], 'ContinuationToken': 'opaque+%2F'}, {'Buckets': [{'Name': 'b'}]}]
+    assert [b['Name'] for b in pyengine._all_buckets(client)] == ['a', 'b']
+    assert client.list_buckets.call_args_list[0].kwargs == {'MaxBuckets': 1000}
+    assert client.list_buckets.call_args_list[1].kwargs == {'MaxBuckets': 1000, 'ContinuationToken': 'opaque+%2F'}
+
+
+def test_history_raw_order_decodes_keys_once(pyengine):
+    from types import SimpleNamespace
+    from botocore.hooks import HierarchicalEmitter
+    from urllib.parse import quote
+    events = HierarchicalEmitter()
+    key = 'a%2Fb+雪'
+    client = Mock()
+    client.meta.events = events
+    def page(**kwargs):
+        xml = f'<ListVersionsResult><EncodingType>url</EncodingType><DeleteMarker><Key>{quote(key, safe="")}</Key><VersionId>delete+%2F</VersionId></DeleteMarker><Version><Key>{quote(key, safe="")}</Key><VersionId>content</VersionId></Version></ListVersionsResult>'
+        events.emit('after-call.s3.ListObjectVersions', http_response=SimpleNamespace(content=xml.encode()))
+        now = datetime.now(timezone.utc)
+        return {'Versions': [{'Key': key, 'VersionId': 'content', 'LastModified': now}],
+                'DeleteMarkers': [{'Key': key, 'VersionId': 'delete+%2F', 'LastModified': now}], 'IsTruncated': False}
+    client.list_object_versions.side_effect = page
+    workflow = pyengine._advanced_module().Workflows(pyengine)
+    assert [v['sourceVersionId'] for v in workflow.versions(client, 'bucket')] == ['delete+%2F', 'content']

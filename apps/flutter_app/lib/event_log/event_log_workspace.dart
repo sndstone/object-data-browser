@@ -18,6 +18,10 @@ class _EventLogWorkspaceState extends State<EventLogWorkspace> {
   String _level = 'All', _category = 'All', _query = '';
   Object? _signature;
   List<EventLogEntry> _filtered = [];
+  List<EventLogEntry>? _countedEntries;
+  List<String> _categories = const ['All'];
+  final Map<String, int> _counts = {};
+
   AppController get controller => widget.controller;
   @override
   void initState() {
@@ -59,18 +63,31 @@ class _EventLogWorkspaceState extends State<EventLogWorkspace> {
     controller.clearEventLog();
   }
 
-  int _count(List<EventLogEntry> entries, String level) => entries
-      .where((e) =>
-          e.level.toUpperCase() == level || e.source?.toUpperCase() == level)
-      .length;
+  void _index(List<EventLogEntry> entries) {
+    if (identical(entries, _countedEntries)) return;
+    _countedEntries = entries;
+    final categories = <String>{};
+    _counts.clear();
+    for (final entry in entries) {
+      categories.add(entry.category);
+      for (final level in {
+        entry.level.toUpperCase(),
+        entry.source?.toUpperCase()
+      }) {
+        if (level != null) {
+          _counts.update(level, (n) => n + 1, ifAbsent: () => 1);
+        }
+      }
+    }
+    _categories = ['All', ...categories.toList()..sort()];
+  }
 
   @override
   Widget build(BuildContext context) {
     final entries = controller.eventLog;
-    final categories = [
-      'All',
-      ...entries.map((e) => e.category).toSet().toList()..sort()
-    ];
+    _index(entries);
+    final categories = _categories;
+    final query = _query.toLowerCase();
     if (!categories.contains(_category)) _category = 'All';
     final signature = (entries, _level, _category, _query);
     if (_signature != signature) {
@@ -81,9 +98,10 @@ class _EventLogWorkspaceState extends State<EventLogWorkspace> {
                   e.level.toUpperCase() == _level ||
                   e.source?.toUpperCase() == _level) &&
               (_category == 'All' || e.category == _category) &&
-              '${e.message} ${e.category} ${e.bucketName ?? ''} ${e.objectKey ?? ''}'
-                  .toLowerCase()
-                  .contains(_query.toLowerCase()))
+              (query.isEmpty ||
+                  '${e.message} ${e.category} ${e.bucketName ?? ''} ${e.objectKey ?? ''}'
+                      .toLowerCase()
+                      .contains(query)))
           .toList();
     }
     return Padding(
@@ -113,7 +131,7 @@ class _EventLogWorkspaceState extends State<EventLogWorkspace> {
                                     value: level,
                                     label: level == 'All'
                                         ? 'All ${entries.length}'
-                                        : '$level ${_count(entries, level)}')
+                                        : '$level ${_counts[level] ?? 0}')
                             ]);
                         final actions =
                             Row(mainAxisSize: MainAxisSize.min, children: [

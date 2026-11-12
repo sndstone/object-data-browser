@@ -64,6 +64,10 @@ abstract interface class TransferJobSinkRegistrant {
   void setTransferSink(TransferJobCallback? sink);
 }
 
+abstract interface class PerformanceOptionsRegistrant {
+  void configurePerformance(PerformanceSettings settings);
+}
+
 abstract class EngineService {
   /// Extended provider operations. Unsupported platforms fail explicitly.
   Future<Map<String, Object?>> storageAction({

@@ -35,7 +35,7 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
-const engineVersion = "2.3.4"
+const engineVersion = "2.3.5"
 
 var supportedMethods = []string{
 	"health", "getCapabilities", "testProfile", "listBuckets",
@@ -390,10 +390,10 @@ func buildClient(p profile) (*s3.Client, context.Context, error) {
 		if p.RoleARN == "" {
 			return nil, ctx, &sidecarError{Code: "invalid_config", Message: "A role ARN is required."}
 		}
-		if p.AWSProfileName != "" {
-			options = append(options, config.WithSharedConfigProfile(p.AWSProfileName))
-		} else if p.AccessKey != "" && p.SecretKey != "" {
+		if p.AccessKey != "" && p.SecretKey != "" {
 			options = append(options, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(p.AccessKey, p.SecretKey, p.SessionToken)))
+		} else if p.AWSProfileName != "" {
+			options = append(options, config.WithSharedConfigProfile(p.AWSProfileName))
 		}
 	case "awsDefault":
 	default:
@@ -413,6 +413,10 @@ func buildClient(p profile) (*s3.Client, context.Context, error) {
 	}
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.UsePathStyle = p.PathStyle
+		if p.EndpointType != "awsS3" {
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+		}
 		if p.EndpointURL != "" {
 			o.BaseEndpoint = aws.String(p.EndpointURL)
 		}
@@ -645,19 +649,16 @@ func listBuckets(profilePayload map[string]interface{}) (map[string]interface{},
 		}
 		return map[string]interface{}{"ok": true, "bucketCount": 1, "endpoint": p.EndpointURL, "items": []map[string]interface{}{{"name": p.KnownBucket, "region": p.Region, "objectCountHint": 0, "versioningEnabled": false}}}, nil
 	}
-	output, err := client.ListBuckets(ctx, &s3.ListBucketsInput{})
-	if err != nil {
-		return nil, err
-	}
-	items := make([]map[string]interface{}, 0, len(output.Buckets))
-	for _, bucket := range output.Buckets {
-		items = append(items, map[string]interface{}{
-			"name":              aws.ToString(bucket.Name),
-			"region":            p.Region,
-			"objectCountHint":   0,
-			"versioningEnabled": false,
-			"createdAt":         serializeTime(bucket.CreationDate),
-		})
+	items := make([]map[string]interface{}, 0)
+	paginator := s3.NewListBucketsPaginator(client, &s3.ListBucketsInput{MaxBuckets: aws.Int32(1000)}, func(o *s3.ListBucketsPaginatorOptions) { o.StopOnDuplicateToken = true })
+	for paginator.HasMorePages() {
+		output, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, bucket := range output.Buckets {
+			items = append(items, map[string]interface{}{"name": aws.ToString(bucket.Name), "region": nonEmpty(aws.ToString(bucket.BucketRegion), p.Region), "objectCountHint": 0, "versioningEnabled": false, "createdAt": serializeTime(bucket.CreationDate)})
+		}
 	}
 	return map[string]interface{}{"items": items}, nil
 }
@@ -760,9 +761,10 @@ func listObjects(params map[string]interface{}) (map[string]interface{}, error) 
 	}
 
 	input := &s3.ListObjectsV2Input{
-		Bucket:  aws.String(bucketName),
-		Prefix:  aws.String(prefix),
-		MaxKeys: aws.Int32(1000),
+		Bucket:       aws.String(bucketName),
+		Prefix:       aws.String(prefix),
+		MaxKeys:      aws.Int32(1000),
+		EncodingType: types.EncodingTypeUrl,
 	}
 	if !flat {
 		input.Delimiter = aws.String("/")
@@ -777,7 +779,10 @@ func listObjects(params map[string]interface{}) (map[string]interface{}, error) 
 
 	items := make([]map[string]interface{}, 0, len(output.CommonPrefixes)+len(output.Contents))
 	for _, commonPrefix := range output.CommonPrefixes {
-		folderPrefix := aws.ToString(commonPrefix.Prefix)
+		folderPrefix, err := decodeListingKey(aws.ToString(commonPrefix.Prefix), output.EncodingType)
+		if err != nil {
+			return nil, err
+		}
 		folderName := folderPrefix
 		if strings.HasPrefix(folderPrefix, prefix) {
 			folderName = folderPrefix[len(prefix):]
@@ -794,7 +799,10 @@ func listObjects(params map[string]interface{}) (map[string]interface{}, error) 
 		})
 	}
 	for _, object := range output.Contents {
-		key := aws.ToString(object.Key)
+		key, err := decodeListingKey(aws.ToString(object.Key), output.EncodingType)
+		if err != nil {
+			return nil, err
+		}
 		if !flat && key == prefix {
 			continue
 		}
@@ -1231,10 +1239,13 @@ func listObjectVersions(params map[string]interface{}) (map[string]interface{}, 
 			effectivePrefix = filterValue
 		}
 	}
+	keyMarker, versionMarker, err := decodeVersionCursor(asMap(params["cursor"]))
+	if err != nil {
+		return nil, err
+	}
 	output, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{
-		Bucket:  aws.String(bucketName),
-		Prefix:  aws.String(effectivePrefix),
-		MaxKeys: aws.Int32(1000),
+		Bucket: aws.String(bucketName), Prefix: aws.String(effectivePrefix), MaxKeys: aws.Int32(1000),
+		EncodingType: types.EncodingTypeUrl, KeyMarker: optionalString(keyMarker), VersionIdMarker: optionalString(versionMarker),
 	})
 	if err != nil {
 		return nil, err
@@ -1242,7 +1253,10 @@ func listObjectVersions(params map[string]interface{}) (map[string]interface{}, 
 
 	items := make([]map[string]interface{}, 0, len(output.Versions)+len(output.DeleteMarkers))
 	for _, version := range output.Versions {
-		versionKey := aws.ToString(version.Key)
+		versionKey, err := decodeListingKey(aws.ToString(version.Key), output.EncodingType)
+		if err != nil {
+			return nil, err
+		}
 		if key != "" && versionKey != key {
 			continue
 		}
@@ -1257,7 +1271,10 @@ func listObjectVersions(params map[string]interface{}) (map[string]interface{}, 
 		})
 	}
 	for _, marker := range output.DeleteMarkers {
-		markerKey := aws.ToString(marker.Key)
+		markerKey, err := decodeListingKey(aws.ToString(marker.Key), output.EncodingType)
+		if err != nil {
+			return nil, err
+		}
 		if key != "" && markerKey != key {
 			continue
 		}
@@ -1283,9 +1300,17 @@ func listObjectVersions(params map[string]interface{}) (map[string]interface{}, 
 			versionCount++
 		}
 	}
+	nextKey, err := decodeListingKey(aws.ToString(output.NextKeyMarker), output.EncodingType)
+	if err != nil {
+		return nil, err
+	}
+	cursor, err := encodeVersionCursor(aws.ToBool(output.IsTruncated), nextKey, aws.ToString(output.NextVersionIdMarker), keyMarker, versionMarker)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]interface{}{
 		"items":             items,
-		"cursor":            map[string]interface{}{"value": nil, "hasMore": false},
+		"cursor":            cursor,
 		"totalCount":        len(items),
 		"versionCount":      versionCount,
 		"deleteMarkerCount": deleteMarkerCount,
@@ -1438,26 +1463,7 @@ func deleteObjects(params map[string]interface{}) (map[string]interface{}, error
 	for _, key := range keys {
 		identifiers = append(identifiers, types.ObjectIdentifier{Key: aws.String(key)})
 	}
-	output, err := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-		Bucket: aws.String(bucketName),
-		Delete: &types.Delete{Objects: identifiers, Quiet: aws.Bool(false)},
-	})
-	if err != nil {
-		return nil, err
-	}
-	failures := make([]map[string]interface{}, 0, len(output.Errors))
-	for _, item := range output.Errors {
-		failures = append(failures, map[string]interface{}{
-			"target":  aws.ToString(item.Key),
-			"code":    nonEmpty(aws.ToString(item.Code), "unknown"),
-			"message": nonEmpty(aws.ToString(item.Message), "Unknown delete error."),
-		})
-	}
-	return map[string]interface{}{
-		"successCount": len(output.Deleted),
-		"failureCount": len(output.Errors),
-		"failures":     failures,
-	}, nil
+	return deleteIdentifiers(client, ctx, bucketName, identifiers)
 }
 
 func deleteObjectVersions(params map[string]interface{}) (map[string]interface{}, error) {
@@ -1477,27 +1483,33 @@ func deleteObjectVersions(params map[string]interface{}) (map[string]interface{}
 			VersionId: stringPtr(asString(version["versionId"])),
 		})
 	}
-	output, err := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-		Bucket: aws.String(bucketName),
-		Delete: &types.Delete{Objects: identifiers, Quiet: aws.Bool(false)},
-	})
-	if err != nil {
-		return nil, err
-	}
-	failures := make([]map[string]interface{}, 0, len(output.Errors))
-	for _, item := range output.Errors {
-		failures = append(failures, map[string]interface{}{
-			"target":    aws.ToString(item.Key),
-			"versionId": emptyToNil(aws.ToString(item.VersionId)),
-			"code":      nonEmpty(aws.ToString(item.Code), "unknown"),
-			"message":   nonEmpty(aws.ToString(item.Message), "Unknown delete error."),
+	return deleteIdentifiers(client, ctx, bucketName, identifiers)
+}
+
+func deleteIdentifiers(client *s3.Client, ctx context.Context, bucket string, identifiers []types.ObjectIdentifier) (map[string]interface{}, error) {
+	completed := 0
+	failures := make([]map[string]interface{}, 0)
+	for start := 0; start < len(identifiers); start += 1000 {
+		end := min(start+1000, len(identifiers))
+		output, err := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(bucket), Delete: &types.Delete{Objects: identifiers[start:end], Quiet: aws.Bool(false)},
 		})
+		if err != nil {
+			for index, item := range identifiers[start:] {
+				code, message := "unknown_outcome", "Delete was not confirmed: "+err.Error()
+				if start+index >= end {
+					code, message = "not_attempted", "Stopped after an unconfirmed delete batch."
+				}
+				failures = append(failures, map[string]interface{}{"target": aws.ToString(item.Key), "versionId": emptyToNil(aws.ToString(item.VersionId)), "code": code, "message": message})
+			}
+			break
+		}
+		completed += len(output.Deleted)
+		for _, item := range output.Errors {
+			failures = append(failures, map[string]interface{}{"target": aws.ToString(item.Key), "versionId": emptyToNil(aws.ToString(item.VersionId)), "code": nonEmpty(aws.ToString(item.Code), "unknown"), "message": nonEmpty(aws.ToString(item.Message), "Unknown delete error.")})
+		}
 	}
-	return map[string]interface{}{
-		"successCount": len(output.Deleted),
-		"failureCount": len(output.Errors),
-		"failures":     failures,
-	}, nil
+	return map[string]interface{}{"successCount": completed, "failureCount": len(failures), "failures": failures}, nil
 }
 
 // maxPartOutputLines caps how many per-part progress lines are appended to a
@@ -1537,6 +1549,7 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 	totalBytes := int64(0)
 	partsTotal := 0
 	usesMultipart := false
+	sources := make(map[string]os.FileInfo, len(filePaths))
 	for _, filePath := range filePaths {
 		info, statErr := os.Stat(filePath)
 		if statErr != nil {
@@ -1545,6 +1558,7 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 		if info.Size() > 50000*1024*1024*1024 || (info.Size() >= thresholdBytes && (info.Size()+chunkBytes-1)/chunkBytes > 10000) {
 			return nil, &sidecarError{Code: "invalid_config", Message: "Upload exceeds S3 object or 10,000-part limits; select a larger part size."}
 		}
+		sources[filePath] = info
 		totalBytes += info.Size()
 		if info.Size() >= thresholdBytes {
 			usesMultipart = true
@@ -1575,6 +1589,10 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 		if statErr != nil {
 			handle.Close()
 			return nil, statErr
+		}
+		if err = verifyUploadSource(handle, filePath, sources[filePath]); err != nil {
+			handle.Close()
+			return nil, err
 		}
 		targetKey := filepath.Base(filePath)
 		if mappedKey, ok := objectKeyByPath[filePath]; ok && strings.TrimSpace(mappedKey) != "" {
@@ -1665,6 +1683,9 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 			}
 			wg.Wait()
 			cancelWorkers()
+			if uploadErr == nil {
+				uploadErr = verifyUploadSource(handle, filePath, sources[filePath])
+			}
 			if uploadErr != nil {
 				_, _ = client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 					Bucket:   aws.String(bucketName),
@@ -1695,6 +1716,9 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 				Body:   handle,
 			})
 			bytesTransferred += info.Size()
+		}
+		if err == nil {
+			err = verifyUploadSource(handle, filePath, sources[filePath])
 		}
 		handle.Close()
 		if err != nil {
@@ -1728,15 +1752,46 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 	usesMultipart := false
 	objectSizes := make(map[string]int64, len(keys))
 	validators := make(map[string]string, len(keys))
-	for _, key := range keys {
-		headOutput, headErr := client.HeadObject(ctx, &s3.HeadObjectInput{
-			Bucket:    aws.String(bucketName),
-			Key:       aws.String(key),
-			VersionId: stringPtr(asString(params["versionId"])),
-		})
-		if headErr != nil {
-			return nil, headErr
-		}
+	heads := make([]*s3.HeadObjectOutput, len(keys))
+	preflight, stopPreflight := context.WithCancel(ctx)
+	var headMu sync.Mutex
+	var headErr error
+	var headWorkers sync.WaitGroup
+	nextHead := 0
+	for worker := 0; worker < min(transferConcurrency(p), len(keys)); worker++ {
+		headWorkers.Add(1)
+		go func() {
+			defer headWorkers.Done()
+			for {
+				headMu.Lock()
+				index := nextHead
+				if index >= len(keys) || headErr != nil {
+					headMu.Unlock()
+					return
+				}
+				nextHead++
+				headMu.Unlock()
+				head, failure := client.HeadObject(preflight, &s3.HeadObjectInput{Bucket: aws.String(bucketName), Key: aws.String(keys[index]), VersionId: stringPtr(asString(params["versionId"]))})
+				if failure != nil {
+					headMu.Lock()
+					if headErr == nil {
+						headErr = failure
+						stopPreflight()
+					}
+					headMu.Unlock()
+					return
+				}
+				heads[index] = head
+			}
+		}()
+	}
+	headWorkers.Wait()
+	stopPreflight()
+	if headErr != nil {
+		return nil, headErr
+	}
+	for index, key := range keys {
+		headOutput := heads[index]
 		size := aws.ToInt64(headOutput.ContentLength)
 		objectSizes[key] = size
 		validators[key] = aws.ToString(headOutput.ETag)
@@ -1760,6 +1815,11 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 		partCount = partsTotal
 		partDone = 0
 	}
+	destination, err := newDownloadDestination(destinationPath)
+	if err != nil {
+		return nil, err
+	}
+	progressGate := newTransferProgressGate(params)
 	emitTransferEvent(buildTransferJob(jobID, label, "download", 0, "queued", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), keys[0], len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
 	for _, key := range keys {
 		size := objectSizes[key]
@@ -1891,7 +1951,9 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 						return nil, writeErr
 					}
 					bytesTransferred += int64(readBytes)
-					emitTransferEvent(buildTransferJob(jobID, label, "download", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), key, len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+					if progressGate.ready(false) {
+						emitTransferEvent(buildTransferJob(jobID, label, "download", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), key, len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+					}
 				}
 				if errors.Is(readErr, io.EOF) {
 					break
@@ -1913,7 +1975,7 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 		if err = handle.Close(); err != nil {
 			return nil, err
 		}
-		finalPath, publishErr := publishDownload(target, destinationPath, key, asString(params["conflictPolicy"]))
+		finalPath, publishErr := destination.publish(target, key, asString(params["conflictPolicy"]))
 		if publishErr != nil {
 			return nil, publishErr
 		}
@@ -3722,4 +3784,15 @@ func stringPtr(value string) *string {
 		return nil
 	}
 	return aws.String(value)
+}
+
+func decodeListingKey(value string, encoding types.EncodingType) (string, error) {
+	if encoding != types.EncodingTypeUrl {
+		return value, nil
+	}
+	result, err := url.PathUnescape(value)
+	if err != nil {
+		return "", &sidecarError{Code: "invalid_response", Message: "Invalid URL-encoded object key in listing."}
+	}
+	return result, nil
 }

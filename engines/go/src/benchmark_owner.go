@@ -10,8 +10,74 @@ import (
 )
 
 type benchmarkOwner struct {
-	mu    sync.Mutex
-	state map[string]interface{}
+	mu                  sync.Mutex // private mutable execution state, never needed for status acknowledgement
+	state               map[string]interface{}
+	controlMu           sync.Mutex
+	published           map[string]interface{}
+	publishedCheckpoint time.Time
+	publishedStatus     string
+	pendingAction       string
+	pendingProfile      map[string]interface{}
+}
+
+func (owner *benchmarkOwner) publish() {
+	checkpoint, _ := owner.state["_benchmarkCheckpoint"].(time.Time)
+	status := asString(owner.state["status"])
+	owner.controlMu.Lock()
+	defer owner.controlMu.Unlock()
+	// The full retained history is materialized only at checkpoint cadence,
+	// not after every fast network batch. Terminal/control changes publish now.
+	if owner.published != nil && owner.publishedCheckpoint.Equal(checkpoint) && owner.publishedStatus == status {
+		return
+	}
+	owner.published = benchmarkSnapshot(owner.state)
+	owner.publishedCheckpoint, owner.publishedStatus = checkpoint, status
+}
+
+// Acknowledgement is independent of network completion. Pause/stop are graceful:
+// already-dispatched operations settle and are accounted before the state changes.
+func (owner *benchmarkOwner) acknowledge(params map[string]interface{}, action string) map[string]interface{} {
+	owner.controlMu.Lock()
+	defer owner.controlMu.Unlock()
+	snapshot := benchmarkSnapshot(owner.published)
+	status := asString(snapshot["status"])
+	if action != "status" && status != "completed" && status != "failed" && status != "stopped" {
+		if owner.pendingAction != "stopped" {
+			owner.pendingAction = action
+			owner.pendingProfile = asMap(params["profile"])
+		}
+	}
+	if owner.pendingAction != "" {
+		snapshot["controlPending"] = owner.pendingAction
+	}
+	return snapshot
+}
+
+func (owner *benchmarkOwner) applyPending() error {
+	owner.controlMu.Lock()
+	action, p := owner.pendingAction, owner.pendingProfile
+	owner.pendingAction = ""
+	owner.pendingProfile = nil
+	owner.controlMu.Unlock()
+	status := asString(owner.state["status"])
+	if action == "" || status == "completed" || status == "failed" || status == "stopped" {
+		return nil
+	}
+	state := owner.state
+	if status == "running" {
+		advanceBenchmarkClock(state)
+	}
+	if len(p) > 0 {
+		state["profile"] = p
+	}
+	state["status"] = action
+	state["lastUpdatedAt"] = serializeTimePtr(time.Now().UTC())
+	state["_benchmarkClock"] = time.Now()
+	appendBenchmarkLog(state, "Benchmark "+action+" by user after in-flight operations settled.")
+	if action == "stopped" {
+		state["completedAt"] = serializeTimePtr(time.Now().UTC())
+	}
+	return checkpointBenchmarkState(state, true)
 }
 
 var benchmarkOwners = struct {
@@ -65,14 +131,15 @@ func checkpointBenchmarkState(state map[string]interface{}, force bool) error {
 func registerBenchmarkOwner(state map[string]interface{}) map[string]interface{} {
 	state["_benchmarkClock"] = time.Now()
 	owner := &benchmarkOwner{state: state}
+	owner.publish()
 	snapshot := benchmarkSnapshot(state)
 	benchmarkOwners.Lock()
 	// Completed states remain on disk; retain at most 32 process-owned run objects.
 	if len(benchmarkOwners.items) >= 32 {
 		for id, item := range benchmarkOwners.items {
-			item.mu.Lock()
-			status := asString(item.state["status"])
-			item.mu.Unlock()
+			item.controlMu.Lock()
+			status := asString(item.published["status"])
+			item.controlMu.Unlock()
 			if status == "completed" || status == "stopped" || status == "failed" {
 				delete(benchmarkOwners.items, id)
 				break
@@ -84,12 +151,17 @@ func registerBenchmarkOwner(state map[string]interface{}) map[string]interface{}
 	go func() {
 		for {
 			owner.mu.Lock()
+			if err := owner.applyPending(); err != nil {
+				state["status"] = "failed"
+				appendBenchmarkLog(state, "Benchmark control checkpoint failed: "+err.Error())
+			}
 			status := asString(state["status"])
 			if status == "completed" || status == "stopped" || status == "failed" {
 				closeBenchmarkCSV(state)
 				delete(state, "profile")
 				delete(state, "_benchmarkPayloadStore")
 				delete(state, "_benchmarkCounters")
+				owner.publish()
 				owner.mu.Unlock()
 				return
 			}
@@ -102,6 +174,11 @@ func registerBenchmarkOwner(state map[string]interface{}) map[string]interface{}
 					_ = checkpointBenchmarkState(state, true)
 				}
 			}
+			if err := owner.applyPending(); err != nil {
+				state["status"] = "failed"
+				appendBenchmarkLog(state, "Benchmark control checkpoint failed: "+err.Error())
+			}
+			owner.publish()
 			owner.mu.Unlock()
 			if status == "paused" {
 				time.Sleep(100 * time.Millisecond)
@@ -149,8 +226,17 @@ func benchmarkOwnedControl(params map[string]interface{}, action string) (map[st
 		}
 		return benchmarkSnapshot(state), nil
 	}
-	owner.mu.Lock()
+	if action != "export" && !owner.mu.TryLock() {
+		return owner.acknowledge(params, action), nil
+	}
+	if action == "export" {
+		owner.mu.Lock()
+	}
 	defer owner.mu.Unlock()
+	defer owner.publish()
+	if err := owner.applyPending(); err != nil {
+		return nil, err
+	}
 	state := owner.state
 	status := asString(state["status"])
 	if action != "status" && action != "export" && status != "completed" && status != "stopped" && status != "failed" {

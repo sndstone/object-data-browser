@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:xml/xml.dart';
@@ -8,6 +9,7 @@ import 'package:xml/xml.dart';
 import '../controllers/action_scope.dart';
 import '../models/domain_models.dart';
 import 'storage_http_client.dart';
+import 'listing_cancellation.dart';
 import 'multipart_sizing.dart';
 
 part 'mobile_azure_storage.dart';
@@ -18,15 +20,122 @@ part 'mobile_storage_tools.dart';
 /// Provider REST administration for Android/iOS, independent of desktop
 /// sidecars and the reduced configuration models in older native SDKs.
 class MobileStorageAdmin {
-  final Map<EndpointProfile, StorageHttpClient> _clients = {};
-  StorageHttpClient client(EndpointProfile profile) {
-    if (!_clients.containsKey(profile) && _clients.length >= 8) {
-      _clients.remove(_clients.keys.first)?.close();
+  void Function(Map<String, Object?>)? onTransfer;
+
+  Future<Map<String, Object?>> trackedTransfer(
+      EndpointProfile profile,
+      String direction,
+      Map<String, Object?> arguments,
+      Future<Map<String, Object?>> Function(Map<String, Object?>) run) async {
+    final id = 'mobile-${DateTime.now().microsecondsSinceEpoch}';
+    final started = DateTime.now();
+    final heads = <String, StorageHttpResponse>{};
+    var total = 0, completed = 0;
+    if (direction == 'upload') {
+      for (final path in arguments['filePaths'] as List? ?? []) {
+        total += await File('$path').length();
+      }
+    } else {
+      final keys = List<String>.from(arguments['keys'] as List? ?? []);
+      await _parallelParts(
+          keys.length, profile.maxConcurrentRequests.clamp(1, 8),
+          (index) async {
+        final key = keys[index];
+        final head = await client(profile)
+            .request('HEAD', '${arguments['bucketName']}', key: key);
+        heads[key] = head;
+        total += int.parse(head.headers['content-length']!);
+        return true;
+      });
     }
-    return _clients.putIfAbsent(profile, () => StorageHttpClient(profile));
+    var last = DateTime.fromMillisecondsSinceEpoch(0);
+    Map<String, Object?> snapshot(String status) => {
+          ...transferResult(direction, total),
+          'id': id,
+          'label':
+              '${direction == 'upload' ? 'Upload' : 'Download'} ${arguments['bucketName']}',
+          'status': status,
+          'startedAt': started.toUtc().toIso8601String(),
+          'completedAt': status == 'running'
+              ? null
+              : DateTime.now().toUtc().toIso8601String(),
+          'bytesTransferred': completed,
+          'totalBytes': total,
+          'progress': total == 0
+              ? (status == 'completed' ? 1.0 : 0.0)
+              : completed / total,
+          'canCancel': status == 'running',
+          'bytesPerSecond': completed *
+              1000 /
+              max(1, DateTime.now().difference(started).inMilliseconds),
+        };
+    void report(int bytes) {
+      completed += bytes;
+      final now = DateTime.now();
+      if (now.difference(last).inMilliseconds >= 100) {
+        last = now;
+        onTransfer?.call(snapshot('running'));
+      }
+    }
+
+    onTransfer?.call(snapshot('running'));
+    try {
+      final result =
+          await run({...arguments, '_progress': report, '_heads': heads});
+      completed = total;
+      final done = {...result, ...snapshot('completed')};
+      onTransfer?.call(done);
+      return done;
+    } catch (error) {
+      final scope = ActionScope.current;
+      onTransfer?.call(snapshot(scope?.outcomeUnknown == true
+          ? 'unknown'
+          : scope?.isCancelled == true
+              ? 'cancelled'
+              : 'failed'));
+      rethrow;
+    }
+  }
+
+  final Map<EndpointProfile, StorageHttpClient> _clients = {};
+  final Map<ActionScope, Set<StorageHttpClient>> _scopeClients = {};
+  void _evictIdle() {
+    while (_clients.length > 8) {
+      final idle = _clients.entries.where((e) => e.value.isIdle).firstOrNull;
+      if (idle == null) break;
+      _clients.remove(idle.key)?.close();
+    }
+  }
+
+  StorageHttpClient client(EndpointProfile profile) {
+    final existing = _clients.remove(profile);
+    final http = existing ?? StorageHttpClient(profile);
+    _clients[profile] = http;
+    final scope = ActionScope.current;
+    if (scope != null) {
+      final newScope = !_scopeClients.containsKey(scope);
+      final leased =
+          _scopeClients.putIfAbsent(scope, () => <StorageHttpClient>{});
+      if (leased.add(http)) http.acquire();
+      if (newScope) {
+        scope.onDispose(() {
+          for (final value
+              in _scopeClients.remove(scope) ?? <StorageHttpClient>{}) {
+            value.release();
+          }
+          _evictIdle();
+        });
+      }
+    }
+    // The just-returned client must not be selected as the idle victim.
+    http.acquire();
+    _evictIdle();
+    http.release();
+    return http;
   }
 
   void close() {
+    onTransfer = null;
     for (final value in _clients.values) {
       value.close();
     }
@@ -219,6 +328,7 @@ class MobileStorageAdmin {
             : jsonDecode('${cursor['value']}') as Map<String, dynamic>;
         final root = (await http.request('GET', bucket, query: {
           'versions': '',
+          'encoding-type': 'url',
           'max-keys': '1000',
           'prefix': key ?? '${arguments['prefix'] ?? ''}',
           if (marker['key'] != null) 'key-marker': '${marker['key']}',
@@ -229,7 +339,7 @@ class MobileStorageAdmin {
         final rows = <Map<String, Object?>>[];
         for (final element in root.childElements
             .where((e) => {'Version', 'DeleteMarker'}.contains(e.name.local))) {
-          final name = xmlText(element, 'Key');
+          final name = storageKeyText(root, element, 'Key');
           if (key != null && name != key) continue;
           final options = arguments['options'] as Map? ?? {};
           if (element.name.local == 'Version' &&
@@ -258,7 +368,7 @@ class MobileStorageAdmin {
             'hasMore': more,
             'value': more
                 ? jsonEncode({
-                    'key': xmlText(root, 'NextKeyMarker'),
+                    'key': storageKeyText(root, root, 'NextKeyMarker'),
                     'version': xmlText(root, 'NextVersionIdMarker')
                   })
                 : null
@@ -363,14 +473,27 @@ class MobileStorageAdmin {
           'sections': sections
         };
       case 'restoreObject':
+        final head = await http.request('HEAD', bucket,
+            key: _key(key), query: versionQuery);
+        final storageClass = head.headers['x-amz-storage-class'] ?? 'STANDARD';
+        final tier = arguments['tier'] ?? 'Standard';
+        if (!{'GLACIER', 'DEEP_ARCHIVE', 'INTELLIGENT_TIERING'}
+            .contains(storageClass)) {
+          _invalid('This storage class does not require archive restoration.');
+        }
+        if (!{'Expedited', 'Standard', 'Bulk'}.contains(tier) ||
+            (storageClass == 'DEEP_ARCHIVE' && tier == 'Expedited')) {
+          _invalid('Select a retrieval tier supported by this archive.');
+        }
         await _putXml(
             http,
             bucket,
             'restore',
             'RestoreRequest',
             {
-              'Days': arguments['days'] ?? 7,
-              'GlacierJobParameters': {'Tier': arguments['tier'] ?? 'Standard'}
+              if (storageClass != 'INTELLIGENT_TIERING')
+                'Days': arguments['days'] ?? 7,
+              'GlacierJobParameters': {'Tier': tier}
             },
             key: _key(key),
             query: versionQuery,
@@ -531,6 +654,7 @@ class MobileStorageAdmin {
     final root =
         (await http.request('GET', '${arguments['bucketName']}', query: {
       'list-type': '2',
+      'encoding-type': 'url',
       'max-keys': '1000',
       'prefix': '${arguments['prefix'] ?? ''}',
       if (arguments['flat'] != true) 'delimiter': '/',
@@ -541,8 +665,8 @@ class MobileStorageAdmin {
     for (final item in root.childElements) {
       if (item.name.local == 'Contents') {
         rows.add({
-          'key': xmlText(item, 'Key'),
-          'name': xmlText(item, 'Key').split('/').last,
+          'key': storageKeyText(root, item, 'Key'),
+          'name': storageKeyText(root, item, 'Key').split('/').last,
           'size': int.tryParse(xmlText(item, 'Size')) ?? 0,
           'modifiedAt': xmlText(item, 'LastModified'),
           'etag': xmlText(item, 'ETag'),
@@ -552,8 +676,8 @@ class MobileStorageAdmin {
       }
       if (item.name.local == 'CommonPrefixes') {
         rows.add({
-          'key': xmlText(item, 'Prefix'),
-          'name': xmlText(item, 'Prefix')
+          'key': storageKeyText(root, item, 'Prefix'),
+          'name': storageKeyText(root, item, 'Prefix')
               .substring('${arguments['prefix'] ?? ''}'.length),
           'size': 0,
           'isFolder': true
@@ -842,3 +966,11 @@ const _missingConfigurations = {
   'NoSuchOwnershipControls',
   'NoSuchPublicAccessBlockConfiguration'
 };
+
+/// Decode key-bearing fields exactly once; continuation/version IDs stay opaque.
+String storageKeyText(XmlElement root, XmlElement element, String field) {
+  final value = xmlText(element, field);
+  return xmlText(root, 'EncodingType') == 'url'
+      ? Uri.decodeComponent(value)
+      : value;
+}

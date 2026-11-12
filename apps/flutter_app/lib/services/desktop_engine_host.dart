@@ -3,6 +3,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'diagnostic_safety.dart';
+import 'bounded_lines.dart';
 import 'listing_cancellation.dart';
 
 class DesktopEngineHostResponse {
@@ -54,6 +55,31 @@ class DesktopEngineHost {
       <String, List<_EngineProcess>>{};
   final Set<_EngineProcess> _liveProcesses = <_EngineProcess>{};
   bool _disposed = false;
+  Duration _idleTimeout = const Duration(minutes: 2);
+  final Map<_EngineProcess, Timer> _idleTimers = {};
+
+  void configureIdleTimeout(Duration timeout) {
+    _idleTimeout = timeout;
+    for (final timer in _idleTimers.values) {
+      timer.cancel();
+    }
+    _idleTimers.clear();
+    for (final entry in _idleProcesses.entries) {
+      for (final process in entry.value) {
+        _scheduleIdleExpiry(entry.key, process);
+      }
+    }
+  }
+
+  void _scheduleIdleExpiry(String key, _EngineProcess process) {
+    _idleTimers.remove(process)?.cancel();
+    if (_idleTimeout == Duration.zero) return;
+    _idleTimers[process] = Timer(_idleTimeout, () {
+      if (_idleProcesses[key]?.contains(process) ?? false) {
+        _discardProcess(key, process);
+      }
+    });
+  }
 
   Future<DesktopEngineHostResponse> send({
     required String executablePath,
@@ -280,6 +306,10 @@ class DesktopEngineHost {
       return;
     }
     _disposed = true;
+    for (final timer in _idleTimers.values) {
+      timer.cancel();
+    }
+    _idleTimers.clear();
     for (final waiter in _waiters) {
       waiter.ready
           .completeError(StateError('DesktopEngineHost has been disposed.'));
@@ -317,6 +347,7 @@ class DesktopEngineHost {
     final idle = _idleProcesses[key];
     while (idle != null && idle.isNotEmpty) {
       final process = idle.removeLast();
+      _idleTimers.remove(process)?.cancel();
       if (!process.isDefunct) {
         return process;
       }
@@ -343,6 +374,7 @@ class DesktopEngineHost {
       _starting--;
     }
     process.onDefunct = (defunct) {
+      _idleTimers.remove(defunct)?.cancel();
       _unpinBenchmark(defunct);
       _jobOwners.removeWhere((_, owner) => identical(owner, defunct));
       _liveProcesses.remove(defunct);
@@ -369,9 +401,11 @@ class DesktopEngineHost {
       return;
     }
     idle.add(process);
+    _scheduleIdleExpiry(key, process);
   }
 
   void _discardProcess(String key, _EngineProcess process) {
+    _idleTimers.remove(process)?.cancel();
     _unpinBenchmark(process);
     _jobOwners.removeWhere((_, owner) => identical(owner, process));
     _idleProcesses[key]?.remove(process);
@@ -397,7 +431,7 @@ class _PendingRequest {
       Completer<Map<String, Object?>>();
   final DiagnosticBuffer stdoutLines = DiagnosticBuffer();
   final DiagnosticBuffer stderrLines = DiagnosticBuffer();
-  DateTime lastProgress = DateTime.now();
+  final Stopwatch sinceProgress = Stopwatch()..start();
   bool paused = false;
 }
 
@@ -410,20 +444,15 @@ class _EngineProcess {
     // Swallow late stdin pipe errors (e.g. the engine dying mid-write);
     // failures are surfaced through the per-request flush instead.
     _process.stdin.done.then((_) {}, onError: (_) {});
-    _stdoutSubscription = process.stdout
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())
-        .listen(
-          _handleStdoutLine,
-          onDone: () =>
-              _markDefunct('Engine closed stdout without responding.'),
-          onError: (_) =>
-              _markDefunct('Engine stdout stream failed unexpectedly.'),
-        );
-    _stderrSubscription = process.stderr
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())
-        .listen(_handleStderrLine, onError: (_) {});
+    _stdoutSubscription =
+        boundedLines(process.stdout, maximumBytes: 128 * 1024 * 1024).listen(
+      _handleStdoutLine,
+      onDone: () => _markDefunct('Engine closed stdout without responding.'),
+      onError: (_) => _markDefunct('Engine stdout stream failed unexpectedly.'),
+    );
+    _stderrSubscription =
+        boundedLines(process.stderr, maximumBytes: 64 * 1024, truncate: true)
+            .listen(_handleStderrLine, onError: (_) {});
     _process.exitCode.then((code) {
       _exitCode = code;
       _markDefunct('Engine exited with code $code');
@@ -470,7 +499,7 @@ class _EngineProcess {
     for (final pending in _pending.values) {
       if (pending.onEvent != null) {
         pending.paused = paused;
-        pending.lastProgress = DateTime.now();
+        pending.sinceProgress.reset();
       }
     }
   }
@@ -503,7 +532,7 @@ class _EngineProcess {
           (progressDeadline && pending.paused)) {
         return;
       }
-      if (DateTime.now().difference(pending.lastProgress) >= timeout) {
+      if (pending.sinceProgress.elapsed >= timeout) {
         pending.completer.completeError(TimeoutException(
             'Engine stopped responding. The operation outcome may be unknown; check before retrying.',
             timeout));
@@ -575,7 +604,7 @@ class _EngineProcess {
     if (message.containsKey('event')) {
       for (final pending in List<_PendingRequest>.of(_pending.values)) {
         if (pending.onEvent == null) continue;
-        if (pending.progressDeadline) pending.lastProgress = DateTime.now();
+        if (pending.progressDeadline) pending.sinceProgress.reset();
         final job = message['job'];
         if (job is Map) pending.paused = job['status'] == 'paused';
         pending.onEvent?.call(message);

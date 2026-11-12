@@ -14,7 +14,9 @@ public final class TransferRegressionTest {
         keepBothCollisions();
         replaceAndDirectories();
         symlinks();
-        System.out.println("Transfer regression checks passed (multipart limits, collisions, replace, symlinks).");
+        ResourceRegressionTest.run();
+        ReviewRegressionTest.run();
+        System.out.println("Transfer regression checks passed (multipart limits, publication, bounded tasks, source snapshots, range retries, cleanup).");
     }
 
     private static void validationBeforeClientCreation() throws Exception {

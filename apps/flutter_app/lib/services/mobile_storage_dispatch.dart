@@ -8,7 +8,9 @@ extension MobileStorageDispatch on MobileStorageAdmin {
       final profile = EndpointProfile.fromJson(
           Map<String, Object?>.from(params['profile'] as Map));
       final options = profile.connection;
-      if (profile.endpointType != EndpointProfileType.azureBlob &&
+      // AWS uses explicit REST pagination. Keep the existing native bridge for
+      // ordinary compatible endpoints and their cached metadata behavior.
+      if (profile.endpointType == EndpointProfileType.s3Compatible &&
           options.authMode == 'static' &&
           options.knownBucket.isEmpty &&
           options.caBundlePath.isEmpty &&
@@ -62,14 +64,19 @@ extension MobileStorageDispatch on MobileStorageAdmin {
         ]
       };
     }
-    if (method == 'startUpload') return uploadStorageFile(profile, params);
+    if (method == 'startUpload') {
+      return trackedTransfer(profile, 'upload', params,
+          (args) => uploadStorageFile(profile, args));
+    }
     if (method == 'startDownload') {
-      var bytes = 0;
-      for (final key in params['keys'] as List? ?? []) {
-        final result = await download(profile, {...params, 'key': key});
-        bytes += (result['completedBytes'] as num).toInt();
-      }
-      return transferResult('download', bytes);
+      return trackedTransfer(profile, 'download', params, (args) async {
+        var bytes = 0;
+        for (final key in args['keys'] as List? ?? []) {
+          final result = await download(profile, {...args, 'key': key});
+          bytes += (result['completedBytes'] as num).toInt();
+        }
+        return transferResult('download', bytes);
+      });
     }
     if (method == 'copyObject' || method == 'moveObject') {
       return copyStorageObject(profile, profile, {
@@ -124,8 +131,10 @@ extension MobileStorageDispatch on MobileStorageAdmin {
         final items = <Map<String, Object?>>[];
         String? token;
         do {
-          final root = (await http.request('GET', '',
-                  query: {if (token != null) 'continuation-token': token}))
+          final root = (await http.request('GET', '', query: {
+            'max-buckets': '1000',
+            if (token != null) 'continuation-token': token
+          }))
               .xml;
           for (final b in root.descendants
               .whereType<XmlElement>()
@@ -242,21 +251,81 @@ extension MobileStorageDispatch on MobileStorageAdmin {
             ? (params['keys'] as List? ?? []).map((k) => {'key': k}).toList()
             : params['versions'] as List? ?? [];
         var completed = 0;
-        final failures = <String>[];
-        for (final item in entries) {
+        final failures = <Map<String, Object?>>[];
+        for (var start = 0; start < entries.length; start += 1000) {
           ActionScope.current?.check();
-          final ref = item as Map;
+          final end = min(start + 1000, entries.length);
+          final batch = entries.sublist(start, end).cast<Map>();
+          final body = storageXml('Delete', {
+            'Object': [
+              for (final ref in batch)
+                {
+                  'Key': ref['key'],
+                  if (ref['versionId'] != null) 'VersionId': ref['versionId']
+                }
+            ],
+            'Quiet': false
+          });
           try {
-            await http.request('DELETE', bucket,
-                key: '${ref['key']}',
-                query: {
-                  if (ref['versionId'] != null)
-                    'versionId': '${ref['versionId']}'
-                },
-                retrySafe: ref['versionId'] != null);
-            completed++;
-          } on StorageHttpException catch (e) {
-            failures.add('${ref['key']}: ${e.message}');
+            final root = (await http.request('POST', bucket,
+                    query: {'delete': ''},
+                    body: body,
+                    headers: {
+                      'content-md5': base64Encode(md5.convert(body).bytes)
+                    },
+                    retrySafe: false))
+                .xml;
+            if (root.name.local != 'DeleteResult') {
+              throw StateError('Invalid delete result.');
+            }
+            String identity(Object? key, Object? version) =>
+                jsonEncode([key, version]);
+            final outcomes = <String, XmlElement>{
+              for (final node in root.childElements)
+                if ({'Deleted', 'Error'}.contains(node.name.local))
+                  identity(
+                      xmlText(node, 'Key'),
+                      node.childElements.any((e) => e.name.local == 'VersionId')
+                          ? xmlText(node, 'VersionId')
+                          : null): node
+            };
+            for (final ref in batch) {
+              final outcome = outcomes[identity(ref['key'], ref['versionId'])];
+              if (outcome?.name.local == 'Deleted') {
+                completed++;
+              } else {
+                failures.add({
+                  'target': ref['key'],
+                  'versionId': ref['versionId'],
+                  'code': outcome == null
+                      ? 'unknown_outcome'
+                      : xmlText(outcome, 'Code'),
+                  'message': outcome == null
+                      ? 'Deletion was not confirmed.'
+                      : xmlText(outcome, 'Message')
+                });
+              }
+            }
+          } catch (e) {
+            if (e is ListingCancelled) rethrow;
+            for (var index = start; index < entries.length; index++) {
+              final ref = entries[index] as Map;
+              failures.add({
+                'target': ref['key'],
+                'versionId': ref['versionId'],
+                'code': index < end
+                    ? (e is StorageHttpException
+                        ? e.serviceCode
+                        : 'unknown_outcome')
+                    : 'not_attempted',
+                'message': index < end
+                    ? (e is StorageHttpException
+                        ? e.message
+                        : 'Deletion was not confirmed. Inspect the selected objects before retrying.')
+                    : 'Stopped after a failed delete batch.'
+              });
+            }
+            break;
           }
         }
         return {

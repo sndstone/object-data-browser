@@ -91,6 +91,7 @@ class _HoverCopyRegionState extends State<HoverCopyRegion> {
           child: widget.builder(
               context,
               AnimatedOpacity(
+                  curve: Curves.easeOutCubic,
                   opacity: AppPlatform.isMobile || _hovered || _focused ? 1 : 0,
                   duration: AppMotion.duration(context,
                       enabled: widget.controller.settings.enableAnimations,

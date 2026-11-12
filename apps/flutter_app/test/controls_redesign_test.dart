@@ -46,7 +46,7 @@ void main() {
     expect(first.top, greaterThan(buttonRect.bottom));
     expect(first.top - buttonRect.bottom, lessThan(16));
     expect((first.right - buttonRect.right).abs(), lessThan(1));
-    expect(first.height, 40);
+    expect(first.height, greaterThanOrEqualTo(48));
     // Destructive rows carry no keyboard hint.
     expect(find.text('Delete object'), findsOneWidget);
     expect(find.text('Del'), findsNothing);

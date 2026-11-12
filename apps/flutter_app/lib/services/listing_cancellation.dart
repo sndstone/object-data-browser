@@ -9,18 +9,40 @@ class ListingCancelled implements Exception {
 /// Transport owners must additionally abort the underlying work when possible.
 class ListingCancellation {
   final _cancelled = Completer<void>();
+  final Set<void Function()> _listeners = {};
   bool get isCancelled => _cancelled.isCompleted;
   Future<void> get whenCancelled => _cancelled.future;
+  int get activeListenerCount => _listeners.length;
+
+  /// Returns a release function so completed work retains no transport closure.
+  void Function() onCancel(void Function() callback) {
+    if (isCancelled) {
+      callback();
+      return () {};
+    }
+    _listeners.add(callback);
+    return () => _listeners.remove(callback);
+  }
 
   void cancel() {
-    if (!isCancelled) _cancelled.complete();
+    if (!isCancelled) {
+      _cancelled.complete();
+      final listeners = _listeners.toList();
+      _listeners.clear();
+      for (final listener in listeners) {
+        listener();
+      }
+    }
   }
 
   Future<T> wait<T>(Future<T> request) async {
+    final cancelled = Completer<T>();
+    final release =
+        onCancel(() => cancelled.completeError(const ListingCancelled()));
     try {
       final result = await Future.any([
         request,
-        _cancelled.future.then<T>((_) => throw const ListingCancelled()),
+        cancelled.future,
       ]);
       if (isCancelled) throw const ListingCancelled();
       return result;
@@ -29,6 +51,8 @@ class ListingCancellation {
       // this continuation runs. It must still win over that stale outcome.
       if (isCancelled) throw const ListingCancelled();
       rethrow;
+    } finally {
+      release();
     }
   }
 }

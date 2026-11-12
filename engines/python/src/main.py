@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import base64
 import csv
+import ctypes
+import errno
 import hashlib
 import importlib.util
 import hmac
@@ -26,7 +28,7 @@ from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from email.utils import formatdate, parsedate_to_datetime
 from pathlib import Path
@@ -34,7 +36,7 @@ from typing import Any
 from urllib.parse import quote, urlparse, parse_qsl
 
 
-ENGINE_VERSION = "2.3.4"
+ENGINE_VERSION = "2.3.5"
 
 # Serialize every write to stdout so transferProgress events emitted from worker
 # threads never interleave with request/response lines.
@@ -84,6 +86,8 @@ class TransferControl:
         self.items_completed = 0
         self.parts_completed = 0
         self.current_item_label: str | None = None
+        self.last_liveness = 0.0
+        self.progress_interval = 0.1
         self.lock = threading.Lock()
         # Set == running/allowed to proceed; cleared == paused.
         self.resume_event = threading.Event()
@@ -101,6 +105,8 @@ def _register_transfer(control: TransferControl) -> TransferControl:
     with _TRANSFER_REGISTRY_LOCK:
         _TRANSFER_REGISTRY[control.job_id] = control
     _CURRENT_TRANSFER.job_id = control.job_id
+    options = getattr(_CURRENT_TRANSFER, 'options', {})
+    control.progress_interval = min(2000, max(50, int(options.get('progressIntervalMs') or 100))) / 1000
     return control
 
 
@@ -136,6 +142,17 @@ def _transfer_gate(control: TransferControl | None) -> None:
         # Wait to be resumed or cancelled; re-check on a short timeout so a
         # cancel that arrives while paused is observed promptly.
         control.resume_event.wait(timeout=0.5)
+
+
+def _transfer_liveness(control):
+    if control is None: return
+    now = time.monotonic()
+    with control.lock:
+        if now - control.last_liveness < control.progress_interval: return
+        control.last_liveness = now
+    # A bounded source/body read occurred. Keep streaming work observable
+    # without claiming committed bytes or repeating uncommitted part logs.
+    _write_stdout_line(json.dumps({'event': 'transferLiveness', 'jobId': control.job_id}))
 
 
 def _transfer_checkpoint(
@@ -201,6 +218,9 @@ def _run_transfer(fn: Any, params: dict[str, Any]) -> dict[str, Any]:
     """Dispatch wrapper that converts a mid-flight cancel into a cancelled job
     and always removes the job from the registry when the transfer ends."""
     _CURRENT_TRANSFER.job_id = None
+    _CURRENT_TRANSFER.options = params
+    _CURRENT_TRANSFER.last_event = 0.0
+    _CURRENT_TRANSFER.sent_lines = 0
     try:
         return fn(params)
     except _TransferCancelled as cancelled:
@@ -210,6 +230,7 @@ def _run_transfer(fn: Any, params: dict[str, Any]) -> dict[str, Any]:
         if job_id:
             _unregister_transfer(job_id)
         _CURRENT_TRANSFER.job_id = None
+        _CURRENT_TRANSFER.options = {}
 
 
 def _run_tool(fn, params):
@@ -297,6 +318,8 @@ def _parse_profile(payload: dict[str, Any]) -> Profile:
     region = str(payload.get("region", "")).strip() or "us-east-1"
 
     auth_mode = str(payload.get("authMode") or "static")
+    if endpoint_type != 'azureBlob' and payload.get('signerOverride') not in {None, '', 's3v4', 'AWS4SignerType', 'AWSS3V4SignerType'}:
+        raise SidecarError('unsupported_feature', 'The Python engine requires Signature V4. Remove the legacy signer override.')
     if auth_mode not in {"static", "awsProfile", "awsDefault", "assumeRole", "azureSas", "azureDefault"}:
         raise SidecarError("invalid_config", "Unknown authentication mode.")
     if auth_mode == 'awsProfile' and not str(payload.get('awsProfileName') or '').strip():
@@ -351,7 +374,15 @@ def _build_client(profile: Profile):
         if cached is not None:
             _CLIENT_CACHE.move_to_end(profile)
             return cached
-        client = _new_client(profile)
+    # Credential discovery may block; unrelated warm cache hits must not.
+    client = _new_client(profile)
+    with _CLIENT_CACHE_LOCK:
+        cached = _CLIENT_CACHE.get(profile)
+        if cached is not None:
+            # A concurrent initializer won. This candidate has no borrowers.
+            if hasattr(client, 'close'):
+                client.close()
+            return cached
         _CLIENT_CACHE[profile] = client
         # Eviction removes credentials from our cache; do not close a client
         # which may still be serving another transfer.
@@ -363,6 +394,9 @@ def _build_client(profile: Profile):
 def _new_client(profile: Profile):
     imports = _lazy_boto_imports()
     config = imports["Config"](
+        signature_version="s3v4",
+        request_checksum_calculation="when_required" if profile.endpoint_type != "awsS3" else "when_supported",
+        response_checksum_validation="when_required" if profile.endpoint_type != "awsS3" else "when_supported",
         region_name=profile.region,
         connect_timeout=profile.connect_timeout_seconds,
         read_timeout=profile.read_timeout_seconds,
@@ -371,7 +405,7 @@ def _new_client(profile: Profile):
         s3={"addressing_style": "path" if profile.path_style else "virtual"},
     )
     session = imports["boto3"].session.Session(
-        profile_name=profile.aws_profile_name or None,
+        profile_name=None if profile.auth_mode == 'assumeRole' and profile.access_key and profile.secret_key else profile.aws_profile_name or None,
         region_name=profile.region,
     )
     if profile.auth_mode == "assumeRole":
@@ -379,10 +413,11 @@ def _new_client(profile: Profile):
             raise SidecarError("invalid_config", "An IAM role ARN is required.")
         from botocore.credentials import DeferredRefreshableCredentials, AssumeRoleCredentialFetcher
         from botocore.session import get_session
-        source = session.get_credentials()
         if profile.access_key and profile.secret_key:
             from botocore.credentials import Credentials
             source = Credentials(profile.access_key, profile.secret_key, profile.session_token)
+        else:
+            source = session.get_credentials()
         extra = {"RoleSessionName": profile.role_session_name}
         if profile.external_id:
             extra["ExternalId"] = profile.external_id
@@ -953,13 +988,15 @@ _AZURE_CLIENT_CACHE = OrderedDict()
 def _build_azure_client(profile):
     with _CLIENT_CACHE_LOCK:
         client = _AZURE_CLIENT_CACHE.get(profile)
-        if client is None:
-            client = _AzureBlobClient(profile)
-            _AZURE_CLIENT_CACHE[profile] = client
-            while len(_AZURE_CLIENT_CACHE) > 16:
-                _AZURE_CLIENT_CACHE.popitem(last=False)
-        else:
+        if client is not None:
             _AZURE_CLIENT_CACHE.move_to_end(profile)
+            return client
+    candidate = _AzureBlobClient(profile)
+    with _CLIENT_CACHE_LOCK:
+        client = _AZURE_CLIENT_CACHE.setdefault(profile, candidate)
+        _AZURE_CLIENT_CACHE.move_to_end(profile)
+        while len(_AZURE_CLIENT_CACHE) > 16:
+            _AZURE_CLIENT_CACHE.popitem(last=False)
         return client
 
 
@@ -1297,12 +1334,13 @@ def _azure_create_folder(params: dict[str, Any]) -> dict[str, Any]:
     return {"created": True, "key": key}
 
 
-def _azure_wait_for_copy(client: _AzureBlobClient, dest_path: str, copy_status: str, copy_id: str) -> None:
+def _azure_wait_for_copy(client: _AzureBlobClient, dest_path: str, copy_status: str, copy_id: str, timeout_seconds: int = 300) -> None:
     if not copy_id:
         raise SidecarError("unknown", "Azure copy identity missing; source retained.")
+    deadline = time.monotonic() + max(5, min(3600, timeout_seconds))
     attempts = 0
-    while copy_status == "pending" and attempts < 20:
-        time.sleep(0.25)
+    while copy_status == "pending" and time.monotonic() < deadline:
+        time.sleep(min(2.0, 0.25 * 2 ** min(attempts, 3), max(0, deadline - time.monotonic())))
         response = client.open("HEAD", dest_path)
         with response:
             response.read()
@@ -1317,7 +1355,7 @@ def _azure_wait_for_copy(client: _AzureBlobClient, dest_path: str, copy_status: 
         )
 
 
-def _azure_copy_object(params: dict[str, Any]) -> dict[str, Any]:
+def _azure_copy_object(params: dict[str, Any], source_etag=None) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     src_bucket = str(params.get("sourceBucketName", "")).strip()
     src_key = str(params.get("sourceKey", "")).strip()
@@ -1328,29 +1366,40 @@ def _azure_copy_object(params: dict[str, Any]) -> dict[str, Any]:
     client = _build_azure_client(profile)
     source_url = f"{client.scheme}://{client.netloc}{client.base_path}{client.blob_path(src_bucket, src_key)}"
     dest_path = client.blob_path(dest_bucket, dest_key)
+    if not source_etag:
+        _, source_headers, _ = client.request('HEAD', client.blob_path(src_bucket, src_key))
+        source_etag = source_headers.get('ETag')
+    if not source_etag:
+        raise SidecarError('object_conflict', 'Source identity is unavailable; copy stopped.')
     _, headers, _ = client.request(
         "PUT",
         dest_path,
-        headers={"x-ms-copy-source": source_url},
+        headers={"x-ms-copy-source": source_url, 'x-ms-source-if-match': source_etag},
         body=b"",
     )
     copy_status = str(headers.get("x-ms-copy-status", "")).lower()
-    _azure_wait_for_copy(client, dest_path, copy_status, str(headers.get("x-ms-copy-id", "")))
+    _azure_wait_for_copy(client, dest_path, copy_status, str(headers.get("x-ms-copy-id", "")), _int_param(params, "copyTimeoutSeconds", 300))
     return {"successCount": 1, "failureCount": 0, "failures": []}
 
 
 def _azure_move_object(params: dict[str, Any]) -> dict[str, Any]:
     if (str(params.get("sourceBucketName", "")).strip(), str(params.get("sourceKey", "")).strip()) == (str(params.get("destinationBucketName", "")).strip(), str(params.get("destinationKey", "")).strip()):
         raise SidecarError("invalid_config", "Move source and destination must differ.")
-    result = _azure_copy_object(params)
     profile = _parse_profile(params.get("profile", {}))
     client = _build_azure_client(profile)
+    source_path = client.blob_path(str(params.get('sourceBucketName', '')).strip(), str(params.get('sourceKey', '')).strip())
+    _, source_headers, _ = client.request('HEAD', source_path)
+    etag = source_headers.get('ETag')
+    if not etag:
+        raise SidecarError('object_conflict', 'Source identity is unavailable; move stopped.')
+    result = _azure_copy_object(params, etag)
     client.request(
         "DELETE",
         client.blob_path(
             str(params.get("sourceBucketName", "")).strip(),
             str(params.get("sourceKey", "")).strip(),
         ),
+        headers={'If-Match': etag},
     )
     return result
 
@@ -1375,23 +1424,21 @@ def _azure_delete_objects(params: dict[str, Any]) -> dict[str, Any]:
     success_count = 0
     failures: list[dict[str, Any]] = []
     max_workers = max(1, min(profile.max_pool_connections, 16))
+    def delete_one(key):
+        try:
+            _azure_delete_blob(client, bucket_name, key)
+            return key, None
+        except Exception as error:
+            return key, error
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_azure_delete_blob, client, bucket_name, key): key for key in keys}
-        for future in as_completed(futures):
-            key = futures[future]
-            try:
-                future.result()
+        for future in _bounded_parallel(pool, delete_one, keys, max_workers * 2):
+            key, error = future.result()
+            if error is None:
                 success_count += 1
-            except SidecarError as error:
-                failures.append(
-                    {
-                        "target": key,
-                        "code": str(error.details.get("azureCode", error.code)),
-                        "message": error.message,
-                    }
-                )
-            except Exception as error:  # noqa: BLE001
-                failures.append({"target": key, "code": "unknown", "message": str(error)})
+            elif isinstance(error, SidecarError):
+                failures.append({'target': key, 'code': str(error.details.get('azureCode', error.code)), 'message': error.message})
+            else:
+                failures.append({'target': key, 'code': 'unknown', 'message': str(error)})
     return {
         "successCount": success_count,
         "failureCount": len(failures),
@@ -1413,6 +1460,7 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
         raise SidecarError("invalid_config", "Bucket name and file paths are required.")
     client = _build_azure_client(profile)
     paths = [Path(file_path) for file_path in file_paths]
+    snapshots = {path: _source_snapshot(path) for path in paths}
     block_sizes = {path: _azure_block_size(path.stat().st_size) for path in paths}
     total_bytes = sum(path.stat().st_size for path in paths)
     uses_multipart = any(path.stat().st_size >= _AZURE_PUT_BLOB_LIMIT for path in paths)
@@ -1450,7 +1498,7 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
             status="queued",
             bytes_transferred=0,
             total_bytes=total_bytes,
-            output_lines=list(output_lines),
+            output_lines=_transfer_output_snapshot(output_lines),
             strategy_label=strategy_label,
             current_item_label=paths[0].name if paths else None,
             item_count=len(paths),
@@ -1467,7 +1515,8 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
         target_name = object_key_by_path.get(str(path), path.name)
         target_key = f"{prefix}{target_name}" if prefix else target_name
         blob_path = client.blob_path(bucket_name, target_key)
-        file_size = path.stat().st_size
+        _verify_source(path, snapshots[path])
+        file_size = snapshots[path][2]
         output_lines.append(f"Uploading {path.name} ({file_size} bytes) to {target_key}.")
         if file_size >= _AZURE_PUT_BLOB_LIMIT:
             chunk_size = block_sizes[path]
@@ -1476,27 +1525,30 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
             block_ids = [base64.b64encode(f"{upload_nonce}-{index:08d}".encode()).decode() for index in range(block_count)]
             def upload_block(index):
                 _transfer_gate(control)
+                _verify_source(path, snapshots[path])
                 with path.open("rb") as handle:
                     length = min(chunk_size, file_size - index * chunk_size)
                     client.request("PUT", blob_path, query={"comp": "block", "blockid": block_ids[index]},
-                                   body=_FilePart(handle, index * chunk_size, length))
+                                   body=_FilePart(handle, index * chunk_size, length, control))
+                _verify_source(path, snapshots[path])
                 return length
             workers = max(1, min(8, profile.max_pool_connections, (256 * 1024**2) // chunk_size))
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(upload_block, index) for index in range(block_count)]
+                futures = _bounded_parallel(pool, upload_block, range(block_count), workers * 2)
                 try:
-                    for future in as_completed(futures):
+                    for future in futures:
                         bytes_transferred += future.result()
                         parts_completed += 1
                         _transfer_checkpoint(control, bytes_transferred=bytes_transferred, items_completed=items_completed, parts_completed=parts_completed, current_item_label=path.name)
                         _emit_transfer_event(_build_transfer_job(job_id=job_id, label=label, direction="upload", progress=bytes_transferred / total_bytes if total_bytes else 1,
-                            status="running", bytes_transferred=bytes_transferred, total_bytes=total_bytes, output_lines=list(output_lines), strategy_label=strategy_label,
+                            status="running", bytes_transferred=bytes_transferred, total_bytes=total_bytes, output_lines=_transfer_output_snapshot(output_lines), strategy_label=strategy_label,
                             current_item_label=path.name, item_count=len(paths), items_completed=items_completed, part_size_bytes=chunk_size,
                             parts_completed=parts_completed, parts_total=parts_total, can_pause=True, can_cancel=True))
                 except BaseException:
-                    for pending in futures: pending.cancel()
+                    futures.close()
                     raise
             _transfer_gate(control)
+            _verify_source(path, snapshots[path])
             block_list_xml = "".join(f"<Latest>{block_id}</Latest>" for block_id in block_ids)
             block_list_body = (
                 f'<?xml version="1.0" encoding="utf-8"?><BlockList>{block_list_xml}</BlockList>'
@@ -1509,13 +1561,13 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
                 body=block_list_body,
             )
         else:
-            client.request(
-                "PUT",
-                blob_path,
-                headers={"x-ms-blob-type": "BlockBlob", "Content-Type": "application/octet-stream"},
-                body=path.read_bytes(),
-            )
+            with path.open('rb') as handle:
+                client.request(
+                    "PUT", blob_path,
+                    headers={"x-ms-blob-type": "BlockBlob", "Content-Type": "application/octet-stream"},
+                    body=_FilePart(handle, 0, file_size, control))
             bytes_transferred += file_size
+        _verify_source(path, snapshots[path])
         items_completed += 1
         _transfer_checkpoint(
             control,
@@ -1534,7 +1586,7 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
                 status="running",
                 bytes_transferred=bytes_transferred,
                 total_bytes=total_bytes,
-                output_lines=list(output_lines),
+                output_lines=_transfer_output_snapshot(output_lines),
                 strategy_label=strategy_label,
                 current_item_label=path.name,
                 item_count=len(paths),
@@ -1575,43 +1627,190 @@ def _download_name(key: str) -> str:
     return name
 
 
+def _publish_no_replace(source: Path, destination: Path):
+    """Atomic complete-file publication on filesystems without hard links."""
+    if os.name == 'nt':
+        # Windows rename fails if the target entry exists.
+        os.rename(source, destination)
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    operation = getattr(libc, 'renamex_np' if sys.platform == 'darwin' else 'renameat2', None)
+    if operation is not None:
+        if sys.platform == 'darwin':
+            operation.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+            result = operation(os.fsencode(source), os.fsencode(destination), 4)  # RENAME_EXCL
+        else:
+            operation.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+            result = operation(-100, os.fsencode(source), -100, os.fsencode(destination), 1)  # RENAME_NOREPLACE
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error not in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP}:
+            raise OSError(error, os.strerror(error), str(destination))
+    # Do not fall back to exists-then-rename, which can overwrite a racing file.
+    os.link(source, destination)
+
+
+def _source_snapshot(path):
+    stat = path.stat()
+    return tuple(getattr(stat, field, None) for field in
+                 ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns'))
+
+
+def _verify_source(path, snapshot):
+    if _source_snapshot(path) != snapshot:
+        raise SidecarError('object_conflict', 'Upload source changed; transfer stopped before completion.')
+
+
+def _retryable_body_error(error):
+    return isinstance(error, (OSError, TimeoutError, ConnectionError)) or type(error).__name__ in {
+        'ResponseStreamingError', 'ReadTimeoutError', 'ConnectionClosedError',
+        'IncompleteReadError', 'ProtocolError', 'EndpointConnectionError'}
+
+
+def _read_range_with_retry(open_range, write, start, end, size, attempts, control):
+    expected = end - start + 1
+    for attempt in range(max(1, min(10, attempts))):
+        _transfer_gate(control)
+        body = None
+        failure = None
+        try:
+            try:
+                body, content_range = open_range()
+            except Exception as error:
+                if not _retryable_body_error(error): raise
+                failure = error
+            if failure is None:
+                _validate_download_range(content_range, start, end, size, expected)
+                received = 0
+                while received <= expected:
+                    try:
+                        data = body.read(min(1024 * 1024, expected - received + 1))
+                    except Exception as error:
+                        if not _retryable_body_error(error): raise
+                        failure = error
+                        break
+                    if not data: break
+                    _transfer_gate(control)
+                    # Local disk errors are terminal and never transport retries.
+                    write(start + received, data)
+                    received += len(data)
+                    _transfer_liveness(control)
+                if failure is None:
+                    _validate_download_range(content_range, start, end, size, received)
+                    return received
+        finally:
+            if body is not None:
+                body.close()
+        if attempt + 1 >= max(1, min(10, attempts)):
+            raise failure
+        # Bounded, cancellation-aware backoff; validators are captured by caller.
+        deadline = time.monotonic() + min(1.0, 0.1 * 2 ** attempt)
+        while time.monotonic() < deadline:
+            _transfer_gate(control)
+            time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+
+
+def _download_references(params):
+    if params.get('objects'):
+        return [(str(item['key']), str(item['versionId']) if item.get('versionId') is not None else
+                 str(params['versionId']) if params.get('versionId') is not None else None)
+                for item in params['objects']]
+    return [(str(key), str(params['versionId']) if params.get('versionId') is not None else None)
+            for key in params.get('keys', []) if str(key).strip()]
+
+
+class _DownloadDestination:
+    """A batch-local name index invalidated by observed directory mutations.
+
+    The case-fold rule remains a directory observation, not an atomic lock
+    against external case-variant writers. Exact targets are protected by the
+    native no-replace primitive even when another process races publication.
+    """
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.occupied = {}
+        self.stamp = None
+        self.refresh()
+
+    def _stamp(self):
+        stat = self.directory.stat()
+        return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size
+
+    def refresh(self):
+        observed = self._stamp()
+        # Coarse directory timestamps cannot reliably reveal between-operation
+        # additions; retain conservative scans on those filesystems.
+        if self.stamp is not None and observed[2] % 1_000_000_000 and self.stamp == observed:
+            return
+        for _ in range(3):
+            before = self._stamp()
+            occupied = {}
+            for item in self.directory.iterdir():
+                occupied.setdefault(item.name.casefold(), item)
+            after = self._stamp()
+            self.occupied = occupied
+            self.stamp = after if before == after else None
+            if self.stamp is not None:
+                break
+
+    def created_staging(self):
+        self.stamp = self._stamp()
+
+    def published(self, source: Path, target: Path):
+        self.occupied.pop(source.name.casefold(), None)
+        self.occupied[target.name.casefold()] = target
+        self.stamp = self._stamp()
+
+
 @contextmanager
-def _staged_download(destination: Path, key: str, policy: str, output_lines: list[str]):
+def _staged_download(destination: Path, key: str, policy: str, output_lines: list[str],
+                     destination_index=None):
     """Publish only validated bytes, without replacing any existing directory entry."""
     if policy not in {"keepBoth", "replace"}:
         raise SidecarError("invalid_config", "Unknown download conflict policy.")
+    index = destination_index or _DownloadDestination(destination)
+    if index.directory != destination:
+        raise SidecarError("invalid_config", "Download destination index mismatch.")
+    index.refresh()
     fd, temporary = tempfile.mkstemp(prefix='.odb-', suffix='.part', dir=destination)
     temporary = Path(temporary)
     try:
         with os.fdopen(fd, 'w+b') as handle:
+            index.created_staging()
             yield handle
             handle.flush()
             os.fsync(handle.fileno())
         name = _download_name(key)
         base = Path(name)
-        occupied = {}
-        for item in destination.iterdir():
-            occupied.setdefault(item.name.casefold(), item)
-        for index in range(100000):
-            target = destination / (name if index == 0 else f'{base.stem} ({index}){base.suffix}')
+        index.refresh()
+        for suffix in range(100000):
+            target = destination / (name if suffix == 0 else f'{base.stem} ({suffix}){base.suffix}')
             if policy == 'replace':
-                target = occupied.get(target.name.casefold(), target)
+                target = index.occupied.get(target.name.casefold(), target)
                 os.replace(temporary, target)
+                index.published(temporary, target)
                 output_lines.append(f'Saved {key} to {target}.')
                 break
-            # Treat case-only differences as conflicts on every platform.
-            if target.name.casefold() in occupied:
+            # Treat observed case-only differences as conflicts on every platform.
+            if target.name.casefold() in index.occupied:
                 continue
             try:
-                os.link(temporary, target)
+                _publish_no_replace(temporary, target)
+                # The safe hard-link fallback can retain the staging name.
+                temporary.unlink(missing_ok=True)
+                index.published(temporary, target)
                 output_lines.append(f'Saved {key} to {target}.')
                 break
             except FileExistsError:
-                continue
+                index.stamp = None
+                index.refresh()
         else:
             raise SidecarError('object_conflict', 'Could not allocate a unique download name.')
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary.exists():
+            temporary.unlink(missing_ok=True)
+            index.stamp = None
 
 
 def _validate_download_range(header: str, start: int, end: int, size: int, received: int) -> None:
@@ -1622,11 +1821,9 @@ def _validate_download_range(header: str, start: int, end: int, size: int, recei
 def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     bucket_name = str(params.get("bucketName", "")).strip()
-    keys = [str(item) for item in params.get("keys", []) if str(item).strip()]
-    versions = {str(item["key"]): str(item["versionId"]) for item in params.get("objects", []) if item.get("versionId") is not None}
-    if params.get("objects"): keys = [str(item["key"]) for item in params["objects"]]
-    if params.get("versionId") is not None: versions.update({key: str(params["versionId"]) for key in keys})
-    def version_query(key): return {"versionid": versions[key]} if key in versions else {}
+    references = _download_references(params)
+    keys = [ref[0] for ref in references]
+    def version_query(ref): return {"versionid": ref[1]} if ref[1] is not None else {}
     destination_path = str(params.get("destinationPath", "")).strip()
     if not bucket_name or not keys or not destination_path:
         raise SidecarError("invalid_config", "Bucket, keys, and destination path are required.")
@@ -1635,17 +1832,19 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
     client = _build_azure_client(profile)
     destination = Path(destination_path)
     destination.mkdir(parents=True, exist_ok=True)
+    destination_index = _DownloadDestination(destination)
     sizes: dict[str, int] = {}
     validators = {}
-    for key in keys:
-        _, head_headers, _ = client.request("HEAD", client.blob_path(bucket_name, key), query=version_query(key))
-        sizes[key] = int(head_headers.get("Content-Length", 0) or 0)
-        validators[key] = {"If-Match": head_headers["ETag"]} if head_headers.get("ETag") else {}
-    total_bytes = sum(sizes.values())
+    for ref in references:
+        key = ref[0]
+        _, head_headers, _ = client.request("HEAD", client.blob_path(bucket_name, key), query=version_query(ref))
+        sizes[ref] = int(head_headers.get("Content-Length", 0) or 0)
+        validators[ref] = {"If-Match": head_headers["ETag"]} if head_headers.get("ETag") else {}
+    total_bytes = sum(sizes[ref] for ref in references)
     uses_multipart = any(size >= multipart_threshold_bytes for size in sizes.values())
     parts_total = sum(
         max((size + multipart_chunk_bytes - 1) // multipart_chunk_bytes, 1)
-        for size in sizes.values()
+        for size in (sizes[ref] for ref in references)
         if size >= multipart_threshold_bytes
     )
     part_size_bytes = multipart_chunk_bytes if parts_total > 0 else None
@@ -1677,7 +1876,7 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
             status="queued",
             bytes_transferred=0,
             total_bytes=total_bytes,
-            output_lines=list(output_lines),
+            output_lines=_transfer_output_snapshot(output_lines),
             strategy_label=strategy_label,
             current_item_label=keys[0] if keys else None,
             item_count=len(keys),
@@ -1689,37 +1888,30 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
             can_cancel=True,
         )
     )
-    for key in keys:
+    for ref in references:
+        key = ref[0]
         _transfer_gate(control)
         target = destination / _download_name(key)
-        object_size = sizes[key]
+        object_size = sizes[ref]
         blob_path = client.blob_path(bucket_name, key)
         output_lines.append(f"Downloading {key} ({object_size} bytes) to {target}.")
         before_object = bytes_transferred
-        with _staged_download(destination, key, params.get("conflictPolicy", "keepBoth"), output_lines) as handle:
+        with _staged_download(destination, key, params.get("conflictPolicy", "keepBoth"), output_lines, destination_index) as handle:
             if object_size >= multipart_threshold_bytes:
                 handle.truncate(object_size)
                 write_lock = threading.Lock()
                 def download_range(start):
-                    _transfer_gate(control)
                     end = min(start + multipart_chunk_bytes, object_size) - 1
-                    response = client.open("GET", blob_path, query=version_query(key), headers={"Range": f"bytes={start}-{end}", **validators[key]})
-                    try:
-                        expected = end - start + 1
-                        _validate_download_range(response.headers.get('Content-Range', ''), start, end, object_size, expected)
-                        received = 0
-                        while received <= expected:
-                            data = response.read(min(1024 * 1024, expected - received + 1))
-                            if not data: break
-                            _transfer_gate(control)
-                            with write_lock:
-                                handle.seek(start + received)
-                                handle.write(data)
-                            received += len(data)
-                    finally:
-                        response.close()
-                    _validate_download_range(response.headers.get('Content-Range', ''), start, end, object_size, received)
-                    return received
+                    def open_range():
+                        response = client.open('GET', blob_path, query=version_query(ref),
+                            headers={'Range': f'bytes={start}-{end}', **validators[ref]})
+                        return response, response.headers.get('Content-Range', '')
+                    def write(offset, data):
+                        with write_lock:
+                            handle.seek(offset)
+                            handle.write(data)
+                    return _read_range_with_retry(open_range, write, start, end, object_size,
+                        profile.max_attempts, control)
                 workers = max(1, min(8, profile.max_pool_connections, (256 * 1024**2) // multipart_chunk_bytes))
                 with ThreadPoolExecutor(max_workers=workers) as pool:
                     futures = _bounded_parallel(pool, download_range, range(0, object_size, multipart_chunk_bytes), workers * 2)
@@ -1729,14 +1921,14 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
                             parts_completed += 1
                             _transfer_checkpoint(control, bytes_transferred=bytes_transferred, items_completed=items_completed, parts_completed=parts_completed, current_item_label=key)
                             _emit_transfer_event(_build_transfer_job(job_id=job_id, label=label, direction="download", progress=bytes_transferred / total_bytes if total_bytes else 1,
-                                status="running", bytes_transferred=bytes_transferred, total_bytes=total_bytes, output_lines=list(output_lines),
+                                status="running", bytes_transferred=bytes_transferred, total_bytes=total_bytes, output_lines=_transfer_output_snapshot(output_lines),
                                 strategy_label=strategy_label, current_item_label=key, item_count=len(keys), items_completed=items_completed,
                                 part_size_bytes=part_size_bytes, parts_completed=parts_completed, parts_total=parts_total, can_pause=True, can_cancel=True))
                     except BaseException:
                         futures.close()
                         raise
             else:
-                response = client.open("GET", blob_path, query=version_query(key), headers=validators[key])
+                response = client.open("GET", blob_path, query=version_query(ref), headers=validators[ref])
                 with response:
                     while True:
                         chunk = response.read(min(multipart_chunk_bytes, 1024 * 1024))
@@ -1760,7 +1952,7 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
                                 status="running",
                                 bytes_transferred=bytes_transferred,
                                 total_bytes=total_bytes,
-                                output_lines=list(output_lines),
+                                output_lines=_transfer_output_snapshot(output_lines),
                                 strategy_label=strategy_label,
                                 current_item_label=key,
                                 item_count=len(keys),
@@ -2055,7 +2247,7 @@ def _get_capabilities(_: dict[str, Any]) -> dict[str, Any]:
 def _test_profile(profile_payload: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(profile_payload)
     client = _build_client(profile)
-    response = ({"Buckets": [{"Name": profile.known_bucket}]} if profile.known_bucket else client.list_buckets())
+    response = ({"Buckets": [{"Name": profile.known_bucket}]} if profile.known_bucket else {"Buckets": _all_buckets(client)})
     if profile.known_bucket:
         client.head_bucket(Bucket=profile.known_bucket)
     buckets = response.get("Buckets", [])
@@ -2067,10 +2259,22 @@ def _test_profile(profile_payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _all_buckets(client):
+    buckets, seen, token = [], set(), None
+    while True:
+        response = client.list_buckets(MaxBuckets=1000, **({'ContinuationToken': token} if token else {}))
+        buckets.extend(response.get('Buckets', []))
+        token = response.get('ContinuationToken')
+        if not token: return buckets
+        if token in seen:
+            raise SidecarError('invalid_response', 'Bucket listing repeated its continuation token.')
+        seen.add(token)
+
+
 def _list_buckets(profile_payload: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(profile_payload)
     client = _build_client(profile)
-    response = ({"Buckets": [{"Name": profile.known_bucket}]} if profile.known_bucket else client.list_buckets())
+    response = ({"Buckets": [{"Name": profile.known_bucket}]} if profile.known_bucket else {"Buckets": _all_buckets(client)})
     buckets = []
     for bucket in response.get("Buckets", []):
         buckets.append(
@@ -2659,7 +2863,7 @@ def _generate_presigned_url(params: dict[str, Any]) -> dict[str, Any]:
 def _create_folder(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     bucket_name = str(params.get("bucketName", "")).strip()
-    key = str(params.get("key", "")).strip()
+    key = str(params.get("key", ""))
     if not bucket_name or not key:
         raise SidecarError("invalid_config", "Bucket name and key are required to create a folder.")
     if not key.endswith("/"):
@@ -2674,14 +2878,7 @@ def _copy_object(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _move_object(params: dict[str, Any]) -> dict[str, Any]:
-    result = _copy_object(params)
-    profile = _parse_profile(params.get("profile", {}))
-    client = _build_client(profile)
-    client.delete_object(
-        Bucket=str(params.get("sourceBucketName", "")).strip(),
-        Key=str(params.get("sourceKey", "")).strip(),
-    )
-    return result
+    return _storage_copy({**params, 'move': True})
 
 
 # S3's DeleteObjects API rejects requests with more than 1000 keys per call.
@@ -2874,7 +3071,28 @@ def _build_transfer_job(
     }
 
 
+def _transfer_output_snapshot(lines):
+    # Incremental clients serialize just new lines in _emit_transfer_event;
+    # avoid copying the entire accumulated history before that slice.
+    if getattr(_CURRENT_TRANSFER, 'options', {}).get('incrementalTransferLogs'):
+        return lines
+    return list(lines)
+
+
 def _emit_transfer_event(job: dict[str, Any]) -> None:
+    options = getattr(_CURRENT_TRANSFER, 'options', {})
+    now = time.monotonic()
+    interval = min(2000, max(50, int(options.get('progressIntervalMs') or 100))) / 1000
+    if job['status'] == 'running' and now - getattr(_CURRENT_TRANSFER, 'last_event', 0) < interval:
+        return
+    _CURRENT_TRANSFER.last_event = now
+    if options.get('incrementalTransferLogs'):
+        start = getattr(_CURRENT_TRANSFER, 'sent_lines', 0)
+        lines = job.get('outputLines') or []
+        if start > len(lines): start = 0
+        job = {**job, 'outputLines': lines[start:], 'outputStartLine': start,
+               'outputLineCount': len(lines)}
+        _CURRENT_TRANSFER.sent_lines = len(lines)
     _write_stdout_line(json.dumps({"event": "transferProgress", "job": job}))
 
 
@@ -2884,15 +3102,18 @@ def _transfer_strategy_label(direction: str, uses_multipart: bool) -> str:
 
 class _FilePart:
     """Seekable view of one file range; SDK hashing and retries stay bounded."""
-    def __init__(self, handle, start, length):
+    def __init__(self, handle, start, length, control=None):
         self.handle, self.start, self.length, self.position = handle, start, length, 0
+        self.control = control
         self.handle.seek(start)
 
     def read(self, size=-1):
         remaining = self.length - self.position
         amount = remaining if size is None or size < 0 else min(size, remaining)
+        _transfer_gate(self.control)
         data = self.handle.read(amount)
         self.position += len(data)
+        if data: _transfer_liveness(self.control)
         return data
 
     def tell(self): return self.position
@@ -2922,6 +3143,7 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
     multipart_threshold_bytes = _int_param(params, "multipartThresholdMiB", 32) * 1024 * 1024
     multipart_chunk_bytes = min(max(_int_param(params, "multipartChunkMiB", 8), 5), 5120) * 1024 * 1024
     paths = [Path(file_path) for file_path in file_paths]
+    snapshots = {path: _source_snapshot(path) for path in paths}
     sizes = {path: path.stat().st_size for path in paths}
     for size in sizes.values():
         if size > 50000 * 1024**3 or (size >= multipart_threshold_bytes and
@@ -2963,7 +3185,7 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
         status="queued",
         bytes_transferred=0,
         total_bytes=total_bytes,
-        output_lines=list(output_lines),
+        output_lines=_transfer_output_snapshot(output_lines),
         strategy_label=strategy_label,
         current_item_label=paths[0].name if paths else None,
         item_count=len(paths),
@@ -2979,7 +3201,8 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
         _transfer_gate(control)
         target_name = object_key_by_path.get(str(path), path.name)
         target_key = f"{prefix}{target_name}" if prefix else target_name
-        file_size = path.stat().st_size
+        _verify_source(path, snapshots[path])
+        file_size = snapshots[path][2]
         output_lines.append(f"Uploading {path.name} ({file_size} bytes) to {target_key}.")
         if file_size >= multipart_threshold_bytes:
             response = client.create_multipart_upload(Bucket=bucket_name, Key=target_key)
@@ -3008,9 +3231,10 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
             def _upload_one_part(part_number: int) -> tuple[int, Any, int]:
                 offset = (part_number - 1) * multipart_chunk_bytes
                 length = min(multipart_chunk_bytes, file_size - offset)
+                _verify_source(path, snapshots[path])
                 handle = _get_part_handle()
                 _transfer_gate(control)
-                chunk = _FilePart(handle, offset, length)
+                chunk = _FilePart(handle, offset, length, control)
                 part_response = client.upload_part(
                     Bucket=bucket_name,
                     Key=target_key,
@@ -3018,6 +3242,7 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
                     PartNumber=part_number,
                     Body=chunk,
                 )
+                _verify_source(path, snapshots[path])
                 return part_number, part_response.get("ETag"), length
 
             completed_parts: list[dict[str, Any]] = []
@@ -3053,7 +3278,7 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
                                     status="running",
                                     bytes_transferred=bytes_transferred,
                                     total_bytes=total_bytes,
-                                    output_lines=list(output_lines),
+                                    output_lines=_transfer_output_snapshot(output_lines),
                                     strategy_label=strategy_label,
                                     current_item_label=path.name,
                                     item_count=len(paths),
@@ -3088,6 +3313,7 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
             completed_parts.sort(key=lambda part: part["PartNumber"])
             try:
                 _transfer_gate(control)
+                _verify_source(path, snapshots[path])
                 client.complete_multipart_upload(
                     Bucket=bucket_name, Key=target_key, UploadId=upload_id,
                     MultipartUpload={"Parts": completed_parts},
@@ -3100,8 +3326,9 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
                 raise
         else:
             with path.open("rb") as handle:
-                client.put_object(Bucket=bucket_name, Key=target_key, Body=handle)
+                client.put_object(Bucket=bucket_name, Key=target_key, Body=_FilePart(handle, 0, file_size, control))
             bytes_transferred += file_size
+        _verify_source(path, snapshots[path])
         items_completed += 1
         _transfer_checkpoint(
             control,
@@ -3120,7 +3347,7 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
                 status="running",
                 bytes_transferred=bytes_transferred,
                 total_bytes=total_bytes,
-                output_lines=list(output_lines),
+                output_lines=_transfer_output_snapshot(output_lines),
                 strategy_label=strategy_label,
                 current_item_label=path.name,
                 item_count=len(paths),
@@ -3155,14 +3382,9 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
 def _start_download(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
     bucket_name = str(params.get("bucketName", "")).strip()
-    keys = [str(item) for item in params.get("keys", []) if str(item).strip()]
-    versions = {str(item["key"]): str(item["versionId"]) for item in params.get("objects", []) if item.get("versionId") is not None}
-    if params.get("objects"):
-        keys = [str(item["key"]) for item in params["objects"]]
-    if params.get("versionId") is not None:
-        versions.update({key: str(params["versionId"]) for key in keys})
-    def version_kwargs(key):
-        return {"VersionId": versions[key]} if key in versions else {}
+    references = _download_references(params)
+    keys = [ref[0] for ref in references]
+    def version_kwargs(ref): return {"VersionId": ref[1]} if ref[1] is not None else {}
     destination_path = str(params.get("destinationPath", "")).strip()
     if not bucket_name or not keys or not destination_path:
         raise SidecarError("invalid_config", "Bucket, keys, and destination path are required.")
@@ -3171,13 +3393,21 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
     client = _build_client(profile)
     destination = Path(destination_path)
     destination.mkdir(parents=True, exist_ok=True)
-    heads = {key: client.head_object(Bucket=bucket_name, Key=key, **version_kwargs(key)) for key in keys}
-    sizes = {key: int(heads[key].get("ContentLength", 0)) for key in keys}
-    total_bytes = sum(sizes.values())
+    destination_index = _DownloadDestination(destination)
+    heads = {}
+    workers = max(1, min(8, profile.max_pool_connections))
+    def inspect(ref):
+        return ref, client.head_object(Bucket=bucket_name, Key=ref[0], **version_kwargs(ref))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for future in _bounded_parallel(pool, inspect, references, workers * 2):
+            ref, head = future.result()
+            heads[ref] = head
+    sizes = {ref: int(heads[ref].get("ContentLength", 0)) for ref in references}
+    total_bytes = sum(sizes[ref] for ref in references)
     uses_multipart = any(size >= multipart_threshold_bytes for size in sizes.values())
     parts_total = sum(
         max((size + multipart_chunk_bytes - 1) // multipart_chunk_bytes, 1)
-        for size in sizes.values()
+        for size in (sizes[ref] for ref in references)
         if size >= multipart_threshold_bytes
     )
     part_size_bytes = multipart_chunk_bytes if parts_total > 0 else None
@@ -3209,7 +3439,7 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
             status="queued",
             bytes_transferred=0,
             total_bytes=total_bytes,
-            output_lines=list(output_lines),
+            output_lines=_transfer_output_snapshot(output_lines),
             strategy_label=strategy_label,
             current_item_label=keys[0] if keys else None,
             item_count=len(keys),
@@ -3221,13 +3451,14 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
             can_cancel=True,
         )
     )
-    for key in keys:
+    for ref in references:
+        key = ref[0]
         _transfer_gate(control)
         target = destination / _download_name(key)
-        object_size = sizes[key]
+        object_size = sizes[ref]
         output_lines.append(f"Downloading {key} ({object_size} bytes) to {target}.")
         before_object = bytes_transferred
-        with _staged_download(destination, key, params.get("conflictPolicy", "keepBoth"), output_lines) as handle:
+        with _staged_download(destination, key, params.get("conflictPolicy", "keepBoth"), output_lines, destination_index) as handle:
             if object_size >= multipart_threshold_bytes:
                 handle.truncate(object_size)
                 write_lock = threading.Lock()
@@ -3241,30 +3472,17 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
                     write_lock=write_lock,
                     key=key,
                 ) -> tuple[int, int, int]:
-                    _transfer_gate(control)
-                    response = client.get_object(
-                        Bucket=bucket_name,
-                        Key=key,
-                        Range=f"bytes={start}-{end}",
-                        **version_kwargs(key),
-                        **({"IfMatch": heads[key]["ETag"]} if heads[key].get("ETag") else {}),
-                    )
-                    try:
-                        _transfer_gate(control)
-                        expected = end - start + 1
-                        _validate_download_range(response.get('ContentRange', ''), start, end, object_size, expected)
-                        received = 0
-                        while received <= expected:
-                            data = response['Body'].read(min(1024 * 1024, expected - received + 1))
-                            if not data: break
-                            _transfer_gate(control)
-                            with write_lock:
-                                handle.seek(start + received)
-                                handle.write(data)
-                            received += len(data)
-                    finally:
-                        response["Body"].close()
-                    _validate_download_range(response.get('ContentRange', ''), start, end, object_size, received)
+                    def open_range():
+                        response = client.get_object(Bucket=bucket_name, Key=key,
+                            Range=f'bytes={start}-{end}', **version_kwargs(ref),
+                            **({'IfMatch': heads[ref]['ETag']} if heads[ref].get('ETag') else {}))
+                        return response['Body'], response.get('ContentRange', '')
+                    def write(offset, data):
+                        with write_lock:
+                            handle.seek(offset)
+                            handle.write(data)
+                    received = _read_range_with_retry(open_range, write, start, end,
+                        object_size, profile.max_attempts, control)
                     return start, end, received
 
                 with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -3293,7 +3511,7 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
                                     status="running",
                                     bytes_transferred=bytes_transferred,
                                     total_bytes=total_bytes,
-                                    output_lines=list(output_lines),
+                                    output_lines=_transfer_output_snapshot(output_lines),
                                     strategy_label=strategy_label,
                                     current_item_label=key,
                                     item_count=len(keys),
@@ -3309,7 +3527,7 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
                         futures.close()
                         raise
             else:
-                response = client.get_object(Bucket=bucket_name, Key=key, **version_kwargs(key), **({"IfMatch": heads[key]["ETag"]} if heads[key].get("ETag") else {}))
+                response = client.get_object(Bucket=bucket_name, Key=key, **version_kwargs(ref), **({"IfMatch": heads[ref]["ETag"]} if heads[ref].get("ETag") else {}))
                 try:
                     while True:
                         chunk = response["Body"].read(min(multipart_chunk_bytes, 1024 * 1024))
@@ -3333,7 +3551,7 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
                                 status="running",
                                 bytes_transferred=bytes_transferred,
                                 total_bytes=total_bytes,
-                                output_lines=list(output_lines),
+                                output_lines=_transfer_output_snapshot(output_lines),
                                 strategy_label=strategy_label,
                                 current_item_label=key,
                                 item_count=len(keys),
@@ -5347,7 +5565,16 @@ def _storage_action(params):
         hold = _maybe_call(calls, 'GetObjectLegalHold', lambda: client.get_object_legal_hold(**ref), {})
         return {'retention': _clean_sdk(retention.get('Retention', {})), 'legalHold': hold.get('LegalHold', {}), 'sections': calls}
     if action == 'restoreObject':
-        request = {'Days': max(1, int(params.get('days') or 7)), 'GlacierJobParameters': {'Tier': params.get('tier') or 'Standard'}}
+        head = client.head_object(**ref)
+        storage_class = head.get('StorageClass', 'STANDARD')
+        tier = params.get('tier') or 'Standard'
+        if storage_class not in {'GLACIER', 'DEEP_ARCHIVE', 'INTELLIGENT_TIERING'}:
+            raise SidecarError('invalid_config', 'This storage class does not require archive restoration.')
+        if tier not in {'Expedited', 'Standard', 'Bulk'} or (storage_class == 'DEEP_ARCHIVE' and tier == 'Expedited'):
+            raise SidecarError('invalid_config', 'Select a retrieval tier supported by this archive.')
+        request = {'GlacierJobParameters': {'Tier': tier}}
+        if storage_class != 'INTELLIGENT_TIERING':
+            request['Days'] = max(1, int(params.get('days') or 7))
         response = client.restore_object(**ref, RestoreRequest=request)
         return {'requested': True, 'statusCode': response.get('ResponseMetadata', {}).get('HTTPStatusCode')}
     if action in {'listParts', 'abortMultipartUpload'}:
@@ -5365,7 +5592,7 @@ def _storage_action(params):
         return _storage_copy({**params, 'sourceProfile': params['profile'], 'destinationProfile': params['profile'],
                               'sourceBucketName': bucket, 'destinationBucketName': bucket,
                               'sourceKey': ref['Key'], 'destinationKey': ref['Key'], 'sourceVersionId': params.get('versionId'),
-                              'conflictPolicy': 'replace', 'options': {k: params[k] for k in ('metadata', 'headers', 'storageClass', 'encryption', 'expectedETag') if k in params}})
+                              'conflictPolicy': 'replace', 'options': {'preserveObjectProtection': True, **{k: params[k] for k in ('metadata', 'headers', 'storageClass', 'encryption', 'expectedETag') if k in params}}})
     raise SidecarError('unsupported_feature', f'Unknown storage action: {action}')
 
 
@@ -5384,6 +5611,48 @@ def _copy_options(head, options):
     if isinstance(encryption, str): encryption = {'ServerSideEncryption': encryption}
     for field in ('ServerSideEncryption', 'SSEKMSKeyId', 'BucketKeyEnabled'):
         if field in encryption: result[field] = encryption[field]
+    return result
+
+
+def _property_copy_protection(client, source):
+    """Resolve access and lock settings before publishing a replacement version.
+
+    Permission failures deliberately stop the edit; guessing could change access
+    or publish an unprotected current version.
+    """
+    bucket = {'Bucket': source['Bucket']}
+    result = {}
+    try:
+        ownership = _configuration_or_missing(lambda: client.get_bucket_ownership_controls(**bucket), {'OwnershipControlsNotFoundError', 'NoSuchOwnershipControls', 'NotImplemented'})
+        enforced = any(rule.get('ObjectOwnership') == 'BucketOwnerEnforced'
+                       for rule in ownership.get('OwnershipControls', {}).get('Rules', []))
+        if not enforced:
+            acl = client.get_object_acl(**source)
+            grants = {}
+            names = {'FULL_CONTROL': 'GrantFullControl', 'READ': 'GrantRead', 'READ_ACP': 'GrantReadACP', 'WRITE_ACP': 'GrantWriteACP'}
+            for grant in acl.get('Grants', []):
+                grantee = grant.get('Grantee', {})
+                field = names.get(grant.get('Permission'))
+                kind = 'id' if grantee.get('Type') == 'CanonicalUser' else 'uri' if grantee.get('Type') == 'Group' else None
+                value = grantee.get('ID' if kind == 'id' else 'URI')
+                if not field or not kind or not value or any(c in value for c in '\r\n"'):
+                    raise SidecarError('unsupported_feature', 'This object ACL cannot be preserved by a property edit.')
+                grants.setdefault(field, []).append(f'{kind}="{value}"')
+            if not grants:
+                raise SidecarError('invalid_response', 'The object ACL did not contain any grants.')
+            result.update({field: ', '.join(values) for field, values in grants.items()})
+        lock = _configuration_or_missing(lambda: client.get_object_lock_configuration(**bucket), {'ObjectLockConfigurationNotFoundError', 'NoSuchObjectLockConfiguration', 'NotImplemented'})
+        if lock.get('ObjectLockConfiguration', {}).get('ObjectLockEnabled') == 'Enabled':
+            retention = _configuration_or_missing(lambda: client.get_object_retention(**source), {'NoSuchObjectLockConfiguration', 'NoSuchRetentionConfiguration'}).get('Retention', {})
+            hold = client.get_object_legal_hold(**source).get('LegalHold', {})
+            if retention.get('Mode'):
+                result['ObjectLockMode'] = retention['Mode']
+                result['ObjectLockRetainUntilDate'] = retention['RetainUntilDate']
+            if hold.get('Status'):
+                result['ObjectLockLegalHoldStatus'] = hold['Status']
+    except Exception as error:
+        if isinstance(error, SidecarError): raise
+        raise SidecarError('access_denied', 'Cannot safely preserve ACL and Object Lock settings. No property changes were applied.', {'reason': str(error)}) from error
     return result
 
 
@@ -5422,6 +5691,10 @@ def _storage_copy_impl(params):
     if not all((*source.values(), *dest.values())):
         raise SidecarError('invalid_config', 'Copy source and destination bucket names and keys are required.')
     if params.get('sourceVersionId') is not None: source['VersionId'] = str(params['sourceVersionId'])
+    selected_version = source.get('VersionId')
+    same_object = (source_profile == dest_profile and source['Bucket'] == dest['Bucket'] and source['Key'] == dest['Key'])
+    if same_object and (params.get('move') or (selected_version is None and not params.get('options'))):
+        raise SidecarError('invalid_config', 'Choose a different destination object.')
     src_azure, dst_azure = source_profile.endpoint_type == 'azureBlob', dest_profile.endpoint_type == 'azureBlob'
     src = _build_azure_client(source_profile) if src_azure else _build_client(source_profile)
     dst = _build_azure_client(dest_profile) if dst_azure else _build_client(dest_profile)
@@ -5434,6 +5707,10 @@ def _storage_copy_impl(params):
             if headers.get(http): head[aws] = headers[http]
     else:
         head = src.head_object(**source)
+        # Pin reads to HEAD's identity without changing ordinary move semantics:
+        # only an explicitly selected version may be permanently deleted.
+        if head.get('VersionId') is not None and selected_version is None:
+            source['VersionId'] = head['VersionId']
     size = int(head.get('ContentLength') or 0)
     options = params.get('options') or {}
     expected = params.get('expectedSourceETag') or options.get('expectedETag') or params.get('expectedETag')
@@ -5470,6 +5747,8 @@ def _storage_copy_impl(params):
     if source_profile == dest_profile and source['Bucket'] == dest['Bucket'] and source['Key'] == dest['Key'] and 'encryption' not in options:
         options = {**options, 'encryption': {field: head[field] for field in ('ServerSideEncryption', 'SSEKMSKeyId', 'BucketKeyEnabled') if field in head}}
     put_options = _copy_options(head, options)
+    if options.get('preserveObjectProtection') and not src_azure:
+        put_options.update(_property_copy_protection(src, source))
     source_tags = {}
     if options.get('preserveTags', True):
         if src_azure:
@@ -5485,11 +5764,17 @@ def _storage_copy_impl(params):
     same_authority = source_profile == dest_profile
     strategy = 'relay'
     result = {}
-    if not src_azure and not dst_azure and same_authority and policy not in {'skip', 'fail'}:
+    conditional_server_copy = (same_authority and source_profile.endpoint_type == 'awsS3'
+                               and policy in {'skip', 'fail'} and size > 0)
+    if not src_azure and not dst_azure and same_authority and (policy not in {'skip', 'fail'} or conditional_server_copy):
+        if conditional_server_copy:
+            # A lost conditional completion response must never be replayed as
+            # another mutation; reconciliation belongs to the caller.
+            dst = _build_client(replace(dest_profile, max_attempts=1))
         strategy = 'server-side-copy'
         copy_source = dict(source)
         match = {'CopySourceIfMatch': head['ETag']} if head.get('ETag') else {}
-        if size <= 5 * 1024**3:
+        if size <= 5 * 1024**3 and not conditional_server_copy:
             result = dst.copy_object(**dest, CopySource=copy_source, MetadataDirective='REPLACE', TaggingDirective='REPLACE', **put_options, **match)
             _check_mutation_result(result, 'CopyObjectResult')
         else:
@@ -5504,15 +5789,19 @@ def _storage_copy_impl(params):
                     response = dst.upload_part_copy(**dest, UploadId=upload, PartNumber=index + 1,
                         CopySource=copy_source, CopySourceRange=f'bytes={start}-{min(start + chunk, size) - 1}', **match)
                     return {'PartNumber': index + 1, 'ETag': response['CopyPartResult']['ETag']}
-                with ThreadPoolExecutor(max_workers=min(8, dest_profile.max_pool_connections)) as pool:
-                    for part in pool.map(copy_part, range((size + chunk - 1) // chunk)):
-                        parts.append(part)
+                workers = max(1, min(8, dest_profile.max_pool_connections))
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    for future in _bounded_parallel(pool, copy_part, range((size + chunk - 1) // chunk), workers * 2):
+                        parts.append(future.result())
                         publish_copy(min(size, len(parts) * chunk))
+                parts.sort(key=lambda part: part['PartNumber'])
                 _transfer_gate(control)
-                result = dst.complete_multipart_upload(**dest, UploadId=upload, MultipartUpload={'Parts': parts})
+                result = dst.complete_multipart_upload(**dest, UploadId=upload, MultipartUpload={'Parts': parts},
+                    **({'IfNoneMatch': '*'} if conditional_server_copy else {}))
                 _check_mutation_result(result)
             except BaseException:
-                dst.abort_multipart_upload(**dest, UploadId=upload)
+                try: dst.abort_multipart_upload(**dest, UploadId=upload)
+                except Exception: pass
                 raise
     else:
         # Relay spills one part at a time above 8 MiB; no credentials go to disk.
@@ -5569,7 +5858,8 @@ def _storage_copy_impl(params):
                                                            **({'IfNoneMatch': '*'} if policy in {'skip', 'fail'} else {}))
                     _check_mutation_result(result)
                 except BaseException:
-                    dst.abort_multipart_upload(**dest, UploadId=upload)
+                    try: dst.abort_multipart_upload(**dest, UploadId=upload)
+                    except Exception: pass
                     raise
         finally:
             body.close()
@@ -5583,8 +5873,27 @@ def _storage_copy_impl(params):
         dest_size = int(dst.head_object(**verify).get('ContentLength') or 0)
     if dest_size != size: raise SidecarError('conflict', 'Destination size verification failed after copying.')
     publish_copy(size, completed=True)
-    return {'successCount': 1, 'failureCount': 0, 'failures': [], 'skipped': False, 'bytesCopied': size,
-            'versionId': result.get('VersionId'), 'strategy': strategy}
+    outcome = {'successCount': 1, 'failureCount': 0, 'failures': [], 'skipped': False, 'bytesCopied': size,
+               'versionId': result.get('VersionId'), 'strategy': strategy,
+               'sourceVersionId': source.get('VersionId'), 'sourceETag': head.get('ETag')}
+    if params.get('move'):
+        try:
+            if not head.get('ETag'):
+                raise SidecarError('unsupported_feature', 'Source has no ETag for a conditional delete.')
+            if src_azure:
+                src.request('DELETE', src.blob_path(source['Bucket'], source['Key']), query=src_query,
+                            headers={'If-Match': head['ETag']})
+            else:
+                if selected_version is None and source_profile.endpoint_type != 'awsS3':
+                    raise SidecarError('unsupported_feature', 'This endpoint has no verified conditional-delete capability.')
+                src.delete_object(Bucket=source['Bucket'], Key=source['Key'], IfMatch=head['ETag'],
+                                  **({'VersionId': selected_version} if selected_version is not None else {}))
+        except Exception as error:
+            outcome.update(successCount=0, failureCount=1, copiedCount=1, sourceRetained=True,
+                           failures=[{'target': source['Key'], 'versionId': selected_version,
+                                      'code': 'source_delete_failed',
+                                      'message': f'Copy completed; source deletion was not confirmed: {error}'}])
+    return outcome
 
 
 def _azure_storage_action(params):

@@ -49,6 +49,12 @@ def _default_engine_cmd() -> list[str]:
 
 
 def _resolve_engine_cmd() -> list[str]:
+    encoded = os.environ.get("ENGINE_CMD_JSON")
+    if encoded:
+        command = json.loads(encoded)
+        if not isinstance(command, list) or not command or not all(isinstance(value, str) and value for value in command):
+            raise ValueError("ENGINE_CMD_JSON must contain a nonempty argv string list")
+        return command
     override = os.environ.get("ENGINE_CMD")
     if override:
         return shlex.split(override, posix=(os.name != "nt"))

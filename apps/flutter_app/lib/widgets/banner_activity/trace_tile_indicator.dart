@@ -214,6 +214,9 @@ Color _legible(Color candidate, BannerActivitySpec spec) =>
     _contrast(candidate, spec.background) >= 3 ? candidate : spec.foreground;
 
 class _TilePainter extends CustomPainter {
+  static final _tile = RRect.fromRectAndRadius(
+      const Rect.fromLTWH(2, 2, 28, 28), const Radius.circular(7));
+  static final _metric = (Path()..addRRect(_tile)).computeMetrics().first;
   _TilePainter({
     required this.spec,
     required this.previous,
@@ -237,10 +240,7 @@ class _TilePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final t = _transition ? Curves.easeInOutCubic.transform(clock.value) : 1.0;
-    final tile = RRect.fromRectAndRadius(
-      const Rect.fromLTWH(2, 2, 28, 28),
-      const Radius.circular(7),
-    );
+    final tile = _tile;
     final terminal =
         !spec.isWorking && spec.phase != BannerActivityPhase.paused;
     final wasTerminal = previous != null &&
@@ -276,8 +276,7 @@ class _TilePainter extends CustomPainter {
     }
     final motion = spec.animate ? clock.value : .22;
     if (spec.isWorking || spec.phase == BannerActivityPhase.paused) {
-      final path = Path()..addRRect(tile);
-      final metric = path.computeMetrics().first;
+      final metric = _metric;
       if (spec.kind == BannerActivityKind.benchmark) {
         canvas.drawPath(
           metric.extractPath(0, metric.length * _progress(spec)),

@@ -1,9 +1,18 @@
 import 'package:flutter/material.dart';
 
+import '../theme/app_motion.dart';
+import 'touch_targets.dart';
+
 /// Shared geometry and motion for every menu in the app, matching the
 /// [AppSelectField] panel used by the engine and profile selectors.
 class AppMenuStyle {
   static const double itemHeight = 40;
+  static double rowHeight(BuildContext context) {
+    final text = MediaQuery.textScalerOf(context).scale(14);
+    final minimum = usesTouchTargets(context) ? 48.0 : itemHeight;
+    return (text + 24).clamp(minimum, double.infinity);
+  }
+
   static const double verticalPadding = 6;
   static const double radius = 10;
   static const double anchorGap = 4;
@@ -15,8 +24,16 @@ class AppMenuStyle {
     reverseCurve: Curves.easeInCubic,
   );
 
+  static AnimationStyle animationFor(BuildContext context) => AnimationStyle(
+        duration: AppMotion.duration(context, milliseconds: 180),
+        reverseDuration: AppMotion.duration(context, milliseconds: 120),
+        curve: Curves.easeOutCubic,
+        reverseCurve: Curves.easeInCubic,
+      );
+
   static Color selectedBackground(ThemeData theme) =>
       theme.colorScheme.primaryContainer.withValues(alpha: 0.55);
+
   /// Soft drop shadow for anchored panels drawn outside a [Material]. Popup
   /// menus get the equivalent from elevation 6 in the theme.
   static List<BoxShadow> shadows(ThemeData theme) {
@@ -65,10 +82,10 @@ class AppMenuRow extends StatelessWidget {
     final foreground = !enabled
         ? scheme.onSurfaceVariant.withValues(alpha: 0.5)
         : destructive
-        ? scheme.error
-        : selected
-        ? scheme.onPrimaryContainer
-        : scheme.onSurface;
+            ? scheme.error
+            : selected
+                ? scheme.onPrimaryContainer
+                : scheme.onSurface;
     return Row(
       children: [
         if (icon != null) ...[
@@ -113,7 +130,7 @@ PopupMenuItem<T> appMenuItem<T>({
     padding: EdgeInsets.zero,
     child: Builder(
       builder: (context) => Container(
-        height: AppMenuStyle.itemHeight,
+        height: AppMenuStyle.rowHeight(context),
         padding: AppMenuStyle.itemPadding,
         color: selected
             ? AppMenuStyle.selectedBackground(Theme.of(context))
@@ -143,9 +160,9 @@ Future<T?> showAppMenu<T>({
   required Rect anchor,
   required List<PopupMenuEntry<T>> items,
 }) {
-  final overlay =
-      Overlay.of(context, rootOverlay: true).context.findRenderObject()
-          as RenderBox;
+  final overlay = Overlay.of(context, rootOverlay: true)
+      .context
+      .findRenderObject() as RenderBox;
   final topLeft = overlay.globalToLocal(anchor.topLeft);
   final bottomRight = overlay.globalToLocal(anchor.bottomRight);
   final gap = anchor.isEmpty ? 0.0 : AppMenuStyle.anchorGap;
@@ -159,7 +176,7 @@ Future<T?> showAppMenu<T>({
     context: context,
     position: RelativeRect.fromRect(target, Offset.zero & overlay.size),
     items: items,
-    popUpAnimationStyle: AppMenuStyle.animation,
+    popUpAnimationStyle: AppMenuStyle.animationFor(context),
   );
 }
 

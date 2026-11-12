@@ -1,10 +1,16 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import '../widgets/app_form_dialog.dart';
 
 class TagEditorDialog extends StatefulWidget {
   const TagEditorDialog(
-      {super.key, required this.initialTags, this.title = 'Edit tags'});
+      {super.key,
+      required this.initialTags,
+      this.title = 'Edit tags',
+      this.onSave});
   final Map<String, String> initialTags;
   final String title;
+  final Future<void> Function(Map<String, String>)? onSave;
   @override
   State<TagEditorDialog> createState() => _TagEditorDialogState();
 }
@@ -22,7 +28,7 @@ class _TagEditorDialogState extends State<TagEditorDialog> {
     if (_rows.length > 50) return 'Use at most 50 tags.';
     final keys = <String>{};
     for (final row in _rows) {
-      final key = row.$1.text.trim();
+      final key = row.$1.text;
       if (key.isEmpty) return 'Tag keys cannot be empty.';
       if (!keys.add(key)) return 'Duplicate tag key: $key';
       if (key.length > 128 || row.$2.text.length > 256) {
@@ -44,31 +50,41 @@ class _TagEditorDialogState extends State<TagEditorDialog> {
     super.dispose();
   }
 
+  Map<String, String> get _value =>
+      {for (final row in _rows) row.$1.text: row.$2.text};
+
   @override
-  Widget build(BuildContext context) => AlertDialog(
-          title: Text(widget.title),
-          content: SizedBox(
-              width: 560,
-              child: SingleChildScrollView(
-                  child: Column(mainAxisSize: MainAxisSize.min, children: [
-                for (final row in _rows)
-                  Padding(
-                      key: ObjectKey(row.$1),
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: Row(children: [
+  Widget build(BuildContext context) => AppFormDialog<Map<String, String>>(
+        title: widget.title,
+        dirty: !mapEquals(_value, widget.initialTags),
+        valid: _error == null,
+        value: () => _value,
+        onSave: widget.onSave,
+        child: LayoutBuilder(builder: (context, constraints) {
+          final stacked = constraints.maxWidth < 450 ||
+              MediaQuery.textScalerOf(context).scale(14) > 20;
+          return Column(mainAxisSize: MainAxisSize.min, children: [
+            for (final row in _rows)
+              Padding(
+                  key: ObjectKey(row.$1),
+                  padding: const EdgeInsets.only(bottom: 16),
+                  child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
                         Expanded(
-                            child: TextField(
-                                controller: row.$1,
-                                decoration:
-                                    const InputDecoration(labelText: 'Key'),
-                                onChanged: (_) => setState(() {}))),
-                        const SizedBox(width: 8),
-                        Expanded(
-                            child: TextField(
-                                controller: row.$2,
-                                decoration:
-                                    const InputDecoration(labelText: 'Value'),
-                                onChanged: (_) => setState(() {}))),
+                            child: stacked
+                                ? Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                        _field(row.$1, 'Key'),
+                                        const SizedBox(height: 12),
+                                        _field(row.$2, 'Value')
+                                      ])
+                                : Row(children: [
+                                    Expanded(child: _field(row.$1, 'Key')),
+                                    const SizedBox(width: 12),
+                                    Expanded(child: _field(row.$2, 'Value'))
+                                  ])),
                         IconButton(
                             tooltip: 'Remove tag',
                             onPressed: () => setState(() {
@@ -77,31 +93,24 @@ class _TagEditorDialogState extends State<TagEditorDialog> {
                                 }),
                             icon: const Icon(Icons.remove_circle_outline)),
                       ])),
-                if (_error != null)
-                  Text(_error!,
-                      style: TextStyle(
-                          color: Theme.of(context).colorScheme.error)),
-                TextButton.icon(
-                    onPressed: _rows.length >= 50
-                        ? null
-                        : () => setState(() => _rows.add((
-                              TextEditingController(),
-                              TextEditingController()
-                            ))),
-                    icon: const Icon(Icons.add),
-                    label: const Text('Add tag')),
-              ]))),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('Cancel')),
-            FilledButton(
-                onPressed: _error != null
+            if (_error != null)
+              Text(_error!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error)),
+            TextButton.icon(
+                onPressed: _rows.length >= 50
                     ? null
-                    : () => Navigator.pop(context, {
-                          for (final row in _rows)
-                            row.$1.text.trim(): row.$2.text
-                        }),
-                child: const Text('Save'))
+                    : () => setState(() => _rows.add(
+                        (TextEditingController(), TextEditingController()))),
+                icon: const Icon(Icons.add),
+                label: const Text('Add tag')),
           ]);
+        }),
+      );
+
+  Widget _field(TextEditingController controller, String label) => TextField(
+      controller: controller,
+      autocorrect: false,
+      enableSuggestions: false,
+      decoration: InputDecoration(labelText: label),
+      onChanged: (_) => setState(() {}));
 }

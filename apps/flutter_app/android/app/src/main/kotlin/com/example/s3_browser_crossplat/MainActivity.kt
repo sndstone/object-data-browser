@@ -60,7 +60,55 @@ import kotlin.math.min
 
 class MainActivity : FlutterActivity() {
     private val channelName = "s3_browser_crossplat/android_engine"
-    private val executor = Executors.newCachedThreadPool()
+    private var executor = Executors.newCachedThreadPool()
+    private var metadataExecutor = Executors.newFixedThreadPool(4)
+    private var engineChannel: MethodChannel? = null
+    private val detached = java.util.concurrent.atomic.AtomicBoolean(false)
+    private class NativeClientEntry(val client: AmazonS3Client, var users: Int = 0)
+    private val clients = LinkedHashMap<AndroidProfile, NativeClientEntry>(16, 0.75f, true)
+    private val requestClients = ThreadLocal<MutableSet<NativeClientEntry>>()
+    private data class CachedVersioning(val enabled: Boolean, val savedAt: Long)
+    private val versioningCache = ConcurrentHashMap<Pair<AndroidProfile, String>, CachedVersioning>()
+    private fun evictIdleClients() {
+        synchronized(clients) {
+            val iterator = clients.entries.iterator()
+            while (clients.size > 8 && iterator.hasNext()) {
+                val entry = iterator.next().value
+                if (entry.users == 0) { iterator.remove(); entry.client.shutdown() }
+            }
+        }
+    }
+    private fun releaseRequestClients() {
+        synchronized(clients) {
+            requestClients.get()?.forEach { it.users = (it.users - 1).coerceAtLeast(0) }
+            requestClients.remove()
+        }
+        evictIdleClients()
+    }
+    private fun shutdownNative() {
+        if (!detached.compareAndSet(false, true)) return
+        engineChannel?.setMethodCallHandler(null)
+        engineChannel = null
+        cancellationTokens.values.forEach { it.set(true) }
+        requests.values.forEach { it.cancel(true) }
+        requests.clear()
+        cancellationTokens.clear()
+        requestResults.keys.toList().forEach { id ->
+            requestResults.remove(id)?.success(mapOf("error" to mapOf("code" to "unknown", "message" to "The native engine detached. Inspect active operation outcomes before retrying.")))
+        }
+        executor.shutdownNow()
+        metadataExecutor.shutdownNow()
+        synchronized(clients) { clients.values.forEach { it.client.shutdown() }; clients.clear() }
+        versioningCache.clear()
+    }
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        shutdownNative()
+        super.cleanUpFlutterEngine(flutterEngine)
+    }
+    override fun onDestroy() {
+        shutdownNative()
+        super.onDestroy()
+    }
     private val isoFormatter = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
     }
@@ -78,8 +126,12 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
-            .setMethodCallHandler(::handleMethodCall)
+        detached.set(false)
+        if (executor.isShutdown) executor = Executors.newCachedThreadPool()
+        if (metadataExecutor.isShutdown) metadataExecutor = Executors.newFixedThreadPool(4)
+        engineChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName).also {
+            it.setMethodCallHandler(::handleMethodCall)
+        }
     }
 
     private fun handleMethodCall(call: MethodCall, result: MethodChannel.Result) {
@@ -102,6 +154,8 @@ class MainActivity : FlutterActivity() {
                 ),
             )
 
+            "invalidateBucketMetadata" -> { versioningCache.clear(); result.success(null) }
+            "shutdown" -> { shutdownNative(); result.success(null) }
             "cancelRequest" -> {
                 val id = stringAnyMap(call.arguments)["requestId"]?.toString()
                 if (id != null) {
@@ -121,6 +175,7 @@ class MainActivity : FlutterActivity() {
                 cancellationTokens[requestId] = token
                 val request = java.util.concurrent.FutureTask<Unit> {
                     requestToken.set(token)
+                    requestClients.set(mutableSetOf())
                     val payload = try {
                         dispatch(engineId, method, params)
                     } catch (error: EngineFailure) {
@@ -128,6 +183,8 @@ class MainActivity : FlutterActivity() {
                     } catch (error: Throwable) {
                         mapOf("error" to mapFailure(error).toMap())
                     }
+                    if (method == "setBucketVersioning" || method == "createBucket" || method == "deleteBucket") versioningCache.clear()
+                    releaseRequestClients()
                     requestToken.remove()
                     cancellationTokens.remove(requestId)
                     requests.remove(requestId)
@@ -208,7 +265,7 @@ class MainActivity : FlutterActivity() {
             "id" to id,
             "label" to label,
             "language" to language,
-            "version" to "2.3.4",
+            "version" to "2.3.5",
             "available" to true,
             "notes" to notes,
         )
@@ -217,7 +274,7 @@ class MainActivity : FlutterActivity() {
     private fun health(engineId: String): Map<String, Any?> {
         return mapOf(
             "engine" to engineId,
-            "version" to "2.3.4",
+            "version" to "2.3.5",
             "available" to true,
             "methods" to listOf(
                 "health",
@@ -321,22 +378,40 @@ class MainActivity : FlutterActivity() {
 
     private fun listBuckets(profile: AndroidProfile): Map<String, Any?> {
         val client = buildClient(profile)
-        val items = client.listBuckets().map { bucket ->
-            val versioningEnabled = try {
-                client.getBucketVersioningConfiguration(bucket.name).status ==
-                    BucketVersioningConfiguration.ENABLED
-            } catch (_: Throwable) {
-                false
+        val buckets = client.listBuckets()
+        val items = arrayOfNulls<Map<String, Any?>>(buckets.size)
+        val next = java.util.concurrent.atomic.AtomicInteger(0)
+        val token = requestToken.get()
+        val workers = (0 until min(4, buckets.size)).map {
+            metadataExecutor.submit<Unit> {
+                requestToken.set(token)
+                try {
+                    while (true) {
+                        ensureRequestActive()
+                        val index = next.getAndIncrement()
+                        if (index >= buckets.size) break
+                        val bucket = buckets[index]
+                        val cacheKey = profile to bucket.name
+                        val cached = versioningCache[cacheKey]?.takeIf { System.nanoTime() - it.savedAt < 60_000_000_000L }
+                        val enabled = cached?.enabled ?: try {
+                            val value = client.getBucketVersioningConfiguration(bucket.name).status == BucketVersioningConfiguration.ENABLED
+                            if (versioningCache.size >= 1024) versioningCache.clear()
+                            versioningCache[cacheKey] = CachedVersioning(value, System.nanoTime())
+                            value
+                        } catch (error: Throwable) {
+                            ensureRequestActive()
+                            // Failed reads remain unknown and are not cached as disabled.
+                            null
+                        }
+                        items[index] = mapOf("name" to bucket.name, "region" to profile.region,
+                            "objectCountHint" to 0, "versioningEnabled" to (enabled ?: false),
+                            "versioningKnown" to (enabled != null), "createdAt" to iso(bucket.creationDate))
+                    }
+                } finally { requestToken.remove() }
             }
-            mapOf(
-                "name" to bucket.name,
-                "region" to profile.region,
-                "objectCountHint" to 0,
-                "versioningEnabled" to versioningEnabled,
-                "createdAt" to iso(bucket.creationDate),
-            )
         }
-        return mapOf("items" to items)
+        try { workers.forEach { it.get() } } finally { workers.forEach { it.cancel(true) } }
+        return mapOf("items" to items.filterNotNull())
     }
 
     private fun createBucket(params: Map<String, Any?>): Map<String, Any?> {
@@ -1205,6 +1280,17 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun buildClient(profile: AndroidProfile): AmazonS3 {
+        synchronized(clients) {
+            if (detached.get()) throw EngineFailure("unknown", "Native engine is detached.")
+            val entry = clients.getOrPut(profile) { NativeClientEntry(newClient(profile)) }
+            val borrowed = requestClients.get()
+            if (borrowed != null && borrowed.add(entry)) entry.users++
+            evictIdleClients()
+            return entry.client
+        }
+    }
+
+    private fun newClient(profile: AndroidProfile): AmazonS3Client {
         val credentials = credentialsFor(profile)
         val configuration = ClientConfiguration().apply {
             protocol = if (profile.endpointUrl.startsWith("http://", ignoreCase = true)) {

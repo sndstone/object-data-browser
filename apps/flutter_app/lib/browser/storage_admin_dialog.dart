@@ -136,38 +136,45 @@ class _StorageAdminDialogState extends State<StorageAdminDialog> {
   Future<void> editMap(String field) async {
     final current = field == 'tags' ? await call('objectTags') : details;
     if (!mounted) return;
-    final result = await showDialog<Map<String, String>>(
+    await showDialog<Map<String, String>>(
         context: context,
         builder: (_) => TagEditorDialog(
             initialTags: stringMap(current[field]),
-            title: field == 'tags' ? 'Object tags' : 'Object metadata'));
-    if (result == null) return;
-    await run(() async {
-      final outcome = await call(
-          field == 'tags' ? 'objectTags' : 'objectProperties', {
-        field: result,
-        if (details['etag'] != null) 'expectedETag': details['etag']
-      });
-      checkOutcome(outcome);
-      details = await call('objectDetails');
-      notice = 'Saved $field.';
-    });
+            title: field == 'tags' ? 'Object tags' : 'Object metadata',
+            onSave: (value) async {
+              checkOutcome(await call(
+                  field == 'tags' ? 'objectTags' : 'objectProperties', {
+                field: value,
+                if (details['etag'] != null) 'expectedETag': details['etag']
+              }));
+              final updated = await call('objectDetails');
+              if (mounted) {
+                setState(() {
+                  details = updated;
+                  notice = 'Saved $field.';
+                });
+              }
+            }));
   }
 
   Future<void> editHeaders() async {
-    final result = await showDialog<Map<String, String>>(
+    await showDialog<Map<String, String>>(
         context: context,
-        builder: (_) =>
-            ContentHeadersDialog(headers: stringMap(details['headers'])));
-    if (result == null) return;
-    await run(() async {
-      checkOutcome(await call('objectProperties', {
-        'headers': result,
-        if (details['etag'] != null) 'expectedETag': details['etag']
-      }));
-      details = await call('objectDetails');
-      notice = 'Headers saved.';
-    });
+        builder: (_) => ContentHeadersDialog(
+            headers: stringMap(details['headers']),
+            onSave: (value) async {
+              checkOutcome(await call('objectProperties', {
+                'headers': value,
+                if (details['etag'] != null) 'expectedETag': details['etag']
+              }));
+              final updated = await call('objectDetails');
+              if (mounted) {
+                setState(() {
+                  details = updated;
+                  notice = 'Headers saved.';
+                });
+              }
+            }));
   }
 
   void checkOutcome(Map<String, Object?> result) {
@@ -270,6 +277,7 @@ class _StorageAdminDialogState extends State<StorageAdminDialog> {
         builder: (context) => StatefulBuilder(
             builder: (context, update) => AlertDialog(
                   title: const Text('Recoverable upload'),
+                  scrollable: true,
                   content: SizedBox(
                       width: 500,
                       child: Column(mainAxisSize: MainAxisSize.min, children: [
@@ -521,23 +529,39 @@ class _StorageAdminDialogState extends State<StorageAdminDialog> {
                             select(
                                 'Retrieval tier',
                                 tier,
-                                ['Standard', 'Bulk', 'Expedited'],
+                                [
+                                  'Standard',
+                                  'Bulk',
+                                  if (details['storageClass'] != 'DEEP_ARCHIVE')
+                                    'Expedited'
+                                ],
                                 (v) => tier = v),
-                            TextField(
-                                controller: amount,
-                                decoration: const InputDecoration(
-                                    labelText: 'Days to keep restored copy'),
-                                keyboardType: TextInputType.number),
+                            if (details['storageClass'] ==
+                                'INTELLIGENT_TIERING')
+                              const Text(
+                                  'Restoration returns the object to Frequent Access; no expiration applies.')
+                            else
+                              TextField(
+                                  controller: amount,
+                                  decoration: const InputDecoration(
+                                      labelText: 'Days to keep restored copy'),
+                                  keyboardType: TextInputType.number),
                             button(
                                 'Request restore',
                                 () => run(() async {
                                       final days = int.tryParse(amount.text);
-                                      if (days == null || days < 1) {
+                                      if (details['storageClass'] !=
+                                              'INTELLIGENT_TIERING' &&
+                                          (days == null || days < 1)) {
                                         throw const FormatException(
                                             'Enter a positive day count.');
                                       }
-                                      await call('restoreObject',
-                                          {'days': days, 'tier': tier});
+                                      await call('restoreObject', {
+                                        if (details['storageClass'] !=
+                                            'INTELLIGENT_TIERING')
+                                          'days': days,
+                                        'tier': tier
+                                      });
                                       notice =
                                           'Restore requested. Retrieval is asynchronous and may incur charges.';
                                     })),

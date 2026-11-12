@@ -72,6 +72,7 @@ class _AppSwitchState extends State<AppSwitch> {
             bottom: 0,
             child: AnimatedOpacity(
               duration: duration,
+              curve: curve,
               opacity: on ? 1 : 0,
               child: Center(
                 child: Text(
@@ -87,6 +88,7 @@ class _AppSwitchState extends State<AppSwitch> {
             bottom: 0,
             child: AnimatedOpacity(
               duration: duration,
+              curve: curve,
               opacity: on ? 0 : 1,
               child: Center(
                 child: Text(
@@ -144,9 +146,8 @@ class _AppSwitchState extends State<AppSwitch> {
       onTap: _enabled ? _toggle : null,
       child: FocusableActionDetector(
         enabled: _enabled,
-        mouseCursor: _enabled
-            ? SystemMouseCursors.click
-            : SystemMouseCursors.basic,
+        mouseCursor:
+            _enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
         onShowFocusHighlight: (value) => setState(() => _focused = value),
         shortcuts: const {
           SingleActivator(LogicalKeyboardKey.space): ActivateIntent(),

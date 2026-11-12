@@ -124,7 +124,7 @@ def test_azure_move_requires_confirmed_copy(engine, download_server, status):
     if 'python' not in name and 'go' not in name: pytest.skip('Azure unsupported')
     profile, handler = download_server; handler.copy_status = status
     result = engine.request('moveObject', params={'profile': {**profile, 'endpointType': 'azureBlob', 'secretKey': 'Zml4dHVyZQ=='},
-        'sourceBucketName': 'source', 'sourceKey': 'important.txt', 'destinationBucketName': 'dest', 'destinationKey': 'important.txt'})
+        'sourceBucketName': 'source', 'sourceKey': 'important.txt', 'destinationBucketName': 'dest', 'destinationKey': 'important.txt', 'copyTimeoutSeconds': 5})
     assert result['ok'] == (status in ('eventual', 'success')), result
     assert handler.deletes == (1 if status in ('eventual', 'success') else 0)
 
@@ -138,7 +138,7 @@ def test_azure_move_conflicts_are_not_success(engine, download_server, mode):
     if mode == 'identity': handler.copy_id = 'different-copy'
     else: handler.mode = mode
     result = engine.request('moveObject', params={'profile': {**profile, 'endpointType': 'azureBlob', 'secretKey': 'Zml4dHVyZQ=='},
-        'sourceBucketName': 'source', 'sourceKey': 'important.txt', 'destinationBucketName': 'dest', 'destinationKey': 'important.txt'})
+        'sourceBucketName': 'source', 'sourceKey': 'important.txt', 'destinationBucketName': 'dest', 'destinationKey': 'important.txt', 'copyTimeoutSeconds': 5})
     assert not result['ok'], result
     assert handler.deletes == (0 if mode == 'identity' else 1)
 

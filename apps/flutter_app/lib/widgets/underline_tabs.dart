@@ -36,6 +36,11 @@ class UnderlineTabs<T> extends StatelessWidget {
       ...overflow.where((tab) => tab.value == selected),
     ];
     final hidden = overflow.where((tab) => tab.value != selected).toList();
+    // Reserve the bolder label width in both states so emphasis never shifts
+    // adjacent tabs when the original, immediate selection highlight changes.
+    final widths = [
+      for (final tab in visible) _tabWidth(context, tab),
+    ];
     return DecoratedBox(
       decoration: BoxDecoration(
         border: Border(
@@ -47,7 +52,9 @@ class UnderlineTabs<T> extends StatelessWidget {
           child: EdgeFadeScroll(
             child: Row(children: [
               for (var i = 0; i < visible.length; i++)
-                _tab(context, visible[i], i, visible.length),
+                SizedBox(
+                    width: widths[i],
+                    child: _tab(context, visible[i], i, visible.length)),
             ]),
           ),
         ),
@@ -57,7 +64,7 @@ class UnderlineTabs<T> extends StatelessWidget {
             icon: const Icon(Icons.more_horiz),
             position: PopupMenuPosition.under,
             offset: const Offset(0, AppMenuStyle.anchorGap),
-            popUpAnimationStyle: AppMenuStyle.animation,
+            popUpAnimationStyle: AppMenuStyle.animationFor(context),
             onSelected: onChanged,
             itemBuilder: (_) => [
               for (final tab in hidden)
@@ -69,6 +76,22 @@ class UnderlineTabs<T> extends StatelessWidget {
           ),
       ]),
     );
+  }
+
+  double _tabWidth(BuildContext context, UnderlineTab<T> tab) {
+    final painter = TextPainter(
+      text: TextSpan(
+          text: tab.label,
+          style: Theme.of(context)
+              .textTheme
+              .labelLarge
+              ?.copyWith(fontWeight: FontWeight.w800)),
+      textDirection: Directionality.of(context),
+      textScaler: MediaQuery.textScalerOf(context),
+    )..layout();
+    final width = painter.width.ceilToDouble() + 20;
+    painter.dispose();
+    return width;
   }
 
   Widget _tab(BuildContext context, UnderlineTab<T> tab, int index, int count) {
@@ -86,14 +109,13 @@ class UnderlineTabs<T> extends StatelessWidget {
           constraints: const BoxConstraints(minHeight: 40),
           padding: const EdgeInsets.symmetric(horizontal: 10),
           alignment: Alignment.center,
+          key: active ? const ValueKey('tab-underline') : null,
           decoration: BoxDecoration(
-            border: Border(
-              bottom: BorderSide(
-                color: active ? theme.colorScheme.primary : Colors.transparent,
-                width: 2,
-              ),
-            ),
-          ),
+              border: Border(
+                  bottom: BorderSide(
+            width: 2,
+            color: active ? theme.colorScheme.primary : Colors.transparent,
+          ))),
           child: Text(
             tab.label,
             maxLines: 1,

@@ -1,4 +1,4 @@
-﻿# Object Data Browser
+# Object Data Browser
 
 A Flutter app for browsing S3-compatible storage, AWS S3, and Azure Blob Storage. Runs on Windows, macOS, Linux, Android, and iOS, with Python, Go, Rust, and Java engines on desktop.
 
@@ -40,15 +40,15 @@ Screenshots show the Windows layout with fictional data. Benchmark figures illus
 
 Get installers and checksums from [GitHub Releases](https://github.com/sndstone/object-data-browser/releases).
 
-The [2.3.3 desktop prerelease](https://github.com/sndstone/object-data-browser/releases/tag/v2.3.3) includes:
+The [2.3.5 macOS development prerelease](https://github.com/sndstone/object-data-browser/releases/tag/v2.3.5) includes the new Apple Silicon DMG with performance, S3 safety and adaptive-dialog improvements.
 
 | Platform | Package |
 | --- | --- |
-| Windows x64 | MSI, unsigned development build |
-| Linux x64 / ARM64 | DEB and RPM; glibc 2.31 or newer |
-| macOS Apple Silicon, 12+ | Development DMG, ad-hoc signed and not notarized |
+| macOS Apple Silicon, 13+ | [2.3.5 development DMG](https://github.com/sndstone/object-data-browser/releases/download/v2.3.5/object-data-browser-macos-2.3.5-arm64-dev.dmg), ad-hoc signed and not notarized |
+| Windows x64 | [2.3.4 MSI](https://github.com/sndstone/object-data-browser/releases/tag/v2.3.4), unsigned development build |
+| Linux x64 / ARM64 | [2.3.3 DEB and RPM](https://github.com/sndstone/object-data-browser/releases/tag/v2.3.3); glibc 2.31 or newer |
 
-Use the DEB on Linux Mint 20 or newer. After updating the macOS development build, you may need to re-enter credentials. Version 2.3.3 has no Windows ARM64, Android, or iOS package; older Android test builds are listed in earlier releases.
+Use the DEB on Linux Mint 20 or newer. Updating a macOS development build may require renewed Keychain authorization or credential re-entry. These DMGs are development artifacts and do not provide an update-stable Developer ID identity. No new Windows, Linux, Android or iOS installers are included in 2.3.5. See the [verification scope](docs/2.3.5-verification.md).
 
 ## Connect
 

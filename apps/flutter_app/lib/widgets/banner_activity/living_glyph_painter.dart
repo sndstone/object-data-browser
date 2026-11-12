@@ -1,4 +1,5 @@
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
@@ -128,15 +129,21 @@ class LivingGlyphPainter extends CustomPainter {
     required this.from,
     required this.palette,
     required this.animate,
-  }) : super(repaint: clock);
+    this.fromSnapshot,
+    this.handoff,
+  }) : super(repaint: Listenable.merge([clock, if (handoff != null) handoff]));
 
   final Animation<double> clock;
+  final Animation<double>? handoff;
 
   /// The current state; its loop position is read from [clock].
   final GlyphFrame frame;
 
   /// The departing state during a result morph.
   final GlyphFrame? from;
+
+  /// Frozen visible composite, including an interrupted result morph.
+  final ui.Picture? fromSnapshot;
   final GlyphPalette palette;
   final bool animate;
 
@@ -145,7 +152,16 @@ class LivingGlyphPainter extends CustomPainter {
     canvas.translate((size.width - 28) / 2, (size.height - 32) / 2);
     final t = clock.value;
     if (!isResult(frame.phase)) {
-      _paintKind(canvas, frame, t);
+      final blend = handoff?.value ?? 1;
+      if (fromSnapshot != null && blend < 1) {
+        final mix = Curves.easeInOutCubic.transform(blend);
+        _layer(canvas, 1 - mix, 1 - .04 * mix,
+            () => canvas.drawPicture(fromSnapshot!));
+        _layer(
+            canvas, mix, .96 + .04 * mix, () => _paintKind(canvas, frame, t));
+      } else {
+        _paintKind(canvas, frame, t);
+      }
       return;
     }
     final departing = from;
@@ -158,7 +174,9 @@ class LivingGlyphPainter extends CustomPainter {
     final out = _interval(t, 0, .45, Curves.easeIn);
     if (out < 1) {
       _layer(canvas, 1 - out, 1 - .4 * out, () {
-        if (isResult(departing.phase)) {
+        if (fromSnapshot != null) {
+          canvas.drawPicture(fromSnapshot!);
+        } else if (isResult(departing.phase)) {
           _paintStatus(canvas, departing.phase, 1);
         } else {
           _paintKind(canvas, departing, departing.t);
@@ -440,7 +458,7 @@ class LivingGlyphPainter extends CustomPainter {
     final ringT = _interval(reveal, .12, .72, Curves.easeInOutCubic);
     final markT = _interval(reveal, .42, 1, Curves.easeOutCubic);
     final opacity = _interval(reveal, .12, .3);
-    final scale = .84 + .16 * _interval(reveal, .12, .8, Curves.easeOutBack);
+    final scale = .84 + .16 * _interval(reveal, .12, .8, Curves.easeOutCubic);
     if (opacity <= 0) return;
     _layer(canvas, opacity, scale, () {
       final line = palette.line;
@@ -466,7 +484,7 @@ class LivingGlyphPainter extends CustomPainter {
       }
       if (markT <= 0) return;
       void dot(Offset at) {
-        final grow = _interval(markT, .55, 1, Curves.easeOutBack);
+        final grow = _interval(markT, .55, 1, Curves.easeOutCubic);
         if (grow > 0) {
           canvas.drawCircle(at, 1.25 * grow, _fill(palette.mark));
         }
@@ -556,6 +574,7 @@ class LivingGlyphPainter extends CustomPainter {
   bool shouldRepaint(covariant LivingGlyphPainter oldDelegate) =>
       oldDelegate.frame != frame ||
       oldDelegate.from != from ||
+      oldDelegate.fromSnapshot != fromSnapshot ||
       oldDelegate.palette != palette ||
       oldDelegate.animate != animate ||
       oldDelegate.clock != clock;

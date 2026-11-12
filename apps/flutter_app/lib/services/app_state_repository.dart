@@ -181,11 +181,23 @@ class LocalAppStateRepository implements AppStateRepository {
   Future<File> _stateFileForLoad() async {
     final primary = await _stateFile();
     final alternate = _alternateMacStateFile(primary);
-    if (alternate == null || !await alternate.exists()) return primary;
-    if (!await primary.exists()) return alternate;
-    final primaryModified = await primary.lastModified();
-    final alternateModified = await alternate.lastModified();
-    return alternateModified.isAfter(primaryModified) ? alternate : primary;
+    if (alternate == null) return primary;
+    File? selected;
+    DateTime? newest;
+    for (final location in [primary, alternate]) {
+      // A backup's modification time is its rotation time, not its state
+      // generation. It is a candidate only when that location's primary fails.
+      final backup = File('${location.path}.last-good');
+      final candidate = await _metadata.isValid(location) ? location : backup;
+      if (await _metadata.isValid(candidate)) {
+        final modified = await candidate.lastModified();
+        if (newest == null || modified.isAfter(newest)) {
+          newest = modified;
+          selected = location;
+        }
+      }
+    }
+    return selected ?? primary;
   }
 
   File? _alternateMacStateFile(File primary) {
@@ -399,8 +411,24 @@ class LocalAppStateRepository implements AppStateRepository {
 
   Map<String, Map<String, String?>> _decodeProfileSecretBundle(String value) {
     final decoded = jsonDecode(value) as Map<String, Object?>;
-    final profiles =
-        Map<String, Object?>.from(decoded['profiles'] as Map? ?? const {});
+    if (decoded['version'] != 2 || decoded['profiles'] is! Map) {
+      throw const FormatException('Unsupported credential bundle schema.');
+    }
+    final profiles = Map<String, Object?>.from(decoded['profiles'] as Map);
+    for (final entry in profiles.entries) {
+      final record = entry.value;
+      if (entry.key.isEmpty ||
+          record is! Map ||
+          !record.containsKey('accessKey') ||
+          !record.containsKey('secretKey') ||
+          [
+            'accessKey',
+            'secretKey',
+            'sessionToken'
+          ].any((field) => record[field] != null && record[field] is! String)) {
+        throw const FormatException('Invalid credential record.');
+      }
+    }
     return <String, Map<String, String?>>{
       for (final entry in profiles.entries)
         entry.key:

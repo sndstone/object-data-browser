@@ -1,6 +1,7 @@
 const settingsSections = <String>[
   'Connections',
   'Transfers & Storage',
+  'Performance',
   'Appearance',
   'Safety & Recovery',
   'Benchmark',

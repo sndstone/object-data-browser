@@ -1,4 +1,8 @@
+#[cfg(test)]
+mod review_regressions;
 mod benchmark_runtime;
+mod transfer_workers;
+mod source_snapshot;
 mod delete_all;
 mod download_destination;
 mod lifecycle;
@@ -22,7 +26,11 @@ use aws_sdk_s3::types::{
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use chrono::{SecondsFormat, Utc};
+use download_destination::DestinationIndex;
+#[cfg(test)]
 use download_destination::StagedDownload;
+use source_snapshot::SourceSnapshot;
+use transfer_workers::run_bounded;
 use lifecycle::{lifecycle_rule_raw, parse_lifecycle_rules};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -41,7 +49,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-const ENGINE_VERSION: &str = "2.3.4";
+const ENGINE_VERSION: &str = "2.3.5";
 
 const SUPPORTED_METHODS: &[&str] = &[
     "health",
@@ -109,6 +117,7 @@ struct Response {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Profile {
+    endpoint_type: String,
     auth_mode: String,
     aws_profile_name: String,
     role_arn: String,
@@ -679,7 +688,8 @@ async fn list_objects(params: Value) -> SidecarResult {
         .list_objects_v2()
         .bucket(bucket_name.clone())
         .prefix(prefix)
-        .max_keys(1000);
+        .max_keys(1000)
+        .encoding_type(aws_sdk_s3::types::EncodingType::Url);
     if !flat {
         request = request.delimiter("/");
     }
@@ -690,14 +700,14 @@ async fn list_objects(params: Value) -> SidecarResult {
 
     let mut items: Vec<Value> = Vec::new();
     for common_prefix in output.common_prefixes() {
-        let folder_prefix = common_prefix.prefix().unwrap_or_default();
+        let folder_prefix = decode_listing_key(common_prefix.prefix(), output.encoding_type())?;
         let folder_name = folder_prefix
             .strip_prefix(prefix)
-            .unwrap_or(folder_prefix)
+            .unwrap_or(&folder_prefix)
             .to_string();
         items.push(json!({
             "key": folder_prefix,
-            "name": if folder_name.is_empty() { folder_prefix } else { folder_name.as_str() },
+            "name": if folder_name.is_empty() { folder_prefix.as_str() } else { folder_name.as_str() },
             "size": 0,
             "storageClass": "FOLDER",
             "modifiedAt": now_iso(),
@@ -707,14 +717,14 @@ async fn list_objects(params: Value) -> SidecarResult {
         }));
     }
     for object in output.contents() {
-        let key = object.key().unwrap_or_default();
+        let key = decode_listing_key(object.key(), output.encoding_type())?;
         if !flat && key == prefix {
             continue;
         }
-        let name = key.strip_prefix(prefix).unwrap_or(key);
+        let name = key.strip_prefix(prefix).unwrap_or(&key);
         items.push(json!({
             "key": key,
-            "name": if name.is_empty() { key } else { name },
+            "name": if name.is_empty() { key.as_str() } else { name },
             "size": object.size().unwrap_or_default(),
             "storageClass": object.storage_class().map(|v| v.as_str()).unwrap_or("STANDARD"),
             "modifiedAt": serialize_aws_datetime(object.last_modified()),
@@ -943,6 +953,7 @@ async fn list_object_versions(params: Value) -> SidecarResult {
         .bucket(bucket_name)
         .prefix(effective_prefix)
         .max_keys(1000)
+        .encoding_type(aws_sdk_s3::types::EncodingType::Url)
         .set_key_marker(
             marker["keyMarker"]
                 .as_str()
@@ -961,7 +972,7 @@ async fn list_object_versions(params: Value) -> SidecarResult {
 
     let mut items = Vec::new();
     for version in output.versions() {
-        let version_key = version.key().unwrap_or_default();
+        let version_key = decode_listing_key(version.key(), output.encoding_type())?;
         if !key.is_empty() && version_key != key {
             continue;
         }
@@ -976,7 +987,7 @@ async fn list_object_versions(params: Value) -> SidecarResult {
         }));
     }
     for marker in output.delete_markers() {
-        let marker_key = marker.key().unwrap_or_default();
+        let marker_key = decode_listing_key(marker.key(), output.encoding_type())?;
         if !key.is_empty() && marker_key != key {
             continue;
         }
@@ -1001,7 +1012,7 @@ async fn list_object_versions(params: Value) -> SidecarResult {
         .count();
     Ok(json!({
         "items": items,
-        "cursor": {"value": if output.is_truncated().unwrap_or(false) {Some(json!({"keyMarker":output.next_key_marker(),"versionIdMarker":output.next_version_id_marker()}).to_string())} else {None}, "hasMore": output.is_truncated().unwrap_or(false)},
+        "cursor": {"value": if output.is_truncated().unwrap_or(false) {Some(json!({"keyMarker":decode_listing_key(output.next_key_marker(), output.encoding_type())?,"versionIdMarker":output.next_version_id_marker()}).to_string())} else {None}, "hasMore": output.is_truncated().unwrap_or(false)},
         "totalCount": items.len(),
         "versionCount": items.len() - delete_marker_count,
         "deleteMarkerCount": delete_marker_count,
@@ -1165,18 +1176,18 @@ async fn move_object(params: Value) -> SidecarResult {
         ));
     }
     let mut result = copy_object(params.clone()).await?;
-    let version = result["sourceVersionId"].as_str().map(str::to_owned);
+    let version = params["sourceVersionId"].as_str().or_else(|| params["versionId"].as_str()).map(str::to_owned);
     if version.is_none() && params["profile"]["endpointType"] != "awsS3" {
         result["successCount"] = json!(0);
         result["failureCount"] = json!(1);
         result["copyCompleted"] = json!(true);
         result["sourceRetained"] = json!(true);
-        result["failures"] = json!(["Copy completed. Source retained because this compatible endpoint has no verified conditional-delete capability."]);
+        result["failures"] = json!([{"target":params["sourceKey"], "code":"source_delete_unsupported", "message":"Copy completed. Source retained because this endpoint has no verified conditional-delete capability."}]);
         return Ok(result);
     }
     let profile = parse_profile(&params["profile"])?;
     let client = build_client(&profile).await?;
-    client
+    let deleted = client
         .delete_object()
         .bucket(required_text(
             &params,
@@ -1184,11 +1195,18 @@ async fn move_object(params: Value) -> SidecarResult {
             "Source bucket required.",
         )?)
         .key(required_text(&params, "sourceKey", "Source key required.")?)
-        .set_version_id(version)
+        .set_version_id(version.clone())
         .set_if_match(result["sourceETag"].as_str().map(str::to_owned))
         .send()
         .await
-        .map_err(map_sdk_error)?;
+        .map_err(map_sdk_error);
+    if let Err(error) = deleted {
+        result["successCount"] = json!(0);
+        result["failureCount"] = json!(1);
+        result["copiedCount"] = json!(1);
+        result["sourceRetained"] = json!(true);
+        result["failures"] = json!([{"target":params["sourceKey"], "versionId":version, "code":"source_delete_failed", "message":format!("Copy completed; source deletion was not confirmed: {}", error.message)}]);
+    }
     Ok(result)
 }
 
@@ -1210,27 +1228,7 @@ async fn delete_objects(params: Value) -> SidecarResult {
                 .map_err(|error| SidecarError::new("invalid_config", error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let delete = Delete::builder()
-        .set_objects(Some(objects))
-        .quiet(false)
-        .build()
-        .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
-    let output = client
-        .delete_objects()
-        .bucket(bucket_name)
-        .delete(delete)
-        .send()
-        .await
-        .map_err(map_sdk_error)?;
-    Ok(json!({
-        "successCount": output.deleted().len(),
-        "failureCount": output.errors().len(),
-        "failures": output.errors().iter().map(|item| json!({
-            "target": item.key().unwrap_or_default(),
-            "code": item.code().unwrap_or("unknown"),
-            "message": item.message().unwrap_or("Unknown delete error.")
-        })).collect::<Vec<_>>()
-    }))
+    delete_identifiers(&client, &bucket_name, objects).await
 }
 
 async fn delete_object_versions(params: Value) -> SidecarResult {
@@ -1256,28 +1254,31 @@ async fn delete_object_versions(params: Value) -> SidecarResult {
                 .map_err(|error| SidecarError::new("invalid_config", error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let delete = Delete::builder()
-        .set_objects(Some(objects))
-        .quiet(false)
-        .build()
-        .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
-    let output = client
-        .delete_objects()
-        .bucket(bucket_name)
-        .delete(delete)
-        .send()
-        .await
-        .map_err(map_sdk_error)?;
-    Ok(json!({
-        "successCount": output.deleted().len(),
-        "failureCount": output.errors().len(),
-        "failures": output.errors().iter().map(|item| json!({
-            "target": item.key().unwrap_or_default(),
-            "versionId": item.version_id(),
-            "code": item.code().unwrap_or("unknown"),
-            "message": item.message().unwrap_or("Unknown delete error.")
-        })).collect::<Vec<_>>()
-    }))
+    delete_identifiers(&client, &bucket_name, objects).await
+}
+
+async fn delete_identifiers(client: &Client, bucket: &str, objects: Vec<ObjectIdentifier>) -> SidecarResult {
+    let mut completed = 0;
+    let mut failures = Vec::new();
+    for (index, batch) in objects.chunks(1000).enumerate() {
+        let delete = Delete::builder().set_objects(Some(batch.to_vec())).quiet(false).build()
+            .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+        match client.delete_objects().bucket(bucket).delete(delete).send().await {
+            Ok(output) => {
+                completed += output.deleted().len();
+                failures.extend(output.errors().iter().map(|item| json!({"target":item.key().unwrap_or_default(), "versionId":item.version_id(), "code":item.code().unwrap_or("unknown"), "message":item.message().unwrap_or("Unknown delete error.")})));
+            }
+            Err(error) => {
+                for (offset, item) in objects[index*1000..].iter().enumerate() {
+                    failures.push(json!({"target":item.key(), "versionId":item.version_id(),
+                        "code":if offset < batch.len() {"unknown_outcome"} else {"not_attempted"},
+                        "message":if offset < batch.len() {format!("Delete was not confirmed: {error}")} else {"Stopped after an unconfirmed delete batch.".to_string()}}));
+                }
+                break;
+            }
+        }
+    }
+    Ok(json!({"successCount":completed, "failureCount":failures.len(), "failures":failures}))
 }
 
 struct TransferProgress {
@@ -1290,6 +1291,7 @@ struct TransferProgress {
     part_size_bytes: Option<u64>,
     parts_total: Option<u64>,
     state: Mutex<TransferProgressState>,
+    activity_interval: Duration,
 }
 
 const MAX_PART_OUTPUT_LINES: u64 = 64;
@@ -1300,6 +1302,8 @@ struct TransferProgressState {
     items_completed: usize,
     part_lines_recorded: u64,
     output_lines: Vec<String>,
+    last_activity_emit: Instant,
+    current_item: Option<String>,
 }
 
 impl TransferProgressState {
@@ -1315,14 +1319,27 @@ impl TransferProgressState {
 }
 
 impl TransferProgress {
+    // A liveness event is emitted only when real bytes advance. Stalled streams
+    // remain subject to the host watchdog; counters commit only successful parts.
+    fn note_activity(&self) {
+        self.emit("running", None);
+    }
     fn emit(&self, status: &str, current_item: Option<String>) {
-        let (bytes_transferred, parts_completed, items_completed, output_lines) = {
-            let state = self.state.lock().unwrap();
+        let (bytes_transferred, parts_completed, items_completed, output_lines, current_item) = {
+            let mut state = self.state.lock().unwrap();
+            if current_item.is_some() {
+                state.current_item = current_item;
+            }
+            if status == "running" && state.last_activity_emit.elapsed() < self.activity_interval {
+                return;
+            }
+            state.last_activity_emit = Instant::now();
             (
                 state.bytes_transferred,
                 state.parts_completed,
                 state.items_completed,
                 state.output_lines.clone(),
+                state.current_item.clone(),
             )
         };
         emit_transfer_event(&transfer_job(
@@ -1360,6 +1377,43 @@ fn transfer_concurrency(profile: &Profile) -> usize {
 // Multipart workers stream independently (at most eight); no whole part is buffered.
 const UPLOAD_FILE_BUFFER_BYTES: usize = 256 * 1024;
 
+struct TransferBody {
+    body: aws_smithy_types::body::SdkBody,
+    progress: Arc<TransferProgress>,
+}
+impl http_body::Body for TransferBody {
+    type Data = Bytes;
+    type Error = BoxError;
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.body).poll_frame(cx);
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &result {
+            if frame.data_ref().is_some_and(|bytes| !bytes.is_empty()) {
+                this.progress.note_activity();
+            }
+        }
+        result
+    }
+    fn is_end_stream(&self) -> bool {
+        http_body::Body::is_end_stream(&self.body)
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::Body::size_hint(&self.body)
+    }
+}
+fn with_transfer_activity(body: ByteStream, progress: &Arc<TransferProgress>) -> ByteStream {
+    let progress = progress.clone();
+    body.map(move |body| {
+        aws_smithy_types::body::SdkBody::from_body_1_x(TransferBody {
+            body,
+            progress: progress.clone(),
+        })
+    })
+}
+
 async fn upload_file_multipart(
     client: &Client,
     bucket_name: &str,
@@ -1371,6 +1425,7 @@ async fn upload_file_multipart(
     progress: &Arc<TransferProgress>,
     file_name: &str,
 ) -> Result<(), SidecarError> {
+    let snapshot = SourceSnapshot::capture(path)?;
     let upload_id = client
         .create_multipart_upload()
         .bucket(bucket_name)
@@ -1387,81 +1442,62 @@ async fn upload_file_multipart(
             )
         })?;
     let part_count = file_size.div_ceil(chunk_bytes);
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut join_set = JoinSet::new();
-    for index in 0..part_count {
-        let part_number = (index + 1) as i32;
-        let offset = index * chunk_bytes;
-        let length = chunk_bytes.min(file_size - offset);
-        let client = client.clone();
-        let bucket_name = bucket_name.to_string();
-        let key = key.to_string();
-        let upload_id = upload_id.clone();
-        let path = path.to_path_buf();
-        let semaphore = Arc::clone(&semaphore);
-        let progress = Arc::clone(progress);
-        let file_name = file_name.to_string();
-        join_set.spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
-            let body = ByteStream::read_from()
-                .path(&path)
-                .offset(offset)
-                .length(aws_sdk_s3::primitives::Length::Exact(length))
-                .buffer_size(UPLOAD_FILE_BUFFER_BYTES)
-                .build()
-                .await
-                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
-            let output = client
-                .upload_part()
-                .bucket(&bucket_name)
-                .key(&key)
-                .upload_id(&upload_id)
-                .part_number(part_number)
-                .body(body)
-                .send()
-                .await
-                .map_err(map_sdk_error)?;
-            {
-                let mut state = progress.state.lock().unwrap();
-                state.bytes_transferred += length;
-                state.parts_completed += 1;
-                state.push_part_line(format!("Uploaded part {part_number} for {file_name}."));
-            }
-            progress.emit("running", Some(file_name));
-            Ok::<(i32, Option<String>), SidecarError>((
-                part_number,
-                output.e_tag().map(str::to_owned),
-            ))
-        });
-    }
     let mut parts: Vec<(i32, Option<String>)> = Vec::with_capacity(part_count as usize);
-    let mut failure: Option<SidecarError> = None;
-    while let Some(joined) = join_set.join_next().await {
-        match joined {
-            Ok(Ok(part)) => parts.push(part),
-            Ok(Err(error)) => {
-                if failure.is_none() {
-                    failure = Some(error);
+    let result = run_bounded(
+        part_count,
+        concurrency,
+        |index| {
+            let part_number = (index + 1) as i32;
+            let offset = index * chunk_bytes;
+            let length = chunk_bytes.min(file_size - offset);
+            let client = client.clone();
+            let bucket_name = bucket_name.to_string();
+            let key = key.to_string();
+            let upload_id = upload_id.clone();
+            let path = path.to_path_buf();
+            let progress = Arc::clone(progress);
+            let file_name = file_name.to_string();
+            let snapshot = snapshot.clone();
+            async move {
+                snapshot.check(&path)?;
+                let body = ByteStream::read_from()
+                    .path(&path)
+                    .offset(offset)
+                    .length(aws_sdk_s3::primitives::Length::Exact(length))
+                    .buffer_size(UPLOAD_FILE_BUFFER_BYTES)
+                    .build()
+                    .await
+                    .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+                let output = client
+                    .upload_part()
+                    .bucket(&bucket_name)
+                    .key(&key)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .body(with_transfer_activity(body, &progress))
+                    .send()
+                    .await
+                    .map_err(map_sdk_error)?;
+                {
+                    let mut state = progress.state.lock().unwrap();
+                    state.bytes_transferred += length;
+                    state.parts_completed += 1;
+                    state.push_part_line(format!("Uploaded part {part_number} for {file_name}."));
                 }
-                join_set.abort_all();
+                progress.emit("running", Some(file_name));
+                Ok::<(i32, Option<String>), SidecarError>((
+                    part_number,
+                    output.e_tag().map(str::to_owned),
+                ))
             }
-            Err(join_error) => {
-                if !join_error.is_cancelled() && failure.is_none() {
-                    failure = Some(SidecarError::new(
-                        "engine_unavailable",
-                        join_error.to_string(),
-                    ));
-                    join_set.abort_all();
-                }
-            }
-        }
-    }
-    let complete_result = match failure {
-        Some(error) => Err(error),
-        None => {
+        },
+        |part| parts.push(part),
+    )
+    .await
+    .and_then(|()| snapshot.check(path));
+    let complete_result = match result {
+        Err(error) => Err(error),
+        Ok(()) => {
             parts.sort_by_key(|(part_number, _)| *part_number);
             let completed_parts = parts
                 .into_iter()
@@ -1542,6 +1578,10 @@ async fn start_upload(params: Value) -> SidecarResult {
     let mut total_bytes = 0_u64;
     let mut parts_total = 0_u64;
     let mut uses_multipart = false;
+    let snapshots = paths
+        .iter()
+        .map(|path| SourceSnapshot::capture(path))
+        .collect::<Result<Vec<_>, _>>()?;
     for path in &paths {
         let metadata = fs::metadata(path)
             .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
@@ -1580,7 +1620,15 @@ async fn start_upload(params: Value) -> SidecarResult {
         item_count: paths.len(),
         part_size_bytes,
         parts_total: part_total_value,
+        activity_interval: Duration::from_millis(
+            params["progressIntervalMs"]
+                .as_u64()
+                .unwrap_or(100)
+                .clamp(50, 2000),
+        ),
         state: Mutex::new(TransferProgressState {
+            last_activity_emit: Instant::now(),
+            current_item: None,
             bytes_transferred: 0,
             parts_completed: 0,
             items_completed: 0,
@@ -1599,7 +1647,8 @@ async fn start_upload(params: Value) -> SidecarResult {
             .and_then(|value| value.to_str())
             .map(str::to_owned),
     );
-    for path in &paths {
+    for (path, snapshot) in paths.iter().zip(&snapshots) {
+        snapshot.check(path)?;
         let default_name = path
             .file_name()
             .and_then(|value| value.to_str())
@@ -1653,13 +1702,14 @@ async fn start_upload(params: Value) -> SidecarResult {
                 .put_object()
                 .bucket(&bucket_name)
                 .key(&key)
-                .body(body)
+                .body(with_transfer_activity(body, &progress))
                 .send()
                 .await
                 .map_err(map_sdk_error)?;
             let mut state = progress.state.lock().unwrap();
             state.bytes_transferred += file_size;
         }
+        snapshot.check(path)?;
         {
             let mut state = progress.state.lock().unwrap();
             state.items_completed += 1;
@@ -1722,6 +1772,7 @@ async fn download_object_ranged(
     object_size: u64,
     chunk_bytes: u64,
     concurrency: usize,
+    max_attempts: u32,
     progress: &Arc<TransferProgress>,
 ) -> Result<(), SidecarError> {
     {
@@ -1733,9 +1784,7 @@ async fn download_object_ranged(
             .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
     }
     let part_count = object_size.div_ceil(chunk_bytes);
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut join_set = JoinSet::new();
-    for index in 0..part_count {
+    run_bounded(part_count, concurrency, |index| {
         let start = index * chunk_bytes;
         let end = (start + chunk_bytes - 1).min(object_size.saturating_sub(1));
         let client = client.clone();
@@ -1744,23 +1793,24 @@ async fn download_object_ranged(
         let bucket_name = bucket_name.to_string();
         let key = key.to_string();
         let target = target.to_path_buf();
-        let semaphore = Arc::clone(&semaphore);
         let progress = Arc::clone(progress);
-        join_set.spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
+        async move {
+            let mut attempt = 0;
+            let range_bytes = loop {
+                let result: Result<u64, SidecarError> = async {
             let output = client
                 .get_object()
                 .bucket(&bucket_name)
                 .key(&key)
                 .range(format!("bytes={start}-{end}"))
-                .set_if_match(validator)
-                .set_version_id(version_id)
+                .set_if_match(validator.clone())
+                .set_version_id(version_id.clone())
                 .send()
                 .await
                 .map_err(map_sdk_error)?;
+            if validator.as_deref().is_some_and(|etag| output.e_tag() != Some(etag)) {
+                return Err(SidecarError::new("object_conflict", "Download ETag mismatch; partial file discarded."));
+            }
             if output.content_range() != Some(format!("bytes {start}-{end}/{object_size}").as_str()) {
                 return Err(SidecarError::new("object_conflict", "Download range mismatch; partial file discarded."));
             }
@@ -1784,6 +1834,7 @@ async fn download_object_ranged(
                     .await
                     .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
                 range_bytes += chunk.len() as u64;
+                progress.note_activity();
             }
             file.flush()
                 .await
@@ -1797,6 +1848,17 @@ async fn download_object_ranged(
                     ),
                 ));
             }
+                    Ok(range_bytes)
+                }.await;
+                match result {
+                    Ok(bytes) => break bytes,
+                    Err(error) if error.code == "engine_unavailable" && attempt < max_attempts.clamp(1, 10) - 1 => {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(100 << attempt.min(4))).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
             {
                 let mut state = progress.state.lock().unwrap();
                 state.bytes_transferred += range_bytes;
@@ -1805,33 +1867,8 @@ async fn download_object_ranged(
             }
             progress.emit("running", Some(key));
             Ok::<(), SidecarError>(())
-        });
-    }
-    let mut failure: Option<SidecarError> = None;
-    while let Some(joined) = join_set.join_next().await {
-        match joined {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                if failure.is_none() {
-                    failure = Some(error);
-                }
-                join_set.abort_all();
-            }
-            Err(join_error) => {
-                if !join_error.is_cancelled() && failure.is_none() {
-                    failure = Some(SidecarError::new(
-                        "engine_unavailable",
-                        join_error.to_string(),
-                    ));
-                    join_set.abort_all();
-                }
-            }
         }
-    }
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    }, |()| {}).await
 }
 
 async fn start_download(params: Value) -> SidecarResult {
@@ -1864,24 +1901,25 @@ async fn start_download(params: Value) -> SidecarResult {
     let mut uses_multipart = false;
     let mut object_sizes = BTreeMap::new();
     let mut validators = BTreeMap::new();
-    for key in &keys {
-        let head = client
-            .head_object()
-            .bucket(&bucket_name)
-            .key(key)
-            .set_version_id(params["versionId"].as_str().map(str::to_owned))
-            .send()
-            .await
-            .map_err(map_sdk_error)?;
-        let size = head.content_length().unwrap_or_default() as u64;
+    run_bounded(keys.len() as u64, transfer_concurrency(&profile), |index| {
+        let client = client.clone();
+        let bucket = bucket_name.clone();
+        let key = keys[index as usize].clone();
+        let version = params["versionId"].as_str().map(str::to_owned);
+        async move {
+            let head = client.head_object().bucket(bucket).key(&key).set_version_id(version).send().await.map_err(map_sdk_error)?;
+            Ok((key, head))
+        }
+    }, |(key, head)| {
+        let size = head.content_length().unwrap_or_default().max(0) as u64;
         object_sizes.insert(key.clone(), size);
-        validators.insert(key.clone(), head.e_tag().map(str::to_owned));
+        validators.insert(key, head.e_tag().map(str::to_owned));
         total_bytes += size;
         if size >= multipart_threshold_bytes {
             uses_multipart = true;
             parts_total += size.div_ceil(multipart_chunk_bytes);
         }
-    }
+    }).await?;
     let concurrency = transfer_concurrency(&profile);
     let job_id = format!("download-{}", short_uuid());
     let label = format!("Download {} object(s) from {bucket_name}", keys.len());
@@ -1905,7 +1943,15 @@ async fn start_download(params: Value) -> SidecarResult {
         item_count: keys.len(),
         part_size_bytes,
         parts_total: part_total_value,
+        activity_interval: Duration::from_millis(
+            params["progressIntervalMs"]
+                .as_u64()
+                .unwrap_or(100)
+                .clamp(50, 2000),
+        ),
         state: Mutex::new(TransferProgressState {
+            last_activity_emit: Instant::now(),
+            current_item: None,
             bytes_transferred: 0,
             parts_completed: 0,
             items_completed: 0,
@@ -1917,8 +1963,10 @@ async fn start_download(params: Value) -> SidecarResult {
         }),
     });
     progress.emit("queued", keys.first().cloned());
+    let mut destination_index = DestinationIndex::new(&destination)
+        .map_err(|e| SidecarError::new("invalid_config", e.to_string()))?;
     for key in &keys {
-        let staged = StagedDownload::new(&destination)
+        let staged = destination_index.stage()
             .map_err(|e| SidecarError::new("invalid_config", e.to_string()))?;
         let target = staged.0.clone();
         let object_size = *object_sizes.get(key).unwrap_or(&0);
@@ -1940,6 +1988,7 @@ async fn start_download(params: Value) -> SidecarResult {
                 object_size,
                 multipart_chunk_bytes,
                 concurrency,
+                profile.max_attempts,
                 &progress,
             )
             .await?;
@@ -1963,10 +2012,17 @@ async fn start_download(params: Value) -> SidecarResult {
                 .await
                 .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?
             {
+                if object_bytes + chunk.len() as u64 > object_size {
+                    return Err(SidecarError::new(
+                        "object_conflict",
+                        "Oversized download body; partial file discarded.",
+                    ));
+                }
                 file.write_all(&chunk)
                     .await
                     .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
                 object_bytes += chunk.len() as u64;
+                progress.note_activity();
             }
             if object_bytes != object_size {
                 return Err(SidecarError::new(
@@ -1983,12 +2039,17 @@ async fn start_download(params: Value) -> SidecarResult {
             }
             progress.emit("running", Some(key.clone()));
         }
-        tokio::fs::OpenOptions::new().write(true).open(&target).await
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .await
             .map_err(|e| SidecarError::new("invalid_config", e.to_string()))?
-            .sync_all().await.map_err(|e| SidecarError::new("invalid_config", e.to_string()))?;
+            .sync_all()
+            .await
+            .map_err(|e| SidecarError::new("invalid_config", e.to_string()))?;
         let final_path = staged
-            .publish(
-                &destination,
+            .publish_with_index(
+                &mut destination_index,
                 key,
                 params["conflictPolicy"].as_str().unwrap_or("keepBoth"),
             )
@@ -2103,61 +2164,39 @@ async fn run_put_test_data(params: Value) -> SidecarResult {
     let client = build_client(&profile).await?;
     let payload = Bytes::from(vec![b'A'; size_bytes]);
 
-    let semaphore = Arc::new(Semaphore::new(threads));
-    let mut join_set = JoinSet::new();
-    for index in 0..object_count {
-        let client = client.clone();
-        let bucket = bucket_name.clone();
-        let key = format!("{prefix}testdata-{index:06}.bin");
-        let payload = payload.clone();
-        let semaphore = Arc::clone(&semaphore);
-        join_set.spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .map_err(|error| SidecarError::new("engine_unavailable", error.to_string()))?;
-            for _ in 0..versions {
-                client
-                    .put_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .body(ByteStream::from(payload.clone()))
-                    .send()
-                    .await
-                    .map_err(map_sdk_error)?;
-            }
-            Ok::<usize, SidecarError>(versions)
-        });
-    }
     let mut created_versions = 0_usize;
-    let mut failure: Option<SidecarError> = None;
-    while let Some(joined) = join_set.join_next().await {
-        match joined {
-            Ok(Ok(count)) => created_versions += count,
-            Ok(Err(error)) => {
-                if failure.is_none() {
-                    failure = Some(error);
+    let result = run_bounded(
+        object_count as u64,
+        threads,
+        |index| {
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let key = format!("{prefix}testdata-{index:06}.bin");
+            let payload = payload.clone();
+            async move {
+                for _ in 0..versions {
+                    client
+                        .put_object()
+                        .bucket(&bucket)
+                        .key(&key)
+                        .body(ByteStream::from(payload.clone()))
+                        .send()
+                        .await
+                        .map_err(map_sdk_error)?;
                 }
-                join_set.abort_all();
+                Ok::<usize, SidecarError>(versions)
             }
-            Err(join_error) => {
-                if !join_error.is_cancelled() && failure.is_none() {
-                    failure = Some(SidecarError::new(
-                        "engine_unavailable",
-                        join_error.to_string(),
-                    ));
-                    join_set.abort_all();
-                }
-            }
-        }
-    }
+        },
+        |count| created_versions += count,
+    )
+    .await;
     let mut output_lines = vec![
         format!("Bucket: {bucket_name}"),
         format!("Prefix: {prefix}"),
         format!("Threads: {threads}"),
         format!("Object size: {size_bytes} bytes"),
     ];
-    if let Some(error) = failure {
+    if let Err(error) = result {
         output_lines.push(format!(
             "Created {created_versions} object version(s) before failing."
         ));
@@ -2421,14 +2460,16 @@ async fn export_benchmark_results(params: Value) -> SidecarResult {
 
 static CLIENTS: OnceLock<tokio::sync::Mutex<Vec<(Profile, Client)>>> = OnceLock::new();
 async fn build_client(profile: &Profile) -> Result<Client, SidecarError> {
-    let mut clients = CLIENTS.get_or_init(Default::default).lock().await;
-    if let Some((_, client)) = clients.iter().find(|(key, _)| key == profile) {
-        return Ok(client.clone());
+    {
+        let clients = CLIENTS.get_or_init(Default::default).lock().await;
+        if let Some((_, client)) = clients.iter().find(|(key, _)| key == profile) {
+            return Ok(client.clone());
+        }
     }
     let mut loader = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new(profile.region.clone()))
         .retry_config(RetryConfig::standard().with_max_attempts(profile.max_attempts));
-    if profile.auth_mode == "static" {
+    if profile.auth_mode == "static" || (profile.auth_mode == "assumeRole" && !profile.access_key.is_empty() && !profile.secret_key.is_empty()) {
         loader = loader.credentials_provider(Credentials::new(
             profile.access_key.clone(),
             profile.secret_key.clone(),
@@ -2475,6 +2516,8 @@ async fn build_client(profile: &Profile) -> Result<Client, SidecarError> {
     let config = aws_sdk_s3::config::Builder::from(&shared_config)
         .endpoint_url(profile.endpoint_url.clone())
         .force_path_style(profile.path_style)
+        .request_checksum_calculation(if profile.endpoint_type == "awsS3" { aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported } else { aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired })
+        .response_checksum_validation(if profile.endpoint_type == "awsS3" { aws_sdk_s3::config::ResponseChecksumValidation::WhenSupported } else { aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired })
         .timeout_config(timeout_config)
         .interceptor(ProfileHeaders {
             requester_pays: profile.requester_pays,
@@ -2485,6 +2528,10 @@ async fn build_client(profile: &Profile) -> Result<Client, SidecarError> {
         })
         .build();
     let client = Client::from_conf(config);
+    let mut clients = CLIENTS.get_or_init(Default::default).lock().await;
+    if let Some((_, cached)) = clients.iter().find(|(key, _)| key == profile) {
+        return Ok(cached.clone());
+    }
     if clients.len() >= 16 {
         clients.remove(0);
     }
@@ -2563,6 +2610,7 @@ fn parse_profile(value: &Value) -> Result<Profile, SidecarError> {
         ));
     }
     Ok(Profile {
+        endpoint_type: value["endpointType"].as_str().unwrap_or("s3Compatible").to_string(),
         auth_mode: auth_mode.to_string(),
         aws_profile_name: value["awsProfileName"].as_str().unwrap_or("").to_string(),
         role_arn: value["roleArn"].as_str().unwrap_or("").to_string(),
@@ -4626,6 +4674,119 @@ fn message_indicates_tls_failure(message: &str) -> bool {
 #[cfg(test)]
 mod advanced_regressions {
     use super::*;
+
+    fn transfer_test_progress() -> Arc<TransferProgress> {
+        Arc::new(TransferProgress {
+            job_id: "test-transfer".into(),
+            label: "test".into(),
+            direction: "download",
+            total_bytes: 8,
+            strategy_label: "test".into(),
+            item_count: 1,
+            part_size_bytes: Some(8),
+            parts_total: Some(1),
+            activity_interval: Duration::from_millis(100),
+            state: Mutex::new(TransferProgressState {
+                bytes_transferred: 0,
+                parts_completed: 0,
+                items_completed: 0,
+                part_lines_recorded: 0,
+                output_lines: vec![],
+                last_activity_emit: Instant::now() - Duration::from_secs(1),
+                current_item: Some("test.bin".into()),
+            }),
+        })
+    }
+
+    #[tokio::test]
+    async fn upload_liveness_wrapper_preserves_retry_body_and_does_not_commit_bytes() {
+        let progress = transfer_test_progress();
+        let body =
+            with_transfer_activity(ByteStream::from(Bytes::from_static(b"abcdefgh")), &progress);
+        let inner = body.into_inner();
+        let retry = inner.try_clone().expect("upload must remain replayable");
+        assert_eq!(
+            ByteStream::new(inner).collect().await.unwrap().into_bytes(),
+            b"abcdefgh"[..]
+        );
+        assert_eq!(
+            ByteStream::new(retry).collect().await.unwrap().into_bytes(),
+            b"abcdefgh"[..]
+        );
+        let state = progress.state.lock().unwrap();
+        assert_eq!(state.bytes_transferred, 0);
+        assert_eq!(state.parts_completed, 0);
+        assert!(state.last_activity_emit.elapsed() < Duration::from_secs(1));
+        assert_eq!(state.current_item.as_deref(), Some("test.bin"));
+    }
+
+    #[tokio::test]
+    async fn broken_range_body_is_retried_with_validators_and_counted_once() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = vec![];
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = vec![];
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                requests.push(String::from_utf8(request).unwrap().to_lowercase());
+                stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\nContent-Range: bytes 0-7/8\r\nETag: \"test\"\r\nConnection: close\r\n\r\n").unwrap();
+                stream
+                    .write_all(if attempt == 0 { b"abcd" } else { b"abcdefgh" })
+                    .unwrap();
+            }
+            requests
+        });
+        let client = Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .behavior_version_latest()
+                .region(Region::new("us-east-1"))
+                .credentials_provider(Credentials::new("fixture", "fixture", None, None, "test"))
+                .endpoint_url(endpoint)
+                .force_path_style(true)
+                .retry_config(RetryConfig::standard().with_max_attempts(1))
+                .build(),
+        );
+        let staged = StagedDownload::new(&std::env::temp_dir()).unwrap();
+        let progress = transfer_test_progress();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            download_object_ranged(
+                &client,
+                Some("\"test\"".into()),
+                Some("selected-version".into()),
+                "fixture-bucket",
+                "test.bin",
+                &staged.0,
+                8,
+                8,
+                1,
+                3,
+                &progress,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(fs::read(&staged.0).unwrap(), b"abcdefgh");
+        let state = progress.state.lock().unwrap();
+        assert_eq!(state.bytes_transferred, 8);
+        assert_eq!(state.parts_completed, 1);
+        for request in server.join().unwrap() {
+            assert!(request.contains("range: bytes=0-7"));
+            assert!(request.contains("if-match: \"test\""));
+            assert!(request.contains("versionid=selected-version"));
+        }
+    }
     #[test]
     fn upload_part_sizes_are_clamped_to_s3_limits() {
         let mib = 1024 * 1024;
@@ -4711,4 +4872,10 @@ mod advanced_regressions {
         );
         assert_eq!(string_array(&value["keys"]), vec!["  ", " %雪+ "]);
     }
+}
+
+fn decode_listing_key(value: Option<&str>, encoding: Option<&aws_sdk_s3::types::EncodingType>) -> Result<String, SidecarError> {
+    let raw = value.unwrap_or_default();
+    if encoding != Some(&aws_sdk_s3::types::EncodingType::Url) { return Ok(raw.to_string()); }
+    urlencoding::decode(raw).map(|v| v.into_owned()).map_err(|_| SidecarError::new("invalid_response", "Invalid URL-encoded object key in listing."))
 }

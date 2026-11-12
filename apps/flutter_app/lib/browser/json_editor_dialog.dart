@@ -1,11 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import '../widgets/app_form_dialog.dart';
 
 class JsonEditorDialog extends StatefulWidget {
   const JsonEditorDialog(
-      {super.key, required this.title, required this.initialValue});
+      {super.key,
+      required this.title,
+      required this.initialValue,
+      this.onSave});
   final String title, initialValue;
+  final Future<void> Function(String)? onSave;
   @override
   State<JsonEditorDialog> createState() => _JsonEditorDialogState();
 }
@@ -55,39 +60,39 @@ class _JsonEditorDialogState extends State<JsonEditorDialog> {
   }
 
   @override
-  Widget build(BuildContext context) => AlertDialog(
-          title: Text(widget.title),
-          content: SizedBox(
-              width: 560,
-              child: SingleChildScrollView(
-                  child: TextField(
-                      controller: _text,
-                      minLines: 8,
-                      maxLines: 18,
-                      style: const TextStyle(fontFamily: 'monospace'),
-                      decoration:
-                          InputDecoration(errorText: _error, errorMaxLines: 4),
-                      onChanged: _changed))),
-          actions: [
-            TextButton(
-                onPressed: _error != null || _pending
-                    ? null
-                    : () {
-                        _text.text = const JsonEncoder.withIndent('  ')
-                            .convert(jsonDecode(_text.text));
-                        setState(_validate);
-                      },
-                child: const Text('Format')),
-            TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('Cancel')),
-            FilledButton(
-                onPressed: _error != null || _pending
-                    ? null
-                    : () => Navigator.pop(
-                        context,
-                        const JsonEncoder.withIndent('  ')
-                            .convert(jsonDecode(_text.text))),
-                child: const Text('Save'))
-          ]);
+  Widget build(BuildContext context) => AppFormDialog<String>(
+        title: widget.title,
+        editor: true,
+        width: 840,
+        dirty: _text.text != widget.initialValue,
+        valid: _error == null && !_pending,
+        value: () =>
+            const JsonEncoder.withIndent('  ').convert(jsonDecode(_text.text)),
+        onSave: widget.onSave,
+        extraActions: [
+          TextButton(
+              onPressed: _error != null || _pending
+                  ? null
+                  : () {
+                      _text.text = const JsonEncoder.withIndent('  ')
+                          .convert(jsonDecode(_text.text));
+                      setState(_validate);
+                    },
+              child: const Text('Format'))
+        ],
+        child: TextField(
+            controller: _text,
+            autofocus: true,
+            autocorrect: false,
+            enableSuggestions: false,
+            minLines: 12,
+            maxLines: null,
+            keyboardType: TextInputType.multiline,
+            style: const TextStyle(fontFamily: 'monospace'),
+            decoration: InputDecoration(
+                errorText: _error,
+                errorMaxLines: 4,
+                helperText: '⌘/Ctrl+Enter to save'),
+            onChanged: _changed),
+      );
 }

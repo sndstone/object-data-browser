@@ -1,4 +1,6 @@
 import 'dart:convert';
+import 'rename_dialog.dart';
+import '../widgets/danger_button.dart';
 import 'package:flutter/material.dart';
 import '../controllers/action_scope.dart';
 import '../controllers/app_controller.dart';
@@ -120,9 +122,14 @@ class _AzureAdminDialogState extends State<AzureAdminDialog> {
                     TextButton(
                         onPressed: () => Navigator.pop(context, false),
                         child: const Text('Cancel')),
-                    FilledButton(
-                        onPressed: () => Navigator.pop(context, true),
-                        child: Text(action)),
+                    if (action == 'Delete')
+                      DangerButton(
+                          onPressed: () => Navigator.pop(context, true),
+                          child: Text(action))
+                    else
+                      FilledButton(
+                          onPressed: () => Navigator.pop(context, true),
+                          child: Text(action)),
                   ],
                 )) ??
         false;
@@ -288,6 +295,34 @@ class _AzureAdminDialogState extends State<AzureAdminDialog> {
       if (group.text.trim().isNotEmpty) 'group': group.text.trim(),
     });
     notice = 'Directory access updated.';
+  }
+
+  Future<void> renameDirectory() async {
+    final source = path.text;
+    if (source.isEmpty) {
+      throw const FormatException('Select a directory to rename.');
+    }
+    final expected = access['etag'];
+    await showDialog<String>(
+        context: context,
+        builder: (_) => RenameDialog(
+              path: source,
+              directory: true,
+              onSave: (target) async {
+                await call('renameDirectory', {
+                  'key': source,
+                  'destinationKey': target,
+                  'expectedETag': expected
+                });
+                if (mounted) {
+                  setState(() {
+                    access = {};
+                    path.text = target;
+                    notice = 'Directory renamed.';
+                  });
+                }
+              },
+            ));
   }
 
   Future<void> changeDirectory(bool rename) async {
@@ -558,9 +593,7 @@ class _AzureAdminDialogState extends State<AzureAdminDialog> {
                             aclGeneration++;
                           }),
                           button('Review and save directory ACL', saveAccess),
-                          field(destination, 'Rename destination path'),
-                          button(
-                              'Rename directory', () => changeDirectory(true)),
+                          button('Rename directory', renameDirectory),
                           CheckboxListTile(
                               value: recursive,
                               onChanged: busy

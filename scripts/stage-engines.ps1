@@ -10,6 +10,7 @@ param(
 
 $ProgressPreference = "SilentlyContinue"
 $ErrorActionPreference = "Stop"
+$env:PYTHONDONTWRITEBYTECODE = '1'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $RootDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -245,7 +246,7 @@ function Stage-PythonEngine {
     Enable-EmbeddedPythonSite -PythonDir $PythonDest
     $PythonExe = Join-Path $PythonDest "python.exe"
     $RequirementsPath = Join-Path $EngineSourceDir "python\requirements.txt"
-    & $PythonExe -m pip install --disable-pip-version-check --no-compile --upgrade --target $SitePackagesDir --requirement $RequirementsPath
+    & $PythonExe -m pip install --disable-pip-version-check --no-compile --target $SitePackagesDir --constraint (Join-Path $EngineSourceDir "python\constraints.txt") --requirement $RequirementsPath
     if ($LASTEXITCODE -ne 0) {
         throw "Python engine dependency installation failed with exit code $LASTEXITCODE."
     }
@@ -407,7 +408,8 @@ function Stage-JavaEngine {
         throw "Java runtime was not found at $JavaHome."
     }
 
-    Copy-DirectoryContent -SourceDir (Join-Path $ToolsDir "java") -DestinationDir (Join-Path $JavaDest "runtime")
+    & (Join-Path (Ensure-EmbeddedPython) "python.exe") (Join-Path $RootDir "scripts\runtime-payload.py") java $JavaHome (Join-Path $JavaDest "runtime")
+    if ($LASTEXITCODE -ne 0) { throw "Java runtime image creation failed." }
 
     $PreviousJavaHome = $env:JAVA_HOME
     $PreviousPath = $env:PATH
@@ -518,4 +520,6 @@ $Manifest = @{
 
 Assert-RequiredEngineFiles -Manifest $Manifest
 $Manifest | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $StageRoot "manifest.json") -Encoding UTF8
+& (Join-Path (Ensure-EmbeddedPython) "python.exe") (Join-Path $RootDir "scripts\verify-staged-engines.py") $StageRoot
+if ($LASTEXITCODE -ne 0) { throw "Final packaged engine qualification failed." }
 Write-Host "Staged desktop engine sidecars into $StageRoot"

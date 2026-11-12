@@ -1,13 +1,15 @@
 [package]
 name = "s3-browser-rust-engine"
-version = "2.3.4"
+version = "2.3.5"
 edition = "2021"
 
 [dependencies]
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process", "sso", "default-https-client"] }
 aws-credential-types = "1"
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
-aws-smithy-types = "1"
+aws-smithy-types = { version = "1", features = ["http-body-1-x"] }
+http-body = "1"
+libc = "0.2"
 bytes = "1"
 chrono = { version = "0.4", features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
@@ -20,3 +22,6 @@ tokio = { version = "1", features = ["full"] }
 url = "2"
 urlencoding = "2"
 uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+strip = "symbols"

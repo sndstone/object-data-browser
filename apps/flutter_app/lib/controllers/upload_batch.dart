@@ -1,4 +1,6 @@
 import 'dart:io';
+import 'action_scope.dart';
+import '../services/listing_cancellation.dart';
 import '../models/domain_models.dart';
 import '../services/engine_service.dart';
 import '../services/multipart_sizing.dart';
@@ -34,11 +36,18 @@ class UploadBatch {
   int _index = -1, _finishedBytes = 0, _completed = 0, _failed = 0;
   int _currentBytes = 0;
   String? _failureMessage;
-  bool _dispatching = false, _cancelled = false, _done = false;
-  int get totalBytes => _sizes.fold(0, (a, b) => a + b);
+  bool _dispatching = false,
+      _cancelled = false,
+      _done = false,
+      _unknown = false;
+  int _totalBytes = 0;
+  int get totalBytes => _totalBytes;
   String? get childId => _child?.id;
 
   Future<void> prepare() async {
+    _sizes.clear();
+    _chunks.clear();
+    _totalBytes = 0;
     // Validate every file before causing any external mutation.
     for (final path in paths) {
       final size = await File(path).length();
@@ -53,6 +62,7 @@ class UploadBatch {
             'Manual part size is too small for $path; enable automatic sizing or increase it.');
       }
       _sizes.add(size);
+      _totalBytes += size;
       _chunks.add(chunk);
     }
   }
@@ -168,6 +178,17 @@ class UploadBatch {
                 ? result.status
                 : result.outputLines.last,
             result);
+      } on ListingCancelled {
+        _cancelled = true;
+        _unknown = ActionScope.current?.outcomeUnknown ?? false;
+        onFile(
+            i,
+            paths[i],
+            _unknown ? 'unknown' : 'cancelled',
+            _unknown
+                ? 'Upload completion was not confirmed. Inspect the destination before retrying.'
+                : 'Upload cancelled.',
+            _child);
       } catch (error) {
         _failed++;
         _failureMessage = error.toString();
@@ -187,11 +208,13 @@ class UploadBatch {
     }
     _done = true;
     final result = _snapshot(
-        status: _failed > 0
-            ? 'failed'
-            : _cancelled
-                ? 'cancelled'
-                : 'completed');
+        status: _unknown
+            ? 'unknown'
+            : _failed > 0
+                ? 'failed'
+                : _cancelled
+                    ? 'cancelled'
+                    : 'completed');
     onUpdate(result);
     return result;
   }

@@ -35,10 +35,10 @@ ObjectVersionEntry version(String id, {String key = 'same.bin'}) =>
         deleteMarker: false,
         size: 1);
 ObjectVersionListResult page(List<ObjectVersionEntry> items,
-        {bool more = false}) =>
+        {bool more = false, String next = 'next'}) =>
     ObjectVersionListResult(
         items: items,
-        cursor: ListCursor(value: more ? 'next' : null, hasMore: more),
+        cursor: ListCursor(value: more ? next : null, hasMore: more),
         totalCount: items.length,
         versionCount: items.length,
         deleteMarkerCount: 0);
@@ -203,11 +203,24 @@ void main() {
     expect(engine.requestedProfile, 'test');
     engine.request.complete(page(
         [version('initial'), version('next'), version('next')],
-        more: true));
+        more: true, next: 'after-page'));
     await loading;
     expect(controller.versions.map((v) => v.versionId), ['initial', 'next']);
     expect(controller.versionCursor.hasMore, isTrue);
     expect(controller.hasBusyActions, isFalse);
+  });
+
+  test('repeated version continuation stops while retaining loaded entries',
+      () async {
+    final loading = controller.loadMoreVersions();
+    engine.request.complete(page([version('next')], more: true));
+    await loading;
+    expect(controller.versions.map((v) => v.versionId), ['initial', 'next']);
+    expect(controller.versionCursor.hasMore, isFalse);
+    expect(
+        controller.eventLog
+            .any((e) => e.message.contains('version continuation token')),
+        isTrue);
   });
 
   test('current page errors still surface and release the busy action',

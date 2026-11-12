@@ -77,6 +77,50 @@ void main() {
     expect(host.cancelCalls, 1);
     expect(fallback.calls, 0);
   });
+
+  test('lost history responses invalidate mappings before explicit resume',
+      () async {
+    await File('${emptyEngineRoot.path}/manifest.json')
+        .writeAsString(jsonEncode({
+      'engines': [
+        {'id': 'python', 'executable': 'fixture'}
+      ]
+    }));
+    final host = ResourceRegressionHost();
+    service.shutdown();
+    service = DesktopSidecarEngineService(
+        host: host, engineRoot: emptyEngineRoot.path);
+    Future<Map<String, Object?>> resume() => service.storageAction(
+        profile: profile,
+        destinationProfile: profile,
+        action: 'resumeHistoryCopy',
+        arguments: {'recoveryId': 'history-run'});
+    await expectLater(resume(), throwsA(isA<TimeoutException>()));
+    final state = await resume();
+    expect(host.inspections, 2);
+    expect(host.completed, 50);
+    expect((state['mappings'] as List).length, 50);
+  });
+  test('failed transfer requests release buffers but retain UI snapshots',
+      () async {
+    await File('${emptyEngineRoot.path}/manifest.json')
+        .writeAsString(jsonEncode({
+      'engines': [
+        {'id': 'python', 'executable': 'fixture'}
+      ]
+    }));
+    final host = ResourceRegressionHost()..failTransfer = true;
+    service.shutdown();
+    service = DesktopSidecarEngineService(
+        host: host, engineRoot: emptyEngineRoot.path);
+    TransferJob? snapshot;
+    service.setTransferSink((job) => snapshot = job);
+    await expectLater(
+        service.storageAction(profile: profile, action: 'copyObject'),
+        throwsA(isA<TimeoutException>()));
+    expect(service.retainedTransferLogCount, 0);
+    expect(snapshot!.outputLines, ['started']);
+  });
 }
 
 const profile = EndpointProfile(
@@ -127,5 +171,59 @@ class BlockedListingHost extends DesktopEngineHost {
     if (started.isCompleted && !pending.isCompleted) {
       pending.completeError(const ListingCancelled());
     }
+  }
+}
+
+class ResourceRegressionHost extends DesktopEngineHost {
+  int inspections = 0, completed = 0;
+  bool failTransfer = false;
+  @override
+  Future<DesktopEngineHostResponse> send(
+      {required String executablePath,
+      List<String> arguments = const [],
+      String? workingDirectory,
+      required Map<String, Object?> request,
+      void Function(Map<String, Object?>)? onEvent,
+      bool concurrentControls = false,
+      Duration? timeout,
+      ListingCancellation? listingCancellation}) async {
+    final params = request['params'] as Map;
+    if (failTransfer) {
+      onEvent?.call({
+        'event': 'transferProgress',
+        'job': {
+          'id': 'failed-job',
+          'status': 'running',
+          'outputStartLine': 0,
+          'outputLineCount': 1,
+          'outputLines': ['started']
+        }
+      });
+      throw TimeoutException('lost response');
+    }
+    Map<String, Object?> result;
+    if (params['action'] == 'inspectHistoryCopy') {
+      inspections++;
+      result = {
+        'id': 'history-run',
+        'status': 'running',
+        'mappings': List.generate(completed, (i) => {'sequence': i})
+      };
+    } else {
+      final start = completed;
+      completed += 25;
+      if (start == 0) throw TimeoutException('committed batch response lost');
+      result = {
+        'id': 'history-run',
+        'status': 'running',
+        'mappingStart': start,
+        'mappingCount': completed,
+        'mappings': List.generate(25, (i) => {'sequence': start + i})
+      };
+    }
+    return DesktopEngineHostResponse(
+        payload: {'ok': true, 'result': result},
+        stdoutOutput: '',
+        stderrOutput: '');
   }
 }

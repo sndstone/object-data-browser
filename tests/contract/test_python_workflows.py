@@ -699,3 +699,77 @@ def test_azure_delegation_key_presign_is_scoped_and_not_persisted(engine, profil
     assert query['sig'] == base64.b64encode(hmac.new(key, '\n'.join(fields).encode(), hashlib.sha256).digest()).decode()
     assert query['sp'] == 'r' and query['sr'] == 'bv' and query['skoid'] == 'oid'
     assert not list(tmp_path.rglob('*.json'))
+
+
+def test_history_journal_persists_boundaries_without_rewriting_manifest(engine, tmp_path):
+    workflows = engine._advanced_module().Workflows(engine)
+    state = {'id': 'history-' + 'a' * 32, 'kind': 'historyCopy', 'status': 'planned',
+        'entries': [{'key': 'long-source-key-' + str(i), 'sourceVersionId': str(i)} for i in range(1000)],
+        'mappings': [], 'completedCount': 0}
+    workflows.write(state)
+    pointer = json.loads(workflows.path(state['id']).read_text())
+    manifest = workflows.path(state['id']).with_name(pointer['manifest'])
+    original = manifest.read_bytes()
+    for index in range(5):
+        state['inFlight'] = {'operationId': str(index)}
+        state['status'] = 'outcomeUnknown'
+        workflows.write(state)
+        assert workflows.read(state['id'])['inFlight']['operationId'] == str(index)
+        state['mappings'].append({'key': str(index), 'destinationVersionId': str(index)})
+        state['completedCount'] += 1
+        state.pop('inFlight')
+        state['status'] = 'running'
+        workflows.write(state)
+        assert 'inFlight' not in workflows.read(state['id'])
+    assert manifest.read_bytes() == original
+    events = manifest.with_name(pointer['events'])
+    assert events.stat().st_size < len(original) / 2
+    restored = workflows.read(state['id'])
+    assert restored['completedCount'] == 5 and restored['mappings'] == state['mappings']
+    assert '_historyJournal' not in workflows.history_public(restored)
+
+
+def test_history_crash_tail_preserves_uncertain_operation(engine):
+    workflows = engine._advanced_module().Workflows(engine)
+    state = {'id': 'history-' + 'b' * 32, 'kind': 'historyCopy', 'status': 'planned',
+        'entries': [], 'mappings': [], 'completedCount': 0}
+    workflows.write(state)
+    state.update(status='outcomeUnknown', inFlight={'operationId': 'remote-might-have-committed'})
+    workflows.write(state)
+    pointer = json.loads(workflows.path(state['id']).read_text())
+    events = workflows.path(state['id']).with_name(pointer['events'])
+    committed_bytes = events.stat().st_size
+    with events.open('ab') as output:
+        output.write(b'{"partial-post-mutation-record":')
+    restored = workflows.read(state['id'])
+    assert restored['status'] == 'outcomeUnknown'
+    assert restored['inFlight']['operationId'] == 'remote-might-have-committed'
+    assert events.stat().st_size == committed_bytes
+    with events.open('ab') as output:
+        output.write(b'{"sha256":"wrong","record":"{}"}\n')
+    with pytest.raises(engine.SidecarError, match='damaged'):
+        workflows.read(state['id'])
+
+
+def test_history_mapping_deltas_preserve_full_inspection(engine, monkeypatch, profile):
+    src, dst, params = pair(engine, monkeypatch, profile)
+    src.list_object_versions.return_value = {'Versions': [version('new', 2), version('old', 1)]}
+    src.head_object.return_value = {'Metadata': {}}
+    rows = []
+    dst.list_object_versions.side_effect = lambda **_: {'Versions': rows}
+    def copy(p):
+        row = version('destination-' + p['sourceVersionId'], len(rows))
+        rows.append(row)
+        return {'successCount': 1, 'versionId': row['VersionId']}
+    monkeypatch.setattr(engine, '_storage_copy', copy)
+    plan = engine._storage_action({**params, 'action': 'planHistoryCopy'})
+    request = {**params, 'action': 'resumeHistoryCopy', 'recoveryId': plan['id'],
+               'maxEntries': 1, 'incrementalHistoryMappings': True}
+    first = engine._storage_action(request)
+    second = engine._storage_action(request)
+    assert first['mappingStart'] == 0 and first['mappingCount'] == 1
+    assert second['mappingStart'] == 1 and second['mappingCount'] == 2
+    assert len(first['mappings']) == len(second['mappings']) == 1
+    inspected = engine._storage_action({**params, 'action': 'inspectHistoryCopy', 'recoveryId': plan['id']})
+    assert inspected['mappings'] == first['mappings'] + second['mappings']
+    assert 'mappingStart' not in inspected

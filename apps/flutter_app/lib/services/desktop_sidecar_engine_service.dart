@@ -8,6 +8,7 @@ import 'desktop_engine_host.dart';
 import 'diagnostic_safety.dart';
 import 'engine_service.dart';
 import 'listing_cancellation.dart';
+import 'transfer_log_accumulator.dart';
 import 'mock_engine_service.dart';
 
 class DesktopSidecarEngineService
@@ -15,7 +16,8 @@ class DesktopSidecarEngineService
         EngineService,
         EngineLogSinkRegistrant,
         TransferJobSinkRegistrant,
-        ListingCancellationRegistrant {
+        ListingCancellationRegistrant,
+        PerformanceOptionsRegistrant {
   DesktopSidecarEngineService({
     DesktopEngineHost? host,
     EngineService? fallback,
@@ -24,6 +26,16 @@ class DesktopSidecarEngineService
         _fallback = fallback ?? MockEngineService(),
         _allowFallback = fallback != null,
         _cachedEngineRoot = engineRoot;
+
+  final _transferLogs = TransferLogAccumulator();
+  int get retainedTransferLogCount => _transferLogs.activeJobCount;
+  final Map<String, List<Object?>> _historyMappings = {};
+  PerformanceSettings _performance = const PerformanceSettings();
+  @override
+  void configurePerformance(PerformanceSettings settings) {
+    _performance = settings;
+    _host.configureIdleTimeout(Duration(seconds: settings.engineIdleSeconds));
+  }
 
   final DesktopEngineHost _host;
   final EngineService _fallback;
@@ -51,18 +63,58 @@ class DesktopSidecarEngineService
     // never replay an uncertain mutation on a different engine.
     final entry = await _tryGetEngine('python');
     if (entry == null) throw _engineUnavailable('python', 'storageAction');
-    return _sendSidecarRequest(entry,
-        method: 'storageAction',
-        onEvent: _handleSidecarEvent,
-        params: {
-          ...arguments,
-          'action': action,
-          'profile': _profileToJson(profile),
-          if (destinationProfile != null) ...{
-            'sourceProfile': _profileToJson(profile),
-            'destinationProfile': _profileToJson(destinationProfile),
-          },
-        });
+    final recoveryId = arguments['recoveryId']?.toString();
+    if (action == 'resumeHistoryCopy' &&
+        recoveryId != null &&
+        !_historyMappings.containsKey(recoveryId)) {
+      await storageAction(
+          profile: profile,
+          action: 'inspectHistoryCopy',
+          arguments: arguments,
+          destinationProfile: destinationProfile);
+    }
+    try {
+      final result = await _sendSidecarRequest(entry,
+          method: 'storageAction',
+          onEvent: _handleSidecarEvent,
+          params: {
+            ...arguments,
+            'action': action,
+            if (action == 'resumeHistoryCopy')
+              'incrementalHistoryMappings': true,
+            'profile': _profileToJson(profile),
+            if (destinationProfile != null) ...{
+              'sourceProfile': _profileToJson(profile),
+              'destinationProfile': _profileToJson(destinationProfile),
+            },
+          });
+      if (result['mappings'] is List && result['id'] != null) {
+        final id = result['id'].toString();
+        final lines = List<Object?>.from(result['mappings'] as List);
+        final start = result['mappingStart'];
+        if (start == null) {
+          _historyMappings[id] = lines;
+        } else {
+          final previous = _historyMappings[id];
+          if (start is! int ||
+              previous == null ||
+              start > previous.length ||
+              start < 0 ||
+              result['mappingCount'] != start + lines.length) {
+            throw const FormatException(
+                'History mapping continuation is inconsistent; inspect recovery state.');
+          }
+          previous.addAll(lines.skip(previous.length - start));
+        }
+        final full = _historyMappings[id]!;
+        result['mappings'] = AppendOnlyPrefix<Object?>(full, full.length);
+        if (result['status'] == 'completed') _historyMappings.remove(id);
+      }
+      return result;
+    } catch (_) {
+      if (recoveryId != null) _historyMappings.remove(recoveryId);
+      rethrow;
+    }
   }
 
   final Map<String, String> _jobEngines = <String, String>{};
@@ -84,6 +136,8 @@ class DesktopSidecarEngineService
   /// Shuts down the long-lived sidecar engine processes owned by the host.
   @override
   void shutdown() {
+    _transferLogs.clear();
+    _historyMappings.clear();
     _host.dispose();
     _benchmarkProfiles.clear();
     _fallback.shutdown();
@@ -1301,7 +1355,12 @@ class DesktopSidecarEngineService
       'requestId': requestId,
       'method': method,
       'engineVersion': '1.0',
-      'params': params ?? const <String, Object?>{},
+      'params': {
+        ...?params,
+        'progressIntervalMs': _performance.progressIntervalMs,
+        'incrementalTransferLogs': true,
+        'copyTimeoutSeconds': _performance.copyTimeoutSeconds
+      },
     };
     // Building sanitized trace bodies + jsonEncode is expensive; only do it
     // when API logging is enabled (the app drops API events otherwise).
@@ -1329,27 +1388,42 @@ class DesktopSidecarEngineService
       );
     }
     final startedAt = DateTime.now();
-    final response = await _host.send(
-      listingCancellation: cancellation,
-      executablePath: _join(engineRoot, entry.executable),
-      arguments: entry.arguments,
-      workingDirectory: entry.workingDirectory == null
-          ? engineRoot
-          : _join(engineRoot, entry.workingDirectory!),
-      request: request,
-      concurrentControls: entry.id == 'python' || entry.id == 'java',
-      timeout: method == 'health' ? const Duration(seconds: 15) : null,
-      onEvent: (event) {
-        final job = event['job'];
-        if (job is Map && job['id'] != null) {
-          _jobEngines[job['id'].toString()] = entry.id;
-          if (_jobEngines.length > 500) {
-            _jobEngines.remove(_jobEngines.keys.first);
+    final observedJobs = <String>{};
+    late final DesktopEngineHostResponse response;
+    try {
+      response = await _host.send(
+        listingCancellation: cancellation,
+        executablePath: _join(engineRoot, entry.executable),
+        arguments: entry.arguments,
+        workingDirectory: entry.workingDirectory == null
+            ? engineRoot
+            : _join(engineRoot, entry.workingDirectory!),
+        request: request,
+        concurrentControls: entry.id == 'python' || entry.id == 'java',
+        timeout: method == 'health'
+            ? const Duration(seconds: 15)
+            : {'copyObject', 'moveObject'}.contains(method) ||
+                    (method == 'storageAction' &&
+                        '${params?['action']}'.toLowerCase().contains('copy'))
+                ? Duration(seconds: _performance.copyTimeoutSeconds + 120)
+                : null,
+        onEvent: (event) {
+          final job = event['job'];
+          if (job is Map && job['id'] != null) {
+            observedJobs.add(job['id'].toString());
+            _jobEngines[job['id'].toString()] = entry.id;
+            if (_jobEngines.length > 500) {
+              _jobEngines.remove(_jobEngines.keys.first);
+            }
           }
-        }
-        onEvent?.call(event);
-      },
-    );
+          onEvent?.call(event);
+        },
+      );
+    } finally {
+      for (final id in observedJobs) {
+        _transferLogs.forget(id);
+      }
+    }
     final latencyMs = DateTime.now().difference(startedAt).inMilliseconds;
     _handleStructuredLogs(response.stderrOutput, params: params);
     if (apiLoggingEnabled) {
@@ -1457,7 +1531,11 @@ class DesktopSidecarEngineService
     if (job is! Map) {
       return;
     }
-    _transferSink?.call(_transferJobFromJson(Map<String, Object?>.from(job)));
+    final payload = Map<String, Object?>.from(job);
+    final lines = _transferLogs.accept(payload);
+    if (lines == null) return;
+    _transferSink
+        ?.call(_transferJobFromJson({...payload, 'outputLines': lines}));
   }
 
   void _handleStructuredLogs(
@@ -1974,9 +2052,11 @@ class DesktopSidecarEngineService
       canPause: json['canPause'] as bool? ?? true,
       canResume: json['canResume'] as bool? ?? true,
       canCancel: json['canCancel'] as bool? ?? true,
-      outputLines: (json['outputLines'] as List<Object?>? ?? const [])
-          .map((item) => item.toString())
-          .toList(),
+      outputLines: json['outputLines'] is List<String>
+          ? json['outputLines'] as List<String>
+          : (json['outputLines'] as List<Object?>? ?? const [])
+              .map((item) => item.toString())
+              .toList(),
     );
   }
 

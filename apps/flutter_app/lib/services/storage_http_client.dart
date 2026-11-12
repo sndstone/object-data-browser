@@ -10,6 +10,7 @@ import 'package:xml/xml.dart';
 import '../controllers/action_scope.dart';
 import '../models/domain_models.dart';
 import 'listing_cancellation.dart';
+import 'mobile_storage_hash.dart';
 
 /// A bounded, signed REST transport shared by mobile storage administration.
 /// Credentials live only in the profile/client instance and are never logged.
@@ -23,6 +24,7 @@ class StorageHttpClient {
   final HttpClient _client;
   final DateTime Function() _now;
   DateTime? _lastRequest;
+  final Map<String, String> _bucketRegions = {};
   Future<void> _admission = Future.value();
   int requestCount = 0, retryCount = 0;
   bool get azure => profile.endpointType == EndpointProfileType.azureBlob;
@@ -41,13 +43,81 @@ class StorageHttpClient {
       ..badCertificateCallback = (_, __, ___) => !profile.verifyTls;
   }
 
-  void close() => _client.close(force: true);
+  int _leases = 0, _activeRequests = 0;
+  bool _closed = false;
+  bool get isIdle => _leases == 0 && _activeRequests == 0;
+  void acquire() {
+    _leases++;
+  }
+
+  void release() {
+    if (_leases > 0) _leases--;
+  }
+
+  MobilePayloadHasher? _hasher;
+  void close() {
+    _closed = true;
+    _hasher?.close();
+    _client.close(force: true);
+  }
+
+  Future<String?> hashPayload(Stream<List<int>> body) async {
+    if (azure) return null;
+    _activeRequests++;
+    try {
+      return await (_hasher ??= MobilePayloadHasher())
+          .hash(body, check: ActionScope.current?.check);
+    } finally {
+      _activeRequests--;
+    }
+  }
+
+  Future<String?> _payloadHash(List<int> body) async {
+    if (azure) return null;
+    if (body.length < 1024 * 1024) return sha256.convert(body).toString();
+    return hashPayload(Stream.value(body));
+  }
+
+  Future<void> _retryWait(int attempt,
+      [Map<String, String> headers = const {}]) async {
+    final hint = headers['x-ms-retry-after-ms'];
+    var milliseconds = int.tryParse(hint ?? '');
+    final retryAfter = headers['retry-after'];
+    if (milliseconds == null && retryAfter != null) {
+      final seconds = int.tryParse(retryAfter);
+      if (seconds != null) {
+        milliseconds = seconds * 1000;
+      } else {
+        try {
+          milliseconds = HttpDate.parse(retryAfter)
+              .difference(_now().toUtc())
+              .inMilliseconds;
+        } catch (_) {}
+      }
+    }
+    final ceiling = min(2000, 100 * (1 << attempt));
+    final wait = Duration(
+        milliseconds:
+            milliseconds?.clamp(0, 60000) ?? Random().nextInt(ceiling + 1));
+    final scope = ActionScope.current;
+    if (scope == null) {
+      await Future<void>.delayed(wait);
+    } else {
+      await scope.wait(Future<void>.delayed(wait));
+    }
+  }
 
   Uri uri(String bucket, [String? key, Map<String, String> query = const {}]) {
     final endpoint = profile.endpointUrl.isEmpty && azure
         ? 'https://${profile.accessKey}.blob.core.windows.net'
         : profile.endpointUrl;
-    final base = Uri.parse(endpoint);
+    var base = Uri.parse(endpoint);
+    final region = _bucketRegions[bucket];
+    if (region != null) {
+      base = base.replace(
+          host:
+              's3.$region.amazonaws.com${base.host.endsWith('.cn') ? '.cn' : ''}');
+    }
     if (!{'http', 'https'}.contains(base.scheme) ||
         base.host.isEmpty ||
         base.userInfo.isNotEmpty ||
@@ -98,15 +168,20 @@ class StorageHttpClient {
       List<int> body = const [],
       int maxResponseBytes = 16 * 1024 * 1024,
       bool? retrySafe}) async {
-    return requestStream(method, bucket,
-        key: key,
-        query: query,
-        headers: headers,
-        body: () => Stream.value(body),
-        bodyLength: body.length,
-        payloadSha256: sha256.convert(body).toString(),
-        maxResponseBytes: maxResponseBytes,
-        retrySafe: retrySafe);
+    _activeRequests++;
+    try {
+      return await requestStream(method, bucket,
+          key: key,
+          query: query,
+          headers: headers,
+          body: () => Stream.value(body),
+          bodyLength: body.length,
+          payloadSha256: await _payloadHash(body),
+          maxResponseBytes: maxResponseBytes,
+          retrySafe: retrySafe);
+    } finally {
+      _activeRequests--;
+    }
   }
 
   /// Each retry recreates the upload stream and calls [onResponseStart] before
@@ -123,13 +198,43 @@ class StorageHttpClient {
       FutureOr<void> Function(List<int>)? onResponseChunk,
       int? maxResponseBytes,
       bool? retrySafe}) async {
+    if (_closed) throw StateError('Storage client is closed.');
+    _activeRequests++;
+    try {
+      return await _requestStream(method, bucket,
+          key: key,
+          query: query,
+          headers: headers,
+          body: body,
+          bodyLength: bodyLength,
+          payloadSha256: payloadSha256,
+          onResponseStart: onResponseStart,
+          onResponseChunk: onResponseChunk,
+          maxResponseBytes: maxResponseBytes,
+          retrySafe: retrySafe);
+    } finally {
+      _activeRequests--;
+    }
+  }
+
+  Future<StorageHttpResponse> _requestStream(String method, String bucket,
+      {String? key,
+      Map<String, String> query = const {},
+      Map<String, String> headers = const {},
+      Stream<List<int>> Function()? body,
+      int bodyLength = 0,
+      String? payloadSha256,
+      FutureOr<void> Function()? onResponseStart,
+      FutureOr<void> Function(List<int>)? onResponseChunk,
+      int? maxResponseBytes,
+      bool? retrySafe}) async {
     if (bodyLength < 0 || (bodyLength > 0 && body == null)) {
       throw const EngineException(
           code: ErrorCode.invalidConfig,
           message:
               'A repeatable upload stream and its exact length are required.');
     }
-    final target = uri(bucket, key, query);
+    var correctedRegion = false;
     final safe = retrySafe ?? {'GET', 'HEAD', 'OPTIONS'}.contains(method);
     final attempts = safe ? profile.maxAttempts.clamp(1, 10) : 1;
     for (var attempt = 0;; attempt++) {
@@ -144,12 +249,16 @@ class StorageHttpClient {
             message:
                 'A precomputed SHA256 digest is required for a streamed S3 upload.');
       }
+      final target = uri(bucket, key, query);
       final signed = signedHeaders(
           method, target, headers, const [], _now().toUtc(),
-          bodyLength: bodyLength, payloadSha256: hash);
+          bodyLength: bodyLength,
+          payloadSha256: hash,
+          signingRegion: _bucketRegions[bucket]);
       HttpClientRequest? outgoing;
       var complete = false, sent = false;
       final scope = ActionScope.current;
+      void Function()? releaseCancellation;
       try {
         outgoing = await _client.openUrl(method, target);
         outgoing.followRedirects = false;
@@ -159,30 +268,40 @@ class StorageHttpClient {
         }
         final cancellable = outgoing;
         if (scope != null) {
-          unawaited(scope.whenCancelled.then((_) {
+          releaseCancellation = scope.onCancel(() {
             if (!complete) {
               if (sent && !safe) scope.outcomeUnknown = true;
               cancellable.abort(const ListingCancelled());
             }
-          }));
+          });
         }
         scope?.check();
         requestCount++;
         sent = true;
         var written = 0;
         if (body != null) {
-          await outgoing
-              .addStream(body().map((chunk) {
-                scope?.check();
-                written += chunk.length;
-                if (written > bodyLength) {
-                  throw const EngineException(
-                      code: ErrorCode.invalidConfig,
-                      message: 'Upload stream exceeded its declared length.');
-                }
-                return chunk;
-              }))
-              .timeout(Duration(seconds: profile.readTimeoutSeconds));
+          // Flush bounded blocks; each completed flush advances the inactivity
+          // deadline instead of limiting the duration of a healthy whole body.
+          await for (final chunk in body()
+              .timeout(Duration(seconds: profile.readTimeoutSeconds))) {
+            scope?.check();
+            written += chunk.length;
+            if (written > bodyLength) {
+              throw const EngineException(
+                  code: ErrorCode.invalidConfig,
+                  message: 'Upload stream exceeded its declared length.');
+            }
+            final bytes =
+                chunk is Uint8List ? chunk : Uint8List.fromList(chunk);
+            for (var offset = 0; offset < bytes.length; offset += 64 * 1024) {
+              scope?.check();
+              outgoing.add(Uint8List.sublistView(
+                  bytes, offset, min(bytes.length, offset + 64 * 1024)));
+              await outgoing
+                  .flush()
+                  .timeout(Duration(seconds: profile.readTimeoutSeconds));
+            }
+          }
         }
         if (written != bodyLength) {
           throw const EngineException(
@@ -225,12 +344,25 @@ class StorageHttpClient {
         final result = StorageHttpResponse(
             response.statusCode, resultHeaders, bytes.takeBytes());
         if (result.status >= 200 && result.status < 300) return result;
+        // Only retry safe reads, once, to a reconstructed AWS origin. Never
+        // follow Location or forward credentials to a provider-supplied host.
+        final region = storageAwsRedirectRegion(profile, bucket, result);
+        if (!correctedRegion &&
+            {'GET', 'HEAD'}.contains(method) &&
+            region != null &&
+            region != _bucketRegions[bucket]) {
+          correctedRegion = true;
+          if (_bucketRegions.length >= 256) {
+            _bucketRegions.remove(_bucketRegions.keys.first);
+          }
+          _bucketRegions[bucket] = region;
+          continue;
+        }
         if (safe &&
             attempt + 1 < attempts &&
             {408, 429, 500, 502, 503, 504}.contains(result.status)) {
           retryCount++;
-          await Future<void>.delayed(
-              Duration(milliseconds: min(2000, 100 * (1 << attempt))));
+          await _retryWait(attempt, result.headers);
           continue;
         }
         throw StorageHttpException(result);
@@ -253,8 +385,7 @@ class StorageHttpClient {
                 error is HttpException)) {
           retryCount++;
           outgoing?.abort();
-          await Future<void>.delayed(
-              Duration(milliseconds: min(2000, 100 * (1 << attempt))));
+          await _retryWait(attempt);
           continue;
         }
         if (sent && !safe) scope?.outcomeUnknown = true;
@@ -270,6 +401,7 @@ class StorageHttpClient {
                 : 'Could not complete the storage request (${error.runtimeType}).');
       } finally {
         complete = true;
+        releaseCancellation?.call();
       }
     }
   }
@@ -285,10 +417,12 @@ class StorageHttpClient {
             Duration(microseconds: 1000000 ~/ profile.maxRequestsPerSecond));
         final remaining = deadline.difference(DateTime.now());
         if (remaining > Duration.zero) {
-          await Future.any<void>([
-            Future<void>.delayed(remaining),
-            if (scope != null) scope.whenCancelled,
-          ]);
+          final delay = Future<void>.delayed(remaining);
+          if (scope == null) {
+            await delay;
+          } else {
+            await scope.wait(delay);
+          }
         }
       }
       scope?.check();
@@ -300,7 +434,7 @@ class StorageHttpClient {
 
   Map<String, String> signedHeaders(String method, Uri target,
       Map<String, String> supplied, List<int> body, DateTime time,
-      {int? bodyLength, String? payloadSha256}) {
+      {int? bodyLength, String? payloadSha256, String? signingRegion}) {
     final length = bodyLength ?? body.length;
     final headers =
         supplied.map((key, value) => MapEntry(key.toLowerCase(), value));
@@ -384,7 +518,8 @@ class StorageHttpClient {
         .join();
     final request =
         [method, target.path, target.query, canonical, signed, hash].join('\n');
-    final region = profile.region.isEmpty ? 'us-east-1' : profile.region;
+    final region = signingRegion ??
+        (profile.region.isEmpty ? 'us-east-1' : profile.region);
     final scope = '$day/$region/s3/aws4_request';
     final signingKey = _signingKey(day, region);
     final signature = Hmac(sha256, signingKey).convert(utf8.encode(
@@ -408,7 +543,8 @@ class StorageHttpClient {
     }
     // Validate the same auth settings before exposing a bearer URL.
     final time = _now().toUtc(),
-        region = profile.region.isEmpty ? 'us-east-1' : profile.region;
+        region = _bucketRegions[bucket] ??
+            (profile.region.isEmpty ? 'us-east-1' : profile.region);
     final date = _awsDate(time), day = date.substring(0, 8);
     final scope = '$day/$region/s3/aws4_request';
     final query = <String, String>{
@@ -592,4 +728,32 @@ class ExactStorageUri implements Uri {
       other is Uri && toString() == other.toString();
   @override
   int get hashCode => toString().hashCode;
+}
+
+/// Trust region corrections only from standard AWS endpoints in the same partition.
+String? storageAwsRedirectRegion(
+    EndpointProfile profile, String bucket, StorageHttpResponse response) {
+  final endpoint = Uri.tryParse(profile.endpointUrl);
+  final region = response.headers['x-amz-bucket-region'];
+  if (profile.endpointType != EndpointProfileType.awsS3 ||
+      bucket.isEmpty ||
+      endpoint == null ||
+      endpoint.scheme != 'https' ||
+      endpoint.port != 443 ||
+      !RegExp(r'^s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com(?:\.cn)?$')
+          .hasMatch(endpoint.host) ||
+      (endpoint.path.isNotEmpty && endpoint.path != '/') ||
+      region == null ||
+      !RegExp(r'^[a-z]{2}(?:-gov)?-[a-z]+-\d+$').hasMatch(region) ||
+      region.startsWith('cn-') != endpoint.host.endsWith('.cn') ||
+      region.startsWith('us-gov-') != profile.region.startsWith('us-gov-') ||
+      !{301, 307, 400}.contains(response.status)) {
+    return null;
+  }
+  if (response.status == 400 &&
+      StorageHttpException(response).serviceCode !=
+          'AuthorizationHeaderMalformed') {
+    return null;
+  }
+  return region;
 }

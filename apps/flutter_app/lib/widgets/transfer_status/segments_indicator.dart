@@ -159,12 +159,12 @@ class _SegmentsIndicatorState extends State<SegmentsIndicator>
 
     final glyph = AnimatedSwitcher(
       duration: switchDuration,
-      switchInCurve: Curves.easeOutBack,
-      switchOutCurve: Curves.easeIn,
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
       transitionBuilder: (child, animation) => FadeTransition(
         opacity: animation,
         child: ScaleTransition(
-          scale: Tween(begin: 0.6, end: 1.0).animate(animation),
+          scale: Tween(begin: 0.9, end: 1.0).animate(animation),
           child: child,
         ),
       ),

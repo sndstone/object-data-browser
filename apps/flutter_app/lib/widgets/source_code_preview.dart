@@ -12,6 +12,8 @@ class SourceCodePreview extends StatelessWidget {
   final String source;
   final String language;
   final TextStyle? textStyle;
+  static final Map<(String, String), List<Node>> _tokens = {};
+  static final Map<Object, TextSpan> _spans = {};
 
   @override
   Widget build(BuildContext context) {
@@ -27,11 +29,26 @@ class SourceCodePreview extends StatelessWidget {
   TextSpan highlightedSpan(BuildContext context) {
     final baseStyle = (textStyle ?? Theme.of(context).textTheme.bodyMedium)
         ?.copyWith(fontFamily: 'monospace');
-    final nodes = highlight.parse(source, language: language).nodes ?? const [];
-    return TextSpan(
+    final key = (source, language);
+    var nodes = _tokens[key];
+    if (nodes == null) {
+      nodes =
+          highlight.parse(source, language: language).nodes ?? const <Node>[];
+      // A handful of bounded previews, rather than a cache per opened object.
+      if (_tokens.length >= 4) _tokens.remove(_tokens.keys.first);
+      if (source.length <= 65536) _tokens[key] = nodes;
+    }
+    final spanKey =
+        (source, language, baseStyle, Theme.of(context).colorScheme);
+    final cached = _spans[spanKey];
+    if (cached != null) return cached;
+    final span = TextSpan(
       style: baseStyle,
       children: nodes.map((node) => _spanForNode(context, node)).toList(),
     );
+    if (_spans.length >= 4) _spans.remove(_spans.keys.first);
+    if (source.length <= 65536) _spans[spanKey] = span;
+    return span;
   }
 
   TextSpan _spanForNode(BuildContext context, Node node) {

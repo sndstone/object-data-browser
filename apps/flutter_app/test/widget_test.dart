@@ -13,6 +13,7 @@ import 'package:s3_browser_crossplat/theme/breakpoints.dart';
 import 'package:s3_browser_crossplat/theme/app_motion.dart';
 import 'package:s3_browser_crossplat/logs/structured_log_list.dart';
 import 'package:s3_browser_crossplat/widgets/app_switch.dart';
+import 'package:s3_browser_crossplat/widgets/app_form_dialog.dart';
 
 class TestAppController extends AppController {
   TestAppController({
@@ -233,16 +234,12 @@ void main() {
                   height: 400,
                   child: Text('$position'))));
       double offset(int position, {bool incoming = true}) {
-        final slide = tester
-            .widgetList<SlideTransition>(find.ancestor(
+        final transform = tester.widget<Transform>(find
+            .ancestor(
                 of: find.byKey(ValueKey('motion-panel-$position')),
-                matching: find.byKey(const ValueKey('directional-slide'))))
-            .firstWhere((slide) =>
-                slide.child is IgnorePointer &&
-                (slide.child as IgnorePointer).ignoring != incoming);
-        return axis == Axis.horizontal
-            ? slide.position.value.dx
-            : slide.position.value.dy;
+                matching: find.byType(Transform))
+            .first);
+        return transform.transform.storage[axis == Axis.horizontal ? 12 : 13];
       }
 
       await tester.pumpWidget(frame(0));
@@ -251,7 +248,11 @@ void main() {
       expect(offset(1), greaterThan(0));
       expect(offset(0, incoming: false), lessThan(0));
       // Reverse before the first transition finishes.
+      final beforeReturn = offset(0, incoming: false);
+      final beforeExit = offset(1);
       await tester.pumpWidget(frame(0));
+      expect(offset(0), closeTo(beforeReturn, .001));
+      expect(offset(1, incoming: false), closeTo(beforeExit, .001));
       await tester.pump(const Duration(milliseconds: 60));
       expect(offset(0), lessThan(0));
       expect(offset(1, incoming: false), greaterThan(0));
@@ -1160,14 +1161,15 @@ void main() {
     await tester.tap(find.widgetWithText(FilledButton, 'Create').last);
     await tester.pump(const Duration(milliseconds: 120));
 
-    expect(find.byType(AlertDialog), findsOneWidget);
+    expect(find.byType(AppFormDialog<String>), findsOneWidget);
 
     await tester.enterText(
         find.widgetWithText(TextField, 'Prefix name'), 'reports/2026');
+    await tester.pump();
     await tester.tap(find.widgetWithText(FilledButton, 'Create').last);
     await tester.pumpAndSettle();
 
-    expect(find.byType(AlertDialog), findsNothing);
+    expect(find.byType(AppFormDialog<String>), findsNothing);
   });
 
   testWidgets('settings workspace renders guided endpoint onboarding controls',

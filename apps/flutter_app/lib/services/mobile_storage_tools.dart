@@ -20,8 +20,6 @@ extension MobileStorageTools on MobileStorageAdmin {
           'Choose a container, a supported object size, nonnegative object count and at least one write per key.');
     }
     final partSize = MultipartSizing.recommendedPartSizeMiB(size);
-    final directory =
-        await Directory.systemTemp.createTemp('object-browser-testdata-');
     var position = 0, success = 0, failures = 0;
     var stop = false;
     var exitCode = 0;
@@ -33,20 +31,6 @@ extension MobileStorageTools on MobileStorageAdmin {
       await Future.wait([
         for (var worker = 0; worker < min(threads, count); worker++)
           () async {
-            final file = File('${directory.path}/payload-$worker');
-            final handle = await file.open(mode: FileMode.write);
-            try {
-              final block = List<int>.filled(min(size, 1024 * 1024), 65);
-              var remaining = size;
-              while (remaining > 0) {
-                ActionScope.current?.check();
-                final length = min(remaining, block.length);
-                await handle.writeFrom(block, 0, length);
-                remaining -= length;
-              }
-            } finally {
-              await handle.close();
-            }
             while (!stop && position < count) {
               ActionScope.current?.check();
               final index = position++;
@@ -56,12 +40,15 @@ extension MobileStorageTools on MobileStorageAdmin {
                 if (stop) break;
                 ActionScope.current?.check();
                 try {
-                  await uploadStorageFile(profile, {
-                    'bucketName': bucket,
-                    'filePaths': [file.path],
-                    'objectKeyByPath': {file.path: key},
-                    'multipartChunkMiB': partSize
-                  });
+                  await _writeObject(
+                      client(profile),
+                      bucket,
+                      key,
+                      size,
+                      (_, length) async =>
+                          Uint8List(length)..fillRange(0, length, 65),
+                      streamReadBytes: 256 * 1024,
+                      partBytes: partSize * 1024 * 1024);
                   success++;
                 } catch (error) {
                   stop = true;
@@ -79,8 +66,6 @@ extension MobileStorageTools on MobileStorageAdmin {
       ]);
     } catch (_) {
       exitCode = (ActionScope.current?.isCancelled ?? false) ? 130 : 1;
-    } finally {
-      await directory.delete(recursive: true);
     }
     final summary =
         'Completed $success writes; $failures failures; ${count * versions - success - failures} writes not completed.';

@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/rendering.dart' show RenderParagraph;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:s3_browser_crossplat/app/s3_browser_app.dart';
+import 'package:s3_browser_crossplat/browser/object_panel.dart';
 import 'package:s3_browser_crossplat/models/domain_models.dart';
 import 'package:s3_browser_crossplat/utils/format.dart';
 import 'improvements_test.dart' as fixture;
@@ -90,6 +91,39 @@ class _BareDetailsEngine extends fixture.TestingEngine {
 }
 
 void inspectorMain() {
+  testWidgets('inspector docking preserves the object panel and expanded tray',
+      (tester) async {
+    final c = fixture.controller(fixture.TestingEngine(), fixture.Repository());
+    await c.initialize();
+    c.clearBanner();
+    await c.updateSettings(c.settings.copyWith(
+      enableAnimations: true,
+      browserInspectorLayout: BrowserInspectorLayout.right,
+      browserInspectorVisible: true,
+    ));
+    await _pumpApp(tester, c);
+    final objects = find.byType(ObjectPanel);
+    final state = tester.state(objects);
+    await tester.tap(find.byKey(const ValueKey('object-view-tools')));
+    await tester.pumpAndSettle();
+    expect(find.text('Flat view'), findsOneWidget);
+
+    for (final visible in [false, true]) {
+      await c.updateSettings(
+          c.settings.copyWith(browserInspectorVisible: visible));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 80));
+      expect(tester.state(objects), same(state));
+      expect(find.text('Flat view'), findsOneWidget);
+      await tester.pumpAndSettle();
+      expect(tester.state(objects), same(state));
+      expect(find.text('Flat view'), findsOneWidget);
+    }
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    c.dispose();
+  });
+
   testWidgets('inspector names empty metadata, header and tag sections',
       (tester) async {
     final c = fixture.controller(_BareDetailsEngine(), fixture.Repository());

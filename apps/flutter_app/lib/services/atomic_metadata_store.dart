@@ -1,9 +1,19 @@
 import 'dart:convert';
 import 'dart:io';
+import '../models/domain_models.dart';
 
 /// Serialized metadata only. Credentials must never be passed to this store.
 class AtomicMetadataStore {
   Future<void> _tail = Future<void>.value();
+
+  Future<bool> isValid(File file) async {
+    try {
+      await _decode(file);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
 
   Future<T> serialize<T>(Future<T> Function() action) {
     final result = _tail.then((_) => action());
@@ -39,7 +49,18 @@ class AtomicMetadataStore {
         value['profiles'] is! List) {
       throw const FormatException('Invalid application metadata schema.');
     }
-    return Map<String, Object?>.from(value);
+    final metadata = Map<String, Object?>.from(value);
+    // Typed validation belongs inside the recovery boundary, before an invalid
+    // primary can replace its last-good generation.
+    AppSettings.fromJson(Map<String, Object?>.from(value['settings'] as Map));
+    for (final profile in value['profiles'] as List) {
+      EndpointProfile.fromJson(Map<String, Object?>.from(profile as Map));
+    }
+    if (value['selectedProfileId'] != null &&
+        value['selectedProfileId'] is! String) {
+      throw const FormatException('Invalid selected profile.');
+    }
+    return metadata;
   }
 
   Future<void> replace(File file, Map<String, Object?> metadata,
@@ -49,13 +70,18 @@ class AtomicMetadataStore {
     await temp.writeAsString(
         const JsonEncoder.withIndent('  ').convert(metadata),
         flush: true);
+    await _decode(temp);
     if (!preserveBackup && await file.exists()) {
       // Validate before rotating: never replace the last-good backup with a
       // corrupt primary. The secure-store write is handled by the caller.
-      await _decode(file);
-      final backupTemp = File('${file.path}.last-good.pending');
-      await backupTemp.writeAsString(await file.readAsString(), flush: true);
-      await backupTemp.rename('${file.path}.last-good');
+      if (await isValid(file)) {
+        final backupTemp = File('${file.path}.last-good.pending');
+        await backupTemp.writeAsString(await file.readAsString(), flush: true);
+        await backupTemp.rename('${file.path}.last-good');
+      } else {
+        await file.copy(
+            '${file.path}.corrupt-${DateTime.now().microsecondsSinceEpoch}');
+      }
     }
     // Dart's same-directory rename replaces an existing file on supported
     // platforms. No delete-first gap: an unsuccessful rename preserves it.

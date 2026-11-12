@@ -10,6 +10,7 @@ import 'dart:ui' show AppExitResponse;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../benchmark/benchmark_workspace.dart';
 import '../browser/browser_workspace_frame.dart';
@@ -23,6 +24,7 @@ import '../theme/app_motion.dart';
 import '../theme/breakpoints.dart';
 import '../widgets/app_select_field.dart';
 import '../widgets/compact_selector.dart';
+import '../widgets/workspace_content_frame.dart';
 
 class S3BrowserApp extends StatefulWidget {
   const S3BrowserApp({
@@ -38,6 +40,9 @@ class S3BrowserApp extends StatefulWidget {
 
 class _S3BrowserAppState extends State<S3BrowserApp> {
   Timer? _benchmarkTimer;
+  Object? _themeKey;
+  AppSettings? _appSettings;
+  ThemeData? _cachedTheme;
   AppLifecycleListener? _lifecycleListener;
   static const List<WorkspaceTab> _allNavTabs = [
     WorkspaceTab.browser,
@@ -66,6 +71,12 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
     // Shut down long-lived engine sidecar processes before the desktop app
     // exits so they do not outlive the UI process.
     _lifecycleListener = AppLifecycleListener(
+      onStateChange: (state) {
+        if (defaultTargetPlatform == TargetPlatform.iOS &&
+            state == AppLifecycleState.paused) {
+          widget.controller.stopForegroundTransfers();
+        }
+      },
       onExitRequested: () async {
         widget.controller.shutdownEngines();
         return AppExitResponse.exit;
@@ -157,7 +168,8 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
       _benchmarkTimer = null;
     }
 
-    if (mounted) {
+    if (mounted && _appSettings != widget.controller.settings) {
+      _appSettings = widget.controller.settings;
       setState(() {});
     }
   }
@@ -166,206 +178,258 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
   Widget build(BuildContext context) {
     final controller = widget.controller;
     final desktopCompact = AppTheme.isDesktopPlatform(defaultTargetPlatform);
-    final theme = controller.settings.darkMode
-        ? AppTheme.dark(
-            scalePercent: controller.settings.uiScalePercent,
-            compactRows: controller.settings.compactRows,
-            desktopCompact: desktopCompact,
-          )
-        : AppTheme.light(
-            scalePercent: controller.settings.uiScalePercent,
-            compactRows: controller.settings.compactRows,
-            desktopCompact: desktopCompact,
-          );
+    final themeKey = (
+      controller.settings.darkMode,
+      controller.settings.uiScalePercent,
+      controller.settings.compactRows,
+      desktopCompact
+    );
+    if (_themeKey != themeKey) {
+      _themeKey = themeKey;
+      _cachedTheme = controller.settings.darkMode
+          ? AppTheme.dark(
+              scalePercent: controller.settings.uiScalePercent,
+              compactRows: controller.settings.compactRows,
+              desktopCompact: desktopCompact,
+            )
+          : AppTheme.light(
+              scalePercent: controller.settings.uiScalePercent,
+              compactRows: controller.settings.compactRows,
+              desktopCompact: desktopCompact,
+            );
+    }
+    final theme = _cachedTheme!;
 
     return MaterialApp(
       title: 'Object Data Browser',
       debugShowCheckedModeBanner: false,
       theme: theme,
-      home: Builder(
-        builder: (context) => MediaQuery(
-          data: MediaQuery.of(context).copyWith(
-            textScaler: PreferenceTextScaler(MediaQuery.textScalerOf(context),
-                controller.settings.uiScalePercent / 100),
-          ),
-          child: LayoutBuilder(
-            builder: (context, constraints) {
-              _shellContext = context;
-              final sizeClass = Breakpoints.sizeClass(constraints.maxWidth);
-              final phone = sizeClass == WindowSizeClass.phone;
-              final tablet = sizeClass == WindowSizeClass.tablet;
-              final compact = phone || tablet;
-              final compactRail = sizeClass == WindowSizeClass.smallDesktop;
-              final navTabs = _visibleNavTabs();
-              final activeTab = navTabs.contains(controller.activeTab)
-                  ? controller.activeTab
-                  : WorkspaceTab.browser;
-              if (activeTab != controller.activeTab) {
-                WidgetsBinding.instance.addPostFrameCallback((_) {
-                  if (mounted) {
-                    controller.selectTab(activeTab);
-                  }
-                });
-              }
-              final body = DirectionalSwitcher(
-                position: navTabs.indexOf(activeTab),
-                axis: compact ? Axis.horizontal : Axis.vertical,
-                duration: AppMotion.duration(context,
-                    enabled: controller.settings.enableAnimations,
-                    milliseconds: 280),
-                child: switch (activeTab) {
-                  WorkspaceTab.browser => BrowserWorkspaceFrame(
-                      key: const ValueKey('browser'),
-                      controller: controller,
-                      compact: compact,
+      builder: (context, child) => MediaQuery(
+        data: MediaQuery.of(context).copyWith(
+          disableAnimations: MediaQuery.disableAnimationsOf(context) ||
+              !controller.settings.enableAnimations,
+          textScaler: PreferenceTextScaler(MediaQuery.textScalerOf(context),
+              controller.settings.uiScalePercent / 100),
+        ),
+        child: AnnotatedRegion<SystemUiOverlayStyle>(
+          value: SystemUiOverlayStyle.light,
+          child: child!,
+        ),
+      ),
+      home: ListenableBuilder(
+        listenable: controller,
+        builder: (context, _) => LayoutBuilder(
+          builder: (context, constraints) {
+            _shellContext = context;
+            final sizeClass = Breakpoints.sizeClass(constraints.maxWidth);
+            final phone = sizeClass == WindowSizeClass.phone;
+            final tablet = sizeClass == WindowSizeClass.tablet;
+            final compact = phone || tablet;
+            final compactRail = sizeClass == WindowSizeClass.smallDesktop;
+            final navTabs = _visibleNavTabs();
+            final activeTab = navTabs.contains(controller.activeTab)
+                ? controller.activeTab
+                : WorkspaceTab.browser;
+            if (activeTab != controller.activeTab) {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (mounted) {
+                  controller.selectTab(activeTab);
+                }
+              });
+            }
+            final body = DirectionalSwitcher(
+              replaceContent: true,
+              position: navTabs.indexOf(activeTab),
+              // Rails stack destinations vertically; compact layouts use
+              // a horizontal tab strip or bottom navigation instead.
+              axis: compact ? Axis.horizontal : Axis.vertical,
+              duration: AppMotion.duration(context,
+                  enabled: controller.settings.enableAnimations,
+                  milliseconds: 300),
+              child: switch (activeTab) {
+                WorkspaceTab.browser => BrowserWorkspaceFrame(
+                    key: const ValueKey('browser'),
+                    controller: controller,
+                    compact: compact,
+                  ),
+                WorkspaceTab.benchmark => WorkspaceContentFrame(
+                    key: const ValueKey('benchmark'),
+                    signature: (
+                      controller,
+                      controller.settings,
+                      controller.selectedProfile,
+                      controller.activeEngineId,
+                      controller.buckets,
+                      controller.benchmarkDraft,
+                      controller.benchmarkRun,
+                      controller.benchmarkHistory,
+                      controller.selectedBenchmarkRun,
+                      controller.busyVersion
                     ),
-                  WorkspaceTab.benchmark => BenchmarkWorkspace(
-                      key: const ValueKey('benchmark'),
-                      controller: controller,
+                    builder: () => BenchmarkWorkspace(controller: controller),
+                  ),
+                WorkspaceTab.settings => WorkspaceContentFrame(
+                    key: const ValueKey('settings'),
+                    signature: (
+                      controller,
+                      controller.settings,
+                      controller.profiles,
+                      controller.engines,
+                      controller.activeEngineId,
+                      controller.selectedProfile,
+                      controller.settingsSectionName,
+                      controller.busyVersion,
+                      controller.persistenceState.warning,
+                      Object.hashAll(controller.profiles.map(
+                          (p) => controller.profilePersistenceStatusFor(p.id)))
                     ),
-                  WorkspaceTab.settings => SettingsWorkspace(
-                      key: const ValueKey('settings'),
-                      controller: controller,
+                    builder: () => SettingsWorkspace(controller: controller),
+                  ),
+                WorkspaceTab.tasks => TasksWorkspace(
+                    key: const ValueKey('tasks'),
+                    controller: controller,
+                  ),
+                WorkspaceTab.eventLog => WorkspaceContentFrame(
+                    key: const ValueKey('event-log'),
+                    signature: (
+                      controller,
+                      controller.eventLog,
+                      controller.settings,
+                      controller.profiles,
+                      controller.pendingEventLogFilter,
+                      controller.busyVersion
                     ),
-                  WorkspaceTab.tasks => TasksWorkspace(
-                      key: const ValueKey('tasks'),
-                      controller: controller,
-                    ),
-                  WorkspaceTab.eventLog => EventLogWorkspace(
-                      key: const ValueKey('event-log'),
-                      controller: controller,
-                    ),
-                },
-              );
+                    builder: () => EventLogWorkspace(controller: controller),
+                  ),
+              },
+            );
 
-              return AppShortcuts(
-                  controller: controller,
-                  child: Scaffold(
-                    bottomNavigationBar: AnimatedSwitcher(
-                      duration: AppMotion.duration(context,
-                          enabled: controller.settings.enableAnimations,
-                          milliseconds: 220),
-                      switchInCurve: Curves.easeOutCubic,
-                      switchOutCurve: Curves.easeOutCubic,
-                      transitionBuilder: (child, animation) => SizeTransition(
-                        sizeFactor: animation,
-                        alignment: Alignment.bottomCenter,
-                        child: FadeTransition(opacity: animation, child: child),
-                      ),
-                      child: phone
-                          ? KeyedSubtree(
-                              key: const ValueKey('phone-navigation'),
-                              child: _buildBottomNav(controller, navTabs),
-                            )
-                          : const SizedBox.shrink(
-                              key: ValueKey('no-phone-navigation'),
-                            ),
+            return AppShortcuts(
+                controller: controller,
+                child: Scaffold(
+                  bottomNavigationBar: AnimatedSwitcher(
+                    duration: AppMotion.duration(context,
+                        enabled: controller.settings.enableAnimations,
+                        milliseconds: 220),
+                    switchInCurve: Curves.easeOutCubic,
+                    switchOutCurve: Curves.easeOutCubic,
+                    transitionBuilder: (child, animation) => SizeTransition(
+                      sizeFactor: animation,
+                      alignment: Alignment.bottomCenter,
+                      child: FadeTransition(opacity: animation, child: child),
                     ),
-                    body: ColoredBox(
-                      color: controller.settings.darkMode
-                          ? AppTheme.darkRail
-                          : Theme.of(context).colorScheme.inverseSurface,
-                      child: SafeArea(
-                        child: Stack(
-                          children: [
-                            Row(
-                              children: [
-                                AnimatedContainer(
-                                  key: const ValueKey(
-                                      'workspace-navigation-rail'),
-                                  duration: AppMotion.duration(context,
-                                      enabled:
-                                          controller.settings.enableAnimations,
-                                      milliseconds: 220),
-                                  curve: Curves.easeOutCubic,
-                                  width: compact ? 0 : (compactRail ? 72 : 126),
-                                  child: ClipRect(
-                                    child: compact
-                                        ? const SizedBox.shrink()
-                                        : _buildRail(
-                                            context,
-                                            controller,
-                                            navTabs,
-                                            collapsed: compactRail,
-                                          ),
-                                  ),
-                                ),
-                                Expanded(
-                                  child: Container(
-                                    decoration: BoxDecoration(
-                                      color: Theme.of(context)
-                                          .scaffoldBackgroundColor,
-                                      borderRadius: !compact
-                                          ? const BorderRadius.horizontal(
-                                              left: Radius.circular(8),
-                                            )
-                                          : BorderRadius.zero,
-                                    ),
-                                    child: Column(
-                                      children: [
-                                        _AppHeader(
-                                          controller: controller,
-                                          compact: compact || compactRail,
-                                          phone: phone,
+                    child: phone
+                        ? KeyedSubtree(
+                            key: const ValueKey('phone-navigation'),
+                            child: _buildBottomNav(controller, navTabs),
+                          )
+                        : const SizedBox.shrink(
+                            key: ValueKey('no-phone-navigation'),
+                          ),
+                  ),
+                  body: ColoredBox(
+                    color: controller.settings.darkMode
+                        ? AppTheme.darkRail
+                        : Theme.of(context).colorScheme.inverseSurface,
+                    child: SafeArea(
+                      child: Stack(
+                        children: [
+                          Row(
+                            children: [
+                              AnimatedContainer(
+                                key:
+                                    const ValueKey('workspace-navigation-rail'),
+                                duration: AppMotion.duration(context,
+                                    enabled:
+                                        controller.settings.enableAnimations,
+                                    milliseconds: 220),
+                                curve: Curves.easeOutCubic,
+                                width: compact ? 0 : (compactRail ? 72 : 126),
+                                child: ClipRect(
+                                  child: compact
+                                      ? const SizedBox.shrink()
+                                      : _buildRail(
+                                          context,
+                                          controller,
+                                          navTabs,
+                                          collapsed: compactRail,
                                         ),
-                                        MotionSize(
+                                ),
+                              ),
+                              Expanded(
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    color: Theme.of(context)
+                                        .scaffoldBackgroundColor,
+                                    borderRadius: !compact
+                                        ? const BorderRadius.horizontal(
+                                            left: Radius.circular(8),
+                                          )
+                                        : BorderRadius.zero,
+                                  ),
+                                  child: Column(
+                                    children: [
+                                      _AppHeader(
+                                        controller: controller,
+                                        compact: compact || compactRail,
+                                        phone: phone,
+                                      ),
+                                      MotionSize(
+                                        duration: AppMotion.duration(context,
+                                            enabled: controller
+                                                .settings.enableAnimations,
+                                            milliseconds: 220),
+                                        curve: Curves.easeOutCubic,
+                                        child: AnimatedSwitcher(
                                           duration: AppMotion.duration(context,
                                               enabled: controller
                                                   .settings.enableAnimations,
                                               milliseconds: 220),
-                                          curve: Curves.easeOutCubic,
-                                          child: AnimatedSwitcher(
-                                            duration: AppMotion.duration(
-                                                context,
-                                                enabled: controller
-                                                    .settings.enableAnimations,
-                                                milliseconds: 220),
-                                            switchInCurve: Curves.easeOutCubic,
-                                            switchOutCurve: Curves.easeInCubic,
-                                            transitionBuilder: (child,
-                                                    animation) =>
-                                                FadeTransition(
-                                                    opacity: animation,
-                                                    child: child),
-                                            child: tablet
-                                                ? KeyedSubtree(
-                                                    key: const ValueKey(
-                                                      'tablet-navigation',
-                                                    ),
-                                                    child: _buildTopTabs(
-                                                      controller,
-                                                      navTabs,
-                                                    ),
-                                                  )
-                                                : const SizedBox.shrink(
-                                                    key: ValueKey(
-                                                      'no-tablet-navigation',
-                                                    ),
+                                          switchInCurve: Curves.easeOutCubic,
+                                          switchOutCurve: Curves.easeInCubic,
+                                          transitionBuilder:
+                                              (child, animation) =>
+                                                  FadeTransition(
+                                                      opacity: animation,
+                                                      child: child),
+                                          child: tablet
+                                              ? KeyedSubtree(
+                                                  key: const ValueKey(
+                                                    'tablet-navigation',
                                                   ),
-                                          ),
+                                                  child: _buildTopTabs(
+                                                    controller,
+                                                    navTabs,
+                                                  ),
+                                                )
+                                              : const SizedBox.shrink(
+                                                  key: ValueKey(
+                                                    'no-tablet-navigation',
+                                                  ),
+                                                ),
                                         ),
-                                        Expanded(child: body),
-                                      ],
-                                    ),
+                                      ),
+                                      Expanded(child: body),
+                                    ],
                                   ),
                                 ),
-                              ],
-                            ),
-                            // Bottom-right on desktop keeps messages clear of
-                            // the endpoint and engine switchers in the header.
-                            Positioned(
-                              bottom: phone ? 12 : 16,
-                              right: phone ? 12 : 16,
-                              left: phone ? 12 : null,
-                              child: _BannerOverlay(controller: controller),
-                            ),
-                          ],
-                        ),
+                              ),
+                            ],
+                          ),
+                          // Bottom-right on desktop keeps messages clear of
+                          // the endpoint and engine switchers in the header.
+                          Positioned(
+                            bottom: phone ? 12 : 16,
+                            right: phone ? 12 : 16,
+                            left: phone ? 12 : null,
+                            child: _BannerOverlay(controller: controller),
+                          ),
+                        ],
                       ),
                     ),
-                  ));
-            },
-          ),
+                  ),
+                ));
+          },
         ),
       ),
     );
@@ -1224,7 +1288,23 @@ class _BannerOverlayState extends State<_BannerOverlay> {
     };
     return AnimatedSwitcher(
       duration: AppMotion.duration(context,
-          enabled: c.settings.enableAnimations, milliseconds: 180),
+          enabled: c.settings.enableAnimations, milliseconds: 220),
+      reverseDuration: AppMotion.duration(context,
+          enabled: c.settings.enableAnimations, milliseconds: 160),
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
+      layoutBuilder: (current, previous) => Stack(
+          alignment: Alignment.bottomRight,
+          children: [...previous, if (current != null) current]),
+      transitionBuilder: (child, animation) => FadeTransition(
+        opacity: animation,
+        child: AnimatedBuilder(
+          animation: animation,
+          builder: (context, content) => Transform.translate(
+              offset: Offset(0, 8 * (1 - animation.value)), child: content),
+          child: child,
+        ),
+      ),
       child: c.bannerMessage == null
           ? const SizedBox.shrink(key: ValueKey('banner-empty'))
           : Align(
@@ -1234,60 +1314,71 @@ class _BannerOverlayState extends State<_BannerOverlay> {
               alignment: Alignment.bottomRight,
               child: Semantics(
                   liveRegion: true,
-                  child: Material(
-                    color: background,
-                    borderRadius: BorderRadius.circular(10),
-                    child: Container(
-                        constraints: const BoxConstraints(maxWidth: 480),
-                        padding: const EdgeInsets.fromLTRB(12, 6, 4, 6),
-                        child: Row(mainAxisSize: MainAxisSize.min, children: [
-                          if (transfer != null)
-                            TransferStatusIndicator(
-                                spec: TransferStatusSpec(
-                                    phase: transfer.phase,
-                                    direction: transfer.direction,
-                                    progress: transfer.progress,
-                                    itemCount: transfer.itemCount,
-                                    copy: transfer.copy,
-                                    animate: animate,
-                                    foreground: foreground,
-                                    background: background))
-                          else if (activity != null)
-                            BannerActivityIndicator(
-                                spec: BannerActivitySpec(
-                                    kind: activity.kind,
-                                    phase: activity.phase,
-                                    progress: activity.progress,
-                                    count: activity.count,
-                                    animate: animate,
-                                    foreground: foreground,
-                                    background: background)),
-                          const SizedBox(width: 12),
-                          Flexible(
-                              child: InkWell(
-                                  onTap: c.bannerTaskId != null
-                                      ? c.openBannerTask
-                                      : null,
-                                  child: Text(c.bannerMessage!,
-                                      style: TextStyle(color: foreground)))),
-                          if (c.bannerSeverity == BannerSeverity.error)
-                            TextButton(
-                                onPressed: c.openErrorDetails,
-                                style: TextButton.styleFrom(
-                                    foregroundColor: foreground),
-                                child: const Text('Details'))
-                          else if (c.bannerTaskId != null)
-                            TextButton(
-                                onPressed: c.openBannerTask,
-                                style: TextButton.styleFrom(
-                                    foregroundColor: foreground),
-                                child: const Text('Details')),
-                          IconButton(
-                              tooltip: 'Dismiss message',
-                              onPressed: c.clearBanner,
-                              icon: Icon(Icons.close, color: foreground)),
-                        ])),
-                  )),
+                  child: MotionSize(
+                      alignment: Alignment.centerRight,
+                      duration: AppMotion.duration(context,
+                          enabled: c.settings.enableAnimations,
+                          milliseconds: 220),
+                      curve: Curves.easeInOutCubic,
+                      child: Material(
+                        animationDuration: AppMotion.duration(context,
+                            enabled: c.settings.enableAnimations,
+                            milliseconds: 220),
+                        color: background,
+                        borderRadius: BorderRadius.circular(10),
+                        child: Container(
+                            constraints: const BoxConstraints(maxWidth: 480),
+                            padding: const EdgeInsets.fromLTRB(12, 6, 4, 6),
+                            child:
+                                Row(mainAxisSize: MainAxisSize.min, children: [
+                              if (transfer != null)
+                                TransferStatusIndicator(
+                                    spec: TransferStatusSpec(
+                                        phase: transfer.phase,
+                                        direction: transfer.direction,
+                                        progress: transfer.progress,
+                                        itemCount: transfer.itemCount,
+                                        copy: transfer.copy,
+                                        animate: animate,
+                                        foreground: foreground,
+                                        background: background))
+                              else if (activity != null)
+                                BannerActivityIndicator(
+                                    spec: BannerActivitySpec(
+                                        kind: activity.kind,
+                                        phase: activity.phase,
+                                        progress: activity.progress,
+                                        count: activity.count,
+                                        animate: animate,
+                                        foreground: foreground,
+                                        background: background)),
+                              const SizedBox(width: 12),
+                              Flexible(
+                                  child: InkWell(
+                                      onTap: c.bannerTaskId != null
+                                          ? c.openBannerTask
+                                          : null,
+                                      child: Text(c.bannerMessage!,
+                                          style:
+                                              TextStyle(color: foreground)))),
+                              if (c.bannerSeverity == BannerSeverity.error)
+                                TextButton(
+                                    onPressed: c.openErrorDetails,
+                                    style: TextButton.styleFrom(
+                                        foregroundColor: foreground),
+                                    child: const Text('Details'))
+                              else if (c.bannerTaskId != null)
+                                TextButton(
+                                    onPressed: c.openBannerTask,
+                                    style: TextButton.styleFrom(
+                                        foregroundColor: foreground),
+                                    child: const Text('Details')),
+                              IconButton(
+                                  tooltip: 'Dismiss message',
+                                  onPressed: c.clearBanner,
+                                  icon: Icon(Icons.close, color: foreground)),
+                            ])),
+                      ))),
             ),
     );
   }

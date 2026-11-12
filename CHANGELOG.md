@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.3.5 — performance, S3 safety and adaptive dialogs
+
+### Transfers and resource use
+- Batch mobile S3 selection deletes at the 1,000-entry API limit and retain per-object and partial-batch failures. Go and Rust enforce the same limit.
+- Run mobile download ranges and desktop download metadata preflight with bounded concurrency, retaining source validators, range checks, retry isolation and atomic publication.
+- Show mobile transfer progress during a file, support in-flight cancellation, stop queued work after uncertain outcomes, and stream generated mobile test data without full temporary payload files.
+- Bound transfer workers, queued tasks, logs, query datasets, preview images and cached runtime state. Package smaller relocatable Python and Java runtimes with pinned Python dependencies.
+- Keep unrelated Settings, Benchmark and Event Log content stable during progress updates, cache benchmark timeline ordering, and improve motion continuity and reduced-motion handling.
+
+### S3 correctness
+- Preserve exact object keys during moves and distinguish versions pinned for copying from versions explicitly selected for permanent deletion. Report a completed copy and retained source when deletion cannot be confirmed.
+- Preserve ACL and Object Lock settings during metadata/header rewrites, or stop before mutation when the required settings cannot be read safely.
+- Support historical same-key restores on mobile, including the literal `null` version; handle encoded history keys, XML-safe listings, bucket pagination and explicit Signature V4 signing.
+- Use compatible-endpoint checksum defaults, honor explicit AssumeRole source credentials, and recover safe mobile reads from trusted AWS bucket-region corrections.
+- Omit restore expiration for Intelligent-Tiering archives and reject retrieval tiers unsupported by Deep Archive.
+
+### Dialogs and mobile readiness
+- Add keyboard-aware bucket/prefix forms, full-height phone JSON editors, stacked tag fields, spaced header inputs, retained drafts, dirty-change confirmation and inline save errors.
+- Add focused AWS object and Azure directory rename dialogs, validate names and key lengths, require typed force-delete confirmation, and reset lifecycle approval whenever its inputs change.
+- Apply UI scale and motion preferences to modal routes, enlarge touch menu rows, cap benchmark result windows and improve technical-field keyboard behavior.
+- Update the universal iPhone/iPad target to iOS 15, use the app artwork for icons and launch screen, add privacy declarations, fix status-bar contrast, and support Command shortcuts on iPad.
+- Stop foreground iOS transfers on backgrounding with a short cleanup window. Durable background resume and physical-device qualification remain follow-up work.
+
+This release provides an Apple Silicon macOS 13+ development DMG only. The
+minimum now matches the bundled Objective-C interop framework. It is ad-hoc
+signed and not notarized; Developer ID signing and stable Keychain identity remain
+required for a production macOS release.
+
 ## 2.3.4 — GUI review fixes
 
 ### Browser

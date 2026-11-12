@@ -292,6 +292,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             const SizedBox(height: 10),
             Expanded(
                 child: DirectionalSwitcher(
+                    replaceContent: true,
                     position: _section.index,
                     duration: duration,
                     layoutBuilder: (current, previous) =>
@@ -1568,6 +1569,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
         builder: (dialogContext, dialogSetState) => Dialog(
           insetPadding: const EdgeInsets.all(24),
           clipBehavior: Clip.antiAlias,
+          constraints: const BoxConstraints(maxWidth: 1400),
           child: FractionallySizedBox(
             widthFactor: 0.94,
             heightFactor: 0.94,
@@ -3417,7 +3419,13 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
         .toList();
   }
 
+  List<Map<String, Object?>>? _timelineSource;
+  List<Map<String, Object?>> _orderedTimeline = const [];
   List<Map<String, Object?>> _latencyTimeline(BenchmarkResultSummary summary) {
+    if (identical(_timelineSource, summary.latencyTimeline)) {
+      return _orderedTimeline;
+    }
+    _timelineSource = summary.latencyTimeline;
     final timeline = summary.latencyTimeline
         .map((entry) => Map<String, Object?>.from(entry))
         .toList();
@@ -3436,7 +3444,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
       }
       return _intMetric(left['second']).compareTo(_intMetric(right['second']));
     });
-    return timeline;
+    return _orderedTimeline = timeline;
   }
 
   List<_ChartSeries> _latencyTimelineSeries(

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 
 /// Horizontal scroller that fades whichever edge has more content, so a
 /// clipped row of options reads as scrollable.
@@ -54,8 +55,9 @@ class _EdgeFadeScrollState extends State<EdgeFadeScroll> {
         child: widget.child,
       ),
     );
-    // Always masked, so toggling the fade never rebuilds the scroller.
-    return ShaderMask(
+    // Keep the render-object identity stable while bypassing opaque masking.
+    return _ConditionalShaderMask(
+      enabled: _before || _after,
       blendMode: BlendMode.dstIn,
       shaderCallback: (bounds) {
         final fade = bounds.width == 0 ? 0.0 : (28 / bounds.width).clamp(0, .3);
@@ -107,7 +109,8 @@ class VerticalEdgeFadeState extends State<VerticalEdgeFade> {
   }
 
   @override
-  Widget build(BuildContext context) => ShaderMask(
+  Widget build(BuildContext context) => _ConditionalShaderMask(
+        enabled: _before || _after,
         blendMode: BlendMode.dstIn,
         shaderCallback: (bounds) {
           final fade = bounds.height == 0
@@ -133,4 +136,51 @@ class VerticalEdgeFadeState extends State<VerticalEdgeFade> {
           ),
         ),
       );
+}
+
+class _ConditionalShaderMask extends ShaderMask {
+  const _ConditionalShaderMask(
+      {required this.enabled,
+      required super.shaderCallback,
+      required super.blendMode,
+      required super.child});
+  final bool enabled;
+  @override
+  RenderShaderMask createRenderObject(BuildContext context) =>
+      _ConditionalRenderShaderMask(
+          enabled: enabled,
+          shaderCallback: shaderCallback,
+          blendMode: blendMode);
+  @override
+  void updateRenderObject(BuildContext context, RenderShaderMask renderObject) {
+    super.updateRenderObject(context, renderObject);
+    (renderObject as _ConditionalRenderShaderMask).enabled = enabled;
+  }
+}
+
+class _ConditionalRenderShaderMask extends RenderShaderMask {
+  _ConditionalRenderShaderMask(
+      {required bool enabled,
+      required super.shaderCallback,
+      required super.blendMode})
+      : _enabled = enabled;
+  bool _enabled;
+  set enabled(bool value) {
+    if (_enabled == value) return;
+    _enabled = value;
+    markNeedsCompositingBitsUpdate();
+    markNeedsPaint();
+  }
+
+  @override
+  bool get alwaysNeedsCompositing => _enabled && super.alwaysNeedsCompositing;
+  @override
+  void paint(PaintingContext context, Offset offset) {
+    if (_enabled) {
+      super.paint(context, offset);
+    } else {
+      layer = null;
+      if (child != null) context.paintChild(child!, offset);
+    }
+  }
 }

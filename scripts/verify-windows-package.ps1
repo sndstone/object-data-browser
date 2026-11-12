@@ -8,6 +8,11 @@ if ($env:GITHUB_ACTIONS -ne 'true') {
     throw 'Installer qualification must run on a disposable GitHub Actions Windows runner.'
 }
 $RootDir = Split-Path -Parent $PSScriptRoot
+$VersionMatch = [regex]::Match((Get-Content (Join-Path $RootDir 'apps/flutter_app/pubspec.yaml') -Raw), '(?m)^version:\s*(\S+)')
+if (-not $VersionMatch.Success) { throw 'Application version is missing.' }
+$ExpectedProductVersion = $VersionMatch.Groups[1].Value
+$ExpectedVersion = ($ExpectedProductVersion -split '\+')[0]
+
 Set-Location $RootDir
 $Tools = Join-Path $RootDir '.tmp\toolchains'
 $Logs = Join-Path $RootDir 'dist\windows-verification'
@@ -52,8 +57,8 @@ Install-Msi -Path $PreviousMsiPath -Name 'install-2.3.1'
 $Installed = Join-Path $env:ProgramFiles 'Object Data Browser'
 $Exe = Join-Path $Installed 's3_browser_crossplat.exe'
 if ((Get-Item $Exe).VersionInfo.ProductVersion -notlike '2.3.1*') { throw 'Previous MSI did not install version 2.3.1' }
-Install-Msi -Path $MsiPath -Name 'upgrade-2.3.3'
-if ((Get-Item $Exe).VersionInfo.ProductVersion -ne '2.3.3+1') { throw 'Upgrade did not install version 2.3.3+1' }
+Install-Msi -Path $MsiPath -Name "upgrade-$ExpectedVersion"
+if ((Get-Item $Exe).VersionInfo.ProductVersion -ne $ExpectedProductVersion) { throw "Upgrade did not install version $ExpectedProductVersion" }
 $Staged = Join-Path $RootDir 'apps\flutter_app\build\windows\x64\runner\Release'
 $FileCount = 0
 foreach ($File in (Get-ChildItem $Staged -File -Recurse)) {
@@ -69,7 +74,7 @@ $TestRoot = Join-Path $RootDir '.tmp\installed-under-test'
 New-Item -ItemType Junction -Path $TestRoot -Target $Installed | Out-Null
 $EngineRoot = Join-Path $TestRoot 'engines'
 $Manifest = Get-Content (Join-Path $EngineRoot 'manifest.json') -Raw | ConvertFrom-Json
-if ($Manifest.version -ne '2.3.3' -or $Manifest.architecture -ne 'x64') { throw 'Unexpected installed manifest' }
+if ($Manifest.version -ne $ExpectedVersion -or $Manifest.architecture -ne 'x64') { throw 'Unexpected installed manifest' }
 if ((($Manifest.engines.id | Sort-Object) -join ',') -ne 'go,java,python,rust') { throw 'Installed engine set is incomplete' }
 foreach ($Engine in $Manifest.engines) {
     foreach ($Required in $Engine.requiredFiles) {
@@ -77,10 +82,10 @@ foreach ($Engine in $Manifest.engines) {
     }
     $Executable = Join-Path $EngineRoot $Engine.executable
     $Arguments = @($Engine.arguments | ForEach-Object { Join-Path (Join-Path $EngineRoot $Engine.workingDirectory) $_ })
-    $Payload = @{requestId='release-health';method='health';engineVersion='2.3.3';params=@{}} | ConvertTo-Json -Compress
+    $Payload = @{requestId='release-health';method='health';engineVersion=$ExpectedVersion;params=@{}} | ConvertTo-Json -Compress
     $Health = $Payload | & $Executable @Arguments | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object requestId -eq 'release-health'
-    if (-not $Health.ok -or $Health.result.version -ne '2.3.3') { throw "Installed $($Engine.id) health/version failed" }
+    if (-not $Health.ok -or $Health.result.version -ne $ExpectedVersion) { throw "Installed $($Engine.id) health/version failed" }
     $env:ENGINE_CMD = (@($Executable) + $Arguments) -join ' '
     Invoke-Check "installed-contract-$($Engine.id)" 'python.exe' @('-m','pytest','tests/contract','-q','-rs',"--junitxml=$Logs\installed-contract-$($Engine.id).xml")
 }
-@{version='2.3.3+1';architecture='x64';previousVersion='2.3.1';installedFileHashesVerified=$FileCount;checks=$Results;sourceCommit=$env:GITHUB_SHA} | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $Logs 'package-verification.json')
+@{version=$ExpectedProductVersion;architecture='x64';previousVersion='2.3.1';installedFileHashesVerified=$FileCount;checks=$Results;sourceCommit=$env:GITHUB_SHA} | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $Logs 'package-verification.json')

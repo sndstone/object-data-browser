@@ -45,6 +45,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
         'Endpoint profiles and credentials. Exports never include secrets.',
     'General': 'Startup preferences and application behavior.',
     'Transfers': 'Upload sizing, concurrency and retry behavior.',
+    'Performance': 'Balance memory, responsiveness and warm engine startup.',
     'Appearance': 'Theme, text size and row density.',
     'Diagnostics': 'Choose which engine activity is recorded.',
     'Transfers & Storage':
@@ -302,6 +303,88 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                     ],
                   ],
                 )),
+        _SettingsSection(
+            'Performance',
+            Icons.speed_outlined,
+            _sectionDescriptions['Performance']!,
+            () => _section(context,
+                title: 'Performance',
+                children: () => [
+                      const Text(
+                          'Lower listing limits release rows sooner; all objects remain available through the next window.'),
+                      const SizedBox(height: 12),
+                      _pairedFields(
+                          context,
+                          _numberField(
+                              label: 'Progress update interval (ms)',
+                              min: 50,
+                              max: 2000,
+                              initialValue:
+                                  settings.performance.progressIntervalMs,
+                              onSubmitted: (v) => controller.updateSettings(
+                                  settings.copyWith(
+                                      performance: settings.performance
+                                          .copyWith(progressIntervalMs: v)))),
+                          _numberField(
+                              label: 'Objects per listing window',
+                              min: 1000,
+                              max: 100000,
+                              initialValue:
+                                  settings.performance.listingWindowObjects,
+                              onSubmitted: (v) => controller.updateSettings(
+                                  settings.copyWith(
+                                      performance: settings.performance
+                                          .copyWith(
+                                              listingWindowObjects: v))))),
+                      if (AppPlatform.isDesktop) ...[
+                        const SizedBox(height: 12),
+                        _pairedFields(
+                            context,
+                            _numberField(
+                                label:
+                                    'Idle engine lifetime (seconds, 0 keeps warm)',
+                                min: 0,
+                                max: 3600,
+                                initialValue:
+                                    settings.performance.engineIdleSeconds,
+                                onSubmitted: (v) => controller.updateSettings(
+                                    settings.copyWith(
+                                        performance: settings.performance
+                                            .copyWith(engineIdleSeconds: v)))),
+                            _numberField(
+                                label:
+                                    'Server copy observation timeout (seconds)',
+                                min: 5,
+                                max: 3600,
+                                initialValue:
+                                    settings.performance.copyTimeoutSeconds,
+                                onSubmitted: (v) => controller.updateSettings(
+                                    settings.copyWith(
+                                        performance: settings.performance
+                                            .copyWith(
+                                                copyTimeoutSeconds: v))))),
+                      ],
+                      const SizedBox(height: 12),
+                      _numberField(
+                          label: 'Image preview detail (megapixels)',
+                          min: 4,
+                          max: 64,
+                          initialValue:
+                              settings.performance.imagePreviewMegapixels,
+                          onSubmitted: (v) => controller.updateSettings(
+                              settings.copyWith(
+                                  performance: settings.performance
+                                      .copyWith(imagePreviewMegapixels: v)))),
+                      const SizedBox(height: 8),
+                      const Text(
+                          'Higher image limits retain more detail when zooming and use more memory.'),
+                      const SizedBox(height: 12),
+                      const Text(
+                          'Longer progress intervals reduce update overhead. Transfer part sizes and connection limits remain available in Transfers & Storage and Connections.'),
+                      if (AppPlatform.isDesktop)
+                        const Text(
+                            'Idle engines restart when needed; active work is retained. Engine and server-copy settings apply to new operations.'),
+                    ])),
         _SettingsSection(
             'Transfers',
             Icons.swap_vert,
@@ -775,9 +858,11 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
       final active = sections.firstWhere((s) => s.title == _sectionName,
           orElse: () => sections.first);
       final content = DirectionalSwitcher(
+          replaceContent: true,
+          axis: Axis.vertical,
           position: settingsSections.indexOf(active.title),
           duration: AppMotion.duration(context,
-              enabled: settings.enableAnimations, milliseconds: 180),
+              enabled: settings.enableAnimations, milliseconds: 300),
           layoutBuilder: (current, previous) =>
               current ?? const SizedBox.shrink(),
           child: ListView(
@@ -1510,6 +1595,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
             if (_endpointType == EndpointProfileType.s3Compatible) ...[
               TextField(
                 controller: _endpointController,
+                autocorrect: false,
+                enableSuggestions: false,
                 decoration: const InputDecoration(
                   labelText: 'Endpoint host or URL',
                   helperText:
@@ -1534,6 +1621,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
             ] else if (_endpointType == EndpointProfileType.azureBlob) ...[
               TextField(
                 controller: _endpointController,
+                autocorrect: false,
+                enableSuggestions: false,
                 decoration: const InputDecoration(
                   labelText: 'Custom blob endpoint (optional)',
                   helperText:
@@ -1605,6 +1694,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 _connection.authMode != 'static')
               TextField(
                 controller: _accessKeyController,
+                autocorrect: false,
+                enableSuggestions: false,
                 decoration: const InputDecoration(
                     labelText: 'Storage account name',
                     helperText:
@@ -1616,6 +1707,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                       children: [
                         TextField(
                           controller: _accessKeyController,
+                          autocorrect: false,
+                          enableSuggestions: false,
                           decoration: InputDecoration(
                             labelText: _endpointType.accessKeyLabel,
                           ),
@@ -1623,6 +1716,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         const SizedBox(height: 8),
                         TextField(
                           controller: _secretKeyController,
+                          autocorrect: false,
+                          enableSuggestions: false,
                           obscureText: !_revealSecret,
                           style: _revealSecret
                               ? const TextStyle(fontFamily: 'monospace')
@@ -1646,6 +1741,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         Expanded(
                           child: TextField(
                             controller: _accessKeyController,
+                            autocorrect: false,
+                            enableSuggestions: false,
                             decoration: InputDecoration(
                               labelText: _endpointType.accessKeyLabel,
                             ),
@@ -1655,6 +1752,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         Expanded(
                           child: TextField(
                             controller: _secretKeyController,
+                            autocorrect: false,
+                            enableSuggestions: false,
                             obscureText: !_revealSecret,
                             style: _revealSecret
                                 ? const TextStyle(fontFamily: 'monospace')
@@ -1680,6 +1779,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 _connection.authMode == 'azureSas')
               TextField(
                 controller: _sessionTokenController,
+                autocorrect: false,
+                enableSuggestions: false,
                 obscureText: !_revealToken,
                 style: _revealToken
                     ? const TextStyle(fontFamily: 'monospace')

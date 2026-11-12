@@ -904,9 +904,21 @@ func azureCopyObject(params map[string]interface{}) (map[string]interface{}, err
 		return nil, &sidecarError{Code: "unknown", Message: "Azure copy identity missing; source retained."}
 	}
 	drainAndClose(resp.Body)
-	for attempt := 0; copyStatus == "pending" && attempt < azureCopyPollAttempts; attempt++ {
-		time.Sleep(azureCopyPollInterval)
-		head, headErr := client.do(ctx, http.MethodHead, destinationBucket, destinationKey, nil, nil, nil)
+	copyTimeout := asInt(params["copyTimeoutSeconds"])
+	if copyTimeout == 0 {
+		copyTimeout = 300
+	}
+	copyTimeout = max(5, min(3600, copyTimeout))
+	copyContext, cancelObservation := context.WithTimeout(ctx, time.Duration(copyTimeout)*time.Second)
+	defer cancelObservation()
+	for delay := azureCopyPollInterval; copyStatus == "pending"; delay = min(2*time.Second, delay*2) {
+		select {
+		case <-copyContext.Done():
+			return nil, &sidecarError{Code: "timeout", Message: "Azure copy observation timed out; source retained. Inspect the destination copy before retrying."}
+		case <-time.After(delay):
+		}
+
+		head, headErr := client.do(copyContext, http.MethodHead, destinationBucket, destinationKey, nil, nil, nil)
 		if headErr != nil {
 			return nil, headErr
 		}
@@ -1024,11 +1036,13 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 	totalBytes := int64(0)
 	partsTotal := 0
 	usesMultipart := false
+	sources := make(map[string]os.FileInfo, len(filePaths))
 	for _, filePath := range filePaths {
 		info, statErr := os.Stat(filePath)
 		if statErr != nil {
 			return nil, statErr
 		}
+		sources[filePath] = info
 		totalBytes += info.Size()
 		if info.Size() >= thresholdBytes {
 			usesMultipart = true
@@ -1063,6 +1077,10 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 		if statErr != nil {
 			handle.Close()
 			return nil, statErr
+		}
+		if err = verifyUploadSource(handle, filePath, sources[filePath]); err != nil {
+			handle.Close()
+			return nil, err
 		}
 		targetKey := filepath.Base(filePath)
 		if mappedKey, ok := objectKeyByPath[filePath]; ok && strings.TrimSpace(mappedKey) != "" {
@@ -1113,6 +1131,10 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 				handle.Close()
 				return nil, err
 			}
+			if err = verifyUploadSource(handle, filePath, sources[filePath]); err != nil {
+				handle.Close()
+				return nil, err
+			}
 			blockListXML := &strings.Builder{}
 			blockListXML.WriteString(`<?xml version="1.0" encoding="utf-8"?><BlockList>`)
 			for _, blockID := range blockIDs {
@@ -1128,16 +1150,19 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 			}
 			drainAndClose(resp.Body)
 		} else {
-			data, readErr := io.ReadAll(handle)
-			if readErr != nil {
-				handle.Close()
-				return nil, readErr
+			response, uploadErr := client.doReader(ctx, http.MethodPut, bucketName, targetKey, nil, map[string]string{"x-ms-blob-type": "BlockBlob"}, info.Size(), func() io.Reader { return io.NewSectionReader(handle, 0, info.Size()) })
+			if response != nil {
+				drainAndClose(response.Body)
 			}
-			if err = client.putBlob(ctx, bucketName, targetKey, data, nil); err != nil {
+			if err = uploadErr; err != nil {
 				handle.Close()
 				return nil, err
 			}
 			bytesTransferred += info.Size()
+		}
+		if err = verifyUploadSource(handle, filePath, sources[filePath]); err != nil {
+			handle.Close()
+			return nil, err
 		}
 		handle.Close()
 		itemsCompleted++
@@ -1196,6 +1221,10 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 		partSize = chunkBytes
 		partCount = partsTotal
 		partDone = 0
+	}
+	destination, err := newDownloadDestination(destinationPath)
+	if err != nil {
+		return nil, err
 	}
 	emitTransferEvent(buildTransferJob(jobID, label, "download", 0, "queued", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), keys[0], len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
 	for _, key := range keys {
@@ -1287,7 +1316,7 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 		if err = handle.Close(); err != nil {
 			return nil, err
 		}
-		finalPath, publishErr := publishDownload(target, destinationPath, key, asString(params["conflictPolicy"]))
+		finalPath, publishErr := destination.publish(target, key, asString(params["conflictPolicy"]))
 		if publishErr != nil {
 			return nil, publishErr
 		}

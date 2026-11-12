@@ -35,6 +35,13 @@ void main() {
         response.headers.set('x-amz-server-side-encryption', 'aws:kms');
         response.headers
             .set('x-amz-server-side-encryption-aws-kms-key-id', 'old-key');
+      } else if (request.uri.queryParameters.containsKey('ownershipControls')) {
+        response.write(
+            '<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>');
+      } else if (request.uri.queryParameters.containsKey('object-lock')) {
+        response.statusCode = 404;
+        response.write(
+            '<Error><Code>ObjectLockConfigurationNotFoundError</Code></Error>');
       } else if (request.uri.queryParameters.containsKey('tagging') &&
           request.uri.path.endsWith('/key')) {
         response.write('<Tagging><TagSet/></Tagging>');

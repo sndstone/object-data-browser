@@ -15,6 +15,8 @@ final class IosEngine {
   private var requests: [String: Task<Void, Never>] = [:]
   private var transfers: [String: TransferState] = [:]
   private var backgroundPausedTransfers: Set<String> = []
+  private let clientLock = NSLock()
+  private var clientCache: [Profile: S3Client] = [:]
 
   init(binaryMessenger: FlutterBinaryMessenger) {
     channel = FlutterMethodChannel(
@@ -39,6 +41,8 @@ final class IosEngine {
   }
 
   deinit {
+    channel.setMethodCallHandler(nil)
+    requests.values.forEach { $0.cancel() }
     NotificationCenter.default.removeObserver(self)
   }
 
@@ -49,6 +53,15 @@ final class IosEngine {
         descriptor(id: "go", label: "Go (iOS)", language: "go"),
         descriptor(id: "rust", label: "Rust (iOS)", language: "rust"),
       ])
+    case "shutdown":
+      channel.setMethodCallHandler(nil)
+      requests.values.forEach { $0.cancel() }
+      requests.removeAll()
+      clientLock.lock()
+      clientCache.removeAll()
+      clientLock.unlock()
+      NotificationCenter.default.removeObserver(self)
+      result(nil)
     case "cancelRequest":
       let args = call.arguments as? [String: Any] ?? [:]
       if let id = args["requestId"] as? String { requests[id]?.cancel() }
@@ -145,7 +158,7 @@ final class IosEngine {
       "id": id,
       "label": label,
       "language": language,
-      "version": "2.3.4",
+      "version": "2.3.5",
       "available": true,
       "notes": "iOS adapter backed by the official AWS SDK for Swift.",
     ]
@@ -154,7 +167,7 @@ final class IosEngine {
   private func health(engineID: String) -> [String: Any] {
     [
       "engine": engineID,
-      "version": "2.3.4",
+      "version": "2.3.5",
       "available": true,
       "adapter": "ios-aws-swift",
     ]
@@ -195,33 +208,33 @@ final class IosEngine {
 
   private func testProfile(_ params: [String: Any]) async throws -> [String: Any] {
     let profile = try profile(params)
-    let output = try await client(profile).listBuckets(input: ListBucketsInput())
-    return [
-      "ok": true,
-      "bucketCount": output.buckets?.count ?? 0,
-      "endpoint": URL(string: profile.endpoint)?.host ?? profile.endpoint,
-    ]
+    let output = try await listBuckets(params)
+    return ["ok": true, "bucketCount": (output["items"] as? [[String: Any]])?.count ?? 0,
+            "endpoint": URL(string: profile.endpoint)?.host ?? profile.endpoint]
   }
 
   private func listBuckets(_ params: [String: Any]) async throws -> [String: Any] {
     let profile = try profile(params)
     let service = try client(profile)
-    try Task.checkCancellation()
-    let output = try await service.listBuckets(input: ListBucketsInput())
     var items: [[String: Any]] = []
-    for bucket in output.buckets ?? [] {
-      guard let name = bucket.name else { continue }
-      let versioning = try? await service.getBucketVersioning(
-        input: GetBucketVersioningInput(bucket: name)
-      )
-      items.append([
-        "name": name,
-        "region": bucket.bucketRegion ?? profile.region,
-        "objectCountHint": 0,
-        "versioningEnabled": versioning?.status == .enabled,
-        "createdAt": iso(bucket.creationDate),
-      ])
-    }
+    var token: String? = nil
+    var seen = Set<String>()
+    repeat {
+      try Task.checkCancellation()
+      let output = try await service.listBuckets(input: ListBucketsInput(continuationToken: token, maxBuckets: 1000))
+      for bucket in output.buckets ?? [] {
+        guard let name = bucket.name else { continue }
+        // Resolve versioning when the bucket is selected, rather than blocking
+        // account enumeration on one administration round-trip per bucket.
+        items.append(["name": name, "region": bucket.bucketRegion ?? profile.region,
+          "objectCountHint": 0, "versioningEnabled": false, "versioningKnown": false,
+          "createdAt": iso(bucket.creationDate)])
+      }
+      token = output.continuationToken
+      if let next = token, !next.isEmpty, !seen.insert(next).inserted {
+        throw EngineFailure(code: "invalid_response", message: "Bucket listing repeated its continuation token.")
+      }
+    } while token?.isEmpty == false
     return ["items": items]
   }
 
@@ -1365,6 +1378,10 @@ final class IosEngine {
   }
 
   private func client(_ profile: Profile) throws -> S3Client {
+    clientLock.lock()
+    let cached = clientCache[profile]
+    clientLock.unlock()
+    if let cached { return cached }
     let identity = AWSCredentialIdentity(
       accessKey: profile.accessKey,
       secret: profile.secretKey,
@@ -1379,7 +1396,14 @@ final class IosEngine {
       forcePathStyle: profile.pathStyle,
       endpoint: profile.endpoint
     )
-    return S3Client(config: configuration)
+    let created = S3Client(config: configuration)
+    clientLock.lock()
+    defer { clientLock.unlock() }
+    if let cached = clientCache[profile] { return cached }
+    if clientCache.count >= 8, let oldest = clientCache.keys.first { clientCache.removeValue(forKey: oldest) }
+    // Active callers retain their own client reference when a cache entry leaves.
+    clientCache[profile] = created
+    return created
   }
 
   private func required(
@@ -1489,7 +1513,7 @@ final class IosEngine {
   }
 }
 
-private struct Profile {
+private struct Profile: Hashable {
   let endpoint: String
   let region: String
   let accessKey: String

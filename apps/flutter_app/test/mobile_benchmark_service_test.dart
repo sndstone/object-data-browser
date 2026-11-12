@@ -17,7 +17,7 @@ void main() {
   late Map<String, List<int>> objects;
   var puts = 0, gets = 0, failPuts = 0, active = 0, maxActive = 0;
   var delay = Duration.zero;
-  var failDelete = false;
+  var failDelete = false, corruptGets = false;
   final requestTimes = <DateTime>[];
   setUp(() async {
     puts = 0;
@@ -27,6 +27,7 @@ void main() {
     maxActive = 0;
     delay = Duration.zero;
     failDelete = false;
+    corruptGets = false;
     objects = {};
     requestTimes.clear();
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -73,7 +74,12 @@ void main() {
             request.response.headers.set('etag', '"${md5.convert(payload)}"');
           case 'GET':
             gets++;
-            final bytes = objects[request.uri.path];
+            final stored = objects[request.uri.path];
+            final bytes = stored == null
+                ? null
+                : corruptGets
+                    ? (List<int>.of(stored)..[0] ^= 1)
+                    : stored;
             if (bytes == null) {
               request.response.statusCode = 404;
               break;
@@ -289,6 +295,122 @@ void main() {
       }
     });
   }
+  test('checksum failures remain failures in history and CSV', () async {
+    corruptGets = true;
+    final started =
+        await service.dispatch('startBenchmark', profile: profile, params: {
+      'config': {
+        ...config(count: 3, workers: 1),
+        'workloadType': 'read-only',
+        'validateChecksum': true,
+        'checksumAlgorithm': 'sha256'
+      }
+    });
+    final state = await complete(started['id'] as String);
+    final summary = state['resultSummary'] as Map;
+    final reads = (summary['latencyTimeline'] as List)
+        .cast<Map>()
+        .where((r) => r['operation'] == 'GET');
+    expect(reads.length, 2);
+    expect(
+        reads.every((r) =>
+            r['success'] == false && r['checksumState'] == 'validated_failure'),
+        isTrue);
+    final output = (state['config'] as Map)['csvOutputPath'] as String;
+    expect(
+        (await File(output).readAsLines())
+            .where((line) => line.contains(',false,validated_failure,'))
+            .length,
+        2);
+  });
+  test('resume removes only the CSV tail newer than its checkpoint', () async {
+    final started = await service.dispatch('startBenchmark',
+        profile: profile, params: {'config': config(count: 4, workers: 1)});
+    final id = started['id'] as String;
+    await complete(id);
+    await service.close();
+    final file = File('${directory.path}/$id.json');
+    final checkpoint =
+        jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+    final output =
+        File((checkpoint['config'] as Map)['csvOutputPath'] as String);
+    final committed = checkpoint['csvCommittedBytes'];
+    expect(committed, await output.length());
+    checkpoint['status'] = 'paused';
+    (checkpoint['config'] as Map)['operationCount'] = 6;
+    await file.writeAsString(jsonEncode(checkpoint));
+    await output.writeAsString('crash-tail\n', mode: FileMode.append);
+    service = MobileBenchmarkService(checkpointDirectory: directory);
+    await service.dispatch('resumeBenchmarkRun',
+        profile: profile, params: {'runId': id});
+    final state = await complete(id);
+    expect(state['processedCount'], 6);
+    final csv = await output.readAsString();
+    expect(csv, isNot(contains('crash-tail')));
+    expect(csv.split('\n').where((r) => r.isNotEmpty).length, 7);
+  });
+  test('unchanged completed polls reuse sorted benchmark history', () async {
+    final started = await service.dispatch('startBenchmark',
+        profile: profile, params: {'config': config(count: 6, workers: 2)});
+    final id = started['id'] as String;
+    await complete(id);
+    final first = (await status(id))['resultSummary'] as Map;
+    final second = (await status(id))['resultSummary'] as Map;
+    expect(
+        identical(first['latencyTimeline'], second['latencyTimeline']), isTrue);
+    expect(first['detailMetrics'], second['detailMetrics']);
+  });
+  test('legacy resume finds quoted CSV record boundaries', () async {
+    final started =
+        await service.dispatch('startBenchmark', profile: profile, params: {
+      'config': {...config(count: 2, workers: 1), 'prefix': 'quoted\n"prefix'}
+    });
+    final id = started['id'] as String;
+    await complete(id);
+    await service.close();
+    final file = File('${directory.path}/$id.json');
+    final checkpoint =
+        jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+    final output =
+        File((checkpoint['config'] as Map)['csvOutputPath'] as String);
+    final original = await output.readAsString();
+    checkpoint.remove('csvCommittedBytes');
+    checkpoint['status'] = 'paused';
+    (checkpoint['config'] as Map)['operationCount'] = 3;
+    await file.writeAsString(jsonEncode(checkpoint));
+    await output.writeAsString('uncommitted-tail\n', mode: FileMode.append);
+    service = MobileBenchmarkService(checkpointDirectory: directory);
+    await service.dispatch('resumeBenchmarkRun',
+        profile: profile, params: {'runId': id});
+    final state = await complete(id);
+    expect(state['status'], 'completed');
+    expect(state['processedCount'], 3);
+    final restored = await output.readAsString();
+    expect(restored, startsWith(original));
+    expect(restored, isNot(contains('uncommitted-tail')));
+  });
+  test('resume refuses CSV shorter than its committed checkpoint', () async {
+    final started = await service.dispatch('startBenchmark',
+        profile: profile, params: {'config': config(count: 2, workers: 1)});
+    final id = started['id'] as String;
+    await complete(id);
+    await service.close();
+    final file = File('${directory.path}/$id.json');
+    final checkpoint =
+        jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+    checkpoint['status'] = 'paused';
+    (checkpoint['config'] as Map)['operationCount'] = 3;
+    await file.writeAsString(jsonEncode(checkpoint));
+    await File((checkpoint['config'] as Map)['csvOutputPath'] as String)
+        .writeAsString('truncated');
+    service = MobileBenchmarkService(checkpointDirectory: directory);
+    await service.dispatch('resumeBenchmarkRun',
+        profile: profile, params: {'runId': id});
+    final state = await complete(id);
+    expect(state['status'], 'failed');
+    expect(state['processedCount'], 2);
+    expect(puts, 2);
+  });
   test('real retries and final failures appear in metrics', () async {
     failPuts = 1;
     final started = await service.dispatch('startBenchmark',

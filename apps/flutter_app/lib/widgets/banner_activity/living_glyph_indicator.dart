@@ -1,4 +1,5 @@
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
@@ -22,12 +23,16 @@ class LivingGlyphIndicator extends StatefulWidget {
 }
 
 class _LivingGlyphState extends State<LivingGlyphIndicator>
-    with SingleTickerProviderStateMixin {
+    with TickerProviderStateMixin {
   /// Drives the working loop, and runs once 0 → 1 for a result morph.
   late final AnimationController _clock = AnimationController(vsync: this);
+  late final AnimationController _handoff =
+      AnimationController(vsync: this, duration: _morphDuration, value: 1);
 
   /// What was on screen when a result arrived; null when not morphing.
   GlyphFrame? _from;
+  ui.Picture? _fromSnapshot;
+  LivingGlyphPainter? _lastPainter;
 
   @override
   void initState() {
@@ -57,7 +62,24 @@ class _LivingGlyphState extends State<LivingGlyphIndicator>
             t: _from == null ? _clock.value : 1,
             progress: (old.progress ?? 0).clamp(0.0, 1.0),
           );
+    // Record the visible composite before changing the clock. A second result
+    // can interrupt the first morph; rebuilding its nominal frame would jump
+    // to a fully drawn mark which was never actually on screen.
+    ui.Picture? snapshot;
+    if (spec.animate &&
+        old?.animate == true &&
+        (isResult(spec.phase) ||
+            isResult(old!.phase) ||
+            old.kind != spec.kind) &&
+        _lastPainter != null) {
+      final recorder = ui.PictureRecorder();
+      _lastPainter!.paint(Canvas(recorder), const Size(_glyphWidth, _height));
+      snapshot = recorder.endRecording();
+    }
+    _fromSnapshot?.dispose();
+    _fromSnapshot = snapshot;
     _clock.stop();
+    _handoff.stop();
     _from = null;
     if (isResult(spec.phase)) {
       if (spec.animate && departing != null && old!.animate) {
@@ -70,6 +92,13 @@ class _LivingGlyphState extends State<LivingGlyphIndicator>
       }
       return;
     }
+    if (snapshot != null) {
+      _from = departing;
+      _handoff.forward(from: 0);
+      _clock.value = restFrame(spec.kind);
+    } else {
+      _handoff.value = 1;
+    }
     if (spec.animate && spec.phase != BannerActivityPhase.paused) {
       final stopping = spec.phase == BannerActivityPhase.stopping;
       final base = loopPeriod(spec.kind);
@@ -78,13 +107,19 @@ class _LivingGlyphState extends State<LivingGlyphIndicator>
         reverse: stopping && spec.kind == BannerActivityKind.benchmark,
       );
     } else {
-      _clock.value = restFrame(spec.kind);
+      // Pausing holds the working pose instead of snapping to a generic rest
+      // frame. Reduced motion still uses the most legible static pose.
+      if (!spec.animate || old == null || old.kind != spec.kind) {
+        _clock.value = restFrame(spec.kind);
+      }
     }
   }
 
   @override
   void dispose() {
+    _fromSnapshot?.dispose();
     _clock.dispose();
+    _handoff.dispose();
     super.dispose();
   }
 
@@ -101,8 +136,9 @@ class _LivingGlyphState extends State<LivingGlyphIndicator>
         curve: Curves.easeOutCubic,
         builder: (context, progress, _) => CustomPaint(
           size: const Size(_glyphWidth, _height),
-          painter: LivingGlyphPainter(
+          painter: _lastPainter = LivingGlyphPainter(
             clock: _clock,
+            handoff: _handoff,
             frame: GlyphFrame(
               kind: spec.kind,
               phase: spec.phase,
@@ -110,6 +146,7 @@ class _LivingGlyphState extends State<LivingGlyphIndicator>
               progress: progress,
             ),
             from: _from,
+            fromSnapshot: _fromSnapshot,
             palette: palette,
             animate: spec.animate,
           ),

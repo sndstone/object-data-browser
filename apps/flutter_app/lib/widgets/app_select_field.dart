@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../theme/app_motion.dart';
 import 'app_menu.dart';
 
 /// A single option shown by [AppSelectField].
@@ -54,7 +55,7 @@ class AppSelectField<T> extends StatefulWidget {
 
 class _AppSelectFieldState<T> extends State<AppSelectField<T>>
     with SingleTickerProviderStateMixin, WidgetsBindingObserver {
-  static const double _itemHeight = AppMenuStyle.itemHeight;
+  double get _itemHeight => AppMenuStyle.rowHeight(context);
   static const double _menuVerticalPadding = AppMenuStyle.verticalPadding;
   static const double _anchorGap = AppMenuStyle.anchorGap;
 
@@ -98,6 +99,26 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
       reverseCurve: Curves.easeInCubic,
     );
     WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final duration = AppMotion.duration(context, milliseconds: 180);
+    _animationController
+      ..duration = duration
+      ..reverseDuration = AppMotion.duration(context, milliseconds: 120);
+    if (duration == Duration.zero && _animationController.isAnimating) {
+      if (_isClosing) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && _isOpen && _isClosing) {
+            _closeMenu(immediately: true);
+          }
+        });
+      } else {
+        _animationController.value = 1;
+      }
+    }
   }
 
   @override

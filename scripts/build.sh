@@ -106,12 +106,32 @@ case "$PLATFORM" in
     clean_macos_release_artifacts
     flutter pub get
     if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
-      flutter build macos --release \
+      flutter build macos --release --config-only \
         --dart-define=OBJECT_BROWSER_MAC_KEYCHAIN_MODE=data-protection
     else
-      flutter build macos --release \
+      flutter build macos --release --config-only \
         --dart-define=OBJECT_BROWSER_MAC_KEYCHAIN_MODE=legacy
     fi
+    case "$ARCH" in
+      arm64|aarch64) MACOS_BUILD_ARCH="arm64" ;;
+      x64|amd64|x86_64) MACOS_BUILD_ARCH="x86_64" ;;
+      *) echo "Unsupported macOS architecture: $ARCH" >&2; exit 1 ;;
+    esac
+    # Match the requested package architecture rather than implicitly building
+    # both slices. This also avoids multi-architecture lipo verification on
+    # Xcode installations that only accept a single verify_arch argument.
+    MACOS_BUILD_ARGS=(-workspace macos/Runner.xcworkspace -scheme Runner
+      -configuration Release -derivedDataPath "$ROOT_DIR/apps/flutter_app/build/macos"
+      -destination 'generic/platform=macOS' "ARCHS=$MACOS_BUILD_ARCH"
+      ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO -quiet)
+    if [[ -n "${OBJECT_BROWSER_MACOS_DEPLOYMENT_TARGET:-}" ]]; then
+      if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
+        echo "A deployment target override is for local compile verification only." >&2
+        exit 1
+      fi
+      MACOS_BUILD_ARGS+=("MACOSX_DEPLOYMENT_TARGET=$OBJECT_BROWSER_MACOS_DEPLOYMENT_TARGET")
+    fi
+    xcodebuild "${MACOS_BUILD_ARGS[@]}"
     MACOS_APP_DIR="$(resolve_macos_app_dir)"
     popd >/dev/null
     if [[ -z "$MACOS_APP_DIR" || ! -d "$MACOS_APP_DIR" ]]; then
@@ -124,7 +144,7 @@ case "$PLATFORM" in
     else
       # Ad-hoc artifacts are development builds only. Their identity changes
       # on every build, so they cannot provide update-stable Keychain access.
-      codesign --force --sign - "$MACOS_APP_DIR"
+      codesign --force --deep --sign - "$MACOS_APP_DIR"
     fi
     codesign --verify --deep --strict --verbose=2 "$MACOS_APP_DIR"
     if [[ -z "${MACOS_SIGNING_IDENTITY:-}" ]] && \

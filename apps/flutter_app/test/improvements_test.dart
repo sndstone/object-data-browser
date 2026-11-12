@@ -193,8 +193,9 @@ void main() {
             .status,
         'cancelled');
   });
-  test('settings have six groups and preserve old deep links', () {
-    expect(settingsSections.length, 6);
+  test('settings include performance and preserve old deep links', () {
+    expect(settingsSections.length, 7);
+    expect(settingsSections, contains('Performance'));
     expect(canonicalSettingsSection('General'), 'Connections');
     expect(canonicalSettingsSection('Downloads & Temp Storage'),
         'Transfers & Storage');

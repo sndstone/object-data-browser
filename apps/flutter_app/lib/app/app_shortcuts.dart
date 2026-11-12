@@ -10,7 +10,8 @@ class AppShortcuts extends StatelessWidget {
   final Widget child;
   @override
   Widget build(BuildContext context) {
-    final mac = Theme.of(context).platform == TargetPlatform.macOS;
+    final mac = {TargetPlatform.macOS, TargetPlatform.iOS}
+        .contains(Theme.of(context).platform);
     SingleActivator key(LogicalKeyboardKey key, {bool shift = false}) =>
         SingleActivator(key, meta: mac, control: !mac, shift: shift);
     final modifier = mac ? '⌘' : 'Ctrl+';
@@ -46,6 +47,7 @@ class AppShortcuts extends StatelessWidget {
           context: context,
           builder: (context) => AlertDialog(
                   title: const Text('Keyboard shortcuts'),
+                  scrollable: true,
                   content: Text(
                       '${modifier}K  Search objects\n${modifier}R  Refresh objects\n${modifier}I  Toggle inspector\n${modifier}1–5  Switch workspace\nDelete  Delete selection (outside text fields)\n$modifier/  Keyboard shortcuts'),
                   actions: [

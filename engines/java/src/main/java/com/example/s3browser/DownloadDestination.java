@@ -13,6 +13,28 @@ final class DownloadDestination implements AutoCloseable {
         path = Files.createTempFile(directory, ".odb-", ".part");
     }
     Path publish(Path directory, String key, String policy) throws IOException {
+        return publish(new Allocator(directory), key, policy);
+    }
+
+    /** One name index per batch; exclusive publication remains the collision authority. */
+    static final class Allocator {
+        final Path directory;
+        final Map<String, Path> occupied = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        Allocator(Path directory) throws IOException {
+            this.directory = directory;
+            try (var entries = Files.list(directory)) {
+                entries.forEach(entry -> occupied.putIfAbsent(entry.getFileName().toString(), entry));
+            }
+        }
+    }
+
+    Path publish(Allocator allocator, String key, String policy) throws IOException {
+        synchronized (allocator) { return publishLocked(allocator, key, policy); }
+    }
+
+    private Path publishLocked(Allocator allocator, String key, String policy) throws IOException {
+        Path directory = allocator.directory;
+        Map<String, Path> occupied = allocator.occupied;
         if (!policy.equals("keepBoth") && !policy.equals("replace")) throw new IOException("Unknown download conflict policy.");
         String normalized = key.replace('\\', '/');
         String name = normalized.substring(normalized.lastIndexOf('/') + 1)
@@ -23,22 +45,24 @@ final class DownloadDestination implements AutoCloseable {
         int dot = name.lastIndexOf('.');
         String stem = dot > 0 ? name.substring(0, dot) : name;
         String ext = dot > 0 ? name.substring(dot) : "";
-        // Keep the same Unicode comparison as equalsIgnoreCase.
-        Map<String, Path> occupied = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-        try (var entries = Files.list(directory)) {
-            entries.forEach(entry -> occupied.putIfAbsent(entry.getFileName().toString(), entry));
-        }
         for (int i = 0; i < 100000; i++) {
             String candidate = i == 0 ? name : stem + " (" + i + ")" + ext;
             Path existing = occupied.get(candidate);
             if (policy.equals("replace")) {
                 Path target = existing == null ? directory.resolve(candidate) : existing;
-                return Files.move(path, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                Path published = Files.move(path, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                occupied.put(candidate, published);
+                return published;
             }
             if (existing != null) continue;
             Path target = directory.resolve(candidate);
-            try { Files.createLink(target, path); return target; }
-            catch (FileAlreadyExistsException conflict) { /* Try another name. */ }
+            try {
+                Files.createLink(target, path);
+                occupied.put(candidate, target);
+                return target;
+            } catch (FileAlreadyExistsException conflict) {
+                occupied.put(candidate, target);
+            }
         }
         throw new IOException("Cannot allocate a unique download name.");
     }

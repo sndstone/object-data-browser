@@ -115,7 +115,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class Main {
-    private static final String ENGINE_VERSION = "2.3.4";
+    private static final String ENGINE_VERSION = "2.3.5";
     private static final int REQUEST_POOL_SIZE = 8;
     private static final int DELETE_BATCH_LIMIT = 1000;
     private static final Object STDOUT_LOCK = new Object();
@@ -1066,7 +1066,7 @@ public final class Main {
                     "invalid_config",
                     "A move requires different source and destination keys or buckets.");
         Map<String, Object> result = copyObject(params);
-        String version = (String) result.get("sourceVersionId");
+        String version = params.path("sourceVersionId").asText(params.path("versionId").asText(null));
         if (version == null
                 && !"awsS3".equals(params.path("profile").path("endpointType").asText())) {
             result.put("successCount", 0);
@@ -1075,9 +1075,8 @@ public final class Main {
             result.put("sourceRetained", true);
             result.put(
                     "failures",
-                    List.of(
-                            "Copy completed. Source retained because this compatible endpoint has"
-                                + " no verified conditional-delete capability."));
+                    List.of(orderedMap("target", params.path("sourceKey").asText(), "code", "source_delete_unsupported", "message",
+                            "Copy completed. Source retained because this endpoint has no verified conditional-delete capability.")));
             return result;
         }
         try (S3Client client = buildClient(parseProfile(params.path("profile")))) {
@@ -1090,6 +1089,13 @@ public final class Main {
                             .versionId(version)
                             .ifMatch((String) result.get("sourceETag"))
                             .build());
+        } catch (RuntimeException error) {
+            result.put("successCount", 0);
+            result.put("failureCount", 1);
+            result.put("copiedCount", 1);
+            result.put("sourceRetained", true);
+            result.put("failures", List.of(orderedMap("target", params.path("sourceKey").asText(), "versionId", version,
+                "code", "source_delete_failed", "message", "Copy completed; source deletion was not confirmed: " + error.getMessage())));
         }
         return result;
     }
@@ -1218,310 +1224,150 @@ public final class Main {
 
     private static Map<String, Object> startUpload(JsonNode params) throws IOException {
         Profile profile = parseProfile(params.path("profile"));
-        String bucketName = requiredText(params, "bucketName", "Bucket name is required.");
-        List<String> filePaths = stringArray(params.path("filePaths"));
-        Map<String, String> objectKeyByPath = stringMap(params.path("objectKeyByPath"));
-        if (filePaths.isEmpty()) {
-            throw new SidecarException(
-                    "invalid_config", "Bucket name and file paths are required.");
-        }
+        String bucket = requiredText(params, "bucketName", "Bucket name is required.");
+        List<Path> paths = stringArray(params.path("filePaths")).stream().map(Path::of).toList();
+        if (paths.isEmpty()) throw new SidecarException("invalid_config", "File paths are required.");
+        Map<String, String> names = stringMap(params.path("objectKeyByPath"));
         String prefix = params.path("prefix").asText("");
-        int multipartThresholdMiB = Math.max(params.path("multipartThresholdMiB").asInt(32), 1);
-        long multipartThresholdBytes = multipartThresholdMiB * 1024L * 1024L;
-        long multipartChunkBytes = uploadPartSizeBytes(params.path("multipartChunkMiB"));
-        List<Path> paths = filePaths.stream().map(Path::of).toList();
-        long validatedTotalBytes = 0;
-        boolean usesMultipart = false;
-        int partsTotal = 0;
+        long threshold = Math.max(params.path("multipartThresholdMiB").asInt(32), 1) * 1024L * 1024L;
+        long chunk = uploadPartSizeBytes(params.path("multipartChunkMiB"));
+        Map<Path, UploadSource.Snapshot> sources = new LinkedHashMap<>();
+        long total = 0;
+        int partCount = 0;
         for (Path path : paths) {
-            long size = Files.size(path);
-            validateUploadSize(size, multipartThresholdBytes, multipartChunkBytes);
-            validatedTotalBytes += size;
-            if (size >= multipartThresholdBytes) {
-                usesMultipart = true;
-                partsTotal += (int) ((size + multipartChunkBytes - 1L) / multipartChunkBytes);
-            }
+            var snapshot = UploadSource.Snapshot.capture(path);
+            validateUploadSize(snapshot.size(), threshold, chunk);
+            sources.put(path, snapshot);
+            total += snapshot.size();
+            if (snapshot.size() >= threshold) partCount += (int) ((snapshot.size() + chunk - 1) / chunk);
         }
-        long totalBytes = validatedTotalBytes;
-        BucketContext context = new BucketContext(profile, bucketName, buildClient(profile));
-        Long partSizeBytes = partsTotal > 0 ? multipartChunkBytes : null;
-        Integer partCount = partsTotal > 0 ? partsTotal : null;
-        String jobId = "upload-" + UUID.randomUUID().toString().substring(0, 8);
+        String job = "upload-" + UUID.randomUUID().toString().substring(0, 8);
         JobControl control = new JobControl();
-        TRANSFER_REGISTRY.put(jobId, control);
-        String label = "Upload " + filePaths.size() + " file(s) to " + context.bucketName();
-        String strategyLabel = transferStrategyLabel("upload", usesMultipart);
-        List<String> outputLines = new ArrayList<>(List.of(
-            "Queued " + filePaths.size() + " file(s) for upload to " + context.bucketName() + "."
-        ));
-        AtomicLong bytesTransferred = new AtomicLong();
-        AtomicInteger itemsCompleted = new AtomicInteger();
-        AtomicInteger partsCompleted = new AtomicInteger();
-        AtomicInteger partOutputLineCount = new AtomicInteger();
-        Object progressLock = new Object();
-        emitTransferEvent(transferJob(
-            jobId,
-            label,
-            "upload",
-            0,
-            "queued",
-            0L,
-            totalBytes,
-            strategyLabel,
-            paths.getFirst().getFileName().toString(),
-            filePaths.size(),
-            itemsCompleted.get(),
-            partSizeBytes,
-            partCount == null ? null : partsCompleted.get(),
-            partCount,
-            true,
-            false,
-            true,
-            List.copyOf(outputLines)
-        ));
+        TransferProgress progress = new TransferProgress(job, "Upload " + paths.size() + " file(s) to " + bucket,
+            "upload", total, paths.size(), chunk, partCount, params.path("progressIntervalMs").asInt(100));
+        progress.item = paths.getFirst().getFileName().toString();
+        progress.line("Queued " + paths.size() + " file(s) for upload to " + bucket + ".");
+        int workers = transferPoolSize(profile);
+        ExecutorService executor = Executors.newFixedThreadPool(workers);
+        TRANSFER_REGISTRY.put(job, control);
         boolean cancelled = false;
-        ExecutorService executor = Executors.newFixedThreadPool(transferPoolSize(context.profile()));
-        try (S3Client client = context.client()) {
-            uploadLoop:
+        try (S3Client client = buildClient(profile)) {
+            progress.emit("queued");
             for (Path path : paths) {
-                if (!control.awaitRunnable()) {
-                    cancelled = true;
-                    break;
-                }
-                long fileSize = Files.size(path);
-                String targetName = objectKeyByPath.getOrDefault(
-                    path.toString(),
-                    path.getFileName().toString()
-                ).replace('\\', '/').replaceFirst("^/+", "");
-                String key = prefix.isBlank() ? targetName : prefix + targetName;
-                synchronized (progressLock) {
-                    outputLines.add(
-                            "Uploading "
-                                    + path.getFileName()
-                                    + " ("
-                                    + fileSize
-                                    + " bytes) to "
-                                    + key
-                                    + ".");
-                }
-                if (fileSize >= multipartThresholdBytes) {
-                    String uploadId = client.createMultipartUpload(CreateMultipartUploadRequest.builder()
-                        .bucket(context.bucketName())
-                        .key(key)
-                        .build()).uploadId();
-                    int filePartCount = (int) ((fileSize + multipartChunkBytes - 1L) / multipartChunkBytes);
-                    try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
-                        List<Future<CompletedPart>> futures = new ArrayList<>(filePartCount);
-                        for (int index = 0; index < filePartCount; index += 1) {
-                            final int partNumber = index + 1;
-                            final long partOffset = (long) index * multipartChunkBytes;
-                            final long partLength = Math.min(multipartChunkBytes, fileSize - partOffset);
-                            futures.add(
-                                    executor.submit(
-                                            () -> {
-                                                if (!control.awaitRunnable()) {
-                                                    throw new TransferCancelledException();
-                                                }
-                                                var partResult =
-                                                        client.uploadPart(
-                                                                UploadPartRequest.builder()
-                                                                        .bucket(
-                                                                                context
-                                                                                        .bucketName())
-                                                                        .key(key)
-                                                                        .uploadId(uploadId)
-                                                                        .partNumber(partNumber)
-                                                                        .build(),
-                                                                RequestBody.fromContentProvider(
-                                                                        () -> {
-                                                                            try {
-                                                                                return new FilePartStream(
-                                                                                        path,
-                                                                                        partOffset,
-                                                                                        partLength,
-                                                                                        () -> {
-                                                                                            if (!control
-                                                                                                    .awaitRunnable())
-                                                                                                throw new TransferCancelledException();
-                                                                                        });
-                                                                            } catch (
-                                                                                    IOException
-                                                                                            error) {
-                                                                                throw new java.io
-                                                                                        .UncheckedIOException(
-                                                                                        error);
-                                                                            }
-                                                                        },
-                                                                        partLength,
-                                                                        "application/octet-stream"));
-                                                long transferredNow =
-                                                        bytesTransferred.addAndGet(partLength);
-                                                int partsCompletedNow =
-                                                        partsCompleted.incrementAndGet();
-                                                List<String> linesSnapshot;
-                                                int itemsCompletedNow;
-                                                synchronized (progressLock) {
-                                                    addPartOutputLine(
-                                                            outputLines,
-                                                            partOutputLineCount,
-                                                            "Uploaded part "
-                                                                    + partNumber
-                                                                    + " for "
-                                                                    + path.getFileName()
-                                                                    + ".");
-                                                    linesSnapshot = List.copyOf(outputLines);
-                                                    itemsCompletedNow = itemsCompleted.get();
-                                                }
-                                                emitTransferEvent(
-                                                        transferJob(
-                                                                jobId,
-                                                                label,
-                                                                "upload",
-                                                                progressFraction(
-                                                                        transferredNow, totalBytes),
-                                                                "running",
-                                                                transferredNow,
-                                                                totalBytes,
-                                                                strategyLabel,
-                                                                path.getFileName().toString(),
-                                                                filePaths.size(),
-                                                                itemsCompletedNow,
-                                                                partSizeBytes,
-                                                                partsCompletedNow,
-                                                                partCount,
-                                                                true,
-                                                                false,
-                                                                true,
-                                                                linesSnapshot));
-                                                return CompletedPart.builder()
-                                                        .eTag(partResult.eTag())
-                                                        .partNumber(partNumber)
-                                                        .build();
-                                            }));
+                checkTransfer(control, progress);
+                progress.item = path.getFileName().toString();
+                var snapshot = sources.get(path);
+                // Validation is repeated immediately before dispatch, not only during preparation.
+                try (UploadSource source = new UploadSource(path, snapshot)) {
+                    long size = snapshot.size();
+                    String name = names.getOrDefault(path.toString(), path.getFileName().toString())
+                        .replace('\\', '/').replaceFirst("^/+", "");
+                    String key = prefix.isBlank() ? name : prefix + name;
+                    progress.line("Uploading " + path.getFileName() + " (" + size + " bytes) to " + key + ".");
+                    if (size >= threshold) {
+                        String id = client.createMultipartUpload(CreateMultipartUploadRequest.builder()
+                            .bucket(bucket).key(key).build()).uploadId();
+                        try (MultipartUploadSession upload = new MultipartUploadSession(client, bucket, key, id)) {
+                            List<CompletedPart> parts = new ArrayList<>();
+                            try (BoundedTasks<CompletedPart> tasks = new BoundedTasks<>(executor, workers, parts::add)) {
+                                int count = (int) ((size + chunk - 1) / chunk);
+                                for (int index = 0; index < count; index++) {
+                                    final int number = index + 1;
+                                    final long offset = index * chunk;
+                                    final long length = Math.min(chunk, size - offset);
+                                    tasks.submit(() -> {
+                                        checkTransfer(control, progress);
+                                        var result = client.uploadPart(UploadPartRequest.builder().bucket(bucket)
+                                            .key(key).uploadId(id).partNumber(number).build(),
+                                            sourceBody(source, offset, length, control, progress));
+                                        progress.part(length, "Uploaded part " + number + " for " + path.getFileName() + ".");
+                                        return CompletedPart.builder().partNumber(number).eTag(result.eTag()).build();
+                                    });
+                                }
+                                tasks.finish();
+                            }
+                            checkTransfer(control, progress);
+                            source.verify();
+                            parts.sort(Comparator.comparingInt(CompletedPart::partNumber));
+                            upload.complete(CompletedMultipartUpload.builder().parts(parts).build());
                         }
-                        List<CompletedPart> completedParts = new ArrayList<>(filePartCount);
-                        try {
-                            for (Future<CompletedPart> future : futures) {
-                                completedParts.add(future.get());
-                            }
-                        } catch (InterruptedException | ExecutionException error) {
-                            futures.forEach(future -> future.cancel(true));
-                            try {
-                                client.abortMultipartUpload(AbortMultipartUploadRequest.builder()
-                                    .bucket(context.bucketName())
-                                    .key(key)
-                                    .uploadId(uploadId)
-                                    .build());
-                            } catch (RuntimeException ignored) {
-                            }
-                            if (isTransferCancellation(error)) {
-                                cancelled = true;
-                                break uploadLoop;
-                            }
-                            if (error instanceof InterruptedException) {
-                                Thread.currentThread().interrupt();
-                                throw new RuntimeException(error);
-                            }
-                            throw unwrapTransferFailure(error.getCause());
-                        }
-                        completedParts.sort(Comparator.comparingInt(CompletedPart::partNumber));
-                        client.completeMultipartUpload(CompleteMultipartUploadRequest.builder()
-                            .bucket(context.bucketName())
-                            .key(key)
-                            .uploadId(uploadId)
-                            .multipartUpload(CompletedMultipartUpload.builder().parts(completedParts).build())
-                            .build());
+                    } else {
+                        client.putObject(PutObjectRequest.builder().bucket(bucket).key(key).build(),
+                            sourceBody(source, 0, size, control, progress));
+                        source.verify();
+                        progress.bytes(size);
                     }
-                } else {
-                    client.putObject(
-                        PutObjectRequest.builder()
-                            .bucket(context.bucketName())
-                            .key(key)
-                            .build(),
-                        RequestBody.fromFile(path)
-                    );
-                    bytesTransferred.addAndGet(fileSize);
-                }
-                itemsCompleted.incrementAndGet();
-                synchronized (progressLock) {
-                    outputLines.add("Finished uploading " + path.getFileName() + ".");
-                    emitTransferEvent(transferJob(
-                        jobId,
-                        label,
-                        "upload",
-                        progressFraction(bytesTransferred.get(), totalBytes),
-                        "running",
-                        bytesTransferred.get(),
-                        totalBytes,
-                        strategyLabel,
-                        path.getFileName().toString(),
-                        filePaths.size(),
-                        itemsCompleted.get(),
-                        partSizeBytes,
-                        partCount == null ? null : partsCompleted.get(),
-                        partCount,
-                        true,
-                        false,
-                        true,
-                        List.copyOf(outputLines)
-                    ));
+                    // A successful server commit remains reflected in counters even if cancel raced it.
+                    progress.finished("Finished uploading " + path.getFileName() + ".");
                 }
             }
-        } catch (RuntimeException error) {
-            if (error.getCause() instanceof IOException ioError) {
-                throw ioError;
-            }
-            throw error;
+            if (!control.awaitRunnable()) cancelled = true;
+        } catch (Exception error) {
+            if (isTransferCancellation(error)) cancelled = true;
+            else if (error instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+                throw new java.io.InterruptedIOException("Upload interrupted.");
+            } else throw unwrapTransferFailure(error instanceof ExecutionException ? error.getCause() : error);
         } finally {
             executor.shutdownNow();
-            TRANSFER_REGISTRY.remove(jobId);
+            TRANSFER_REGISTRY.remove(job);
         }
-        if (cancelled) {
-            outputLines.add("Upload cancelled after " + itemsCompleted.get() + " of "
-                + filePaths.size() + " file(s).");
-            return transferJob(
-                jobId,
-                label,
-                "upload",
-                progressFraction(bytesTransferred.get(), totalBytes),
-                "cancelled",
-                bytesTransferred.get(),
-                totalBytes,
-                strategyLabel,
-                paths.getLast().getFileName().toString(),
-                filePaths.size(),
-                itemsCompleted.get(),
-                partSizeBytes,
-                partCount == null ? null : partsCompleted.get(),
-                partCount,
-                false,
-                false,
-                false,
-                outputLines
-            );
+        progress.line(cancelled ? "Upload cancelled after " + progress.items + " of " + paths.size() + " file(s)."
+            : "Uploaded " + paths.size() + " file(s) into " + bucket + ".");
+        return progress.snapshot(cancelled ? "cancelled" : "completed");
+    }
+
+    private static RequestBody sourceBody(UploadSource source, long offset, long length,
+                                           JobControl control, TransferProgress progress) {
+        return RequestBody.fromContentProvider(() -> {
+            try {
+                source.verify();
+                return new FilePartStream(source.channel, offset, length, () -> checkTransfer(control, progress));
+            } catch (IOException error) { throw new java.io.UncheckedIOException(error); }
+        }, length, "application/octet-stream");
+    }
+
+    private static void checkTransfer(JobControl control, TransferProgress progress) {
+        if (!control.awaitRunnable()) throw new TransferCancelledException();
+        progress.heartbeat();
+    }
+
+    /** Shared state snapshots are coalesced; acknowledged bytes never include retry attempts. */
+    private static final class TransferProgress {
+        final String id, label, direction, strategy;
+        final long total, chunk, intervalNanos;
+        final int count, partCount;
+        private long transferred, lastEmission;
+        private int items, parts, partLines;
+        volatile String item = "";
+        final List<String> lines = new ArrayList<>();
+        TransferProgress(String id, String label, String direction, long total, int count,
+                         long chunk, int partCount, int intervalMs) {
+            this.id = id; this.label = label; this.direction = direction; this.total = total;
+            this.count = count; this.chunk = chunk; this.partCount = partCount;
+            this.intervalNanos = Math.clamp(intervalMs, 50, 2000) * 1_000_000L;
+            this.strategy = transferStrategyLabel(direction, partCount > 0);
         }
-        outputLines.add(
-                "Uploaded " + filePaths.size() + " file(s) into " + context.bucketName() + ".");
-        return transferJob(
-            jobId,
-            label,
-            "upload",
-            1.0,
-            "completed",
-            bytesTransferred.get(),
-            totalBytes,
-            strategyLabel,
-            paths.getLast().getFileName().toString(),
-            filePaths.size(),
-            itemsCompleted.get(),
-            partSizeBytes,
-            partCount == null ? null : partsCompleted.get(),
-            partCount,
-            false,
-            false,
-            false,
-            outputLines
-        );
+        synchronized void line(String line) { lines.add(line); }
+        synchronized void bytes(long bytes) { transferred += bytes; }
+        synchronized void part(long bytes, String line) {
+            transferred += bytes; parts++;
+            if (++partLines <= MAX_PART_OUTPUT_LINES) lines.add(line);
+            else if (partLines == MAX_PART_OUTPUT_LINES + 1) lines.add("... further part progress lines omitted.");
+            heartbeat();
+        }
+        synchronized void finished(String line) { items++; lines.add(line); emit("running"); }
+        synchronized void heartbeat() {
+            if (System.nanoTime() - lastEmission >= intervalNanos) emit("running");
+        }
+        synchronized void emit(String status) { lastEmission = System.nanoTime(); emitTransferEvent(snapshot(status)); }
+        synchronized Map<String, Object> snapshot(String status) {
+            boolean active = status.equals("queued") || status.equals("running");
+            return transferJob(id, label, direction, progressFraction(transferred, total), status,
+                transferred, total, strategy, item, count, items, partCount > 0 ? chunk : null,
+                partCount > 0 ? parts : null, partCount > 0 ? partCount : null,
+                active, false, active, List.copyOf(lines));
+        }
     }
 
     private static int transferPoolSize(Profile profile) {
@@ -1552,347 +1398,102 @@ public final class Main {
     private static Map<String, Object> startDownload(JsonNode params) throws IOException {
         BucketContext context = bucketContext(params);
         List<String> keys = stringArray(params.path("keys"));
-        String destinationPath =
-                requiredText(
-                        params,
-                        "destinationPath",
-                        "Bucket, keys, and destination path are required.");
-        if (keys.isEmpty()) {
-            throw new SidecarException(
-                    "invalid_config", "Bucket, keys, and destination path are required.");
-        }
+        String destinationPath = requiredText(params, "destinationPath", "Download directory is required.");
+        if (keys.isEmpty()) throw new SidecarException("invalid_config", "Object keys are required.");
         Path destination = Path.of(destinationPath);
         Files.createDirectories(destination);
-        int multipartThresholdMiB = Math.max(params.path("multipartThresholdMiB").asInt(32), 1);
-        int multipartChunkMiB = Math.max(params.path("multipartChunkMiB").asInt(8), 1);
-        long multipartThresholdBytes = multipartThresholdMiB * 1024L * 1024L;
-        long multipartChunkBytes = multipartChunkMiB * 1024L * 1024L;
-        String jobId = "download-" + UUID.randomUUID().toString().substring(0, 8);
+        long threshold = Math.max(params.path("multipartThresholdMiB").asInt(32), 1) * 1024L * 1024L;
+        long chunk = Math.clamp(params.path("multipartChunkMiB").asLong(8), 1, 5120) * 1024L * 1024L;
+        String job = "download-" + UUID.randomUUID().toString().substring(0, 8);
         JobControl control = new JobControl();
-        TRANSFER_REGISTRY.put(jobId, control);
-        String label = "Download " + keys.size() + " object(s) from " + context.bucketName();
-        List<String> outputLines = new ArrayList<>(List.of(
-            "Queued " + keys.size() + " object(s) for download to " + destinationPath + "."
-        ));
-        AtomicLong bytesTransferred = new AtomicLong();
-        AtomicInteger itemsCompleted = new AtomicInteger();
-        AtomicInteger partsCompleted = new AtomicInteger();
-        AtomicInteger partOutputLineCount = new AtomicInteger();
-        Object progressLock = new Object();
-        ExecutorService executor = Executors.newFixedThreadPool(transferPoolSize(context.profile()));
+        int workers = transferPoolSize(context.profile());
+        ExecutorService executor = Executors.newFixedThreadPool(workers);
+        TRANSFER_REGISTRY.put(job, control);
         try (S3Client client = context.client()) {
             Map<String, Long> sizes = new LinkedHashMap<>();
             Map<String, String> validators = new LinkedHashMap<>();
-            long totalBytesTally = 0L;
-            for (String key : keys) {
-                var head =
-                        client.headObject(
-                                HeadObjectRequest.builder()
-                                        .bucket(context.bucketName())
-                                        .key(key)
-                                        .versionId(params.path("versionId").asText(null))
-                                        .build());
-                long size = head.contentLength();
-                validators.put(key, head.eTag());
-                sizes.put(key, size);
-                totalBytesTally += size;
+            long total = 0;
+            int partCount = 0;
+            String version = params.path("versionId").asText(null);
+            try (BoundedTasks<Map.Entry<String, software.amazon.awssdk.services.s3.model.HeadObjectResponse>> reads = new BoundedTasks<>(executor, workers, entry -> {
+                sizes.put(entry.getKey(), entry.getValue().contentLength());
+                validators.put(entry.getKey(), entry.getValue().eTag());
+            })) {
+                for (String key : keys) reads.submit(() -> {
+                    if (!control.awaitRunnable()) throw new TransferCancelledException();
+                    return Map.entry(key, client.headObject(HeadObjectRequest.builder().bucket(context.bucketName()).key(key).versionId(version).build()));
+                });
+                reads.finish();
+            } catch (Exception error) {
+                if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+                throw unwrapTransferFailure(error instanceof ExecutionException ? error.getCause() : error);
             }
-            final long totalBytes = totalBytesTally;
-            boolean usesMultipart = sizes.values().stream().anyMatch(size -> size >= multipartThresholdBytes);
-            int partsTotal = sizes.values().stream()
-                .mapToInt(size -> size >= multipartThresholdBytes
-                    ? (int) ((size + multipartChunkBytes - 1L) / multipartChunkBytes)
-                    : 0)
-                .sum();
-            Long partSizeBytes = partsTotal > 0 ? multipartChunkBytes : null;
-            Integer partCount = partsTotal > 0 ? partsTotal : null;
-            String strategyLabel = transferStrategyLabel("download", usesMultipart);
-            emitTransferEvent(transferJob(
-                jobId,
-                label,
-                "download",
-                0,
-                "queued",
-                0L,
-                totalBytes,
-                strategyLabel,
-                keys.getFirst(),
-                keys.size(),
-                itemsCompleted.get(),
-                partSizeBytes,
-                partCount == null ? null : partsCompleted.get(),
-                partCount,
-                true,
-                false,
-                true,
-                List.copyOf(outputLines)
-            ));
+            for (String key : keys) {
+                long size = sizes.get(key); total += size;
+                if (size >= threshold) partCount += (int) ((size + chunk - 1) / chunk);
+            }
+            TransferProgress progress = new TransferProgress(job, "Download " + keys.size() + " object(s) from "
+                + context.bucketName(), "download", total, keys.size(), chunk, partCount,
+                params.path("progressIntervalMs").asInt(100));
+            progress.item = keys.getFirst();
+            progress.line("Queued " + keys.size() + " object(s) for download to " + destinationPath + ".");
+            progress.emit("queued");
+            DownloadDestination.Allocator allocator = new DownloadDestination.Allocator(destination);
             boolean cancelled = false;
-            downloadLoop:
-            for (String key : keys) {
-                if (!control.awaitRunnable()) {
-                    cancelled = true;
-                    break;
-                }
-                long size = sizes.getOrDefault(key, 0L);
-                long beforeObject = bytesTransferred.get();
-                try (DownloadDestination staged = new DownloadDestination(destination)) {
-                Path target = staged.path;
-                synchronized (progressLock) {
-                        outputLines.add(
-                                "Downloading " + key + " (" + size + " bytes) to " + target + ".");
-                }
-                if (size >= multipartThresholdBytes) {
-                    try (RandomAccessFile file = new RandomAccessFile(target.toFile(), "rw")) {
-                        file.setLength(size);
-                        FileChannel channel = file.getChannel();
-                        List<Future<?>> futures = new ArrayList<>();
-                        for (long start = 0; start < size; start += multipartChunkBytes) {
-                            final long rangeStart = start;
-                            final long rangeEnd = Math.min(start + multipartChunkBytes - 1L, size - 1L);
-                                futures.add(
-                                        executor.submit(
-                                                () -> {
-                                                    if (!control.awaitRunnable()) {
-                                                        throw new TransferCancelledException();
-                                                    }
-                                                    long rangeBytes = 0;
-                                                    try (ResponseInputStream<
-                                                                    software.amazon.awssdk.services
-                                                                            .s3.model
-                                                                            .GetObjectResponse>
-                                                            stream =
-                                                                    client.getObject(
-                                                                            GetObjectRequest
-                                                                                    .builder()
-                                                                                    .bucket(
-                                                                                            context
-                                                                                                    .bucketName())
-                                                                                    .key(key)
-                                                                                    .versionId(params.path("versionId").asText(null))
-                                                                                    .ifMatch(
-                                                                                            validators
-                                                                                                    .get(
-                                                                                                            key))
-                                                                                    .range(
-                                                                                            "bytes="
-                                                                                                    + rangeStart
-                                                                                                    + "-"
-                                                                                                    + rangeEnd)
-                                                                                    .build())) {
-                                                        if (!("bytes "
-                                                                        + rangeStart
-                                                                        + "-"
-                                                                        + rangeEnd
-                                                                        + "/"
-                                                                        + size)
-                                                                .equals(
-                                                                        stream.response()
-                                                                                .contentRange())) {
-                                                            throw new IOException(
-                                                                    "Download range mismatch.");
-                                                        }
-                                                        byte[] bytes = new byte[1024 * 1024];
-                                                        int read;
-                                                        while ((read = stream.read(bytes)) != -1) {
-                                                            if (!control.awaitRunnable())
-                                                                throw new TransferCancelledException();
-                                                            if (rangeBytes + read
-                                                                    > rangeEnd - rangeStart + 1)
-                                                                throw new IOException(
-                                                                        "Oversized range body.");
-                                                            ByteBuffer buffer =
-                                                                    ByteBuffer.wrap(bytes, 0, read);
-                                                            long position = rangeStart + rangeBytes;
-                                                            while (buffer.hasRemaining())
-                                                                position +=
-                                                                        channel.write(
-                                                                                buffer, position);
-                                                            rangeBytes += read;
-                                                        }
-                                                    }
-                                                    if (rangeBytes != rangeEnd - rangeStart + 1)
-                                                        throw new IOException(
-                                                                "Incomplete range body.");
-                                                    long transferredNow =
-                                                            bytesTransferred.addAndGet(rangeBytes);
-                                                    int partsCompletedNow =
-                                                            partsCompleted.incrementAndGet();
-                                                    List<String> linesSnapshot;
-                                                    int itemsCompletedNow;
-                                                    synchronized (progressLock) {
-                                                        addPartOutputLine(
-                                                                outputLines,
-                                                                partOutputLineCount,
-                                                                "Downloaded byte range "
-                                                                        + rangeStart
-                                                                        + "-"
-                                                                        + rangeEnd
-                                                                        + " for "
-                                                                        + key
-                                                                        + ".");
-                                                        linesSnapshot = List.copyOf(outputLines);
-                                                        itemsCompletedNow = itemsCompleted.get();
-                                                    }
-                                                    emitTransferEvent(
-                                                            transferJob(
-                                                                    jobId,
-                                                                    label,
-                                                                    "download",
-                                                                    progressFraction(
-                                                                            transferredNow,
-                                                                            totalBytes),
-                                                                    "running",
-                                                                    transferredNow,
-                                                                    totalBytes,
-                                                                    strategyLabel,
-                                                                    key,
-                                                                    keys.size(),
-                                                                    itemsCompletedNow,
-                                                                    partSizeBytes,
-                                                                    partsCompletedNow,
-                                                                    partCount,
-                                                                    true,
-                                                                    false,
-                                                                    true,
-                                                                    linesSnapshot));
-                                                    return null;
-                                                }));
-                        }
-                        try {
-                            for (Future<?> future : futures) {
-                                future.get();
-                            }
-                        } catch (InterruptedException | ExecutionException error) {
-                            futures.forEach(future -> future.cancel(true));
-                            if (isTransferCancellation(error)) {
-                                cancelled = true;
-                                break downloadLoop;
-                            }
-                            if (error instanceof InterruptedException) {
-                                Thread.currentThread().interrupt();
-                                throw new RuntimeException(error);
-                            }
-                            throw unwrapTransferFailure(error.getCause());
-                        }
-                    }
-                } else {
-                        try (OutputStream outputStream = Files.newOutputStream(target);
-                                ResponseInputStream<?> stream =
-                                        client.getObject(
-                                                GetObjectRequest.builder()
-                                                        .bucket(context.bucketName())
-                                                        .key(key)
-                                                        .versionId(
-                                                                params.path("versionId")
-                                                                        .asText(null))
-                                                        .ifMatch(validators.get(key))
-                                                        .build())) {
-                        byte[] buffer = new byte[(int) Math.min(multipartChunkBytes, 1024 * 1024)];
-                        int read;
-                        while ((read = stream.read(buffer)) != -1) {
-                            if (!control.awaitRunnable()) {
-                                cancelled = true;
-                                break;
-                            }
-                            outputStream.write(buffer, 0, read);
-                            long transferredNow = bytesTransferred.addAndGet(read);
-                            synchronized (progressLock) {
-                                emitTransferEvent(transferJob(
-                                    jobId,
-                                    label,
-                                    "download",
-                                    progressFraction(transferredNow, totalBytes),
-                                    "running",
-                                    transferredNow,
-                                    totalBytes,
-                                    strategyLabel,
-                                    key,
-                                    keys.size(),
-                                    itemsCompleted.get(),
-                                    partSizeBytes,
-                                    partCount == null ? null : partsCompleted.get(),
-                                    partCount,
-                                    true,
-                                    false,
-                                    true,
-                                    List.copyOf(outputLines)
-                                ));
+            try {
+                for (String key : keys) {
+                    checkTransfer(control, progress);
+                    progress.item = key;
+                    long size = sizes.get(key);
+                    try (DownloadDestination staged = new DownloadDestination(destination);
+                         FileChannel channel = FileChannel.open(staged.path, StandardOpenOption.WRITE)) {
+                        progress.line("Downloading " + key + " (" + size + " bytes) to " + staged.path + ".");
+                        if (size > 0) {
+                            boolean ranged = size >= threshold;
+                            long rangeSize = ranged ? chunk : size;
+                            try (BoundedTasks<Void> tasks = new BoundedTasks<>(executor, workers, ignored -> {})) {
+                                for (long start = 0; start < size; start += rangeSize) {
+                                    final long from = start, to = Math.min(start + rangeSize - 1, size - 1);
+                                    tasks.submit(() -> {
+                                        long bytes = RangedDownload.transfer(channel, from, to, size, validators.get(key),
+                                            context.profile().maxAttempts(), ranged, () -> {
+                                                var response = client.getObject(GetObjectRequest.builder()
+                                                    .bucket(context.bucketName()).key(key).versionId(version)
+                                                    .ifMatch(validators.get(key)).range(ranged ? "bytes=" + from + "-" + to : null).build());
+                                                return new RangedDownload.Response(response, response.response().contentRange(),
+                                                    response.response().eTag(), response.response().contentLength());
+                                            }, () -> checkTransfer(control, progress));
+                                        if (ranged) progress.part(bytes, "Downloaded byte range " + from + "-" + to + " for " + key + ".");
+                                        else progress.bytes(bytes);
+                                        return null;
+                                    });
+                                }
+                                tasks.finish();
                             }
                         }
+                        checkTransfer(control, progress);
+                        if (channel.size() != size) throw new IOException("Download size mismatch; partial file discarded.");
+                        channel.force(true);
+                        // Close the handle before publication, including on Windows.
+                        channel.close();
+                        Path target = staged.publish(allocator, key, params.path("conflictPolicy").asText("keepBoth"));
+                        progress.line("Saved " + key + " to " + target + ".");
+                        progress.finished("Finished downloading " + key + ".");
                     }
                 }
-                if (cancelled || !control.awaitRunnable()) {
-                    cancelled = true;
-                    break;
-                }
-                if (bytesTransferred.get() - beforeObject != size) {
-                        throw new IOException("Download size mismatch; partial file discarded.");
-                    }
-                    try (FileChannel durable = FileChannel.open(target, StandardOpenOption.WRITE)) {
-                        durable.force(true);
-                    }
-                    Path finalPath =
-                            staged.publish(
-                                    destination,
-                                    key,
-                                    params.path("conflictPolicy").asText("keepBoth"));
-                outputLines.add("Saved " + key + " to " + finalPath + ".");
-                itemsCompleted.incrementAndGet();
-                synchronized (progressLock) {
-                    outputLines.add("Finished downloading " + key + ".");
-                }
-                }
+            } catch (Exception error) {
+                if (isTransferCancellation(error)) cancelled = true;
+                else if (error instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                    throw new java.io.InterruptedIOException("Download interrupted.");
+                } else throw unwrapTransferFailure(error instanceof ExecutionException ? error.getCause() : error);
             }
-            if (cancelled) {
-                outputLines.add("Download cancelled after " + itemsCompleted.get() + " of "
-                    + keys.size() + " object(s).");
-                return transferJob(
-                    jobId,
-                    label,
-                    "download",
-                    progressFraction(bytesTransferred.get(), totalBytes),
-                    "cancelled",
-                    bytesTransferred.get(),
-                    totalBytes,
-                    strategyLabel,
-                    keys.getLast(),
-                    keys.size(),
-                    itemsCompleted.get(),
-                    partSizeBytes,
-                    partCount == null ? null : partsCompleted.get(),
-                    partCount,
-                    false,
-                    false,
-                    false,
-                    outputLines
-                );
-            }
-            outputLines.add(
-                    "Downloaded " + keys.size() + " object(s) into " + destinationPath + ".");
-            return transferJob(
-                jobId,
-                label,
-                "download",
-                1.0,
-                "completed",
-                bytesTransferred.get(),
-                totalBytes,
-                strategyLabel,
-                keys.getLast(),
-                keys.size(),
-                itemsCompleted.get(),
-                partSizeBytes,
-                partCount == null ? null : partsCompleted.get(),
-                partCount,
-                false,
-                false,
-                false,
-                outputLines
-            );
+            progress.line(cancelled ? "Download cancelled after " + progress.items + " of " + keys.size() + " object(s)."
+                : "Downloaded " + keys.size() + " object(s) into " + destinationPath + ".");
+            return progress.snapshot(cancelled ? "cancelled" : "completed");
         } finally {
             executor.shutdownNow();
-            TRANSFER_REGISTRY.remove(jobId);
+            TRANSFER_REGISTRY.remove(job);
         }
     }
 
@@ -2361,6 +1962,7 @@ public final class Main {
             throw new SidecarException("invalid_config", "Access key and secret key are required.");
         }
         return new Profile(
+            payload.path("endpointType").asText("s3Compatible"),
                 authMode,
                 payload.path("awsProfileName").asText(""),
                 payload.path("roleArn").asText(""),
@@ -2465,6 +2067,8 @@ public final class Main {
             .region(Region.of(profile.region))
             .credentialsProvider(credentialsProvider(profile))
             .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(profile.pathStyle).build())
+            .requestChecksumCalculation("awsS3".equals(profile.endpointType) ? software.amazon.awssdk.core.checksums.RequestChecksumCalculation.WHEN_SUPPORTED : software.amazon.awssdk.core.checksums.RequestChecksumCalculation.WHEN_REQUIRED)
+            .responseChecksumValidation("awsS3".equals(profile.endpointType) ? software.amazon.awssdk.core.checksums.ResponseChecksumValidation.WHEN_SUPPORTED : software.amazon.awssdk.core.checksums.ResponseChecksumValidation.WHEN_REQUIRED)
             .httpClientBuilder(httpClient)
             .overrideConfiguration(overrides)
             .build();
@@ -2480,13 +2084,14 @@ public final class Main {
         if ("assumeRole".equals(profile.authMode)) {
             if (profile.roleArn.isBlank())
                 throw new SidecarException("invalid_config", "Role ARN is required.");
-            var source =
-                    profile.awsProfileName.isBlank()
-                            ? software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider
-                                    .builder()
-                                    .build()
-                            : software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider
-                                    .create(profile.awsProfileName);
+                AwsCredentialsProvider source =
+                    !profile.accessKey.isBlank() && !profile.secretKey.isBlank()
+                            ? StaticCredentialsProvider.create(profile.sessionToken.isBlank()
+                                ? AwsBasicCredentials.create(profile.accessKey, profile.secretKey)
+                                : AwsSessionCredentials.create(profile.accessKey, profile.secretKey, profile.sessionToken))
+                            : profile.awsProfileName.isBlank()
+                                ? software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider.builder().build()
+                                : software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider.create(profile.awsProfileName);
             var sts =
                     software.amazon.awssdk.services.sts.StsClient.builder()
                             .region(Region.of(profile.region))
@@ -3939,6 +3544,7 @@ public final class Main {
     }
 
     private record Profile(
+            String endpointType,
             String authMode,
             String awsProfileName,
             String roleArn,
@@ -4016,7 +3622,7 @@ public final class Main {
                         return false;
                     }
                 }
-                return !"cancelled".equals(status);
+                return !Thread.currentThread().isInterrupted() && !"cancelled".equals(status);
             }
         }
     }

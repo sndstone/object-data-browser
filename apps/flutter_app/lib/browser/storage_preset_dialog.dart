@@ -39,6 +39,24 @@ class _StoragePresetDialogState extends State<StoragePresetDialog> {
   @override
   void initState() {
     super.initState();
+    for (final field in [
+      principal,
+      prefix,
+      days,
+      filterTags,
+      minimumBytes,
+      maximumBytes,
+      expiration,
+      transitionAge,
+      archiveAge,
+      historyAge,
+      retained,
+      abortAge
+    ]) {
+      field.addListener(() {
+        if (mounted) setState(() => confirmed = false);
+      });
+    }
     _load();
   }
 
@@ -291,7 +309,10 @@ class _StoragePresetDialogState extends State<StoragePresetDialog> {
                             .map((s) =>
                                 DropdownMenuItem(value: s, child: Text(s)))
                             .toList(),
-                        onChanged: (v) => setState(() => storageClass = v!)),
+                        onChanged: (v) => setState(() {
+                              storageClass = v!;
+                              confirmed = false;
+                            })),
                     TextField(
                         controller: days,
                         decoration: const InputDecoration(
@@ -306,7 +327,10 @@ class _StoragePresetDialogState extends State<StoragePresetDialog> {
                         contentPadding: EdgeInsets.zero,
                         title: const Text('Enable this preset rule'),
                         value: enabled,
-                        onChanged: (v) => setState(() => enabled = v)),
+                        onChanged: (v) => setState(() {
+                              enabled = v;
+                              confirmed = false;
+                            })),
                     if ({'tier', 'infrequent', 'intelligent'}.contains(preset))
                       _number('First transition after days', transitionAge),
                     if ({'tier', 'archive', 'deepArchive'}.contains(preset))

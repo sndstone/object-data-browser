@@ -19,14 +19,21 @@ extension MobileStorageTransfers on MobileStorageAdmin {
     if (sameEndpoint &&
         sourceBucket == bucket &&
         sourceKey == key &&
-        (args['move'] == true || args['options'] is! Map)) {
+        (args['move'] == true ||
+            (version == null && args['options'] is! Map))) {
       MobileStorageAdmin._invalid('Choose a different destination object.');
     }
     final query = <String, String>{
       if (version != null) from.azure ? 'versionid' : 'versionId': version
     };
+    final deleteQuery = Map<String, String>.of(query);
     final head =
         await from.request('HEAD', sourceBucket, key: sourceKey, query: query);
+    final copiedVersion = version ??
+        head.headers[from.azure ? 'x-ms-version-id' : 'x-amz-version-id'];
+    if (copiedVersion != null) {
+      query[from.azure ? 'versionid' : 'versionId'] = copiedVersion;
+    }
     final etag = head.headers['etag'];
     if (etag == null) {
       MobileStorageAdmin._conflict(
@@ -116,13 +123,19 @@ extension MobileStorageTransfers on MobileStorageAdmin {
         }
       }
     }
+    if ((selfCopy || args['move'] == true) &&
+        args['options'] is Map &&
+        !from.azure) {
+      headers.addAll(await _propertyProtectionHeaders(
+          from, sourceBucket, sourceKey, query));
+    }
     // Read the tag set before any destination mutation. A denied read must not
     // silently publish a copy with tags missing.
     final tagResult =
         await action(profile: source, action: 'objectTags', arguments: {
       'bucketName': sourceBucket,
       'key': sourceKey,
-      if (version != null) 'versionId': version
+      if (copiedVersion != null) 'versionId': copiedVersion
     });
     final tags = tagResult['tags'] as Map? ?? {};
     if (tags.isNotEmpty) {
@@ -146,10 +159,43 @@ extension MobileStorageTransfers on MobileStorageAdmin {
     }
 
     try {
-      final response = await _writeObject(to, bucket, key, size, read,
-          headers: headers,
-          conflict: conflict,
-          expectedDestinationETag: selfCopy && version == null ? etag : null);
+      final serverCopyEligible = sameEndpoint &&
+          !from.azure &&
+          !to.azure &&
+          source.accessKey == destination.accessKey &&
+          source.secretKey == destination.secretKey &&
+          source.sessionToken == destination.sessionToken &&
+          conflict == 'replace' &&
+          !selfCopy &&
+          size <= 5 * 1024 * 1024 * 1024;
+      final StorageHttpResponse response;
+      if (serverCopyEligible) {
+        // Only replace is eligible: HEAD-then-copy cannot enforce no-overwrite.
+        final sourceLocation =
+            '/${storageUriEncode(sourceBucket)}/${sourceKey.split('/').map(storageUriEncode).join('/')}'
+            '${copiedVersion == null ? '' : '?versionId=${storageUriEncode(copiedVersion)}'}';
+        final copied = await to.request('PUT', bucket, key: key, headers: {
+          ...headers,
+          'x-amz-copy-source': sourceLocation,
+          'x-amz-copy-source-if-match': etag,
+          'x-amz-metadata-directive': 'REPLACE',
+          'x-amz-tagging-directive': 'REPLACE',
+        });
+        if (copied.xml.name.local == 'Error') {
+          throw StorageHttpException(
+              StorageHttpResponse(500, copied.headers, copied.body));
+        }
+        final copiedEtag = xmlText(copied.xml, 'ETag');
+        response = StorageHttpResponse(
+            copied.status,
+            {...copied.headers, if (copiedEtag.isNotEmpty) 'etag': copiedEtag},
+            copied.body);
+      } else {
+        response = await _writeObject(to, bucket, key, size, read,
+            headers: headers,
+            conflict: conflict,
+            expectedDestinationETag: selfCopy && version == null ? etag : null);
+      }
       final destinationVersion =
           response.headers[to.azure ? 'x-ms-version-id' : 'x-amz-version-id'];
       if (response.headers['etag'] == null && destinationVersion == null) {
@@ -170,7 +216,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       }
       if (args['move'] == true) {
         await from.request('DELETE', sourceBucket,
-            key: sourceKey, query: query, headers: {'if-match': etag});
+            key: sourceKey, query: deleteQuery, headers: {'if-match': etag});
       }
       return {
         'successCount': 1,
@@ -188,6 +234,89 @@ extension MobileStorageTransfers on MobileStorageAdmin {
     }
   }
 
+  Future<Map<String, String>> _propertyProtectionHeaders(StorageHttpClient http,
+      String bucket, String key, Map<String, String> query) async {
+    final result = <String, String>{};
+    Future<XmlElement?> optional(String name, {bool object = false}) async {
+      try {
+        return (await http.request('GET', bucket,
+                key: object ? key : null,
+                query: {...(object ? query : <String, String>{}), name: ''}))
+            .xml;
+      } on StorageHttpException catch (error) {
+        if ({
+          'OwnershipControlsNotFoundError',
+          'NoSuchOwnershipControls',
+          'ObjectLockConfigurationNotFoundError',
+          'NoSuchObjectLockConfiguration',
+          'NoSuchRetentionConfiguration',
+          'NotImplemented'
+        }.contains(error.serviceCode)) {
+          return null;
+        }
+        throw StateError(
+            'Cannot safely preserve access permissions and Object Lock settings. No property changes were applied. ${error.message}');
+      }
+    }
+
+    final ownership = await optional('ownershipControls');
+    final enforced = ownership?.descendants.whereType<XmlElement>().any((e) =>
+            e.name.local == 'ObjectOwnership' &&
+            e.innerText == 'BucketOwnerEnforced') ??
+        false;
+    if (!enforced) {
+      final acl = await optional('acl', object: true);
+      final grants = <String, List<String>>{};
+      const names = {
+        'FULL_CONTROL': 'x-amz-grant-full-control',
+        'READ': 'x-amz-grant-read',
+        'READ_ACP': 'x-amz-grant-read-acp',
+        'WRITE_ACP': 'x-amz-grant-write-acp'
+      };
+      for (final grant in acl?.descendants
+              .whereType<XmlElement>()
+              .where((e) => e.name.local == 'Grant') ??
+          <XmlElement>[]) {
+        final field = names[xmlText(grant, 'Permission')];
+        final grantee = grant.childElements
+            .where((e) => e.name.local == 'Grantee')
+            .firstOrNull;
+        final id = grantee == null ? '' : xmlText(grantee, 'ID');
+        final uri = grantee == null ? '' : xmlText(grantee, 'URI');
+        final value = id.isNotEmpty ? id : uri;
+        if (field == null ||
+            value.isEmpty ||
+            value.contains(RegExp(r'[\r\n"]'))) {
+          throw StateError(
+              'This object ACL cannot be preserved by a property edit.');
+        }
+        grants
+            .putIfAbsent(field, () => [])
+            .add('${id.isNotEmpty ? 'id' : 'uri'}="$value"');
+      }
+      if (grants.isEmpty) {
+        throw StateError(
+            'The object ACL could not be read. No property changes were applied.');
+      }
+      result.addAll(
+          grants.map((name, values) => MapEntry(name, values.join(', '))));
+    }
+    final lock = await optional('object-lock');
+    if (lock != null && xmlText(lock, 'ObjectLockEnabled') == 'Enabled') {
+      final retention = await optional('retention', object: true);
+      final hold = await optional('legal-hold', object: true);
+      if (retention != null && xmlText(retention, 'Mode').isNotEmpty) {
+        result['x-amz-object-lock-mode'] = xmlText(retention, 'Mode');
+        result['x-amz-object-lock-retain-until-date'] =
+            xmlText(retention, 'RetainUntilDate');
+      }
+      if (hold != null && xmlText(hold, 'Status').isNotEmpty) {
+        result['x-amz-object-lock-legal-hold'] = xmlText(hold, 'Status');
+      }
+    }
+    return result;
+  }
+
   Future<StorageHttpResponse> _writeObject(
       StorageHttpClient http,
       String bucket,
@@ -198,7 +327,10 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       String conflict = 'replace',
       String? expectedDestinationETag,
       Future<void> Function()? verifySource,
-      int partBytes = 8 * 1024 * 1024}) async {
+      int partBytes = 8 * 1024 * 1024,
+      int streamReadBytes = 8 * 1024 * 1024,
+      int? multipartThresholdBytes,
+      void Function(int)? onProgress}) async {
     if (size > 50000 * 1024 * 1024 * 1024) {
       MobileStorageAdmin._invalid(
           'Object exceeds the supported transfer limit.');
@@ -218,27 +350,28 @@ extension MobileStorageTransfers on MobileStorageAdmin {
     Future<StorageHttpResponse> sendPart(int offset, int count,
         Map<String, String> query, Map<String, String> partHeaders,
         {bool retrySafe = true}) async {
-      if (count <= 128 * 1024 * 1024) {
+      if (!http.azure && count <= 8 * 1024 * 1024) {
         final bytes = await read(offset, count);
         if (!retrySafe) await verifySource?.call();
-        return http.request('PUT', bucket,
+        final response = await http.request('PUT', bucket,
             key: key,
             query: query,
             headers: partHeaders,
             body: bytes,
             retrySafe: retrySafe);
+        onProgress?.call(count);
+        return response;
       }
       Stream<List<int>> stream() async* {
-        const chunk = 8 * 1024 * 1024;
+        final chunk = streamReadBytes.clamp(64 * 1024, 8 * 1024 * 1024);
         for (var index = 0; index < count; index += chunk) {
           ActionScope.current?.check();
           yield await read(offset + index, min(chunk, count - index));
         }
       }
 
-      final hash =
-          http.azure ? null : (await sha256.bind(stream()).first).toString();
-      return http.requestStream('PUT', bucket,
+      final hash = await http.hashPayload(stream());
+      final response = await http.requestStream('PUT', bucket,
           key: key,
           query: query,
           headers: partHeaders,
@@ -246,14 +379,24 @@ extension MobileStorageTransfers on MobileStorageAdmin {
           bodyLength: count,
           payloadSha256: hash,
           retrySafe: retrySafe);
+      onProgress?.call(count);
+      return response;
     }
 
     final count = (size + partSize - 1) ~/ partSize;
     final workers = min(
         count,
-        min(http.profile.maxConcurrentRequests.clamp(1, 16),
-            max(1, (256 * 1024 * 1024) ~/ min(partSize, 128 * 1024 * 1024))));
-    if (size <= partSize) {
+        min(
+            http.profile.maxConcurrentRequests.clamp(1, 16),
+            max(1,
+                (256 * 1024 * 1024) ~/ (min(partSize, 8 * 1024 * 1024) * 2))));
+    final singleRequestLimit = (http.azure ? 5000 : 5120) * 1024 * 1024;
+    final single = size <= singleRequestLimit &&
+        (size == 0 ||
+            (multipartThresholdBytes == null
+                ? size <= partSize
+                : size < multipartThresholdBytes));
+    if (single) {
       return sendPart(
           0,
           size,
@@ -328,11 +471,13 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       // An ambiguous completion may have published an object. Never replay it.
       // Aborting a definitively rejected completion removes only its upload ID.
       if (!completing || error is StorageHttpException) {
+        final cleanup = ActionScope(inheritParent: false);
         try {
-          await ActionScope(inheritParent: false).run(() => http.request(
-              'DELETE', bucket,
+          await cleanup.run(() => http.request('DELETE', bucket,
               key: key, query: {'uploadId': uploadId}));
-        } catch (_) {/* Available through multipart recovery. */}
+        } catch (_) {/* Available through multipart recovery. */} finally {
+          cleanup.dispose();
+        }
       }
       rethrow;
     }
@@ -347,7 +492,8 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       if (args['versionId'] != null)
         http.azure ? 'versionid' : 'versionId': '${args['versionId']}'
     };
-    final head = await http.request('HEAD', bucket, key: key, query: query);
+    final head = (args['_heads'] as Map?)?[key] as StorageHttpResponse? ??
+        await http.request('HEAD', bucket, key: key, query: query);
     final size = int.parse(head.headers['content-length']!),
         etag = head.headers['etag'];
     if (etag == null) {
@@ -370,21 +516,41 @@ extension MobileStorageTransfers on MobileStorageAdmin {
     final staging = await Directory(resolved).createTemp('.object-browser-');
     final temp = File('${staging.path}/download');
     final file = await temp.open(mode: FileMode.write);
+    File? reservation;
     try {
-      const range = 8 * 1024 * 1024;
-      for (var start = 0; start < size; start += range) {
+      final range =
+          ((args['multipartChunkMiB'] as num?)?.toInt() ?? 8).clamp(5, 5120) *
+              1024 *
+              1024;
+      Future<void> writes = Future.value();
+      await _parallelParts((size + range - 1) ~/ range,
+          profile.maxConcurrentRequests.clamp(1, 8), (index) async {
+        final start = index * range;
         final count = min(range, size - start);
-        final data = await http.request('GET', bucket,
+        var received = 0;
+        final data = await http.requestStream('GET', bucket,
             key: key,
             query: query,
             headers: {
               'range': 'bytes=$start-${start + count - 1}',
               'if-match': etag
             },
-            maxResponseBytes: count);
-        _validateRange(data, start, count, size, etag);
-        await file.writeFrom(data.body);
-      }
+            maxResponseBytes: count, onResponseStart: () async {
+          received = 0;
+        }, onResponseChunk: (chunk) async {
+          final offset = start + received;
+          received += chunk.length;
+          // Serialize disk writes while bounded network streams run together.
+          writes = writes.then((_) async {
+            await file.setPosition(offset);
+            await file.writeFrom(chunk);
+          });
+          await writes;
+        });
+        _validateRange(data, start, count, size, etag, receivedBytes: received);
+        (args['_progress'] as void Function(int)?)?.call(count);
+        return true;
+      });
       await file.flush();
       await file.close();
       ActionScope.current?.check();
@@ -393,6 +559,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
         var suffix = 0;
         // Reserve a previously unused name before atomic publication.
         while (true) {
+          ActionScope.current?.check();
           output =
               File('${destination.path}${suffix == 0 ? '' : ' ($suffix)'}');
           if (await FileSystemEntity.type(output.path, followLinks: false) ==
@@ -400,13 +567,22 @@ extension MobileStorageTransfers on MobileStorageAdmin {
             // Reserve the name exclusively, then replace only our reservation.
             try {
               await output.create(exclusive: true);
+              reservation = output;
               break;
-            } on FileSystemException {/* raced */}
+            } on FileSystemException {
+              // Only a confirmed racing name collision is retryable.
+              if (await FileSystemEntity.type(output.path,
+                      followLinks: false) ==
+                  FileSystemEntityType.notFound) {
+                rethrow;
+              }
+            }
           }
           suffix++;
         }
       }
       await temp.rename(output.path);
+      reservation = null;
       return {
         'status': 'completed',
         'path': output.path,
@@ -419,14 +595,20 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       try {
         await file.close();
       } catch (_) {}
+      if (reservation != null) {
+        try {
+          await reservation.delete();
+        } catch (_) {}
+      }
       if (await staging.exists()) await staging.delete(recursive: true);
     }
   }
 
   static void _validateRange(StorageHttpResponse response, int start, int count,
-      int total, String etag) {
+      int total, String etag,
+      {int? receivedBytes}) {
     if (response.status != 206 ||
-        response.body.length != count ||
+        (receivedBytes ?? response.body.length) != count ||
         response.headers['content-range'] !=
             'bytes $start-${start + count - 1}/$total' ||
         response.headers['etag'] != etag) {
@@ -472,6 +654,13 @@ extension MobileStorageTransfers on MobileStorageAdmin {
           return data;
         },
             verifySource: verifySource,
+            onProgress: args['_progress'] as void Function(int)?,
+            streamReadBytes: 256 * 1024,
+            multipartThresholdBytes:
+                ((args['multipartThresholdMiB'] as num?)?.toInt() ?? 32)
+                        .clamp(1, 5120) *
+                    1024 *
+                    1024,
             partBytes: ((args['multipartChunkMiB'] as num?)?.toInt() ?? 8)
                     .clamp(5, 5120) *
                 1024 *

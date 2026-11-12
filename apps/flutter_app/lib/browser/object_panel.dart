@@ -148,66 +148,78 @@ class _ObjectPanelState extends State<ObjectPanel> {
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
                       _toolbar(context, hasBucket: hasBucket, busy: busy),
-                      ClipRect(
-                          child: MotionSize(
-                        alignment: Alignment.topCenter,
+                      TweenAnimationBuilder<double>(
+                        tween: Tween<double>(
+                            begin: _viewExpanded ? 1 : 0,
+                            end: _viewExpanded ? 1 : 0),
                         duration: AppMotion.duration(context,
                             enabled: c.settings.enableAnimations),
-                        curve: Curves.easeOutCubic,
-                        child: !_viewExpanded
+                        curve: Curves.easeInOutCubic,
+                        builder: (context, reveal, child) => reveal == 0
                             ? const SizedBox(width: double.infinity)
-                            : Padding(
-                                padding:
-                                    const EdgeInsets.symmetric(vertical: 8),
-                                child: DecoratedBox(
-                                  decoration: BoxDecoration(
-                                      color: Theme.of(context)
-                                          .colorScheme
-                                          .surfaceContainerLow,
-                                      borderRadius: BorderRadius.circular(12)),
-                                  child: Padding(
-                                      padding: const EdgeInsets.all(6),
-                                      child: Wrap(
-                                          spacing: 4,
-                                          runSpacing: 4,
-                                          children: [
-                                            _tool(
-                                                'Flat view',
-                                                Icons.account_tree_outlined,
-                                                hasBucket
-                                                    ? () => c.toggleFlatView(
-                                                        !c.flatView)
-                                                    : null,
-                                                toggled: c.flatView),
-                                            _tool(
-                                                'Create prefix',
-                                                Icons
-                                                    .create_new_folder_outlined,
-                                                hasBucket
-                                                    ? onCreatePrefix
-                                                    : null),
-                                            _tool(
-                                                'Select all loaded objects',
-                                                Icons.select_all,
-                                                hasBucket
-                                                    ? c.selectAllLoadedObjects
-                                                    : null),
-                                            _tool(
-                                                'Show loaded rows',
-                                                Icons.view_agenda_outlined,
-                                                () => c.setShowAllObjects(
-                                                    !c.showAllObjects),
-                                                toggled: c.showAllObjects),
-                                            _tool(
-                                                'List all',
-                                                Icons.cloud_download_outlined,
-                                                c.objectCursor.hasMore && !busy
-                                                    ? () => _listAll(context)
-                                                    : null),
-                                          ])),
+                            : ClipRect(
+                                child: Align(
+                                  alignment: Alignment.topCenter,
+                                  heightFactor: reveal,
+                                  child: Opacity(
+                                    opacity: reveal,
+                                    child: IgnorePointer(
+                                      ignoring: !_viewExpanded,
+                                      child: ExcludeFocus(
+                                        excluding: !_viewExpanded,
+                                        child: ExcludeSemantics(
+                                            excluding: !_viewExpanded,
+                                            child: child!),
+                                      ),
+                                    ),
+                                  ),
                                 ),
                               ),
-                      )),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .surfaceContainerLow,
+                                borderRadius: BorderRadius.circular(12)),
+                            child: Padding(
+                                padding: const EdgeInsets.all(6),
+                                child:
+                                    Wrap(spacing: 4, runSpacing: 4, children: [
+                                  _tool(
+                                      'Flat view',
+                                      Icons.account_tree_outlined,
+                                      hasBucket
+                                          ? () => c.toggleFlatView(!c.flatView)
+                                          : null,
+                                      toggled: c.flatView),
+                                  _tool(
+                                      'Create prefix',
+                                      Icons.create_new_folder_outlined,
+                                      hasBucket ? onCreatePrefix : null),
+                                  _tool(
+                                      'Select all loaded objects',
+                                      Icons.select_all,
+                                      hasBucket
+                                          ? c.selectAllLoadedObjects
+                                          : null),
+                                  _tool(
+                                      'Show loaded rows',
+                                      Icons.view_agenda_outlined,
+                                      () => c
+                                          .setShowAllObjects(!c.showAllObjects),
+                                      toggled: c.showAllObjects),
+                                  _tool(
+                                      'List all',
+                                      Icons.cloud_download_outlined,
+                                      c.objectCursor.hasMore && !busy
+                                          ? () => _listAll(context)
+                                          : null),
+                                ])),
+                          ),
+                        ),
+                      ),
                       if (busy || c.filteringObjects)
                         const LinearProgressIndicator(minHeight: 2),
                       Expanded(
@@ -407,10 +419,18 @@ class _ObjectPanelState extends State<ObjectPanel> {
           height: 48,
           child: AnimatedSwitcher(
               duration: AppMotion.duration(context,
-                  enabled: c.settings.enableAnimations, milliseconds: 160),
-              layoutBuilder: (current, previous) => Stack(
-                  alignment: Alignment.centerRight,
-                  children: [...previous, if (current != null) current]),
+                  enabled: c.settings.enableAnimations, milliseconds: 180),
+              // Fade the previous labels out before revealing the new labels;
+              // overlapping toolbar text is hard to read even in a short blend.
+              switchInCurve: const Interval(.45, 1, curve: Curves.easeOutCubic),
+              switchOutCurve:
+                  const Interval(.55, 1, curve: Curves.easeOutCubic),
+              layoutBuilder: (current, previous) =>
+                  Stack(alignment: Alignment.centerRight, children: [
+                    for (final outgoing in previous)
+                      IgnorePointer(child: ExcludeSemantics(child: outgoing)),
+                    if (current != null) current,
+                  ]),
               child:
                   c.objectSelection.keys.isNotEmpty || c.selectedObject != null
                       ? KeyedSubtree(
@@ -541,9 +561,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
     final object = c.selectedObject;
     final String label;
     if (keys.isNotEmpty) {
-      final bytes = c.objects
-          .where((o) => keys.contains(o.key))
-          .fold<int>(0, (sum, o) => sum + o.size);
+      final bytes = c.selectedObjectBytes;
       label = '${keys.length} selected · ${formatBytes(bytes)}';
     } else {
       label = object!.name;
@@ -710,7 +728,8 @@ class _ObjectPanelState extends State<ObjectPanel> {
                         heightFactor: 1,
                         child: ExcludeSemantics(
                           child: Text(
-                            Theme.of(context).platform == TargetPlatform.macOS
+                            {TargetPlatform.macOS, TargetPlatform.iOS}
+                                    .contains(Theme.of(context).platform)
                                 ? '⌘K'
                                 : 'Ctrl K',
                             style: Theme.of(context).textTheme.labelSmall,
@@ -731,7 +750,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
                     enabled: hasBucket,
                     position: PopupMenuPosition.under,
                     offset: const Offset(0, AppMenuStyle.anchorGap),
-                    popUpAnimationStyle: AppMenuStyle.animation,
+                    popUpAnimationStyle: AppMenuStyle.animationFor(context),
                     onSelected: (mode) {
                       _debounce?.cancel();
                       c.setObjectFilterMode(mode);
