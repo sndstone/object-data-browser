@@ -259,11 +259,20 @@ def test_benchmark_progresses_without_polling_and_never_persists_profile(native_
     assert started['ok'], started
     run_id = started['result']['id']
     assert 'profile' not in started['result']
-    deadline = time.monotonic()+5
-    while fixture.puts < 12 and time.monotonic() < deadline: time.sleep(.05)
-    assert fixture.puts >= 12, 'Work only progresses when polled.'
-    status = engine.request('getBenchmarkStatus', {'runId': run_id, 'profile': profile})
-    assert status['ok'], status
+    deadline = time.monotonic() + 5
+    while fixture.puts < 12 and time.monotonic() < deadline:
+        time.sleep(.05)
+    assert fixture.puts == 12, 'The benchmark did not dispatch all work before the first poll.'
+    # The fixture counts requests before sending its replies. The engine publishes
+    # its completed snapshot after those replies arrive and the results are saved.
+    deadline = time.monotonic() + 5
+    while True:
+        status = engine.request('getBenchmarkStatus', {'runId': run_id, 'profile': profile})
+        assert status['ok'], status
+        if status['result']['status'] != 'running' or time.monotonic() >= deadline:
+            break
+        time.sleep(.05)
+    assert status['result']['status'] == 'completed', status
     assert status['result']['processedCount'] == 12
     assert fixture.parallel > 1, 'Configured benchmark workers must run concurrently.'
     state = Path(tempfile.gettempdir())/f'object-data-browser-{name}-engine'/f'benchmark-{run_id}.json'

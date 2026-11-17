@@ -165,6 +165,26 @@ final class EncryptionRegressionTest {
                 new LinkedHashMap<>(Map.of("config", Map.of("encryption", Map.of("customerKey", KEY)), "profile", Map.of("secretKey", "secret"))));
             check(!JSON.writeValueAsString(state).contains(KEY), "Benchmark checkpoint redaction");
         }
+        // A short credential is an ordinary word: names, cursors and request IDs that contain it stay intact.
+        var weak = params(); ((ObjectNode) weak.path("profile")).put("secretKey", "fixture").put("sessionToken", "test");
+        try (var secrets = new SecretHygiene(weak)) {
+            var response = new LinkedHashMap<String, Object>();
+            response.put("requestId", "multipart-fixture");
+            response.put("result", Map.of("items", List.of(Map.of("key", "reports/test/fixture.txt")), "nextCursor", Map.of("value", "fixture-next")));
+            String wire = JSON.writeValueAsString(SecretHygiene.clean(response));
+            check(wire.contains("multipart-fixture") && wire.contains("reports/test/fixture.txt") && wire.contains("fixture-next"), "Short credential rewrote response data");
+            var credentials = Map.of("secretKey", "fixture", "sessionToken", "test");
+            var redacted = Map.of("secretKey", "[REDACTED]", "sessionToken", "[REDACTED]");
+            check(SecretHygiene.clean(credentials).equals(redacted), "Short credential field left readable");
+        }
+        var strong = params(); ((ObjectNode) strong.path("profile")).put("secretKey", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        try (var secrets = new SecretHygiene(strong)) {
+            check(!SecretHygiene.text("Provider echoed wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY").contains("K7MDENG"), "Long credential echo redaction");
+            check(!JSON.writeValueAsString(SecretHygiene.clean(Map.of("message", "echo wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"))).contains("K7MDENG"), "Long credential response redaction");
+        }
+        // Response data is never rewritten by pattern: a key may look like a sensitive assignment.
+        for (String name : new String[]{"logs/token=abc/part-0.json", "notes/secret: draft.txt", "authorization: basic.txt"})
+            check(JSON.writeValueAsString(SecretHygiene.clean(Map.of("key", name))).contains(name), "Response key rewritten: " + name);
         try (Temp temp = new Temp(); var secrets = new SecretHygiene(p)) {
             String previous = System.getProperty("java.io.tmpdir");
             try {

@@ -10,6 +10,7 @@
 - Go retries an interrupted download range instead of discarding the whole download. Java waits for transfer workers to stop before reporting the result.
 - Changing an unrelated setting no longer resets the benchmark draft. Cancelling a profile export no longer writes a file. Breadcrumbs keep prefixes that contain empty segments. Inspector "current object" actions act on the inspected object only.
 - A denied HEAD with no error body no longer crashes Java's error mapping.
+- Java preserves object names, pagination cursors and request IDs that contain short credential text while continuing to redact credential fields and encryption keys.
 
 ### Interface
 - Settings captions, helper text and responsive layouts stay readable at larger UI scales and on narrow screens.

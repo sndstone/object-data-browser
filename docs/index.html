@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Object Data Browser 2.3.5</title>
+    <title>Object Data Browser 2.4.0</title>
     <meta
       name="description"
       content="Object Data Browser is a Flutter-based object data browser for Windows, macOS, Linux, Android, and iOS with pluggable backend engines."
@@ -148,6 +148,73 @@
         padding-left: 20px;
       }
 
+      .version h3 {
+        font-size: 0.95rem;
+        margin: 26px 0 10px;
+      }
+
+      .downloads {
+        border-collapse: collapse;
+        width: 100%;
+      }
+
+      .downloads th,
+      .downloads td {
+        border-top: 1px solid var(--line);
+        padding: 8px 10px 8px 0;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      .downloads th {
+        font-weight: 700;
+      }
+
+      .downloads td:last-child,
+      .note,
+      figcaption {
+        color: var(--muted);
+      }
+
+      .note {
+        margin-top: 12px;
+      }
+
+      figure {
+        margin: 0 0 22px;
+      }
+
+      figure img {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        display: block;
+        height: auto;
+        width: 100%;
+      }
+
+      .pair {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .tag {
+        display: block;
+        font-size: 0.8rem;
+        font-weight: 800;
+        margin-bottom: 6px;
+      }
+
+      figcaption {
+        margin-top: 8px;
+      }
+
+      @media (max-width: 760px) {
+        .pair {
+          grid-template-columns: 1fr;
+        }
+      }
+
       @media (max-width: 760px) {
         main {
           padding: 36px 0;
@@ -171,7 +238,7 @@
   </head>
   <body>
     <main>
-      <p class="eyebrow">Version 2.3.5</p>
+      <p class="eyebrow">Version 2.4.0</p>
       <h1>Object Data Browser</h1>
       <p class="intro">
         A cross-platform object data browser with a Flutter interface, real desktop
@@ -179,7 +246,7 @@
         inspection tools, and benchmark workflows.
       </p>
       <div class="actions">
-        <a class="button" href="https://github.com/sndstone/object-data-browser/releases/tag/v2.3.5">View 2.3.5 release</a>
+        <a class="button" href="https://github.com/sndstone/object-data-browser/releases/tag/v2.4.0">View 2.4.0 release</a>
         <a class="secondary" href="https://github.com/sndstone/object-data-browser">View source</a>
       </div>
 
@@ -199,20 +266,76 @@
       </div>
 
       <section class="version">
-        <h2>What changed in 2.3.5</h2>
+        <h2>What changed in 2.4.0</h2>
         <ul>
-          <li>Bounded parallel downloads and metadata preflight, batched mobile deletes, smaller runtime payloads and fewer unrelated workspace rebuilds.</li>
-          <li>Safer versioned moves, preserved ACL/Object Lock settings, exact key encoding, pagination and archive-restore fixes.</li>
-          <li>Adaptive rename and configuration forms with keyboard-aware layouts, retained drafts, inline errors and stronger delete confirmation.</li>
-          <li>iPhone/iPad source improvements include iOS 15 support, app artwork, Command shortcuts, readable status bars and foreground-transfer cancellation on backgrounding.</li>
+          <li>Optional encryption, off by default: provider-side encryption for S3 and Azure uploads, and client-side vault encryption in the standard age format, with optional encryption of file and folder names.</li>
+          <li>Encryption keys live in a passphrase-protected key file that can be backed up, moved to another device, or synced through a bucket you choose.</li>
+          <li>Provider templates for 21 storage services, plus native Google Cloud Storage in the Python and Go desktop engines.</li>
+          <li>Settings stay readable at larger UI scales and on narrow screens. Desktop Upload opens a menu beneath its button.</li>
+          <li>Fixes for share links, uploads started before navigating, slow transfers, download retries and engine memory use.</li>
         </ul>
-        <p>
-          <a href="https://github.com/sndstone/object-data-browser/releases/download/v2.3.5/object-data-browser-macos-2.3.5-arm64-dev.dmg">Download the 2.3.5 Apple Silicon DMG</a>.
-          This is a macOS 13+ development build, ad-hoc signed and not notarized.
-          Windows x64 remains available in <a href="https://github.com/sndstone/object-data-browser/releases/tag/v2.3.4">2.3.4</a>;
+
+        <h3>Downloads</h3>
+        <table class="downloads">
+          <tr><th>macOS, Apple Silicon, 13+</th><td><a href="https://github.com/sndstone/object-data-browser/releases/download/v2.4.0/object-data-browser-macos-2.4.0-build3-arm64-dev.dmg">DMG</a></td><td>ad-hoc signed, not notarized</td></tr>
+          <tr><th>Windows x64</th><td><a href="https://github.com/sndstone/object-data-browser/releases/download/v2.4.0/object-data-browser-windows-2.4.0-build3-x64-dev.msi">MSI</a></td><td>unsigned</td></tr>
+          <tr><th>Windows ARM64</th><td><a href="https://github.com/sndstone/object-data-browser/releases/download/v2.4.0/object-data-browser-windows-2.4.0-build3-arm64-dev.msi">MSI</a></td><td>unsigned</td></tr>
+          <tr><th>Android, arm64</th><td><a href="https://github.com/sndstone/object-data-browser/releases/download/v2.4.0/object-data-browser-android-2.4.0-build3-arm64-dev.apk">APK</a></td><td>signed with a debug certificate</td></tr>
+        </table>
+        <p class="note">
+          These are development builds (2.4.0 build 3). They were not tested against a live storage service.
           Linux packages remain in <a href="https://github.com/sndstone/object-data-browser/releases/tag/v2.3.3">2.3.3</a>.
-          <a href="https://github.com/sndstone/object-data-browser/blob/v2.3.5/docs/2.3.5-verification.md">Verification details</a>.
+          <a href="https://github.com/sndstone/object-data-browser/blob/v2.4.0/docs/2.4.0-verification.md">Verification details</a>.
         </p>
+
+        <h3>Settings, before and after</h3>
+        <figure class="compare">
+          <div class="pair">
+            <div><span class="tag">Before</span><img loading="lazy" src="screenshots/2.4.0/02-transfers-before.png" alt="Transfers and Storage settings, before"></div>
+            <div><span class="tag">After</span><img loading="lazy" src="screenshots/2.4.0/02-transfers-after.png" alt="Transfers and Storage settings, after"></div>
+          </div>
+          <figcaption>Transfers &amp; Storage: units moved out of the field captions into helper text, and captions are larger.</figcaption>
+        </figure>
+        <figure class="compare">
+          <div class="pair">
+            <div><span class="tag">Before</span><img loading="lazy" src="screenshots/2.4.0/01-performance-before.png" alt="Performance settings, before"></div>
+            <div><span class="tag">After</span><img loading="lazy" src="screenshots/2.4.0/01-performance-after.png" alt="Performance settings, after"></div>
+          </div>
+          <figcaption>Performance: the same caption and helper-text treatment.</figcaption>
+        </figure>
+        <figure class="compare">
+          <div class="pair">
+            <div><span class="tag">Before</span><img loading="lazy" src="screenshots/2.4.0/03-profile-before.png" alt="Connection editor, before"></div>
+            <div><span class="tag">After</span><img loading="lazy" src="screenshots/2.4.0/03-profile-after.png" alt="Connection editor, after"></div>
+          </div>
+          <figcaption>Connections: the profile editor with readable captions and the new provider template field.</figcaption>
+        </figure>
+
+        <h3>New in 2.4.0</h3>
+        <figure class="shot">
+          <img loading="lazy" src="screenshots/2.4.0/04-upload-popup-desktop.png" alt="Upload menu opened beneath the Upload button">
+          <figcaption>Desktop Upload opens a menu beneath its button.</figcaption>
+        </figure>
+        <figure class="shot">
+          <img loading="lazy" src="screenshots/2.4.0/05-bucket-encryption-form.png" alt="Bucket encryption form">
+          <figcaption>Bucket encryption is a form: choose the bucket default and turn on vault encryption in one step.</figcaption>
+        </figure>
+        <figure class="shot">
+          <img loading="lazy" src="screenshots/2.4.0/07-settings-encryption.png" alt="Encryption settings">
+          <figcaption>Settings → Encryption: the key file, and each connection’s upload encryption and vault rules.</figcaption>
+        </figure>
+        <figure class="shot">
+          <img loading="lazy" src="screenshots/2.4.0/08-setup-guide-sse-kms.png" alt="Encryption setup guide open at SSE-KMS">
+          <figcaption>A setup guide covers SSE-S3, SSE-KMS, DSSE-KMS, SSE-C, Azure and vault encryption.</figcaption>
+        </figure>
+        <figure class="shot">
+          <img loading="lazy" src="screenshots/2.4.0/12-vault-protection-controls.png" alt="Vault rule with name protection controls">
+          <figcaption>A vault rule can also encrypt file and folder names, per folder or with a strict policy.</figcaption>
+        </figure>
+        <figure class="shot">
+          <img loading="lazy" src="screenshots/2.4.0/13-generate-vault-key.png" alt="Generated vault key shown before saving">
+          <figcaption>A generated key is shown before it is saved, with Copy and “Generate another”.</figcaption>
+        </figure>
       </section>
     </main>
   </body>
