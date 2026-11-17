@@ -185,13 +185,21 @@ extension MobileAzureStorageAdapter on MobileStorageAdmin {
         };
       case 'objectDetails':
       case 'getObjectDetails':
-        return _azureDetails(http, bucket, _azureKey(key), query);
+        return _azureDetails(
+          http,
+          bucket,
+          _azureKey(key),
+          query,
+          arguments['encryption'],
+        );
       case 'createFolder':
         final raw = _azureKey(key ?? arguments['prefix'] as String?);
         final folder = raw.endsWith('/') ? raw : '$raw/';
-        await http.request('PUT', bucket,
-            key: folder,
-            headers: {'x-ms-blob-type': 'BlockBlob', 'if-none-match': '*'});
+        await http.request('PUT', bucket, key: folder, headers: {
+          'x-ms-blob-type': 'BlockBlob',
+          'if-none-match': '*',
+          ...objectEncryptionHeaders(profile, arguments['encryption']),
+        });
         return {'created': true, 'key': folder};
       case 'deleteVersion':
         if (version == null || version.isEmpty) {
@@ -324,6 +332,7 @@ extension MobileAzureStorageAdapter on MobileStorageAdmin {
         };
       case 'presignVersion':
       case 'generatePresignedUrl':
+        rejectCustomerKeyPresign(profile, arguments['encryption']);
         return mobileAzurePresign(http, bucket, _azureKey(key),
             versionId: version,
             expiresSeconds: ((arguments['expiresSeconds'] ??
@@ -453,9 +462,20 @@ Map<String, Object?> mobileAzurePresign(
   };
 }
 
-Future<Map<String, Object?>> _azureDetails(StorageHttpClient http,
-    String bucket, String key, Map<String, String> query) async {
-  final response = await http.request('HEAD', bucket, key: key, query: query);
+Future<Map<String, Object?>> _azureDetails(
+  StorageHttpClient http,
+  String bucket,
+  String key,
+  Map<String, String> query, [
+  Object? encryption,
+]) async {
+  final response = await http.request(
+    'HEAD',
+    bucket,
+    key: key,
+    query: query,
+    headers: objectEncryptionHeaders(http.profile, encryption, read: true),
+  );
   final headers = response.headers;
   return {
     'key': key,
@@ -465,7 +485,8 @@ Future<Map<String, Object?>> _azureDetails(StorageHttpClient http,
     'modifiedAt': MobileStorageAdmin._date(headers['last-modified']),
     'versionId': headers['x-ms-version-id'] ?? query['versionid'],
     'storageClass': headers['x-ms-access-tier'] ?? 'Hot',
-    'encryption': headers['x-ms-server-encrypted'],
+    if (objectEncryptionInfo(headers, azure: true) case final encryption?)
+      'encryption': encryption,
     'metadata': {
       for (final entry in headers.entries)
         if (entry.key.startsWith('x-ms-meta-'))
@@ -475,7 +496,7 @@ Future<Map<String, Object?>> _azureDetails(StorageHttpClient http,
       for (final entry in MobileStorageAdmin.contentHeaders.entries)
         if (headers[entry.value] != null) entry.key: headers[entry.value]
     },
-    'rawHeaders': headers,
+    'rawHeaders': DiagnosticSafety.sanitize(headers),
     'archiveStatus': headers['x-ms-archive-status'],
     'rehydratePriority': headers['x-ms-rehydrate-priority']
   };

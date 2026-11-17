@@ -1,9 +1,13 @@
+import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:s3_browser_crossplat/models/domain_models.dart';
 import 'package:s3_browser_crossplat/services/android_engine_service.dart';
 import 'package:s3_browser_crossplat/services/engine_service.dart';
+
+import 'mobile_client_encryption_fixture.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -24,6 +28,38 @@ void main() {
   tearDown(() async {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, null);
+  });
+
+  test('provider template metadata never changes the native engine payload',
+      () async {
+    final payloads = <Map<String, Object?>>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'dispatch') {
+        final arguments = Map<String, Object?>.from(
+          call.arguments as Map,
+        );
+        final params = Map<String, Object?>.from(
+          arguments['params'] as Map,
+        );
+        payloads.add(Map<String, Object?>.from(params['profile'] as Map));
+        return {'items': <Map<String, Object?>>[]};
+      }
+      return null;
+    });
+    final service = AndroidEngineService(channel: channel);
+    addTearDown(service.shutdown);
+    await service.listBuckets(engineId: 'android', profile: profile());
+    await service.listBuckets(
+      engineId: 'android',
+      profile: profile()
+          .copyWith(providerTemplateId: 'minio', useCustomAwsEndpoint: true),
+    );
+    expect(payloads, hasLength(2));
+    expect(payloads.first, profile().toJson());
+    expect(payloads.last, payloads.first);
+    expect(payloads.last, isNot(contains('providerTemplateId')));
+    expect(payloads.last, isNot(contains('useCustomAwsEndpoint')));
   });
 
   test('listBuckets returns platform data instead of placeholder fallback',
@@ -122,6 +158,76 @@ void main() {
     expect(records.first.requestId, records.last.requestId);
     expect(records.first.engineId, 'rust');
     expect(records.last.method, 'listBuckets');
+  });
+
+  test(
+      'name-encrypted uploads sanitize mobile request response and error diagnostics',
+      () async {
+    // The widget test binding replaces HttpClient with a stub that answers
+    // 400; this test talks to a local fixture.
+    HttpOverrides.global = null;
+    final fixture = MobileAgeFixture(false);
+    await fixture.start();
+    addTearDown(fixture.close);
+    final service = AndroidEngineService(channel: channel);
+    addTearDown(service.shutdown);
+    final records = <EngineLogRecord>[];
+    service.setLogSink(records.add);
+    service.configureDiagnostics(const DiagnosticsOptions(
+        enableApiLogging: true, enableDebugLogging: true));
+    final vector = mobileAgeVectors().first;
+    final source = File('${fixture.directory.path}/PRIVATE-mobile-report.txt');
+    await source.writeAsBytes(vectorPlaintext(vector));
+    final token =
+        base64Url.encode([1, ...List.filled(17, 7)]).replaceAll('=', '');
+    Future<TransferJob> upload({bool names = true}) => service.startUpload(
+        engineId: 'android',
+        profile: fixture.profile,
+        bucketName: 'bucket',
+        prefix: 'vault/',
+        filePaths: [source.path],
+        objectKeyByPath: {source.path: names ? '$token.age' : 'plain.age'},
+        multipartThresholdMiB: 32,
+        multipartChunkMiB: 5,
+        clientEncryption: names
+            ? {
+                'format': 'age-v1',
+                'header': vector['header'],
+                'fileKey': vector['fileKey'],
+                'payloadNonce': vector['payloadNonce']
+              }
+            : null);
+    await upload();
+    expect(fixture.objects['vault/$token.age'], isNotNull);
+    expect(records.any((r) => r.tracePhase == 'response'), isTrue);
+    final request =
+        records.firstWhere((r) => r.tracePhase == 'send').traceBody as Map;
+    expect(request['filePaths'], ['$token.age']);
+    expect((request['objectKeyByPath'] as Map).keys, ['$token.age']);
+    await source.delete();
+    Object? failure;
+    try {
+      await upload();
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure, isA<EngineException>());
+    final retained = jsonEncode({
+      'error': '$failure',
+      'logs': records.map((r) => [r.message, r.traceHead, r.traceBody]).toList()
+    });
+    expect(retained, isNot(contains(source.path)));
+    expect(retained, isNot(contains('PRIVATE-mobile-report.txt')));
+    expect(retained, isNot(contains(vector['fileKey'])));
+    // Ordinary uploads retain their original path and request shape.
+    records.clear();
+    await source.writeAsBytes([1, 2, 3]);
+    await upload(names: false);
+    final ordinary =
+        records.firstWhere((r) => r.tracePhase == 'send').traceBody as Map;
+    expect(ordinary['filePaths'], [source.path]);
+    expect((ordinary['objectKeyByPath'] as Map)[source.path], 'plain.age');
+    expect(ordinary.containsKey('clientEncryption'), isFalse);
   });
 
   test('native unsupported errors surface instead of mock data', () async {

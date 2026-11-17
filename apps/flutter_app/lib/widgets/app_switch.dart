@@ -23,9 +23,9 @@ class AppSwitch extends StatefulWidget {
   final bool focusable;
   final String? semanticLabel;
 
-  // Wide enough for an 11px OFF label beside the thumb.
-  static const double width = 56;
-  static const double height = 24;
+  // Room for the themed OFF label beside the thumb at the base text scale.
+  static const double width = 64;
+  static const double height = 28;
   static const double _thumb = 18;
   static const double _inset = 2;
 
@@ -46,22 +46,21 @@ class _AppSwitchState extends State<AppSwitch> {
     final on = widget.value;
     final duration = AppMotion.duration(context, milliseconds: 170);
     const curve = Curves.easeOutCubic;
-    const labelStyle = TextStyle(
-      fontFamily: 'Inter',
-      fontSize: 11,
-      height: 1,
-      fontWeight: FontWeight.w800,
-      letterSpacing: 0.4,
-    );
+    final labelStyle = Theme.of(context).textTheme.labelMedium!.copyWith(
+          height: 1,
+          fontWeight: FontWeight.w800,
+        );
+    final scale = MediaQuery.textScalerOf(context).scale(labelStyle.fontSize!) /
+        labelStyle.fontSize!;
 
     Widget track = AnimatedContainer(
       duration: duration,
       curve: curve,
-      width: AppSwitch.width,
-      height: AppSwitch.height,
+      width: AppSwitch.width * scale,
+      height: AppSwitch.height * scale,
       decoration: BoxDecoration(
         color: on ? scheme.primary : scheme.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(AppSwitch.height / 2),
+        borderRadius: BorderRadius.circular(AppSwitch.height * scale / 2),
         border: Border.all(color: on ? scheme.primary : scheme.outline),
       ),
       child: Stack(
@@ -107,8 +106,8 @@ class _AppSwitchState extends State<AppSwitch> {
               child: AnimatedContainer(
                 duration: duration,
                 curve: curve,
-                width: AppSwitch._thumb,
-                height: AppSwitch._thumb,
+                width: AppSwitch._thumb * scale,
+                height: AppSwitch._thumb * scale,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: on ? scheme.onPrimary : scheme.onSurfaceVariant,
@@ -124,7 +123,7 @@ class _AppSwitchState extends State<AppSwitch> {
       track = DecoratedBox(
         position: DecorationPosition.foreground,
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(AppSwitch.height / 2 + 3),
+          borderRadius: BorderRadius.circular(AppSwitch.height * scale / 2 + 3),
           border: Border.all(
             color: scheme.primary.withValues(alpha: 0.7),
             width: 2,
@@ -199,21 +198,33 @@ class AppSwitchTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final enabled = onChanged != null;
     return MergeSemantics(
-      child: Semantics(
-        toggled: value,
-        child: ListTile(
-          enabled: enabled,
-          contentPadding: contentPadding,
-          dense: dense,
-          visualDensity: visualDensity,
-          title: title,
-          subtitle: subtitle,
-          trailing: AppSwitch(
-            value: value,
-            onChanged: onChanged,
-            focusable: false,
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: 16),
+        child: Semantics(
+          toggled: value,
+          child: ListTile(
+            enabled: enabled,
+            contentPadding: contentPadding,
+            dense: dense,
+            visualDensity: visualDensity,
+            title: title,
+            titleTextStyle: Theme.of(context).textTheme.bodyMedium,
+            subtitleTextStyle: Theme.of(context).textTheme.bodySmall,
+            // Dense ListTile hard-codes a smaller subtitle even when its
+            // theme supplies a size. Reapply the themed style inside the tile.
+            subtitle: subtitle == null
+                ? null
+                : DefaultTextStyle.merge(
+                    style: Theme.of(context).textTheme.bodySmall,
+                    child: subtitle!,
+                  ),
+            trailing: AppSwitch(
+              value: value,
+              onChanged: onChanged,
+              focusable: false,
+            ),
+            onTap: enabled ? () => onChanged!(!value) : null,
           ),
-          onTap: enabled ? () => onChanged!(!value) : null,
         ),
       ),
     );

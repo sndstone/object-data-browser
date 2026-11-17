@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import '../services/diagnostic_safety.dart';
 import '../theme/app_motion.dart';
+import 'danger_button.dart';
 
 void submitAppForm(BuildContext context) =>
     context.findAncestorStateOfType<_AppFormDialogState>()?._submit();
@@ -21,6 +22,7 @@ class AppFormDialog<T> extends StatefulWidget {
     this.valid = true,
     this.dirty = false,
     this.editor = false,
+    this.destructive = false,
     this.width = 560,
     this.submitLabel = 'Save',
     this.extraActions = const [],
@@ -30,7 +32,7 @@ class AppFormDialog<T> extends StatefulWidget {
   final Widget child;
   final T Function() value;
   final Future<void> Function(T)? onSave;
-  final bool valid, dirty, editor;
+  final bool valid, dirty, editor, destructive;
   final double width;
   final List<Widget> extraActions;
 
@@ -84,6 +86,13 @@ class _AppFormDialogState<T> extends State<AppFormDialog<T>> {
       if (mounted) setState(() => _busy = false);
     }
   }
+
+  Widget get _submitContent => _busy
+      ? const SizedBox(
+          width: 18,
+          height: 18,
+          child: CircularProgressIndicator(strokeWidth: 2))
+      : Text(widget.submitLabel);
 
   @override
   Widget build(BuildContext context) {
@@ -150,11 +159,23 @@ class _AppFormDialogState<T> extends State<AppFormDialog<T>> {
                                     padding: const EdgeInsets.only(top: 16),
                                     child: Semantics(
                                         liveRegion: true,
-                                        child: Text(_error!,
-                                            style: TextStyle(
+                                        child: Row(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Icon(Icons.error_outline,
                                                 color: Theme.of(context)
                                                     .colorScheme
-                                                    .error)))),
+                                                    .error),
+                                            const SizedBox(width: 8),
+                                            Expanded(
+                                                child: Text(_error!,
+                                                    style: TextStyle(
+                                                        color: Theme.of(context)
+                                                            .colorScheme
+                                                            .error))),
+                                          ],
+                                        ))),
                             ]),
                       ),
                     ),
@@ -171,16 +192,18 @@ class _AppFormDialogState<T> extends State<AppFormDialog<T>> {
                             TextButton(
                                 onPressed: _busy ? null : _cancel,
                                 child: const Text('Cancel')),
-                            FilledButton(
+                            if (widget.destructive)
+                              DangerButton(
                                 onPressed:
                                     _busy || !widget.valid ? null : _submit,
-                                child: _busy
-                                    ? const SizedBox(
-                                        width: 18,
-                                        height: 18,
-                                        child: CircularProgressIndicator(
-                                            strokeWidth: 2))
-                                    : Text(widget.submitLabel)),
+                                child: _submitContent,
+                              )
+                            else
+                              FilledButton(
+                                onPressed:
+                                    _busy || !widget.valid ? null : _submit,
+                                child: _submitContent,
+                              ),
                           ]),
                     ),
                   ]),

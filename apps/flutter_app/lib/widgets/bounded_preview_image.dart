@@ -1,3 +1,4 @@
+import 'dart:typed_data';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../services/preview_image_loader.dart';
@@ -5,12 +6,14 @@ import '../services/preview_image_loader.dart';
 class BoundedPreviewImage extends StatefulWidget {
   const BoundedPreviewImage(
       {super.key,
-      required this.url,
+      this.url,
+      this.bytes,
       this.etag,
       this.expanded = false,
       this.loader,
       this.maximumMegapixels = 32});
-  final String url;
+  final String? url;
+  final Uint8List? bytes;
   final String? etag;
   final bool expanded;
   final PreviewImageLoader? loader;
@@ -24,8 +27,10 @@ class _BoundedPreviewImageState extends State<BoundedPreviewImage> {
   late Future<PreviewImageData> _image;
   void _load() {
     _loader = widget.loader ?? PreviewImageLoader();
-    _image = _loader.load(widget.url,
-        etag: widget.etag, cache: widget.loader == null);
+    _image = widget.bytes != null
+        ? _loader.loadBytes(widget.bytes!)
+        : _loader.load(widget.url!,
+            etag: widget.etag, cache: widget.loader == null);
   }
 
   @override
@@ -37,7 +42,8 @@ class _BoundedPreviewImageState extends State<BoundedPreviewImage> {
   @override
   void didUpdateWidget(BoundedPreviewImage old) {
     super.didUpdateWidget(old);
-    if (old.url != widget.url ||
+    if (old.bytes != widget.bytes ||
+        old.url != widget.url ||
         old.etag != widget.etag ||
         old.loader != widget.loader) {
       if (old.loader == null) _loader.close();
@@ -47,6 +53,7 @@ class _BoundedPreviewImageState extends State<BoundedPreviewImage> {
 
   @override
   void dispose() {
+    if (widget.bytes != null) MemoryImage(widget.bytes!).evict();
     if (widget.loader == null) _loader.close();
     super.dispose();
   }

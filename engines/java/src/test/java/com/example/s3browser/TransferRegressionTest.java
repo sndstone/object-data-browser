@@ -15,7 +15,10 @@ public final class TransferRegressionTest {
         replaceAndDirectories();
         symlinks();
         ResourceRegressionTest.run();
+        EngineLimitsRegressionTest.run();
+        TimeoutRegressionTest.run();
         ReviewRegressionTest.run();
+        EncryptionRegressionTest.run();
         System.out.println("Transfer regression checks passed (multipart limits, publication, bounded tasks, source snapshots, range retries, cleanup).");
     }
 

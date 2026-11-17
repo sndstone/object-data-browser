@@ -35,6 +35,7 @@ class AppSelectField<T> extends StatefulWidget {
     this.decoration,
     this.style,
     this.isExpanded = true,
+    this.wrapSelectedText = true,
     this.menuMaxHeight = 320,
   });
 
@@ -47,6 +48,9 @@ class AppSelectField<T> extends StatefulWidget {
   final InputDecoration? decoration;
   final TextStyle? style;
   final bool isExpanded;
+
+  /// Header selectors may shorten user data; the full value has a tooltip.
+  final bool wrapSelectedText;
   final double menuMaxHeight;
 
   @override
@@ -55,7 +59,29 @@ class AppSelectField<T> extends StatefulWidget {
 
 class _AppSelectFieldState<T> extends State<AppSelectField<T>>
     with SingleTickerProviderStateMixin, WidgetsBindingObserver {
-  double get _itemHeight => AppMenuStyle.rowHeight(context);
+  double get _itemHeight {
+    var height = AppMenuStyle.rowHeight(context);
+    if (_menuWidth <= 0) return height;
+    for (final item in widget.items) {
+      final available = _menuWidth - 24 - (item.icon == null ? 0 : 24) - 24;
+      if (available <= 0) continue;
+      final painter = TextPainter(
+        text: TextSpan(
+          text: item.label,
+          style: Theme.of(context)
+              .textTheme
+              .bodyMedium
+              ?.copyWith(fontWeight: FontWeight.w700),
+        ),
+        textDirection: Directionality.of(context),
+        textScaler: MediaQuery.textScalerOf(context),
+      )..layout(maxWidth: available);
+      if (painter.height + 16 > height) height = painter.height + 16;
+      painter.dispose();
+    }
+    return height;
+  }
+
   static const double _menuVerticalPadding = AppMenuStyle.verticalPadding;
   static const double _anchorGap = AppMenuStyle.anchorGap;
 
@@ -399,6 +425,8 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
         decoration: baseDecoration,
         style: widget.style ?? theme.textTheme.bodyMedium,
         isExpanded: widget.isExpanded,
+        isDense: false,
+        itemHeight: null,
         menuMaxHeight: widget.menuMaxHeight,
         dropdownColor: theme.colorScheme.surface,
         borderRadius: BorderRadius.circular(AppMenuStyle.radius),
@@ -406,9 +434,15 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
         // open menu.
         selectedItemBuilder: (context) => widget.items
             .map((item) => Align(
+                  heightFactor: 1,
                   alignment: AlignmentDirectional.centerStart,
-                  child: Text(item.label,
-                      maxLines: 1, overflow: TextOverflow.ellipsis),
+                  child: Tooltip(
+                      message: item.label,
+                      child: Text(item.label,
+                          maxLines: widget.wrapSelectedText ? null : 1,
+                          overflow: widget.wrapSelectedText
+                              ? TextOverflow.visible
+                              : TextOverflow.ellipsis)),
                 ))
             .toList(growable: false),
       );
@@ -433,16 +467,21 @@ class _AppSelectFieldState<T> extends State<AppSelectField<T>>
             ?.copyWith(color: theme.colorScheme.onSurface);
     final valueText = selected == null
         ? const SizedBox.shrink()
-        : Text(
-            selected.label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: _enabled
-                ? textStyle
-                : textStyle?.copyWith(
-                    color: theme.colorScheme.onSurfaceVariant
-                        .withValues(alpha: 0.6),
-                  ),
+        : Tooltip(
+            message: selected.label,
+            child: Text(
+              selected.label,
+              maxLines: widget.wrapSelectedText ? null : 1,
+              overflow: widget.wrapSelectedText
+                  ? TextOverflow.visible
+                  : TextOverflow.ellipsis,
+              style: _enabled
+                  ? textStyle
+                  : textStyle?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant
+                          .withValues(alpha: 0.6),
+                    ),
+            ),
           );
 
     return OverlayPortal(

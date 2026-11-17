@@ -3,6 +3,7 @@ part of 'mobile_storage_admin.dart';
 extension MobileStorageTools on MobileStorageAdmin {
   Future<Map<String, Object?>> runStoragePutTestData(
       EndpointProfile profile, Map<String, Object?> arguments) async {
+    objectEncryptionHeaders(profile, arguments['encryption']);
     final config =
         Map<String, Object?>.from(arguments['config'] as Map? ?? arguments);
     final bucket = '${config['bucketName'] ?? ''}',
@@ -47,6 +48,7 @@ extension MobileStorageTools on MobileStorageAdmin {
                       size,
                       (_, length) async =>
                           Uint8List(length)..fillRange(0, length, 65),
+                      encryption: arguments['encryption'],
                       streamReadBytes: 256 * 1024,
                       partBytes: partSize * 1024 * 1024);
                   success++;

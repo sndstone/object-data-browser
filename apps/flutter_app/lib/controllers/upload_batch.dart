@@ -1,3 +1,7 @@
+import '../services/client_encryption.dart';
+import '../services/crypto/age.dart';
+import '../services/vault_name_codec.dart';
+import '../services/diagnostic_safety.dart';
 import 'dart:io';
 import 'action_scope.dart';
 import '../services/listing_cancellation.dart';
@@ -10,7 +14,9 @@ import '../services/multipart_sizing.dart';
 /// without multiplying those workers by the selected file count.
 class UploadBatch {
   UploadBatch(
-      {required this.engine,
+      {this.encryption,
+      this.encodeName,
+      required this.engine,
       required this.engineId,
       required this.profile,
       required this.bucket,
@@ -21,6 +27,13 @@ class UploadBatch {
       required this.onUpdate,
       required this.onFile,
       required this.id});
+  final ObjectEncryption? encryption;
+  final Future<String> Function(ClientEncryptionRule, String)? encodeName;
+  final Map<String, String> _storedKeys = {};
+  final Set<String> _nameEncryptedPaths = {};
+  String storedKeyFor(String path) =>
+      _storedKeys[path] ??
+      '$prefix${objectKeys[path] ?? path.split(Platform.pathSeparator).last}';
   final EngineService engine;
   final String engineId, bucket, prefix, id;
   final EndpointProfile profile;
@@ -45,21 +58,77 @@ class UploadBatch {
   String? get childId => _child?.id;
 
   Future<void> prepare() async {
+    _storedKeys.clear();
+    _nameEncryptedPaths.clear();
     _sizes.clear();
     _chunks.clear();
     _totalBytes = 0;
     // Validate every file before causing any external mutation.
     for (final path in paths) {
-      final size = await File(path).length();
+      final name = objectKeys[path] ?? path.split(Platform.pathSeparator).last;
+      final key = '$prefix$name';
+      // Engines may read a name differently from how it is matched here.
+      if (vaultTargetIsAmbiguous(profile.clientEncryptionRules, bucket, key,
+          uploadPrefix: prefix, uploadName: name)) {
+        throw const FormatException(vaultAmbiguousTarget);
+      }
+      final rule = matchingClientEncryptionRule(
+        profile.clientEncryptionRules,
+        bucket,
+        key,
+      );
+      if (rule != null) {
+        if (rule.policy == ClientEncryptionPolicy.unsupported) {
+          throw const FormatException(vaultPolicyUnsupported);
+        }
+        if (rule.encryptsNames && encodeName == null) {
+          throw const FormatException(vaultNamesLocked);
+        }
+        if (rule.encryptsNames) _nameEncryptedPaths.add(path);
+        _storedKeys[path] = rule.encryptsNames
+            ? await encodeName!(rule,
+                objectKeys[path] ?? path.split(Platform.pathSeparator).last)
+            : validateStoredKey('$key.age');
+      } else {
+        _storedKeys[path] = validateStoredKey(key);
+      }
+      final int plaintextSize;
+      try {
+        plaintextSize = await File(path).length();
+      } catch (_) {
+        if (rule?.encryptsNames == true) {
+          throw const FormatException(
+              'Cannot read a file selected for this vault upload.');
+        }
+        rethrow;
+      }
+      // Measure a fresh header without retaining its key. The dispatched
+      // attempt creates its own fresh header, key and nonce.
+      final encryptedSizing = rule == null
+          ? null
+          : await withClientUpload(
+              rule,
+              (_, headerLength) async => (
+                    size: ageCiphertextLength(
+                        headerLength: headerLength,
+                        plaintextLength: plaintextSize),
+                    chunk: clientUploadPartSizeMiB(
+                        headerLength: headerLength,
+                        plaintextLength: plaintextSize,
+                        automatic: settings.dynamicMultipartSizing,
+                        manualMiB: settings.multipartChunkMiB)
+                  ));
+      final size = encryptedSizing?.size ?? plaintextSize;
       final automatic = MultipartSizing.recommendedPartSizeMiB(size);
-      final chunk = settings.dynamicMultipartSizing
-          ? automatic
-          : MultipartSizing.compliantManualPartSizeMiB(
-              settings.multipartChunkMiB);
+      final chunk = encryptedSizing?.chunk ??
+          (settings.dynamicMultipartSizing
+              ? automatic
+              : MultipartSizing.compliantManualPartSizeMiB(
+                  settings.multipartChunkMiB));
       if (MultipartSizing.partCount(fileSizeBytes: size, partSizeMiB: chunk) >
           MultipartSizing.maximumParts) {
         throw ArgumentError(
-            'Manual part size is too small for $path; enable automatic sizing or increase it.');
+            'Manual part size is too small; enable automatic sizing or increase it.');
       }
       _sizes.add(size);
       _totalBytes += size;
@@ -89,7 +158,7 @@ class UploadBatch {
         strategyLabel: 'Per-file upload · bounded part workers',
         currentItemLabel: _index < 0
             ? 'Preparing files'
-            : '${_index + 1}/${paths.length} · ${paths[_index].split(Platform.pathSeparator).last}',
+            : '${_index + 1}/${paths.length} · ${_nameEncryptedPaths.contains(paths[_index]) ? storedKeyFor(paths[_index]) : paths[_index].split(Platform.pathSeparator).last}',
         itemCount: paths.length,
         itemsCompleted: _completed,
         partSizeBytes: _child?.partSizeBytes,
@@ -107,6 +176,13 @@ class UploadBatch {
         ]);
   }
 
+  String _safeText(String text) =>
+      DiagnosticSafety.forNameEncryptedRequest(text, {
+        'objectKeyByPath': {
+          for (final path in _nameEncryptedPaths) path: _storedKeys[path]
+        }
+      }) as String;
+
   bool consume(TransferJob job) {
     if (_childIds.contains(job.id) && (!_dispatching || _child?.id != job.id)) {
       return true;
@@ -117,6 +193,12 @@ class UploadBatch {
       return false;
     }
     _childIds.add(job.id);
+    job = job.copyWith(
+        label: _safeText(job.label),
+        currentItemLabel: job.currentItemLabel == null
+            ? null
+            : _safeText(job.currentItemLabel!),
+        outputLines: job.outputLines.map(_safeText).toList());
     _child = job;
     // Multipart retries or control responses must not move aggregate bytes backwards.
     final bytes = job.bytesTransferred.clamp(0, _sizes[_index]);
@@ -141,18 +223,35 @@ class UploadBatch {
           null);
       onUpdate(_snapshot());
       try {
-        final result = await engine.startUpload(
-            engineId: engineId,
-            profile: profile,
-            bucketName: bucket,
-            prefix: prefix,
-            filePaths: [paths[i]],
-            objectKeyByPath: {
-              if (objectKeys.containsKey(paths[i]))
-                paths[i]: objectKeys[paths[i]]!
-            },
-            multipartThresholdMiB: settings.multipartThresholdMiB,
-            multipartChunkMiB: _chunks[i]);
+        Future<TransferJob> dispatch(
+          Map<String, Object?>? clientEncryption,
+        ) =>
+            engine.startUpload(
+              clientEncryption: clientEncryption,
+              encryption: encryption,
+              engineId: engineId,
+              profile: profile,
+              bucketName: bucket,
+              prefix: prefix,
+              filePaths: [paths[i]],
+              objectKeyByPath: {
+                if (clientEncryption != null ||
+                    objectKeys.containsKey(paths[i]))
+                  paths[i]: storedKeyFor(paths[i]).substring(prefix.length)
+              },
+              multipartThresholdMiB: settings.multipartThresholdMiB,
+              multipartChunkMiB: _chunks[i],
+            );
+        final key =
+            '$prefix${objectKeys[paths[i]] ?? paths[i].split(Platform.pathSeparator).last}';
+        final rule = matchingClientEncryptionRule(
+          profile.clientEncryptionRules,
+          bucket,
+          key,
+        );
+        final result = rule == null
+            ? await dispatch(null)
+            : await withClientUpload(rule, (payload, _) => dispatch(payload));
         consume(result);
         if (result.status == 'completed') {
           _completed++;
@@ -163,8 +262,8 @@ class UploadBatch {
         } else {
           _failed++;
           _failureMessage = result.outputLines.isEmpty
-              ? 'File upload did not complete: ${paths[i]}'
-              : result.outputLines.last;
+              ? 'File upload did not complete: ${storedKeyFor(paths[i])}'
+              : _safeText(result.outputLines.last);
           // A nonterminal response cannot authorize scheduling another file.
           if (!['failed', 'error'].contains(result.status)) {
             _cancelled = true;
@@ -176,7 +275,7 @@ class UploadBatch {
             result.status,
             result.outputLines.isEmpty
                 ? result.status
-                : result.outputLines.last,
+                : _safeText(result.outputLines.last),
             result);
       } on ListingCancelled {
         _cancelled = true;
@@ -191,8 +290,8 @@ class UploadBatch {
             _child);
       } catch (error) {
         _failed++;
-        _failureMessage = error.toString();
-        onFile(i, paths[i], 'failed', error.toString(), _child);
+        _failureMessage = _safeText(error.toString());
+        onFile(i, paths[i], 'failed', _failureMessage!, _child);
         // Unknown engine/process outcomes must stop the batch, not schedule
         // another request while an earlier upload might still be executing.
         _cancelled = true;

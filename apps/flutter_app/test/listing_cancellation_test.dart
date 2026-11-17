@@ -213,7 +213,7 @@ void main() {
       listenable: controller,
       builder: (_, __) => ObjectPanel(
           controller: controller,
-          onUpload: () {},
+          onUpload: (_) {},
           onDelete: () {},
           onCreatePrefix: () {},
           onInspector: () {},

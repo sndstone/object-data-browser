@@ -42,7 +42,9 @@ class ProgressEngine extends MockEngineService {
       required String destinationPath,
       String conflictPolicy = 'keepBoth',
       required int multipartThresholdMiB,
-      required int multipartChunkMiB}) async {
+      required int multipartChunkMiB,
+      Map<String, Object?>? clientEncryption,
+      ObjectEncryption? encryption}) async {
     requests.add((List.of(keys), destinationPath));
     return TransferJob(
         id: 'retry-${++attempts}',

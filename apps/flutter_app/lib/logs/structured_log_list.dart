@@ -14,6 +14,7 @@ class StructuredLogList extends StatefulWidget {
     required this.textScalePercent,
     required this.emptyMessage,
     this.embedded = false,
+    this.sliver = false,
     this.profileNames = const {},
   });
 
@@ -21,6 +22,9 @@ class StructuredLogList extends StatefulWidget {
   final int textScalePercent;
   final String emptyMessage;
   final bool embedded;
+
+  /// Contributes lazy rows to a surrounding CustomScrollView.
+  final bool sliver;
 
   /// Profile display names by ID, so context lines name the connection the
   /// user recognizes instead of its internal identifier.
@@ -50,56 +54,72 @@ class _StructuredLogListState extends State<StructuredLogList> {
   @override
   Widget build(BuildContext context) {
     final items = _itemsFor(widget.entries);
-    final scaledChild = MediaQuery(
+    Widget row(BuildContext context, int index) {
+      final item = items[index];
+      return _ProfileNames(
+        key: item.key,
+        names: widget.profileNames,
+        child: item.upload != null
+            ? _UploadBatchCard(entries: item.upload!)
+            : item.group != null
+                ? _ApiTraceCard(group: item.group!)
+                : _EventEntryCard(entry: item.entry!),
+      );
+    }
+
+    int? findIndex(Key key) {
+      final index = items.indexWhere((item) => item.key == key);
+      return index < 0 ? null : index;
+    }
+
+    final empty = widget.embedded || widget.sliver
+        ? Padding(
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            child: Row(children: [
+              Icon(Icons.receipt_long_outlined,
+                  size: 18,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant),
+              const SizedBox(width: 8),
+              Expanded(
+                  child: Text(widget.emptyMessage,
+                      style: Theme.of(context).textTheme.bodySmall)),
+            ]),
+          )
+        : EmptyState(
+            icon: Icons.manage_search_outlined, title: widget.emptyMessage);
+    return MediaQuery(
       data: MediaQuery.of(context).copyWith(
         textScaler: PreferenceTextScaler(
             MediaQuery.textScalerOf(context), widget.textScalePercent / 100),
       ),
-      child: items.isEmpty
-          ? widget.embedded
-              // Embedded lists sit inside another scroll view; keep the
-              // empty notice compact and left-aligned with surrounding text.
-              ? Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                  child: Row(children: [
-                    Icon(Icons.receipt_long_outlined,
-                        size: 18,
-                        color: Theme.of(context).colorScheme.onSurfaceVariant),
-                    const SizedBox(width: 8),
-                    Expanded(
-                        child: Text(widget.emptyMessage,
-                            style: Theme.of(context).textTheme.bodySmall)),
-                  ]),
+      child: widget.sliver
+          ? items.isEmpty
+              ? SliverToBoxAdapter(child: empty)
+              : SliverList(
+                  delegate: SliverChildBuilderDelegate(
+                    (context, index) => index.isOdd
+                        ? const Divider(height: 1)
+                        : row(context, index ~/ 2),
+                    childCount: items.length * 2 - 1,
+                    findChildIndexCallback: (key) {
+                      final index = findIndex(key);
+                      return index == null ? null : index * 2;
+                    },
+                  ),
                 )
-              : EmptyState(
-                  icon: Icons.manage_search_outlined,
-                  title: widget.emptyMessage)
-          : ListView.separated(
-              shrinkWrap: widget.embedded,
-              physics: widget.embedded
-                  ? const NeverScrollableScrollPhysics()
-                  : const AlwaysScrollableScrollPhysics(),
-              itemCount: items.length,
-              findItemIndexCallback: (key) {
-                final index = items.indexWhere((item) => item.key == key);
-                return index < 0 ? null : index;
-              },
-              separatorBuilder: (_, __) => const Divider(height: 1),
-              itemBuilder: (context, index) {
-                final item = items[index];
-                return _ProfileNames(
-                  key: item.key,
-                  names: widget.profileNames,
-                  child: item.upload != null
-                      ? _UploadBatchCard(entries: item.upload!)
-                      : item.group != null
-                          ? _ApiTraceCard(group: item.group!)
-                          : _EventEntryCard(entry: item.entry!),
-                );
-              },
-            ),
+          : items.isEmpty
+              ? empty
+              : ListView.separated(
+                  shrinkWrap: widget.embedded,
+                  physics: widget.embedded
+                      ? const NeverScrollableScrollPhysics()
+                      : const AlwaysScrollableScrollPhysics(),
+                  itemCount: items.length,
+                  findItemIndexCallback: findIndex,
+                  separatorBuilder: (_, __) => const Divider(height: 1),
+                  itemBuilder: row,
+                ),
     );
-    return scaledChild;
   }
 
   List<_StructuredLogItem> _buildItems(List<EventLogEntry> entries) {

@@ -34,8 +34,31 @@ class _ObjectPreviewDialogState extends State<ObjectPreviewDialog> {
   ObjectPreview get preview => widget.preview;
   ObjectEntry get object => widget.object;
   bool get _image => preview.kind == ObjectPreviewKind.image;
+  late final bool _encrypted;
+  late final String _visibleKey;
+  bool _keyLocked = false;
+  @override
+  void initState() {
+    super.initState();
+    _encrypted = widget.controller.isClientEncrypted(object);
+    _visibleKey = widget.controller.visibleObjectKey(object);
+    if (_encrypted) widget.controller.retainClientPreview(preview);
+    widget.controller.addListener(_onControllerChanged);
+  }
+
+  void _onControllerChanged() {
+    if (_encrypted &&
+        widget.controller.encryptionKeyStore?.isUnlocked != true &&
+        mounted) {
+      _htmlImages.close();
+      setState(() => _keyLocked = true);
+    }
+  }
+
   @override
   void dispose() {
+    widget.controller.removeListener(_onControllerChanged);
+    if (_encrypted) widget.controller.releaseClientPreview(preview);
     _htmlImages.close();
     _imageTransform.dispose();
     super.dispose();
@@ -43,6 +66,17 @@ class _ObjectPreviewDialogState extends State<ObjectPreviewDialog> {
 
   @override
   Widget build(BuildContext context) {
+    if (_keyLocked) {
+      return AlertDialog(
+          title: const Text('Key file locked'),
+          content:
+              const Text('Unlock the key file and open this preview again.'),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('Close'))
+          ]);
+    }
     final theme = Theme.of(context);
     final media = MediaQuery.sizeOf(context);
     final phone = media.width < 600;
@@ -64,7 +98,7 @@ class _ObjectPreviewDialogState extends State<ObjectPreviewDialog> {
                             Expanded(
                                 child: HoverCopyRegion(
                                     label: 'object key',
-                                    value: object.key,
+                                    value: _visibleKey,
                                     controller: widget.controller,
                                     builder: (context, copyAction) =>
                                         Row(children: [
@@ -80,15 +114,16 @@ class _ObjectPreviewDialogState extends State<ObjectPreviewDialog> {
                                                   crossAxisAlignment:
                                                       CrossAxisAlignment.start,
                                                   children: [
-                                                Text(object.name,
+                                                Text(
+                                                    _visibleKey.split('/').last,
                                                     style: theme
                                                         .textTheme.titleMedium,
                                                     maxLines: 2,
                                                     overflow:
                                                         TextOverflow.ellipsis),
                                                 Tooltip(
-                                                    message: object.key,
-                                                    child: Text(object.key,
+                                                    message: _visibleKey,
+                                                    child: Text(_visibleKey,
                                                         maxLines: 2,
                                                         overflow: TextOverflow
                                                             .ellipsis,
@@ -243,10 +278,11 @@ class _ObjectPreviewDialogState extends State<ObjectPreviewDialog> {
                     minScale: .5,
                     maxScale: 5,
                     child: Center(
-                        child: preview.url == null
+                        child: preview.url == null && preview.bytes == null
                             ? const Text('Image unavailable.')
                             : BoundedPreviewImage(
-                                url: preview.url!,
+                                url: preview.url,
+                                bytes: preview.bytes,
                                 etag: object.etag,
                                 expanded: true,
                                 maximumMegapixels: widget.controller.settings
@@ -274,7 +310,7 @@ class _ObjectPreviewDialogState extends State<ObjectPreviewDialog> {
                 ])),
       ]);
     }
-    final canRender = isHtmlPreview(object.key, preview.contentType);
+    final canRender = isHtmlPreview(_visibleKey, preview.contentType);
     return HoverCopyRegion(
         label: 'loaded text',
         value: preview.text ?? '',
@@ -306,7 +342,9 @@ class _ObjectPreviewDialogState extends State<ObjectPreviewDialog> {
                                         : 'Render page')))
                             : Text(
                                 sourcePreviewLanguage(
-                                            object.key, preview.contentType)
+                                            widget.controller
+                                                .visibleObjectKey(object),
+                                            preview.contentType)
                                         ?.toUpperCase() ??
                                     'Text',
                                 style: Theme.of(context).textTheme.bodySmall)),
@@ -330,7 +368,7 @@ class _ObjectPreviewDialogState extends State<ObjectPreviewDialog> {
                           : PreviewSourceView(
                               key: const ValueKey('expanded-source-preview'),
                               source: preview.text ?? '',
-                              objectKey: object.key,
+                              objectKey: _visibleKey,
                               contentType: preview.contentType))),
             ]));
   }
@@ -353,7 +391,9 @@ class _ObjectPreviewDialogState extends State<ObjectPreviewDialog> {
                           BoundedHtmlImageFactory(_htmlImages),
                       key: const ValueKey('rendered-html-page'),
                       textStyle: const TextStyle(color: Colors.black),
-                      baseUrl: Uri.tryParse(preview.url ?? '')?.resolve('.'),
+                      baseUrl: _encrypted
+                          ? null
+                          : Uri.tryParse(preview.url ?? '')?.resolve('.'),
                       onTapUrl: (_) async => true)))));
 
   Widget _limitNotice(BuildContext context) => Container(

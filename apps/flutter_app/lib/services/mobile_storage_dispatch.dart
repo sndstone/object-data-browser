@@ -26,14 +26,40 @@ extension MobileStorageDispatch on MobileStorageAdmin {
       String method, Map<String, Object?> params) async {
     final profile = EndpointProfile.fromJson(
         Map<String, Object?>.from(params['profile'] as Map));
+    if (profile.endpointType.isGoogleCloudStorage) {
+      throw const EngineException(
+        code: ErrorCode.unsupportedFeature,
+        message:
+            'Google Cloud Storage profiles are available on desktop in this version',
+      );
+    }
     final http = client(profile), bucket = '${params['bucketName'] ?? ''}';
     if (method == 'runDeleteAll') return runStorageTool(profile, params);
     if (method == 'runPutTestData') {
       return runStoragePutTestData(profile, params);
     }
+    if (params['clientEncryption'] != null) {
+      final upload = method == 'startUpload';
+      final items = params[upload ? 'filePaths' : 'keys'];
+      if ((!upload && method != 'startDownload') ||
+          items is! List ||
+          items.length != 1) {
+        MobileStorageAdmin._invalid(
+            'Client encryption requires exactly one file or key.');
+      }
+      MobileClientEncryption.parse(params['clientEncryption'], upload: upload)
+          ?.dispose();
+    }
     if (method == 'getCapabilities') {
       return {
         'items': [
+          {
+            'key': 'object.clientEncryption',
+            'label': 'Client-side encryption',
+            'state': 'supported',
+            'formats': ['age-v1'],
+            'reason': 'Provider REST adapter',
+          },
           for (final key in [
             'storage.admin',
             'bucket.browse',
@@ -47,18 +73,25 @@ extension MobileStorageDispatch on MobileStorageAdmin {
             'transfers',
             'bucket.lifecycle',
             'bucket.encryption',
-            'object.presign'
+            'object.presign',
+            for (final mode in ObjectEncryptionMode.values)
+              if (mode != ObjectEncryptionMode.bucketDefault)
+                'object.encryption.${mode.wireName}',
           ])
             {
               'key': key,
               'label': key,
-              'state': http.azure &&
-                      ({'bucket.lifecycle', 'bucket.encryption'}
-                              .contains(key) ||
-                          (key == 'object.presign' &&
-                              profile.connection.authMode == 'azureSas'))
-                  ? 'unsupported'
-                  : 'supported',
+              'state': key.startsWith('object.encryption.')
+                  ? (key.startsWith('object.encryption.azure-') == http.azure
+                      ? 'supported'
+                      : 'unsupported')
+                  : http.azure &&
+                          ({'bucket.lifecycle', 'bucket.encryption'}
+                                  .contains(key) ||
+                              (key == 'object.presign' &&
+                                  profile.connection.authMode == 'azureSas'))
+                      ? 'unsupported'
+                      : 'supported',
               'reason': 'Provider REST adapter'
             }
         ]
@@ -242,8 +275,12 @@ extension MobileStorageDispatch on MobileStorageAdmin {
         });
       case 'createFolder':
         final key = '${params['key'] ?? params['prefix'] ?? ''}';
-        await http.request('PUT', bucket,
-            key: key.endsWith('/') ? key : '$key/');
+        await http.request(
+          'PUT',
+          bucket,
+          key: key.endsWith('/') ? key : '$key/',
+          headers: objectEncryptionHeaders(profile, params['encryption']),
+        );
         return {'created': true};
       case 'deleteObjects':
       case 'deleteObjectVersions':

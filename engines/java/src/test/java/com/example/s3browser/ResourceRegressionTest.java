@@ -10,12 +10,17 @@ import java.nio.file.attribute.FileTime;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Fault injection for bounded dispatch, retry isolation, source identity and cleanup. */
 final class ResourceRegressionTest {
     static void run() throws Exception {
         boundedDispatch();
         failureCancelsPending();
+        cancellationDrainsCallable();
+        queuedCancellationDoesNotWaitForExecution();
+        putTestDataUsesBoundedDispatch();
         sourceSnapshots();
         rangeRetries();
         multipartCleanup();
@@ -66,6 +71,100 @@ final class ResourceRegressionTest {
             }
             check(cancelled.await(2, TimeUnit.SECONDS), "Outstanding worker interrupted on failure");
         } finally { executor.shutdownNow(); }
+    }
+
+    private static void cancellationDrainsCallable() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        CountDownLatch started = new CountDownLatch(1), interrupted = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1), closed = new CountDownLatch(1);
+        AtomicBoolean exited = new AtomicBoolean(), interruptRestored = new AtomicBoolean();
+        var tasks = new BoundedTasks<Void>(executor, 1, ignored -> {});
+        Thread closer = new Thread(() -> {
+            Thread.currentThread().interrupt();
+            tasks.close();
+            interruptRestored.set(Thread.currentThread().isInterrupted());
+            closed.countDown();
+        });
+        try {
+            tasks.submit(() -> {
+                started.countDown();
+                try { new CountDownLatch(1).await(); }
+                catch (InterruptedException expected) {
+                    interrupted.countDown();
+                    release.await(); // Simulate a response body taking time to unwind.
+                } finally { exited.set(true); }
+                return null;
+            });
+            check(started.await(2, TimeUnit.SECONDS), "Worker started");
+            closer.start();
+            check(interrupted.await(2, TimeUnit.SECONDS), "Cancellation reached callable");
+            check(!closed.await(100, TimeUnit.MILLISECONDS), "Close waits beyond Future cancellation");
+            release.countDown();
+            check(closed.await(2, TimeUnit.SECONDS) && exited.get(), "Close drains actual callable exit");
+            check(interruptRestored.get(), "Interrupted owner still drains and retains interrupt status");
+        } finally {
+            release.countDown();
+            closer.join(2000);
+            BoundedTasks.shutdownAndAwait(executor);
+        }
+    }
+
+    private static void queuedCancellationDoesNotWaitForExecution() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        CountDownLatch started = new CountDownLatch(1);
+        AtomicInteger queuedCalls = new AtomicInteger();
+        try (BoundedTasks<Void> tasks = new BoundedTasks<>(executor, 2, ignored -> {})) {
+            tasks.submit(() -> { started.countDown(); new CountDownLatch(1).await(); return null; });
+            check(started.await(2, TimeUnit.SECONDS), "First callable owns executor thread");
+            tasks.submit(() -> { queuedCalls.incrementAndGet(); return null; });
+        } finally { BoundedTasks.shutdownAndAwait(executor); }
+        check(queuedCalls.get() == 0, "Cancelled queued callable never starts or delays drain");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void putTestDataUsesBoundedDispatch() throws Exception {
+        var json = new com.fasterxml.jackson.databind.ObjectMapper();
+        var params = json.createObjectNode();
+        var profileNode = params.putObject("profile").put("endpointUrl", "http://bounded-put.invalid")
+            .put("accessKey", "fixture").put("secretKey", "fixture");
+        params.putObject("config").put("bucketName", "bucket").put("threads", 2)
+            .put("objectCount", Integer.MAX_VALUE).put("objectSizeBytes", 1);
+        var parse = Main.class.getDeclaredMethod("parseProfile", com.fasterxml.jackson.databind.JsonNode.class);
+        parse.setAccessible(true);
+        Object profile = parse.invoke(null, profileNode);
+        var field = Main.class.getDeclaredField("CLIENTS");
+        field.setAccessible(true);
+        Map<Object, S3Client> clients = (Map<Object, S3Client>) field.get(null);
+        var run = Main.class.getDeclaredMethod("runPutTestData", com.fasterxml.jackson.databind.JsonNode.class);
+        run.setAccessible(true);
+        CountDownLatch started = new CountDownLatch(2);
+        AtomicInteger calls = new AtomicInteger(), active = new AtomicInteger();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        S3Client fixture = (S3Client) java.lang.reflect.Proxy.newProxyInstance(S3Client.class.getClassLoader(),
+            new Class<?>[] {S3Client.class}, (proxy, method, args) -> {
+                if (method.getName().equals("putObject")) {
+                    calls.incrementAndGet(); active.incrementAndGet(); started.countDown();
+                    try { new CountDownLatch(1).await(); }
+                    finally { active.decrementAndGet(); }
+                }
+                return null;
+            });
+        Thread owner = new Thread(() -> {
+            try { run.invoke(null, params); }
+            catch (Throwable error) { failure.set(error); }
+        });
+        synchronized (Main.class) { clients.put(profile, fixture); }
+        try {
+            owner.start();
+            check(started.await(2, TimeUnit.SECONDS), "Huge logical object count dispatches without allocating all futures");
+            owner.interrupt();
+            owner.join(2000);
+            check(!owner.isAlive() && failure.get() == null, "Tool owner settles after interruption");
+            check(active.get() == 0 && calls.get() == 2, "Tool drains its bounded window before returning");
+        } finally {
+            owner.interrupt(); owner.join(2000);
+            synchronized (Main.class) { clients.remove(profile); }
+        }
     }
 
     private static void sourceSnapshots() throws Exception {

@@ -1,3 +1,4 @@
+import '../widgets/controller_content_frame.dart';
 import 'benchmark_metrics.dart';
 import 'operation_mix_bar.dart';
 import 'dart:io';
@@ -217,6 +218,11 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
 
   @override
   Widget build(BuildContext context) {
+    if (!controller.profileCapability('benchmark')) {
+      return Center(
+        child: Text(controller.profileCapabilityReason('benchmark')),
+      );
+    }
     return LayoutBuilder(builder: (context, constraints) {
       final duration = AppMotion.duration(context,
           enabled: controller.settings.enableAnimations, milliseconds: 200);
@@ -1575,9 +1581,10 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
             heightFactor: 0.94,
             child: DefaultTabController(
               length: 3,
-              child: AnimatedBuilder(
-                animation: controller,
-                builder: (context, _) {
+              child: ControllerContentFrame(
+                controller: controller,
+                signature: () => (controller.settings, _liveBenchmarkRun(run)),
+                builder: (context) {
                   final liveRun = _liveBenchmarkRun(run);
                   final liveSummary =
                       controller.benchmarkSummaryForRun(liveRun);

@@ -244,7 +244,11 @@ function Ensure-Python {
     if (-not (Test-Path (Join-Path $PythonRoot "python.exe"))) {
         $Version = "3.12.10"
         $Archive = Join-Path $ToolCacheDir "python-embed-$Version.zip"
-        $PythonArch = if ($Arch -eq "arm64") { "arm64" } else { "amd64" }
+        # Always the x64 runtime. The Python engine's native dependencies
+        # (cryptography, google-crc32c) publish no Windows ARM64 wheels, and
+        # Windows 11 on ARM runs the x64 interpreter under emulation. The app
+        # and the Go, Rust and Java engines remain native on ARM64.
+        $PythonArch = "amd64"
         Download-File "https://www.python.org/ftp/python/$Version/python-$Version-embed-$PythonArch.zip" $Archive
         Remove-DirectoryIfExists $PythonRoot
         New-Item -ItemType Directory -Force -Path $PythonRoot | Out-Null
@@ -283,11 +287,13 @@ function Ensure-Rust {
         & $Installer -y --default-toolchain stable --no-modify-path
     }
 
-    if ($Arch -eq "arm64") {
-        $env:CARGO_HOME = Join-Path $ToolsDir "cargo"
-        $env:RUSTUP_HOME = Join-Path $ToolsDir "rustup"
-        & $Cargo target add aarch64-pc-windows-msvc
-    }
+    # Add the requested target explicitly. On Windows ARM64 rustup installs
+    # the native aarch64 toolchain even from the x86_64 installer, so an x64
+    # build there has no x86_64 standard library until it is added.
+    $env:CARGO_HOME = Join-Path $ToolsDir "cargo"
+    $env:RUSTUP_HOME = Join-Path $ToolsDir "rustup"
+    $RustTarget = if ($Arch -eq "arm64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
+    & (Join-Path $ToolsDir "cargo\bin\rustup.exe") target add $RustTarget
 }
 
 function Ensure-Wix {

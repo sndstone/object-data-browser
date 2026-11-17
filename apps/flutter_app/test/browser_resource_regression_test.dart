@@ -54,7 +54,8 @@ class ResourceEngine extends MockEngineService {
       {required String engineId,
       required EndpointProfile profile,
       required String bucketName,
-      required String key}) async {
+      required String key,
+      ObjectEncryption? encryption}) async {
     if (key == 'a.bin' && firstDetails != null) return firstDetails!.future;
     return details(key);
   }
@@ -95,7 +96,8 @@ class ResourceEngine extends MockEngineService {
           required EndpointProfile profile,
           required String bucketName,
           required String key,
-          required Duration expiration}) async =>
+          required Duration expiration,
+          ObjectEncryption? encryption}) async =>
       previewUrl!;
 }
 

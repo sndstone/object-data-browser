@@ -1,0 +1,21 @@
+{
+  "measurement": "allocated installed KiB; local build samples, not runtime benchmarks",
+  "baselineAppKiB": 1072248,
+  "newAppKiB": 387308,
+  "baselineEnginesKiB": {
+    "python": 633912,
+    "java": 361128,
+    "go": 13236,
+    "rust": 23720
+  },
+  "newEnginesKiB": {
+    "python": 181608,
+    "java": 143320,
+    "go": 13252,
+    "rust": 16720
+  },
+  "dmgBytes": 163048943,
+  "architecture": "arm64",
+  "developmentMinimumMacOS": "12.0",
+  "projectMinimumOSPolicyChanged": false
+}

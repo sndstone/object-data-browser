@@ -10,8 +10,14 @@ final class MultipartUploadSession implements AutoCloseable {
     private final String bucket, key;
     final String uploadId;
     private boolean committed, uncertain;
+    private final ObjectEncryption encryption;
 
     MultipartUploadSession(S3Client client, String bucket, String key, String uploadId) {
+        this(client, bucket, key, uploadId, null);
+    }
+
+    MultipartUploadSession(S3Client client, String bucket, String key, String uploadId, ObjectEncryption encryption) {
+        this.encryption = encryption;
         if (uploadId == null || uploadId.isBlank()) throw new IllegalStateException("Multipart upload returned no ID.");
         this.client = client;
         this.bucket = bucket;
@@ -21,8 +27,10 @@ final class MultipartUploadSession implements AutoCloseable {
 
     CompleteMultipartUploadResponse complete(CompletedMultipartUpload parts) {
         try {
-            var result = client.completeMultipartUpload(CompleteMultipartUploadRequest.builder()
-                .bucket(bucket).key(key).uploadId(uploadId).multipartUpload(parts).build());
+            var request = CompleteMultipartUploadRequest.builder()
+                .bucket(bucket).key(key).uploadId(uploadId).multipartUpload(parts);
+            if (encryption != null) encryption.read(request);
+            var result = client.completeMultipartUpload(request.build());
             committed = true;
             return result;
         } catch (SdkClientException error) {

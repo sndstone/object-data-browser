@@ -1,3 +1,5 @@
+import 'google_cloud_storage_fixture.dart'
+    show googleProfile, dummyServiceAccountJson;
 import 'dart:convert';
 import 'dart:io';
 
@@ -181,6 +183,61 @@ const _profile = EndpointProfile(
 );
 
 void main() {
+  test(
+      'Cloud Storage JSON key round trips only through the unchanged secure bundle',
+      () async {
+    final tempDir = await Directory.systemTemp.createTemp('app-state-gcs');
+    addTearDown(() => tempDir.delete(recursive: true));
+    final store = RecordingProfileSecretStore({});
+    final repository = LocalAppStateRepository(
+        secretStore: store,
+        applicationSupportDirectoryProvider: () async => tempDir);
+    final profile = googleProfile();
+    await repository.saveState(
+        settings: _settings,
+        profiles: [profile],
+        selectedProfileId: profile.id);
+    expect(store.writeCalls, ['profiles.credentials.v2']);
+    final bundle = jsonDecode(store.values['profiles.credentials.v2']!) as Map;
+    expect(bundle['version'], 2);
+    final credentials = (bundle['profiles'] as Map)[profile.id] as Map;
+    expect(
+        credentials.keys.toSet(), {'accessKey', 'secretKey', 'sessionToken'});
+    expect(credentials['secretKey'], dummyServiceAccountJson());
+    expect(credentials['accessKey'], profile.accessKey);
+    final metadata =
+        await File('${tempDir.path}/object-data-browser-state.json')
+            .readAsString();
+    final exported = await repository.exportProfiles(
+        profiles: [profile], path: '${tempDir.path}/profiles.json');
+    for (final text in [metadata, await exported.readAsString()]) {
+      expect(text, contains('googleCloudStorage'));
+      // Exports keep the credential field names with blank values, so the
+      // check is on the values themselves.
+      for (final secret in [
+        profile.accessKey,
+        'private_key',
+        'dummy',
+        'throwaway-project'
+      ]) {
+        expect(text, isNot(contains(secret)), reason: secret);
+      }
+    }
+    final loaded = await repository.loadState();
+    expect(loaded!.profiles.single, profile);
+    final imported = await repository.importProfiles(exported.path);
+    expect(imported.single.secretKey, isEmpty);
+    expect(imported.single.accessKey, isEmpty);
+    expect(
+        imported.single.endpointType, EndpointProfileType.googleCloudStorage);
+    store.resetCalls();
+    await repository.saveState(
+        settings: _settings,
+        profiles: [profile.copyWith(name: 'Renamed')],
+        selectedProfileId: profile.id);
+    expect(store.writeCalls, isEmpty);
+  });
+
   test('queued saves snapshot profiles before the caller mutates its list',
       () async {
     final tempDir = await Directory.systemTemp.createTemp('app-state-snapshot');

@@ -158,7 +158,7 @@ final class IosEngine {
       "id": id,
       "label": label,
       "language": language,
-      "version": "2.3.5",
+      "version": "2.4.0",
       "available": true,
       "notes": "iOS adapter backed by the official AWS SDK for Swift.",
     ]
@@ -167,7 +167,7 @@ final class IosEngine {
   private func health(engineID: String) -> [String: Any] {
     [
       "engine": engineID,
-      "version": "2.3.5",
+      "version": "2.4.0",
       "available": true,
       "adapter": "ios-aws-swift",
     ]

@@ -125,8 +125,14 @@ class AppRulerSlider extends StatelessWidget {
         ),
         const SizedBox(height: 4),
         SizedBox(
-          // Tick marks (8px) + gap + one line of 12px labels.
-          height: 26,
+          // Tick marks and a themed, accessibility-scaled label.
+          height: math.max(
+            26,
+            10 +
+                MediaQuery.textScalerOf(context)
+                        .scale(theme.textTheme.labelSmall!.fontSize!) *
+                    1.4,
+          ),
           child: CustomPaint(
             painter: _RulerPainter(
               min: min,
@@ -138,8 +144,8 @@ class AppRulerSlider extends StatelessWidget {
               tick: theme.colorScheme.outline,
               major: theme.colorScheme.onSurfaceVariant,
               active: theme.colorScheme.primary,
+              textScaler: MediaQuery.textScalerOf(context),
               textStyle: theme.textTheme.labelSmall!.copyWith(
-                fontSize: 12,
                 height: 1.2,
                 fontWeight: FontWeight.w600,
                 fontFeatures: const [FontFeature.tabularFigures()],
@@ -164,6 +170,7 @@ class _RulerPainter extends CustomPainter {
     required this.major,
     required this.active,
     required this.textStyle,
+    required this.textScaler,
   });
 
   final double min, max, value;
@@ -172,6 +179,7 @@ class _RulerPainter extends CustomPainter {
   final String Function(double) format;
   final Color tick, major, active;
   final TextStyle textStyle;
+  final TextScaler textScaler;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -179,8 +187,7 @@ class _RulerPainter extends CustomPainter {
     for (var i = 0; i <= divisions; i++) {
       final v = min + i * step;
       final x = size.width * i / divisions;
-      final isMajor =
-          i == 0 ||
+      final isMajor = i == 0 ||
           i == divisions ||
           (defaultValue != null && (v - defaultValue!).abs() < step / 2);
       final paint = Paint()
@@ -194,13 +201,15 @@ class _RulerPainter extends CustomPainter {
             style: textStyle.copyWith(color: major),
           ),
           textDirection: TextDirection.ltr,
+          textScaler: textScaler,
         )..layout();
         final dx = i == 0
             ? 0.0
             : i == divisions
-            ? x - painter.width
-            : x - painter.width / 2;
+                ? x - painter.width
+                : x - painter.width / 2;
         painter.paint(canvas, Offset(dx, 10));
+        painter.dispose();
       }
     }
   }
@@ -213,7 +222,9 @@ class _RulerPainter extends CustomPainter {
       old.divisions != divisions ||
       old.defaultValue != defaultValue ||
       old.active != active ||
-      old.tick != tick;
+      old.tick != tick ||
+      old.textStyle != textStyle ||
+      old.textScaler != textScaler;
 }
 
 /// A stepped value picker where every allowed value is a block. The current
@@ -282,15 +293,12 @@ class _AppStepBlocksState extends State<AppStepBlocks> {
         final width = constraints.maxWidth;
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
-          onTapDown: _enabled
-              ? (d) => _fromPosition(d.localPosition.dx, width)
-              : null,
-          onHorizontalDragStart: _enabled
-              ? (d) => _fromPosition(d.localPosition.dx, width)
-              : null,
-          onHorizontalDragUpdate: _enabled
-              ? (d) => _fromPosition(d.localPosition.dx, width)
-              : null,
+          onTapDown:
+              _enabled ? (d) => _fromPosition(d.localPosition.dx, width) : null,
+          onHorizontalDragStart:
+              _enabled ? (d) => _fromPosition(d.localPosition.dx, width) : null,
+          onHorizontalDragUpdate:
+              _enabled ? (d) => _fromPosition(d.localPosition.dx, width) : null,
           child: SizedBox(
             height: 24,
             child: Row(
@@ -304,12 +312,12 @@ class _AppStepBlocksState extends State<AppStepBlocks> {
                         color: i == current
                             ? scheme.primary
                             : i < current
-                            ? Color.lerp(
-                                scheme.primaryContainer,
-                                scheme.primary,
-                                0.7,
-                              )
-                            : scheme.outlineVariant,
+                                ? Color.lerp(
+                                    scheme.primaryContainer,
+                                    scheme.primary,
+                                    0.7,
+                                  )
+                                : scheme.outlineVariant,
                         borderRadius: BorderRadius.horizontal(
                           left: Radius.circular(i == 0 ? 6 : 3),
                           right: Radius.circular(i == _count - 1 ? 6 : 3),
@@ -370,9 +378,8 @@ class _AppStepBlocksState extends State<AppStepBlocks> {
       onDecrease: _enabled && current > 0 ? () => _setIndex(current - 1) : null,
       child: FocusableActionDetector(
         enabled: _enabled,
-        mouseCursor: _enabled
-            ? SystemMouseCursors.click
-            : SystemMouseCursors.basic,
+        mouseCursor:
+            _enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
         onShowFocusHighlight: (value) => setState(() => _focused = value),
         shortcuts: const {
           SingleActivator(LogicalKeyboardKey.arrowRight): _StepIntent(1),
@@ -404,8 +411,12 @@ class _AppStepBlocksState extends State<AppStepBlocks> {
 
 class _StepIntent extends Intent {
   const _StepIntent(this.delta) : absolute = 0;
-  const _StepIntent.first() : delta = 0, absolute = -1;
-  const _StepIntent.last() : delta = 0, absolute = 1;
+  const _StepIntent.first()
+      : delta = 0,
+        absolute = -1;
+  const _StepIntent.last()
+      : delta = 0,
+        absolute = 1;
   final int delta;
   final int absolute;
 }
@@ -471,77 +482,90 @@ class AppSettingSlider extends StatelessWidget {
     );
     final control = switch (style) {
       AppSliderStyle.stepBlocks => AppStepBlocks(
-        value: clamped,
-        min: min,
-        max: max,
-        step: step,
-        defaultValue: defaultValue,
-        onChanged: onChanged,
-        semanticLabel: title,
-        formatValue: format,
-      ),
+          value: clamped,
+          min: min,
+          max: max,
+          step: step,
+          defaultValue: defaultValue,
+          onChanged: onChanged,
+          semanticLabel: title,
+          formatValue: format,
+        ),
       AppSliderStyle.ruler => AppRulerSlider(
-        value: clamped.toDouble(),
-        min: min.toDouble(),
-        max: max.toDouble(),
-        step: step.toDouble(),
-        defaultValue: defaultValue?.toDouble(),
-        semanticLabel: title,
-        formatLabel: (v) => format(v.round()),
-        onChanged: onChanged == null
-            ? null
-            : (v) => onChanged!(min + ((v - min) / step).round() * step),
-      ),
+          value: clamped.toDouble(),
+          min: min.toDouble(),
+          max: max.toDouble(),
+          step: step.toDouble(),
+          defaultValue: defaultValue?.toDouble(),
+          semanticLabel: title,
+          formatLabel: (v) => format(v.round()),
+          onChanged: onChanged == null
+              ? null
+              : (v) => onChanged!(min + ((v - min) / step).round() * step),
+        ),
     };
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 10),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(title, style: theme.textTheme.bodyLarge),
-                    if (subtitle != null) ...[
-                      const SizedBox(height: 2),
-                      Text(
-                        subtitle!,
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: scheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-              const SizedBox(width: 12),
-              Visibility(
-                visible: canReset,
-                maintainSize: true,
-                maintainAnimation: true,
-                maintainState: true,
-                child: TextButton(
-                  onPressed: canReset ? () => onChanged!(defaultValue!) : null,
-                  style: TextButton.styleFrom(
-                    minimumSize: const Size(0, 28),
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
-                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          LayoutBuilder(builder: (context, constraints) {
+            final scale = MediaQuery.textScalerOf(context).scale(14) / 14;
+            final actions = Wrap(
+              spacing: 4,
+              runSpacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                if (canReset)
+                  TextButton(
+                    onPressed: () => onChanged!(defaultValue!),
+                    style: TextButton.styleFrom(
+                      minimumSize: const Size(0, 28),
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    child: Text('Reset',
+                        semanticsLabel:
+                            'Reset $title to ${format(defaultValue ?? min)}'),
                   ),
-                  child: Text(
-                    'Reset',
-                    semanticsLabel:
-                        'Reset $title to ${format(defaultValue ?? min)}',
-                  ),
-                ),
+                chip,
+              ],
+            );
+            if (constraints.maxWidth < 420 * scale) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title, style: theme.textTheme.bodyLarge),
+                  const SizedBox(height: 8),
+                  actions,
+                ],
+              );
+            }
+            return Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(child: Text(title, style: theme.textTheme.bodyLarge)),
+                const SizedBox(width: 12),
+                actions,
+              ],
+            );
+          }),
+          if (subtitle != null) ...[
+            const SizedBox(height: 8),
+            Align(
+              alignment: AlignmentDirectional.centerStart,
+              child: ConstrainedBox(
+                // Roughly 72 characters, using the available card width first.
+                constraints: BoxConstraints(
+                    maxWidth: MediaQuery.textScalerOf(context)
+                            .scale(theme.textTheme.bodyMedium!.fontSize!) *
+                        36),
+                child: Text(subtitle!,
+                    style: theme.textTheme.bodyMedium
+                        ?.copyWith(color: scheme.onSurfaceVariant)),
               ),
-              const SizedBox(width: 4),
-              chip,
-            ],
-          ),
+            ),
+          ],
           const SizedBox(height: 12),
           control,
           if (style == AppSliderStyle.stepBlocks) ...[

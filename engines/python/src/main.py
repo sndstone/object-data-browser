@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import hmac
 import io
+import ipaddress
 import json
 import os
 import re
@@ -36,17 +37,76 @@ from typing import Any
 from urllib.parse import quote, urlparse, parse_qsl
 
 
-ENGINE_VERSION = "2.3.5"
+ENGINE_VERSION = "2.4.0"
 
 # Serialize every write to stdout so transferProgress events emitted from worker
 # threads never interleave with request/response lines.
 _STDOUT_LOCK = threading.Lock()
 _STDERR_LOCK = threading.Lock()
+_CUSTOMER_KEYS: dict[str, int] = {}
+_CUSTOMER_KEYS_LOCK = threading.RLock()
+
+
+def _is_customer_key(name):
+    return str(name).lower().replace('-', '').replace('_', '') in {
+        'customerkey', 'ssecustomerkey', 'copysourcessecustomerkey', 'filekey', 'filename',
+        'xamzserversideencryptioncustomerkey',
+        'xamzcopysourceserversideencryptioncustomerkey', 'xmsencryptionkey',
+        'privatekey', 'accesstoken', 'refreshtoken', 'assertion',
+        'signedurl', 'resumablesessionuri',
+    }
+
+
+def _redact_customer_text(value):
+    with _CUSTOMER_KEYS_LOCK:
+        for key in _CUSTOMER_KEYS:
+            value = value.replace(key, '[redacted]')
+    return value
+
+
+def _safe_diagnostics(value):
+    """Remove customer secrets at every output/persistence boundary."""
+    if isinstance(value, dict):
+        return {k: '[redacted]' if _is_customer_key(k) else _safe_diagnostics(v)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_safe_diagnostics(v) for v in value]
+    if isinstance(value, str):
+        return _redact_customer_text(value)
+    return value
+
+
+@contextmanager
+def _customer_key_scope(payload):
+    keys = set()
+    def collect(value):
+        if isinstance(value, dict):
+            for name, item in value.items():
+                if str(name).lower() == 'filename':
+                    # Hidden as a field only: the value is an ordinary word and
+                    # the published destination path contains it.
+                    continue
+                if _is_customer_key(name) and isinstance(item, str) and item:
+                    keys.add(item)
+                else:
+                    collect(item)
+        elif isinstance(value, list):
+            for item in value: collect(item)
+    collect(payload)
+    with _CUSTOMER_KEYS_LOCK:
+        for key in keys: _CUSTOMER_KEYS[key] = _CUSTOMER_KEYS.get(key, 0) + 1
+    try:
+        yield
+    finally:
+        with _CUSTOMER_KEYS_LOCK:
+            for key in keys:
+                _CUSTOMER_KEYS[key] -= 1
+                if not _CUSTOMER_KEYS[key]: del _CUSTOMER_KEYS[key]
 
 
 def _write_stdout_line(text: str) -> None:
     with _STDOUT_LOCK:
-        sys.stdout.write(text + "\n")
+        sys.stdout.write(_redact_customer_text(text) + "\n")
         sys.stdout.flush()
 
 
@@ -247,10 +307,11 @@ def _run_tool(fn, params):
 
 class SidecarError(Exception):
     def __init__(self, code: str, message: str, details: dict[str, Any] | None = None):
+        message = _redact_customer_text(message)
         super().__init__(message)
         self.code = code
         self.message = message
-        self.details = details or {}
+        self.details = _safe_diagnostics(details or {})
 
 
 @dataclass(frozen=True)
@@ -313,20 +374,26 @@ def _lazy_boto_imports():
 def _parse_profile(payload: dict[str, Any]) -> Profile:
     endpoint_url = str(payload.get("endpointUrl", "")).strip()
     endpoint_type = str(payload.get("endpointType", "")).strip() or "s3Compatible"
+    if endpoint_type not in {'s3Compatible', 'awsS3', 'azureBlob', 'googleCloudStorage'}:
+        raise SidecarError('invalid_config', 'Unknown endpoint type.')
     access_key = str(payload.get("accessKey", "")).strip()
     secret_key = str(payload.get("secretKey", "")).strip()
     region = str(payload.get("region", "")).strip() or "us-east-1"
+    if endpoint_type == 'googleCloudStorage':
+        region = str(payload.get('region') or '').strip()
 
     auth_mode = str(payload.get("authMode") or "static")
-    if endpoint_type != 'azureBlob' and payload.get('signerOverride') not in {None, '', 's3v4', 'AWS4SignerType', 'AWSS3V4SignerType'}:
+    if endpoint_type not in {'azureBlob', 'googleCloudStorage'} and payload.get('signerOverride') not in {None, '', 's3v4', 'AWS4SignerType', 'AWSS3V4SignerType'}:
         raise SidecarError('unsupported_feature', 'The Python engine requires Signature V4. Remove the legacy signer override.')
     if auth_mode not in {"static", "awsProfile", "awsDefault", "assumeRole", "azureSas", "azureDefault"}:
         raise SidecarError("invalid_config", "Unknown authentication mode.")
     if auth_mode == 'awsProfile' and not str(payload.get('awsProfileName') or '').strip():
         raise SidecarError('invalid_config', 'Select a named AWS profile for this authentication mode.')
-    if not endpoint_url and endpoint_type not in {"azureBlob", "awsS3"} and auth_mode == "static":
+    if endpoint_type == 'googleCloudStorage' and auth_mode != 'static':
+        raise SidecarError('invalid_config', 'Cloud Storage requires a service-account key file.')
+    if not endpoint_url and endpoint_type not in {"azureBlob", "awsS3", "googleCloudStorage"} and auth_mode == "static":
         raise SidecarError("invalid_config", "Endpoint URL is required.")
-    if auth_mode == "static" and (not access_key or not secret_key):
+    if auth_mode == "static" and endpoint_type != 'googleCloudStorage' and (not access_key or not secret_key):
         raise SidecarError("invalid_config", "Access key and secret key are required.")
 
     return Profile(
@@ -369,6 +436,8 @@ _CLIENT_CACHE_LOCK = threading.RLock()
 
 
 def _build_client(profile: Profile):
+    if profile.endpoint_type == 'googleCloudStorage':
+        raise SidecarError('unsupported_feature', 'Cloud Storage profiles require the native JSON API adapter.')
     with _CLIENT_CACHE_LOCK:
         cached = _CLIENT_CACHE.get(profile)
         if cached is not None:
@@ -492,7 +561,7 @@ def _emit_structured_log(level: str, category: str, message: str, source: str) -
         {
             "level": level,
             "category": category,
-            "message": message,
+            "message": _redact_customer_text(message),
             "source": source,
         },
         sort_keys=True,
@@ -501,14 +570,22 @@ def _emit_structured_log(level: str, category: str, message: str, source: str) -
         print(f"S3_BROWSER_LOG {payload}", file=sys.stderr, flush=True)
 
 
+def _sanitize_gcs_urls(value):
+    # A resumable session and a signed URL are bearer credentials. Preserve
+    # ordinary S3/Azure diagnostics while removing GCS authorization URLs.
+    return re.sub(r'https?://[^\s<>"\']+',
+        lambda match: '[redacted]' if any(name.lower() in {'x-goog-signature', 'upload_id'}
+            for name, _ in parse_qsl(urlparse(match[0]).query)) else match[0], str(value))
+
+
 def _sanitize_headers(headers: Any) -> dict[str, str]:
     sanitized: dict[str, str] = {}
     for key, value in dict(headers or {}).items():
         lower = str(key).lower()
-        if any(token in lower for token in ("authorization", "security-token", "access-key", "secret", "token")) or (lower in {'x-ms-copy-source', 'x-ms-rename-source'} and '?' in str(value)):
+        if _is_customer_key(key) or any(token in lower for token in ("authorization", "security-token", "access-key", "secret", "token")) or (lower in {'x-ms-copy-source', 'x-ms-rename-source'} and '?' in str(value)) or (lower == 'location' and ('upload_id=' in str(value) or 'X-Goog-' in str(value))):
             sanitized[str(key)] = "[redacted]"
             continue
-        sanitized[str(key)] = str(value)
+        sanitized[str(key)] = _sanitize_gcs_urls(value)
     return sanitized
 
 
@@ -527,13 +604,19 @@ def _summarize_http_body(content_type: str, body: Any) -> str:
         except UnicodeDecodeError:
             return "[omitted binary body]"
     else:
-        text = str(body)
-    text = text.strip()
+        text = str(_safe_diagnostics(body))
+    try:
+        decoded = json.loads(text)
+        if isinstance(decoded, (dict, list)):
+            text = json.dumps(_safe_diagnostics(decoded))
+    except (ValueError, TypeError):
+        pass
+    text = _sanitize_gcs_urls(_redact_customer_text(text)).strip()
     if not text:
         return "null"
     if len(text) > 16000:
         text = f"{text[:16000]}...(truncated)"
-    return text
+    return _redact_customer_text(text)
 
 
 def _log_http_send(profile: Profile, request: Any) -> None:
@@ -544,7 +627,7 @@ def _log_http_send(profile: Profile, request: Any) -> None:
     _emit_structured_log(
         "API",
         "HttpSend",
-        f"SEND {getattr(request, 'method', 'UNKNOWN')} {getattr(request, 'url', '')} HEADERS={json.dumps(headers, sort_keys=True)} BODY={body}",
+        f"SEND {getattr(request, 'method', 'UNKNOWN')} {_sanitize_gcs_urls(getattr(request, 'url', ''))} HEADERS={json.dumps(headers, sort_keys=True)} BODY={body}",
         "api",
     )
 
@@ -553,10 +636,15 @@ def _log_http_receive(profile: Profile, http_response: Any, parsed: Any, model: 
     if not profile.enable_api_logging:
         return
     headers = _sanitize_headers(getattr(http_response, "headers", {}))
-    body = _summarize_http_body(
-        headers.get("Content-Type", ""),
-        getattr(http_response, "content", None) or parsed,
-    )
+    if getattr(model, "has_streaming_output", False):
+        # AWSResponse.content consumes and buffers raw.stream(), including the
+        # body that botocore has already handed to the GetObject caller.
+        body = "[streaming body]"
+    else:
+        body = _summarize_http_body(
+            headers.get("Content-Type", ""),
+            getattr(http_response, "content", None) or parsed,
+        )
     operation = getattr(model, "name", "S3")
     _emit_structured_log(
         "API",
@@ -639,6 +727,24 @@ def _maybe_call(api_calls: list[dict[str, Any]], operation: str, fn, default: An
         raise
 
 
+def _encryption_hint(code, message, operation='', status=None, customer_write=False):
+    text = (code + ' ' + message).lower()
+    if ('kms.' in text or 'kms:' in text) and any(word in text for word in ('denied', 'access', 'permission')):
+        return 'kms_access_denied'
+    if ('kms.' in text or 'kms:' in text) and any(word in text for word in ('disabled', 'notfound', 'unavailable', 'invalidstate')):
+        return 'kms_key_unavailable'
+    if any(word in text for word in ('sse-c', 'customer', 'encryption key')):
+        if customer_write and any(word in text for word in ('blocked', 'prohibited', 'disabled')):
+            return 'sse_c_blocked'
+        if any(word in text for word in ('mismatch', 'incorrect', 'does not match')):
+            return 'sse_c_key_mismatch'
+        if any(word in text for word in ('required', 'missing', 'must provide')):
+            return 'sse_c_key_required'
+    if status == 400 and operation in {'HeadObject', 'GetObject'} and code in {'400', 'BadRequest'}:
+        return 'sse_c_key_required'
+    return None
+
+
 def _map_exception(error: Exception) -> SidecarError:
     if isinstance(error, SidecarError):
         return error
@@ -661,12 +767,16 @@ def _map_exception(error: Exception) -> SidecarError:
         code = str(error.response.get("Error", {}).get("Code", "Unknown"))
         status = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         message = str(error.response.get("Error", {}).get("Message", str(error)))
+        details = {"awsCode": code, "httpStatus": status}
+        hint = _encryption_hint(code, message, getattr(error, 'operation_name', ''), status,
+                                getattr(error, '_customer_encryption_write', False))
+        if hint: details['encryptionHint'] = hint
         if code in {"AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"}:
-            return SidecarError("auth_failed", message, {"awsCode": code, "httpStatus": status})
+            return SidecarError("auth_failed", message, details)
         if code in {"RequestTimeout", "SlowDown"}:
             mapped = "throttled" if code == "SlowDown" else "timeout"
-            return SidecarError(mapped, message, {"awsCode": code, "httpStatus": status})
-        return SidecarError("unknown", message, {"awsCode": code, "httpStatus": status})
+            return SidecarError(mapped, message, details)
+        return SidecarError("unknown", message, details)
 
     if isinstance(error, (connect_timeout_error, read_timeout_error, socket.timeout, TimeoutError)):
         return SidecarError("timeout", str(error))
@@ -678,6 +788,134 @@ def _map_exception(error: Exception) -> SidecarError:
         return SidecarError("engine_unavailable", str(error))
 
     return SidecarError("unknown", str(error))
+
+
+def _parse_object_encryption(value, profile, source=False):
+    """Validate once before issuing requests; never include field values in errors."""
+    if value is None: return {}
+    if profile.endpoint_type == 'googleCloudStorage':
+        raise SidecarError('invalid_config', 'Object encryption is not supported for Cloud Storage profiles.')
+    fields = {
+        'bucketDefault': set(), 'sse-s3': set(),
+        'sse-kms': {'kmsKeyId', 'kmsEncryptionContext', 'bucketKeyEnabled'},
+        'dsse-kms': {'kmsKeyId', 'kmsEncryptionContext'},
+        'sse-c': {'customerKey'}, 'azure-scope': {'encryptionScope'},
+        'azure-cpk': {'customerKey'},
+    }
+    if not isinstance(value, dict) or not isinstance(value.get('mode'), str) or value['mode'] not in fields:
+        raise SidecarError('invalid_config', 'Unknown object encryption mode.')
+    mode = value['mode']
+    if set(value) - fields[mode] - {'mode'}:
+        raise SidecarError('invalid_config', 'Object encryption contains fields not allowed for this mode.')
+    if mode == 'bucketDefault': return {}
+    if source and mode not in {'sse-c', 'azure-cpk'}:
+        raise SidecarError('invalid_config', 'Source encryption requires a customer-key mode.')
+    if mode.startswith('azure-') != (profile.endpoint_type == 'azureBlob'):
+        raise SidecarError('invalid_config', 'Object encryption mode does not match the profile provider.')
+    for field in ('kmsKeyId', 'encryptionScope'):
+        if field in value and not isinstance(value[field], str):
+            raise SidecarError('invalid_config', 'Object encryption identifiers must be strings.')
+    if mode == 'azure-scope' and not value.get('encryptionScope'):
+        raise SidecarError('invalid_config', 'An encryption scope is required.')
+    if 'bucketKeyEnabled' in value and not isinstance(value['bucketKeyEnabled'], bool):
+        raise SidecarError('invalid_config', 'The bucket-key flag must be a boolean.')
+    context = value.get('kmsEncryptionContext', {})
+    if not isinstance(context, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in context.items()):
+        raise SidecarError('invalid_config', 'The KMS encryption context must be a string map.')
+    if mode in {'sse-c', 'azure-cpk'}:
+        try:
+            key = base64.b64decode(value['customerKey'], validate=True)
+            if len(key) != 32: raise ValueError()
+        except (KeyError, ValueError, TypeError):
+            raise SidecarError('invalid_config', 'The customer key must be base64 of exactly 32 bytes.') from None
+        endpoint = urlparse(profile.endpoint_url or 'https://provider.invalid')
+        try: loopback = ipaddress.ip_address(endpoint.hostname or '').is_loopback
+        except ValueError: loopback = (endpoint.hostname or '').lower() == 'localhost'
+        if endpoint.scheme.lower() != 'https' and not loopback:
+            raise SidecarError('invalid_config', 'Customer-key encryption requires HTTPS or a loopback endpoint.')
+    return dict(value)
+
+
+def _s3_encryption_options(value, customer_only=False, source=False):
+    mode = value.get('mode')
+    if mode == 'sse-c':
+        key = value['customerKey']
+        prefix = 'CopySourceSSECustomer' if source else 'SSECustomer'
+        return {prefix + 'Algorithm': 'AES256', prefix + 'Key': key,
+                prefix + 'KeyMD5': base64.b64encode(hashlib.md5(base64.b64decode(key)).digest()).decode()}
+    if customer_only: return {}
+    if mode not in {'sse-s3', 'sse-kms', 'dsse-kms'}: return {}
+    result = {'ServerSideEncryption': {'sse-s3': 'AES256', 'sse-kms': 'aws:kms', 'dsse-kms': 'aws:kms:dsse'}[mode]}
+    for field, sdk in (('kmsKeyId', 'SSEKMSKeyId'), ('bucketKeyEnabled', 'BucketKeyEnabled')):
+        if field in value: result[sdk] = value[field]
+    if 'kmsEncryptionContext' in value:
+        result['SSEKMSEncryptionContext'] = base64.b64encode(json.dumps(value['kmsEncryptionContext'], ensure_ascii=False, separators=(',', ':')).encode()).decode()
+    return result
+
+
+def _azure_encryption_headers(value, read=False):
+    if value.get('mode') == 'azure-cpk':
+        key = value['customerKey']
+        return {'x-ms-encryption-key': key, 'x-ms-encryption-algorithm': 'AES256',
+                'x-ms-encryption-key-sha256': base64.b64encode(hashlib.sha256(base64.b64decode(key)).digest()).decode()}
+    if not read and value.get('mode') == 'azure-scope':
+        return {'x-ms-encryption-scope': value['encryptionScope']}
+    return {}
+
+
+class _ObjectEncryptionClient:
+    """Request-local facade: never mutate a cached client or its event handlers."""
+    def __init__(self, client, value, azure=False, copy_source=None, read_only=False):
+        self.client, self.value, self.azure = client, value, azure
+        self.copy_source, self.read_only = copy_source or {}, read_only
+
+    def __getattr__(self, name):
+        method = getattr(self.client, name)
+        if self.azure:
+            if name not in {'open', 'request'}: return method
+            def azure_call(verb, *args, **kwargs):
+                query = kwargs.get('query') or {}
+                if verb.upper() in {'HEAD', 'GET', 'PUT'} and query.get('comp') not in {'tags', 'metadata'}:
+                    read = verb.upper() != 'PUT' or self.read_only
+                    headers = _azure_encryption_headers(self.value, read=read)
+                    if headers: kwargs['headers'] = {**kwargs.get('headers', {}), **headers}
+                return method(verb, *args, **kwargs)
+            return azure_call
+        if name not in {'put_object', 'create_multipart_upload', 'upload_part', 'upload_part_copy',
+                        'copy_object', 'head_object', 'get_object', 'complete_multipart_upload'}:
+            return method
+        def s3_call(**kwargs):
+            customer_only = self.read_only or name in {'head_object', 'get_object', 'upload_part', 'upload_part_copy', 'complete_multipart_upload'}
+            kwargs.update(_s3_encryption_options(self.value, customer_only=customer_only))
+            if name in {'copy_object', 'upload_part_copy'}:
+                kwargs.update(_s3_encryption_options(self.copy_source, customer_only=True, source=True))
+            try:
+                return method(**kwargs)
+            except Exception as error:
+                if self.value.get('mode') == 'sse-c' and name not in {'head_object', 'get_object'}:
+                    error._customer_encryption_write = True
+                raise
+        return s3_call
+
+
+def _encrypted_client(client, profile, value, **kwargs):
+    if not value and not kwargs.get('copy_source'): return client
+    return _ObjectEncryptionClient(client, value, azure=profile.endpoint_type == 'azureBlob', **kwargs)
+
+
+def _reported_encryption(head, azure=False):
+    if azure:
+        head = {k.lower(): v for k, v in head.items()}
+        fields = {'x-ms-encryption-key-sha256': 'customerKeySha256', 'x-ms-encryption-scope': 'encryptionScope'}
+        result = {out: head[key] for key, out in fields.items() if head.get(key)}
+        if 'x-ms-server-encrypted' in head: result['serverEncrypted'] = str(head['x-ms-server-encrypted']).lower() == 'true'
+        mode = 'azure-cpk' if 'customerKeySha256' in result else 'azure-scope' if 'encryptionScope' in result else 'provider'
+    else:
+        fields = {'SSEKMSKeyId': 'kmsKeyId', 'BucketKeyEnabled': 'bucketKeyEnabled', 'SSECustomerKeyMD5': 'customerKeyMd5'}
+        result = {out: head[key] for key, out in fields.items() if key in head}
+        mode = 'sse-c' if head.get('SSECustomerAlgorithm') or head.get('SSECustomerKeyMD5') else {'AES256': 'sse-s3', 'aws:kms': 'sse-kms', 'aws:kms:dsse': 'dsse-kms'}.get(head.get('ServerSideEncryption'))
+        if not mode and head.get('ServerSideEncryption'): mode = 'provider'
+    return {'encryption': {'mode': mode or 'provider', **result}} if result or (not azure and mode) else {}
 
 
 # ---------------------------------------------------------------------------
@@ -1240,12 +1478,13 @@ def _azure_get_bucket_admin_state(params: dict[str, Any]) -> dict[str, Any]:
 
 def _azure_get_object_details(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
+    encryption = _parse_object_encryption(params.get("encryption"), profile)
     bucket_name = str(params.get("bucketName", "")).strip()
     key = str(params.get("key", ""))
     if not bucket_name or not key:
         raise SidecarError("invalid_config", "Bucket name and object key are required for object inspection.")
 
-    client = _build_azure_client(profile)
+    client = _encrypted_client(_build_azure_client(profile), profile, encryption, read_only=True)
     api_calls: list[dict[str, Any]] = []
     debug_events: list[dict[str, Any]] = []
 
@@ -1299,7 +1538,7 @@ def _azure_get_object_details(params: dict[str, Any]) -> dict[str, Any]:
         "leaseStatus": head_headers.get('x-ms-lease-status'),
         "leaseState": head_headers.get('x-ms-lease-state'),
         "archiveStatus": head_headers.get('x-ms-archive-status'),
-        "encryption": {'serverEncrypted': head_headers.get('x-ms-server-encrypted') == 'true', 'scope': head_headers.get('x-ms-encryption-scope')},
+        **_reported_encryption(head_headers, azure=True),
         "metadata": metadata,
         "headers": headers,
         "tags": {},
@@ -1318,13 +1557,14 @@ def _azure_get_object_details(params: dict[str, Any]) -> dict[str, Any]:
 
 def _azure_create_folder(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
+    encryption = _parse_object_encryption(params.get("encryption"), profile)
     bucket_name = str(params.get("bucketName", "")).strip()
     key = str(params.get("key", "")).strip()
     if not bucket_name or not key:
         raise SidecarError("invalid_config", "Bucket name and key are required to create a folder.")
     if not key.endswith("/"):
         key = f"{key}/"
-    client = _build_azure_client(profile)
+    client = _encrypted_client(_build_azure_client(profile), profile, encryption, read_only=False)
     client.request(
         "PUT",
         client.blob_path(bucket_name, key),
@@ -1355,15 +1595,24 @@ def _azure_wait_for_copy(client: _AzureBlobClient, dest_path: str, copy_status: 
         )
 
 
-def _azure_copy_object(params: dict[str, Any], source_etag=None) -> dict[str, Any]:
+def _azure_copy_object(params: dict[str, Any], source_etag=None, parsed_encryption=None) -> dict[str, Any]:
+    # CPK needs the shared relay. Parse there, before either endpoint is touched.
+    if any(isinstance(params.get(field), dict) and params[field].get('mode') == 'azure-cpk'
+           for field in ('encryption', 'sourceEncryption')):
+        return _storage_copy(params)
     profile = _parse_profile(params.get("profile", {}))
+    if parsed_encryption is None:
+        encryption = _parse_object_encryption(params.get('encryption'), profile)
+        _parse_object_encryption(params.get('sourceEncryption'), profile, source=True)
+    else:
+        encryption = parsed_encryption
     src_bucket = str(params.get("sourceBucketName", "")).strip()
     src_key = str(params.get("sourceKey", "")).strip()
     dest_bucket = str(params.get("destinationBucketName", "")).strip()
     dest_key = str(params.get("destinationKey", "")).strip()
     if not src_bucket or not src_key or not dest_bucket or not dest_key:
         raise SidecarError("invalid_config", "Copy source and destination are required.")
-    client = _build_azure_client(profile)
+    client = _encrypted_client(_build_azure_client(profile), profile, encryption)
     source_url = f"{client.scheme}://{client.netloc}{client.base_path}{client.blob_path(src_bucket, src_key)}"
     dest_path = client.blob_path(dest_bucket, dest_key)
     if not source_etag:
@@ -1385,14 +1634,19 @@ def _azure_copy_object(params: dict[str, Any], source_etag=None) -> dict[str, An
 def _azure_move_object(params: dict[str, Any]) -> dict[str, Any]:
     if (str(params.get("sourceBucketName", "")).strip(), str(params.get("sourceKey", "")).strip()) == (str(params.get("destinationBucketName", "")).strip(), str(params.get("destinationKey", "")).strip()):
         raise SidecarError("invalid_config", "Move source and destination must differ.")
+    if any(isinstance(params.get(field), dict) and params[field].get('mode') == 'azure-cpk'
+           for field in ('encryption', 'sourceEncryption')):
+        return _storage_copy({**params, 'move': True})
     profile = _parse_profile(params.get("profile", {}))
-    client = _build_azure_client(profile)
+    encryption = _parse_object_encryption(params.get('encryption'), profile)
+    _parse_object_encryption(params.get('sourceEncryption'), profile, source=True)
+    client = _encrypted_client(_build_azure_client(profile), profile, encryption)
     source_path = client.blob_path(str(params.get('sourceBucketName', '')).strip(), str(params.get('sourceKey', '')).strip())
     _, source_headers, _ = client.request('HEAD', source_path)
     etag = source_headers.get('ETag')
     if not etag:
         raise SidecarError('object_conflict', 'Source identity is unavailable; move stopped.')
-    result = _azure_copy_object(params, etag)
+    result = _azure_copy_object(params, etag, parsed_encryption=encryption)
     client.request(
         "DELETE",
         client.blob_path(
@@ -1448,9 +1702,11 @@ def _azure_delete_objects(params: dict[str, Any]) -> dict[str, Any]:
 
 def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
+    encryption = _parse_object_encryption(params.get("encryption"), profile)
     bucket_name = str(params.get("bucketName", "")).strip()
     prefix = str(params.get("prefix", ""))
     file_paths = [str(item) for item in params.get("filePaths", []) if str(item).strip()]
+    client_encryption = _parse_client_encryption(params, True, len(file_paths))
     object_key_by_path = {
         str(key): str(value).replace("\\", "/").lstrip("/")
         for key, value in dict(params.get("objectKeyByPath", {}) or {}).items()
@@ -1458,16 +1714,17 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
     }
     if not bucket_name or not file_paths:
         raise SidecarError("invalid_config", "Bucket name and file paths are required.")
-    client = _build_azure_client(profile)
+    client = _encrypted_client(_build_azure_client(profile), profile, encryption, read_only=False)
     paths = [Path(file_path) for file_path in file_paths]
     snapshots = {path: _source_snapshot(path) for path in paths}
-    block_sizes = {path: _azure_block_size(path.stat().st_size) for path in paths}
-    total_bytes = sum(path.stat().st_size for path in paths)
-    uses_multipart = any(path.stat().st_size >= _AZURE_PUT_BLOB_LIMIT for path in paths)
+    sizes = {path: _age_object_size(client_encryption, snapshots[path][2]) if client_encryption else snapshots[path][2] for path in paths}
+    block_sizes = {path: _azure_block_size(sizes[path]) for path in paths}
+    total_bytes = sum(sizes[path] for path in paths)
+    uses_multipart = any(sizes[path] >= _AZURE_PUT_BLOB_LIMIT for path in paths)
     parts_total = sum(
-        max((path.stat().st_size + block_sizes[path] - 1) // block_sizes[path], 1)
+        max((sizes[path] + block_sizes[path] - 1) // block_sizes[path], 1)
         for path in paths
-        if path.stat().st_size >= _AZURE_PUT_BLOB_LIMIT
+        if sizes[path] >= _AZURE_PUT_BLOB_LIMIT
     )
     part_size_bytes = max(block_sizes.values()) if parts_total > 0 else None
     job_id = f"upload-{uuid.uuid4().hex[:8]}"
@@ -1516,7 +1773,7 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
         target_key = f"{prefix}{target_name}" if prefix else target_name
         blob_path = client.blob_path(bucket_name, target_key)
         _verify_source(path, snapshots[path])
-        file_size = snapshots[path][2]
+        file_size = sizes[path]
         output_lines.append(f"Uploading {path.name} ({file_size} bytes) to {target_key}.")
         if file_size >= _AZURE_PUT_BLOB_LIMIT:
             chunk_size = block_sizes[path]
@@ -1529,7 +1786,7 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
                 with path.open("rb") as handle:
                     length = min(chunk_size, file_size - index * chunk_size)
                     client.request("PUT", blob_path, query={"comp": "block", "blockid": block_ids[index]},
-                                   body=_FilePart(handle, index * chunk_size, length, control))
+                                   body=_upload_body(handle, index * chunk_size, length, control, client_encryption, path, snapshots[path]))
                 _verify_source(path, snapshots[path])
                 return length
             workers = max(1, min(8, profile.max_pool_connections, (256 * 1024**2) // chunk_size))
@@ -1565,7 +1822,7 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
                 client.request(
                     "PUT", blob_path,
                     headers={"x-ms-blob-type": "BlockBlob", "Content-Type": "application/octet-stream"},
-                    body=_FilePart(handle, 0, file_size, control))
+                    body=_upload_body(handle, 0, file_size, control, client_encryption, path, snapshots[path]))
             bytes_transferred += file_size
         _verify_source(path, snapshots[path])
         items_completed += 1
@@ -1618,8 +1875,13 @@ def _azure_start_upload(params: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _download_name(key: str) -> str:
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', key.replace('\\', '/').split('/')[-1]).rstrip(' .')[:180]
+def _download_name(key: str, client_encryption=False) -> str:
+    name = key.replace('\\', '/').split('/')[-1]
+    if isinstance(client_encryption, dict) and 'fileName' in client_encryption:
+        name = client_encryption['fileName']
+    elif client_encryption and name.endswith('.age') and len(name) > 4:
+        name = name[:-4]
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).rstrip(' .')[:180]
     if not name or name in {'.', '..'}:
         name = 'download'
     if name.split('.')[0].upper() in {'CON', 'PRN', 'AUX', 'NUL', *{f'COM{i}' for i in range(1, 10)}, *{f'LPT{i}' for i in range(1, 10)}}:
@@ -1765,7 +2027,7 @@ class _DownloadDestination:
 
 @contextmanager
 def _staged_download(destination: Path, key: str, policy: str, output_lines: list[str],
-                     destination_index=None):
+                     destination_index=None, client_encryption=False):
     """Publish only validated bytes, without replacing any existing directory entry."""
     if policy not in {"keepBoth", "replace"}:
         raise SidecarError("invalid_config", "Unknown download conflict policy.")
@@ -1781,7 +2043,7 @@ def _staged_download(destination: Path, key: str, policy: str, output_lines: lis
             yield handle
             handle.flush()
             os.fsync(handle.fileno())
-        name = _download_name(key)
+        name = _download_name(key, client_encryption)
         base = Path(name)
         index.refresh()
         for suffix in range(100000):
@@ -1820,16 +2082,18 @@ def _validate_download_range(header: str, start: int, end: int, size: int, recei
 
 def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
+    encryption = _parse_object_encryption(params.get("encryption"), profile)
     bucket_name = str(params.get("bucketName", "")).strip()
     references = _download_references(params)
     keys = [ref[0] for ref in references]
+    client_encryption = _parse_client_encryption(params, False, len(references))
     def version_query(ref): return {"versionid": ref[1]} if ref[1] is not None else {}
     destination_path = str(params.get("destinationPath", "")).strip()
     if not bucket_name or not keys or not destination_path:
         raise SidecarError("invalid_config", "Bucket, keys, and destination path are required.")
     multipart_threshold_bytes = _int_param(params, "multipartThresholdMiB", 32) * 1024 * 1024
     multipart_chunk_bytes = _int_param(params, "multipartChunkMiB", 8) * 1024 * 1024
-    client = _build_azure_client(profile)
+    client = _encrypted_client(_build_azure_client(profile), profile, encryption, read_only=True)
     destination = Path(destination_path)
     destination.mkdir(parents=True, exist_ok=True)
     destination_index = _DownloadDestination(destination)
@@ -1847,7 +2111,9 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
         for size in (sizes[ref] for ref in references)
         if size >= multipart_threshold_bytes
     )
-    part_size_bytes = multipart_chunk_bytes if parts_total > 0 else None
+    if client_encryption:
+        parts_total = sum(_age_plaintext_size(client_encryption, size)[1] for size in sizes.values())
+    part_size_bytes = (_AGE_SEALED_CHUNK if client_encryption else multipart_chunk_bytes) if parts_total > 0 else None
     job_id = f"download-{uuid.uuid4().hex[:8]}"
     label = f"Download {len(keys)} object(s) from {bucket_name}"
     strategy_label = _transfer_strategy_label("download", uses_multipart)
@@ -1891,13 +2157,33 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
     for ref in references:
         key = ref[0]
         _transfer_gate(control)
-        target = destination / _download_name(key)
+        target = destination / _download_name(key, client_encryption)
         object_size = sizes[ref]
         blob_path = client.blob_path(bucket_name, key)
         output_lines.append(f"Downloading {key} ({object_size} bytes) to {target}.")
         before_object = bytes_transferred
-        with _staged_download(destination, key, params.get("conflictPolicy", "keepBoth"), output_lines, destination_index) as handle:
-            if object_size >= multipart_threshold_bytes:
+        with _staged_download(destination, key, params.get("conflictPolicy", "keepBoth"), output_lines, destination_index,
+                              client_encryption=client_encryption) as handle:
+            if client_encryption:
+                def open_encrypted_range(start, end):
+                    response = client.open('GET', blob_path, query=version_query(ref),
+                        headers={'Range': f'bytes={start}-{end}', **validators[ref]})
+                    return response, response.headers.get('Content-Range', '')
+                for received in _age_download(handle, client_encryption, object_size,
+                                               open_encrypted_range, profile, control):
+                    bytes_transferred += received
+                    # The first yield accounts for the host-verified header and nonce.
+                    if bytes_transferred - before_object > client_encryption['headerLength'] + 16:
+                        parts_completed += 1
+                    _transfer_checkpoint(control, bytes_transferred=bytes_transferred,
+                        items_completed=items_completed, parts_completed=parts_completed, current_item_label=key)
+                    _emit_transfer_event(_build_transfer_job(job_id=job_id, label=label, direction='download',
+                        progress=bytes_transferred / total_bytes, status='running', bytes_transferred=bytes_transferred,
+                        total_bytes=total_bytes, output_lines=_transfer_output_snapshot(output_lines),
+                        strategy_label=strategy_label, current_item_label=key, item_count=len(keys),
+                        items_completed=items_completed, part_size_bytes=part_size_bytes,
+                        parts_completed=parts_completed, parts_total=parts_total, can_pause=True, can_cancel=True))
+            elif object_size >= multipart_threshold_bytes:
                 handle.truncate(object_size)
                 write_lock = threading.Lock()
                 def download_range(start):
@@ -1991,6 +2277,7 @@ def _azure_start_download(params: dict[str, Any]) -> dict[str, Any]:
 
 def _azure_run_put_testdata(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
+    encryption = _parse_object_encryption(params.get("encryption"), profile)
     config = params.get("config") or {}
     object_count = max(int(config.get("objectCount", 0) or 0), 0)
     versions = max(int(config.get("versions", 1) or 1), 1)
@@ -2000,7 +2287,7 @@ def _azure_run_put_testdata(params: dict[str, Any]) -> dict[str, Any]:
     size_bytes = max(int(config.get("objectSizeBytes", config.get("sizeBytes", 4096)) or 4096), 0)
     if not bucket_name:
         raise SidecarError("invalid_config", "Bucket name is required.")
-    client = _build_azure_client(profile)
+    client = _encrypted_client(_build_azure_client(profile), profile, encryption, read_only=False)
     payload = b"A" * size_bytes
 
     def put_one(index: int) -> None:
@@ -2229,12 +2516,16 @@ def _get_capabilities(_: dict[str, Any]) -> dict[str, Any]:
             {"key": "bucket.tagging", "label": "Bucket tagging", "state": "supported"},
             {"key": "bucket.versioning", "label": "Bucket versioning", "state": "supported"},
             {"key": "object.copy_move", "label": "Copy, move, rename", "state": "supported"},
+            {"key": "object.clientEncryption", "label": "Client-side encryption", "state": "supported", "formats": ["age-v1"]},
             {"key": "object.resumable", "label": "Resumable transfer jobs", "state": "supported", "reason": "Explicit multipart/block upload and verified range-download checkpoints; credentials are resupplied on resume."},
             {"key": "tools.bulk-delete", "label": "Delete-all maintenance tool", "state": "supported"},
             {"key": "benchmark", "label": "Integrated benchmark mode", "state": "supported"},
             {"key": "storage.admin", "label": "Advanced storage administration", "state": "supported", "actions": _STORAGE_ACTIONS},
         ]
     }
+    result['items'].extend({'key': 'object.encryption.' + mode, 'label': 'Object encryption: ' + mode,
+                            'state': 'supported'}
+                           for mode in ('sse-s3', 'sse-kms', 'dsse-kms', 'sse-c', 'azure-scope', 'azure-cpk'))
     if _is_azure_profile(_.get('profile')):
         for item in result['items']:
             if item['key'].startswith('bucket.'):
@@ -2770,12 +3061,13 @@ def _list_object_versions(params: dict[str, Any]) -> dict[str, Any]:
 
 def _get_object_details(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
+    encryption = _parse_object_encryption(params.get("encryption"), profile)
     bucket_name = str(params.get("bucketName", "")).strip()
     key = str(params.get("key", ""))
     if not bucket_name or not key:
         raise SidecarError("invalid_config", "Bucket name and object key are required for object inspection.")
 
-    client = _build_client(profile)
+    client = _encrypted_client(_build_client(profile), profile, encryption, read_only=True)
     api_calls: list[dict[str, Any]] = []
     debug_events: list[dict[str, Any]] = []
 
@@ -2826,7 +3118,7 @@ def _get_object_details(params: dict[str, Any]) -> dict[str, Any]:
         "storageClass": head.get('StorageClass', 'STANDARD'),
         "restore": head.get('Restore'),
         "archiveStatus": head.get('ArchiveStatus'),
-        "encryption": {field: head[field] for field in ('ServerSideEncryption', 'SSEKMSKeyId', 'BucketKeyEnabled') if field in head},
+        **_reported_encryption(head),
         "metadata": metadata,
         "headers": headers,
         "tags": tags,
@@ -2845,6 +3137,9 @@ def _get_object_details(params: dict[str, Any]) -> dict[str, Any]:
 
 def _generate_presigned_url(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
+    encryption = _parse_object_encryption(params.get('encryption'), profile)
+    if encryption.get('mode') in {'sse-c', 'azure-cpk'}:
+        raise SidecarError('unsupported_feature', 'Customer-key encrypted objects cannot use shareable presigned URLs.')
     bucket_name = str(params.get("bucketName", "")).strip()
     key = str(params.get("key", ""))
     expiration_seconds = max(int(params.get("expirationSeconds", 3600) or 3600), 1)
@@ -2862,13 +3157,14 @@ def _generate_presigned_url(params: dict[str, Any]) -> dict[str, Any]:
 
 def _create_folder(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
+    encryption = _parse_object_encryption(params.get("encryption"), profile)
     bucket_name = str(params.get("bucketName", "")).strip()
     key = str(params.get("key", ""))
     if not bucket_name or not key:
         raise SidecarError("invalid_config", "Bucket name and key are required to create a folder.")
     if not key.endswith("/"):
         key = f"{key}/"
-    client = _build_client(profile)
+    client = _encrypted_client(_build_client(profile), profile, encryption, read_only=False)
     client.put_object(Bucket=bucket_name, Key=key, Body=b"")
     return {"created": True, "key": key}
 
@@ -2902,9 +3198,11 @@ def _bounded_parallel(pool, function, items, pending_limit):
         refill()
         while pending:
             completed, _ = wait(pending, return_when=FIRST_COMPLETED)
-            for future in completed:
+            while completed:
+                future = completed.pop()
                 pending.remove(future)
                 yield future
+                del future
             refill()
     finally:
         for future in pending: future.cancel()
@@ -3128,11 +3426,184 @@ class _FilePart:
     def __len__(self): return self.length
 
 
+_AGE_CHUNK = 65536
+_AGE_SEALED_CHUNK = _AGE_CHUNK + 16
+
+
+def _parse_client_encryption(params, upload, count):
+    config = params.get('clientEncryption')
+    if config is None:
+        return None
+    if count != 1 or not isinstance(config, dict) or config.get('format') != 'age-v1':
+        raise SidecarError('invalid_config', 'Client encryption requires age-v1 and exactly one file or key.')
+    allowed = {'format', 'fileKey', 'header', 'payloadNonce'} if upload else {'format', 'fileKey', 'headerLength', 'fileName'}
+    if set(config) - allowed:
+        raise SidecarError('invalid_config', 'Unexpected client encryption fields.')
+    def decode(name, length=None):
+        try:
+            value = base64.b64decode(config[name], validate=True)
+        except (KeyError, TypeError, ValueError):
+            raise SidecarError('invalid_config', 'Invalid client encryption ' + name + '.') from None
+        if length is not None and len(value) != length:
+            raise SidecarError('invalid_config', 'Invalid client encryption ' + name + ' length.')
+        return value
+    key = decode('fileKey', 16)
+    if upload:
+        header, nonce = decode('header'), decode('payloadNonce', 16)
+        if not 1 <= len(header) <= _AGE_CHUNK:
+            raise SidecarError('invalid_config', 'Client encryption header must contain 1–65536 bytes.')
+        return {'key': key, 'header': header, 'nonce': nonce, 'headerLength': len(header)}
+    length = config.get('headerLength')
+    if type(length) is not int or not 1 <= length <= _AGE_CHUNK:
+        raise SidecarError('invalid_config', 'Client encryption headerLength must be 1–65536.')
+    if 'fileName' in config:
+        name = config['fileName']
+        if not isinstance(name, str) or name in {'', '.', '..'} or any(c in name for c in '/\\\x00'):
+            raise SidecarError('invalid_config', 'Invalid client encryption fileName.')
+        return {'key': key, 'headerLength': length, 'fileName': name}
+    return {'key': key, 'headerLength': length}
+
+
+def _age_cipher(key, nonce):
+    # Both primitives are provided by the bundled, maintained cryptography library.
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    return ChaCha20Poly1305(HKDF(algorithm=hashes.SHA256(), length=32,
+                               salt=nonce, info=b'payload').derive(key))
+
+
+def _age_nonce(index, final):
+    return index.to_bytes(11, 'big') + bytes([int(final)])
+
+
+def _age_object_size(config, plaintext_size):
+    return config['headerLength'] + 16 + plaintext_size + 16 * max(1, (plaintext_size + _AGE_CHUNK - 1) // _AGE_CHUNK)
+
+
+def _age_plaintext_size(config, object_size):
+    payload_size = object_size - config['headerLength'] - 16
+    count = max(1, (payload_size + _AGE_SEALED_CHUNK - 1) // _AGE_SEALED_CHUNK)
+    last = payload_size - (count - 1) * _AGE_SEALED_CHUNK
+    if last < 16 or (count > 1 and last == 16):
+        raise SidecarError('decryption_failed', 'Invalid encrypted object length.', {'chunk': count - 1})
+    return payload_size - 16 * count, count
+
+
+def _age_open(cipher, index, final, data):
+    from cryptography.exceptions import InvalidTag
+    try:
+        return cipher.decrypt(_age_nonce(index, final), data, None)
+    except InvalidTag:
+        raise SidecarError('decryption_failed', 'Encrypted chunk authentication failed.', {'chunk': index}) from None
+
+
+class _AgeFilePart(_FilePart):
+    """Seekable ciphertext range with short, bounded reads and one chunk cached."""
+    def __init__(self, handle, start, length, control, config, path, snapshot):
+        self.handle, self.start, self.length, self.position = handle, start, length, 0
+        self.control, self.path, self.snapshot = control, path, snapshot
+        self.prefix = config['header'] + config['nonce']
+        self.cipher = _age_cipher(config['key'], config['nonce'])
+        self.plaintext_size = snapshot[2]
+        self.count = max(1, (self.plaintext_size + _AGE_CHUNK - 1) // _AGE_CHUNK)
+        self.cached_index, self.cached_chunk = None, b''
+
+    def _check_source(self):
+        _verify_source(self.path, self.snapshot)
+        stat = os.fstat(self.handle.fileno())
+        if tuple(getattr(stat, field, None) for field in
+                 ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')) != self.snapshot:
+            raise SidecarError('object_conflict', 'Upload source changed; transfer stopped before completion.')
+
+    def seek(self, offset, whence=0):
+        target = offset if whence == 0 else self.position + offset if whence == 1 else self.length + offset
+        if not 0 <= target <= self.length:
+            raise ValueError('Seek outside encrypted range')
+        self.position = target
+        return target
+
+    def read(self, size=-1):
+        _transfer_gate(self.control)
+        self._check_source()
+        # SDK hashing and HTTP readers loop on short reads. Never materialize a
+        # whole multipart range, even if the caller requests it in one read.
+        amount = min(self.length - self.position, _AGE_CHUNK)
+        if size is not None and size >= 0:
+            amount = min(amount, size)
+        result = bytearray()
+        while len(result) < amount:
+            offset = self.start + self.position
+            if offset < len(self.prefix):
+                data = self.prefix[offset:offset + amount - len(result)]
+            else:
+                index, inner = divmod(offset - len(self.prefix), _AGE_SEALED_CHUNK)
+                if index != self.cached_index:
+                    self.handle.seek(index * _AGE_CHUNK)
+                    length = min(_AGE_CHUNK, self.plaintext_size - index * _AGE_CHUNK)
+                    plaintext = self.handle.read(length)
+                    self._check_source()
+                    if len(plaintext) != length:
+                        raise SidecarError('object_conflict', 'Upload source changed; incomplete plaintext chunk.')
+                    self.cached_chunk = self.cipher.encrypt(_age_nonce(index, index == self.count - 1), plaintext, None)
+                    self.cached_index = index
+                data = self.cached_chunk[inner:inner + amount - len(result)]
+            result.extend(data)
+            self.position += len(data)
+            _transfer_gate(self.control)
+        if result:
+            _transfer_liveness(self.control)
+        self._check_source()
+        return bytes(result)
+
+
+def _upload_body(handle, start, length, control, config, path, snapshot):
+    if config is None:
+        return _FilePart(handle, start, length, control)
+    return _AgeFilePart(handle, start, length, control, config, path, snapshot)
+
+
+def _age_download(handle, config, object_size, open_range, profile, control):
+    """Yield authenticated ciphertext byte counts; write only verified plaintext."""
+    plaintext_size, count = _age_plaintext_size(config, object_size)
+    def fetch(start, end):
+        data = bytearray(end - start + 1)
+        def write(offset, chunk):
+            data[offset - start:offset - start + len(chunk)] = chunk
+        _read_range_with_retry(lambda: open_range(start, end), write, start, end,
+                               object_size, profile.max_attempts, control)
+        return bytes(data)
+    header_length = config['headerLength']
+    cipher = _age_cipher(config['key'], fetch(header_length, header_length + 15))
+    handle.truncate(plaintext_size)
+    yield header_length + 16
+    write_lock = threading.Lock()
+    def download_chunk(index):
+        start = header_length + 16 + index * _AGE_SEALED_CHUNK
+        data = fetch(start, min(start + _AGE_SEALED_CHUNK, object_size) - 1)
+        plaintext = _age_open(cipher, index, index == count - 1, data)
+        with write_lock:
+            _transfer_gate(control)
+            handle.seek(index * _AGE_CHUNK)
+            handle.write(plaintext)
+        return len(data)
+    workers = max(1, min(8, profile.max_pool_connections))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = _bounded_parallel(pool, download_chunk, range(count), workers * 2)
+        try:
+            for future in futures:
+                yield future.result()
+        finally:
+            futures.close()
+
+
 def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
+    encryption = _parse_object_encryption(params.get("encryption"), profile)
     bucket_name = str(params.get("bucketName", "")).strip()
     prefix = str(params.get("prefix", ""))
     file_paths = [str(item) for item in params.get("filePaths", []) if str(item).strip()]
+    client_encryption = _parse_client_encryption(params, True, len(file_paths))
     object_key_by_path = {
         str(key): str(value).replace("\\", "/").lstrip("/")
         for key, value in dict(params.get("objectKeyByPath", {}) or {}).items()
@@ -3144,12 +3615,12 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
     multipart_chunk_bytes = min(max(_int_param(params, "multipartChunkMiB", 8), 5), 5120) * 1024 * 1024
     paths = [Path(file_path) for file_path in file_paths]
     snapshots = {path: _source_snapshot(path) for path in paths}
-    sizes = {path: path.stat().st_size for path in paths}
+    sizes = {path: _age_object_size(client_encryption, snapshots[path][2]) if client_encryption else snapshots[path][2] for path in paths}
     for size in sizes.values():
         if size > 50000 * 1024**3 or (size >= multipart_threshold_bytes and
                 (size + multipart_chunk_bytes - 1) // multipart_chunk_bytes > 10000):
             raise SidecarError("invalid_config", "Upload exceeds S3 object or 10,000-part limits; select a larger part size.")
-    client = _build_client(profile)
+    client = _encrypted_client(_build_client(profile), profile, encryption, read_only=False)
     total_bytes = sum(sizes[path] for path in paths)
     uses_multipart = any(size >= multipart_threshold_bytes for size in sizes.values())
     parts_total = sum(
@@ -3202,7 +3673,7 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
         target_name = object_key_by_path.get(str(path), path.name)
         target_key = f"{prefix}{target_name}" if prefix else target_name
         _verify_source(path, snapshots[path])
-        file_size = snapshots[path][2]
+        file_size = sizes[path]
         output_lines.append(f"Uploading {path.name} ({file_size} bytes) to {target_key}.")
         if file_size >= multipart_threshold_bytes:
             response = client.create_multipart_upload(Bucket=bucket_name, Key=target_key)
@@ -3234,7 +3705,7 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
                 _verify_source(path, snapshots[path])
                 handle = _get_part_handle()
                 _transfer_gate(control)
-                chunk = _FilePart(handle, offset, length, control)
+                chunk = _upload_body(handle, offset, length, control, client_encryption, path, snapshots[path])
                 part_response = client.upload_part(
                     Bucket=bucket_name,
                     Key=target_key,
@@ -3326,7 +3797,7 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
                 raise
         else:
             with path.open("rb") as handle:
-                client.put_object(Bucket=bucket_name, Key=target_key, Body=_FilePart(handle, 0, file_size, control))
+                client.put_object(Bucket=bucket_name, Key=target_key, Body=_upload_body(handle, 0, file_size, control, client_encryption, path, snapshots[path]))
             bytes_transferred += file_size
         _verify_source(path, snapshots[path])
         items_completed += 1
@@ -3379,18 +3850,20 @@ def _start_upload(params: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _start_download(params: dict[str, Any]) -> dict[str, Any]:
+def _start_download(params: dict[str, Any], storage_client=None) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
+    encryption = _parse_object_encryption(params.get("encryption"), profile)
     bucket_name = str(params.get("bucketName", "")).strip()
     references = _download_references(params)
     keys = [ref[0] for ref in references]
+    client_encryption = _parse_client_encryption(params, False, len(references))
     def version_kwargs(ref): return {"VersionId": ref[1]} if ref[1] is not None else {}
     destination_path = str(params.get("destinationPath", "")).strip()
     if not bucket_name or not keys or not destination_path:
         raise SidecarError("invalid_config", "Bucket, keys, and destination path are required.")
     multipart_threshold_bytes = _int_param(params, "multipartThresholdMiB", 32) * 1024 * 1024
     multipart_chunk_bytes = _int_param(params, "multipartChunkMiB", 8) * 1024 * 1024
-    client = _build_client(profile)
+    client = storage_client if storage_client is not None else _encrypted_client(_build_client(profile), profile, encryption, read_only=True)
     destination = Path(destination_path)
     destination.mkdir(parents=True, exist_ok=True)
     destination_index = _DownloadDestination(destination)
@@ -3410,7 +3883,9 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
         for size in (sizes[ref] for ref in references)
         if size >= multipart_threshold_bytes
     )
-    part_size_bytes = multipart_chunk_bytes if parts_total > 0 else None
+    if client_encryption:
+        parts_total = sum(_age_plaintext_size(client_encryption, size)[1] for size in sizes.values())
+    part_size_bytes = (_AGE_SEALED_CHUNK if client_encryption else multipart_chunk_bytes) if parts_total > 0 else None
     job_id = f"download-{uuid.uuid4().hex[:8]}"
     label = f"Download {len(keys)} object(s) from {bucket_name}"
     strategy_label = _transfer_strategy_label("download", uses_multipart)
@@ -3454,12 +3929,33 @@ def _start_download(params: dict[str, Any]) -> dict[str, Any]:
     for ref in references:
         key = ref[0]
         _transfer_gate(control)
-        target = destination / _download_name(key)
+        target = destination / _download_name(key, client_encryption)
         object_size = sizes[ref]
         output_lines.append(f"Downloading {key} ({object_size} bytes) to {target}.")
         before_object = bytes_transferred
-        with _staged_download(destination, key, params.get("conflictPolicy", "keepBoth"), output_lines, destination_index) as handle:
-            if object_size >= multipart_threshold_bytes:
+        with _staged_download(destination, key, params.get("conflictPolicy", "keepBoth"), output_lines, destination_index,
+                              client_encryption=client_encryption) as handle:
+            if client_encryption:
+                def open_encrypted_range(start, end):
+                    response = client.get_object(Bucket=bucket_name, Key=key,
+                        Range=f'bytes={start}-{end}', **version_kwargs(ref),
+                        **({'IfMatch': heads[ref]['ETag']} if heads[ref].get('ETag') else {}))
+                    return response['Body'], response.get('ContentRange', '')
+                for received in _age_download(handle, client_encryption, object_size,
+                                               open_encrypted_range, profile, control):
+                    bytes_transferred += received
+                    # The first yield accounts for the host-verified header and nonce.
+                    if bytes_transferred - before_object > client_encryption['headerLength'] + 16:
+                        parts_completed += 1
+                    _transfer_checkpoint(control, bytes_transferred=bytes_transferred,
+                        items_completed=items_completed, parts_completed=parts_completed, current_item_label=key)
+                    _emit_transfer_event(_build_transfer_job(job_id=job_id, label=label, direction='download',
+                        progress=bytes_transferred / total_bytes, status='running', bytes_transferred=bytes_transferred,
+                        total_bytes=total_bytes, output_lines=_transfer_output_snapshot(output_lines),
+                        strategy_label=strategy_label, current_item_label=key, item_count=len(keys),
+                        items_completed=items_completed, part_size_bytes=part_size_bytes,
+                        parts_completed=parts_completed, parts_total=parts_total, can_pause=True, can_cancel=True))
+            elif (storage_client is None and object_size >= multipart_threshold_bytes) or (storage_client is not None and object_size > 0):
                 handle.truncate(object_size)
                 write_lock = threading.Lock()
                 ranges = ((start, min(start + multipart_chunk_bytes, object_size) - 1) for start in range(0, object_size, multipart_chunk_bytes))
@@ -3666,6 +4162,7 @@ def _tool_state(label: str, status: str, lines: list[str]) -> dict[str, Any]:
 
 def _run_put_testdata(params: dict[str, Any]) -> dict[str, Any]:
     profile = _parse_profile(params.get("profile", {}))
+    encryption = _parse_object_encryption(params.get("encryption"), profile)
     config = params.get("config") or {}
     object_count = max(int(config.get("objectCount", 0) or 0), 0)
     versions = max(int(config.get("versions", 1) or 1), 1)
@@ -3677,7 +4174,7 @@ def _run_put_testdata(params: dict[str, Any]) -> dict[str, Any]:
     )
     if not bucket_name:
         raise SidecarError("invalid_config", "Bucket name is required.")
-    client = _build_client(profile)
+    client = _encrypted_client(_build_client(profile), profile, encryption, read_only=False)
     payload = b"A" * size_bytes
 
     failure_count = 0
@@ -4880,7 +5377,7 @@ _PROFILE_PUBLIC_FIELDS = {'id', 'name', 'endpointType', 'region', 'pathStyle', '
 def _public_benchmark(state):
     public = dict(state)
     public['profile'] = {k: v for k, v in (state.get('profile') or {}).items() if k in _PROFILE_PUBLIC_FIELDS}
-    return json.loads(json.dumps(public, default=_serialize_dt))
+    return json.loads(json.dumps(_safe_diagnostics(public), default=_serialize_dt))
 
 
 class _BenchmarkRun:
@@ -4894,6 +5391,7 @@ class _BenchmarkRun:
         self.reserved = 0
         self.last_persisted = 0.0
         self.threads = []
+        self.workers_remaining = 0
         self.payload_store = _BenchmarkPayloadStore(state['config'])
         # Monotonic anchors are process-local and never enter saved state.
         self.elapsed_base = max(0, float(state.get('activeElapsedSeconds') or 0))
@@ -4919,6 +5417,9 @@ class _BenchmarkRun:
         self.client = _AzureBenchmarkClient(profile) if profile.endpoint_type == 'azureBlob' else _build_client(profile)
         self.profile = {}
         workers = min(32, max(1, int(self.state['config'].get('concurrentThreads') or 1)))
+        # Count every lane before starting any: a fast first worker can finish
+        # while start() is still launching the remaining lanes.
+        self.workers_remaining = workers
         for index in range(workers):
             worker = threading.Thread(target=self.run, args=(index,), daemon=True)
             self.threads.append(worker)
@@ -4995,8 +5496,23 @@ class _BenchmarkRun:
                 self.snapshot(persist=True)
         finally:
             with self.lock:
-                if self.state['status'] in {'completed', 'stopped', 'failed'}:
-                    self.profile = {}
+                self.workers_remaining -= 1
+                if self.workers_remaining == 0 and self.state['status'] in {'completed', 'stopped', 'failed'}:
+                    try:
+                        # Stop/failure may precede other in-flight completions.
+                        # Persist their final accounting before dropping ownership.
+                        self.snapshot(persist=True)
+                    finally:
+                        self.profile = {}
+                        with self.payload_store.lock:
+                            self.payload_store.cache.clear()
+                            self.payload_store.bytes = 0
+                        self.payload_store = None
+                        # SDK clients can be shared by the process client cache.
+                        self.client = None
+                        with _BENCHMARKS_LOCK:
+                            if _BENCHMARKS.get(self.state['id']) is self:
+                                del _BENCHMARKS[self.state['id']]
 
 
 def _materialize_benchmark_state(state):
@@ -5016,7 +5532,7 @@ def _start_benchmark(params):
     if not profile: raise SidecarError('invalid_config', 'Profile configuration is required for benchmark runs.')
     _parse_profile(profile)
     run_id = f'bench-{uuid.uuid4().hex[:8]}'
-    config = _benchmark_config_with_run_dir(dict(params.get('config') or {}), run_id)
+    config = _benchmark_config_with_run_dir(_safe_diagnostics(dict(params.get('config') or {})), run_id)
     if not config.get('bucketName'): raise SidecarError('invalid_config', 'A benchmark bucket is required.')
     if any(size > 5 * 1024**3 for size in _benchmark_size_list(config)):
         raise SidecarError('invalid_config', 'Single-request benchmark objects cannot exceed 5 GiB.')
@@ -5049,6 +5565,8 @@ def _benchmark_control(params, status):
     with _BENCHMARKS_LOCK: run = _BENCHMARKS.get(run_id)
     if run is None:
         state = _read_benchmark_state(run_id)
+        if state.get('status') in {'completed', 'failed', 'stopped'}:
+            return _public_benchmark(state)
         if status == 'running':
             profile = dict(params.get('profile') or {})
             _parse_profile(profile)
@@ -5109,7 +5627,7 @@ def _recovery_write(state):
     try:
         with temporary.open('x', encoding='utf-8') as output:
             os.chmod(temporary, 0o600)
-            json.dump(state, output)
+            json.dump(_safe_diagnostics(state), output)
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -5379,6 +5897,18 @@ _STORAGE_ACTIONS = [
 ]
 
 _ADVANCED_MODULE = None
+_GCS_MODULE = None
+
+
+def _gcs_module():
+    global _GCS_MODULE
+    with _CLIENT_CACHE_LOCK:
+        if _GCS_MODULE is None:
+            spec = importlib.util.spec_from_file_location('object_browser_gcs', Path(__file__).with_name('gcs.py'))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _GCS_MODULE = module
+    return _GCS_MODULE
 
 
 def _advanced_module():
@@ -5686,6 +6216,11 @@ def _storage_copy(params):
 def _storage_copy_impl(params):
     source_profile = _parse_profile(params.get('sourceProfile') or params.get('profile') or {})
     dest_profile = _parse_profile(params.get('destinationProfile') or params.get('profile') or {})
+    # objectProperties has an established SDK-shaped self-copy option, separate
+    # from the optional transport encryption object on copyObject/moveObject.
+    property_edit = params.get('action') == 'objectProperties'
+    encryption = _parse_object_encryption(None if property_edit else params.get('encryption'), dest_profile)
+    source_encryption = _parse_object_encryption(None if property_edit else params.get('sourceEncryption'), source_profile, source=True)
     source = {'Bucket': str(params.get('sourceBucketName') or ''), 'Key': str(params.get('sourceKey') or '')}
     dest = {'Bucket': str(params.get('destinationBucketName') or ''), 'Key': str(params.get('destinationKey') or '')}
     if not all((*source.values(), *dest.values())):
@@ -5693,11 +6228,13 @@ def _storage_copy_impl(params):
     if params.get('sourceVersionId') is not None: source['VersionId'] = str(params['sourceVersionId'])
     selected_version = source.get('VersionId')
     same_object = (source_profile == dest_profile and source['Bucket'] == dest['Bucket'] and source['Key'] == dest['Key'])
-    if same_object and (params.get('move') or (selected_version is None and not params.get('options'))):
+    if same_object and (params.get('move') or (selected_version is None and not params.get('options') and not encryption)):
         raise SidecarError('invalid_config', 'Choose a different destination object.')
     src_azure, dst_azure = source_profile.endpoint_type == 'azureBlob', dest_profile.endpoint_type == 'azureBlob'
     src = _build_azure_client(source_profile) if src_azure else _build_client(source_profile)
     dst = _build_azure_client(dest_profile) if dst_azure else _build_client(dest_profile)
+    src = _encrypted_client(src, source_profile, source_encryption, read_only=True)
+    dst = _encrypted_client(dst, dest_profile, encryption, copy_source=source_encryption)
     src_query = {'versionid': source['VersionId']} if 'VersionId' in source else {}
     if src_azure:
         _, headers, _ = src.request('HEAD', src.blob_path(source['Bucket'], source['Key']), query=src_query)
@@ -5770,7 +6307,8 @@ def _storage_copy_impl(params):
         if conditional_server_copy:
             # A lost conditional completion response must never be replayed as
             # another mutation; reconciliation belongs to the caller.
-            dst = _build_client(replace(dest_profile, max_attempts=1))
+            dst = _encrypted_client(_build_client(replace(dest_profile, max_attempts=1)), dest_profile,
+                                    encryption, copy_source=source_encryption)
         strategy = 'server-side-copy'
         copy_source = dict(source)
         match = {'CopySourceIfMatch': head['ETag']} if head.get('ETag') else {}
@@ -5953,8 +6491,32 @@ def _azure_storage_action(params):
 
 
 def handle_request(payload: dict[str, Any]) -> dict[str, Any]:
+    with _customer_key_scope(payload):
+        try:
+            return _safe_diagnostics(_handle_request_impl(payload))
+        except Exception as error:
+            raise _map_exception(error) from None
+
+
+def _handle_request_impl(payload: dict[str, Any]) -> dict[str, Any]:
     method = payload.get("method")
     params = payload.get("params") or {}
+
+    profile_payload = params.get('profile') if isinstance(params, dict) else None
+    if isinstance(profile_payload, dict):
+        endpoint_type = str(profile_payload.get('endpointType') or '').strip() or 's3Compatible'
+        if endpoint_type not in {'s3Compatible', 'awsS3', 'azureBlob', 'googleCloudStorage'}:
+            raise SidecarError('invalid_config', 'Unknown endpoint type.')
+        if endpoint_type == 'googleCloudStorage':
+            result = _gcs_module().handle(str(method), dict(params), SimpleNamespace(**globals()))
+            if result is not None:
+                return result
+
+    if method == 'generatePresignedUrl' and _is_azure_profile(params.get('profile')):
+        profile = _parse_profile(params.get('profile') or {})
+        encryption = _parse_object_encryption(params.get('encryption'), profile)
+        if encryption.get('mode') in {'sse-c', 'azure-cpk'}:
+            raise SidecarError('unsupported_feature', 'Customer-key encrypted objects cannot use shareable presigned URLs.')
 
     if _is_azure_profile(params.get("profile") if isinstance(params, dict) else None):
         azure_result = _handle_azure_request(str(method), dict(params))
@@ -6079,8 +6641,53 @@ def _process_line(line: str) -> None:
 
 
 _CONTROL_PLANE_METHODS = frozenset(
-    {"pauseTransfer", "resumeTransfer", "cancelTransfer", "cancelToolExecution"}
+    {"pauseTransfer", "resumeTransfer", "cancelTransfer", "cancelToolExecution",
+     "pauseBenchmark", "resumeBenchmark", "stopBenchmark", "getBenchmarkStatus"}
 )
+
+_MAX_INPUT_FRAME_BYTES = 64 * 1024**2
+# The Flutter host defaults to 64 queued requests and exclusive ordinary work
+# per process. Allow four times that burst here, beyond eight active workers.
+_MAX_QUEUED_REQUESTS = 256
+
+
+def _input_frames(stream):
+    """Read byte-limited JSON lines; None marks one discarded oversized frame."""
+    while True:
+        line = stream.readline(_MAX_INPUT_FRAME_BYTES + 1)
+        if not line:
+            return
+        if len(line) - int(line.endswith(b'\n')) > _MAX_INPUT_FRAME_BYTES:
+            # Discard in small blocks so an arbitrarily long line cannot grow
+            # memory. Only the next newline can resynchronize the transport.
+            terminated = line.endswith(b'\n')
+            del line
+            while not terminated:
+                tail = stream.readline(64 * 1024)
+                if not tail or tail.endswith(b'\n'):
+                    break
+            yield None
+        else:
+            yield line
+            del line
+
+
+def _reject_request(line, code, message):
+    request_id = None
+    if line is not None:
+        try:
+            payload = json.loads(line)
+            if isinstance(payload, dict): request_id = payload.get('requestId')
+        except (ValueError, UnicodeError):
+            pass
+    _write_stdout_line(json.dumps({'requestId': request_id, 'ok': False,
+                                  'error': {'code': code, 'message': message, 'details': None}}))
+
+
+def _process_admitted_line(line, queued):
+    # Admission counts only requests that have not started, not active work.
+    queued.release()
+    _process_line(line)
 
 
 def _is_control_plane_request(line: str) -> bool:
@@ -6106,15 +6713,25 @@ def main() -> int:
     # registry mutations, and running them here guarantees they land even when
     # every worker is blocked in a paused transfer.
     executor = ThreadPoolExecutor(max_workers=8)
+    queued = threading.BoundedSemaphore(_MAX_QUEUED_REQUESTS)
     try:
-        for line in sys.stdin:
+        for line in _input_frames(sys.stdin.buffer):
+            if line is None:
+                _reject_request(None, 'invalid_request', 'Input frame exceeds the 64 MiB limit.')
+                continue
             line = line.strip()
             if not line:
                 continue
             if _is_control_plane_request(line):
                 _process_line(line)
+            elif not queued.acquire(blocking=False):
+                _reject_request(line, 'overloaded', 'Engine request queue is full; retry after active requests finish.')
             else:
-                executor.submit(_process_line, line)
+                try:
+                    executor.submit(_process_admitted_line, line, queued)
+                except BaseException:
+                    queued.release()
+                    raise
     finally:
         executor.shutdown(wait=True)
 

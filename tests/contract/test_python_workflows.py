@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import sys
+import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,7 +31,7 @@ def engine(monkeypatch, tmp_path):
     monkeypatch.setattr(module, '_emit_transfer_event', lambda _: None)
     monkeypatch.chdir(tmp_path)
     yield module
-    for run in module._BENCHMARKS.values():
+    for run in list(module._BENCHMARKS.values()):
         with run.lock:
             run.state['status'] = 'stopped'
             run.wake.set()
@@ -187,6 +188,112 @@ def ranged_client(engine, monkeypatch, data):
     client.get_object.side_effect = get
     monkeypatch.setattr(engine, '_build_client', lambda _: client)
     return client
+
+
+@pytest.mark.parametrize('provider', ['s3', 'azure'])
+def test_recoverable_download_streams_retries_hashes_and_syncs_before_checkpoint(engine, monkeypatch, profile, tmp_path, provider):
+    data = b'A' * (1024**2 + 123) + b'B' * (3 * 1024**2)
+    azure = provider == 'azure'
+    payload = azure_profile(profile) if azure else profile
+    client = Mock()
+    client.head_object.return_value = {'ContentLength': len(data), 'ETag': '"stable"', 'VersionId': 'null'}
+    client.request.return_value = (200, {'Content-Length': str(len(data)), 'ETag': '"stable"', 'x-ms-version-id': 'null'}, b'')
+    client.blob_path.return_value = '/bucket/key'
+    attempts, bodies, writes = [], [], []
+    class Body(io.BytesIO):
+        def __init__(self, value, fail):
+            super().__init__(value)
+            self.fail = fail
+        def read(self, size=-1):
+            assert 0 < size <= 1024**2
+            if self.fail and self.tell():
+                raise ConnectionError('injected mid-body reset')
+            return super().read(size)
+    def response(headers, version):
+        assert headers['If-Match'] == '"stable"' and version == 'null'
+        start, end = map(int, headers['Range'][6:].split('-'))
+        attempts.append(start)
+        body = Body(data[start:end + 1], start == 0 and attempts.count(0) == 1)
+        bodies.append(body)
+        body.headers = {'Content-Range': f'bytes {start}-{end}/{len(data)}'}
+        return body
+    def get(**kw):
+        body = response({'Range': kw['Range'], 'If-Match': kw['IfMatch']}, kw['VersionId'])
+        return {'Body': body, 'ContentRange': body.headers['Content-Range']}
+    client.get_object.side_effect = get
+    client.open.side_effect = lambda *args, **kw: response(kw['headers'], kw['query']['versionid'])
+    monkeypatch.setattr(engine, '_build_azure_client' if azure else '_build_client', lambda _: client)
+    synced = set()
+    real_fsync = engine.os.fsync
+    def fsync(fd):
+        real_fsync(fd)
+        synced.add(engine.os.fstat(fd).st_ino)
+    monkeypatch.setattr(engine.os, 'fsync', fsync)
+    # Check checkpoint durability against an independent descriptor. This also
+    # catches buffered seek/write races between concurrent range workers.
+    workflows = engine._advanced_module()
+    real_write = workflows.Workflows.write
+    def checkpoint(owner, state):
+        if state.get('kind') == 'download' and state.get('status') == 'downloading':
+            for item in state['ranges']:
+                with Path(state['stagedPath']).open('rb') as source:
+                    source.seek(item['start'])
+                    value = source.read(item['length'])
+                assert hashlib.sha256(value).hexdigest() == item['sha256']
+            if state['ranges']:
+                assert Path(state['stagedPath']).stat().st_ino in synced
+                synced.clear()
+            writes.append(len(state['ranges']))
+        return real_write(owner, state)
+    monkeypatch.setattr(workflows.Workflows, 'write', checkpoint)
+    result = engine._storage_action({'profile': payload, 'action': 'startResumableDownload', 'bucketName': 'bucket',
+        'key': 'key', 'versionId': 'null', 'destinationDirectory': str(tmp_path), 'multipartChunkMiB': 2})
+    assert result['status'] == 'completed' and Path(result['filePath']).read_bytes() == data
+    assert attempts.count(0) == 2 and all(body.closed for body in bodies)
+    assert max(writes) == 3
+
+
+def test_recoverable_download_resume_validation_reads_bounded_blocks(engine, monkeypatch, profile, tmp_path):
+    data = b'A' * (5 * 1024**2)
+    client = ranged_client(engine, monkeypatch, data)
+    result = engine._storage_action({'profile': profile, 'action': 'startResumableDownload', 'bucketName': 'bucket',
+        'key': 'key', 'destinationDirectory': str(tmp_path), 'multipartChunkMiB': 4, 'maxRanges': 1})
+    assert result['status'] == 'paused'
+    real_fdopen = engine.os.fdopen
+    reads = []
+    class CheckedFile:
+        def __init__(self, wrapped): self.wrapped = wrapped
+        def __enter__(self): return self
+        def __exit__(self, *args): return self.wrapped.__exit__(*args)
+        def __getattr__(self, name): return getattr(self.wrapped, name)
+        def read(self, size=-1):
+            assert 0 < size <= 1024**2
+            reads.append(size)
+            return self.wrapped.read(size)
+    monkeypatch.setattr(engine.os, 'fdopen', lambda *args, **kw: CheckedFile(real_fdopen(*args, **kw)))
+    result = engine._storage_action({'profile': profile, 'action': 'resumeDownload', 'recoveryId': result['id']})
+    assert result['status'] == 'completed' and Path(result['filePath']).read_bytes() == data
+    assert reads == [1024**2] * 4 and client.get_object.call_count == 2
+
+
+def test_recoverable_download_overlong_body_preserves_adjacent_committed_range(engine, monkeypatch, profile, tmp_path):
+    chunk = 2 * 1024**2
+    data = b'A' * chunk + b'B' * chunk + b'C' * chunk
+    client = ranged_client(engine, monkeypatch, data)
+    result = engine._storage_action({'profile': profile, 'action': 'startResumableDownload', 'bucketName': 'bucket',
+        'key': 'key', 'destinationDirectory': str(tmp_path), 'multipartChunkMiB': 2, 'maxRanges': 2})
+    assert result['status'] == 'paused'
+    stage = Path(result['stagedPath'])
+    with stage.open('r+b') as output: output.write(b'corrupt')
+    body = io.BytesIO(data[:chunk] + b'!')
+    client.get_object.side_effect = lambda **_: {'Body': body, 'ContentRange': f'bytes 0-{chunk-1}/{len(data)}'}
+    with pytest.raises(engine.SidecarError) as error:
+        engine._storage_action({'profile': profile, 'action': 'resumeDownload', 'recoveryId': result['id'], 'maxRanges': 1})
+    assert error.value.code == 'object_conflict' and body.closed
+    assert stage.read_bytes()[chunk:2*chunk] == b'B' * chunk
+    state = json.loads((tmp_path / 'recovery' / (result['id'] + '.json')).read_text())
+    assert state['status'] == 'paused' and state['completedBytes'] == chunk
+    assert state['ranges'] == [{'start': chunk, 'length': chunk, 'sha256': hashlib.sha256(b'B' * chunk).hexdigest()}]
 
 
 def test_download_resumes_verified_ranges_and_checks_local_tampering(engine, monkeypatch, profile, tmp_path):
@@ -428,6 +535,113 @@ def test_benchmark_monotonic_clock_excludes_only_idle_pause_time(engine, monkeyp
     assert run.snapshot()['activeElapsedSeconds'] == pytest.approx(1)
 
 
+def capture_benchmark_runs(engine, monkeypatch):
+    runs = []
+    start = engine._BenchmarkRun.start
+    def capture(run):
+        runs.append(run)
+        start(run)
+    monkeypatch.setattr(engine._BenchmarkRun, 'start', capture)
+    return runs
+
+
+@pytest.mark.parametrize('terminal', ['completed', 'stopped', 'failed'])
+def test_terminal_benchmark_releases_owner_cache_and_client_after_workers_drain(engine, monkeypatch, profile, terminal):
+    client = Mock()
+    started = [threading.Event(), threading.Event()]
+    releases = [threading.Event(), threading.Event()]
+    first_drained = threading.Event()
+    calls = []
+    lock = threading.Lock()
+    def put(**_):
+        with lock:
+            index = len(calls)
+            calls.append(index)
+        started[index].set()
+        assert releases[index].wait(timeout=5)
+        if terminal == 'failed' and index == 0:
+            raise ConnectionError('injected benchmark failure')
+        return {'ResponseMetadata': {'RetryAttempts': 0}}
+    client.put_object.side_effect = put
+    monkeypatch.setattr(engine, '_build_client', lambda _: client)
+    runs = capture_benchmark_runs(engine, monkeypatch)
+    try:
+        result = engine._start_benchmark({'profile': profile, 'config': {
+            'bucketName': 'fixture', 'testMode': 'operation-count', 'operationCount': 2,
+            'concurrentThreads': 2, 'objectCount': 2, 'workloadType': 'write-only',
+            'objectSizes': [1024], 'dataCacheMb': 1, 'inMemoryData': True, 'randomData': False}})
+        run = runs[0]
+        assert all(event.wait(timeout=5) for event in started)
+        store = run.payload_store
+        assert store.bytes and store.cache
+        # A paused owner must survive even when no new dispatch is permitted.
+        engine._pause_benchmark({'runId': result['id']})
+        assert engine._BENCHMARKS[result['id']] is run
+        assert run.payload_store is store and run.client is client
+        if terminal == 'stopped': engine._stop_benchmark({'runId': result['id']})
+        elif terminal == 'completed': engine._resume_benchmark({'runId': result['id']})
+        # Observe the first lane leaving, while the second is still blocked.
+        original_snapshot = run.snapshot
+        def snapshot(persist=False):
+            value = original_snapshot(persist)
+            if terminal == 'failed' and value['status'] == 'failed': first_drained.set()
+            return value
+        monkeypatch.setattr(run, 'snapshot', snapshot)
+        releases[0].set()
+        if terminal == 'failed': assert first_drained.wait(timeout=5)
+        assert engine._BENCHMARKS[result['id']] is run
+        assert run.payload_store is store and run.client is client
+    finally:
+        for event in releases: event.set()
+        for run in runs:
+            for worker in run.threads: worker.join(timeout=5)
+    assert all(not worker.is_alive() for worker in run.threads)
+    assert result['id'] not in engine._BENCHMARKS
+    assert run.payload_store is None and run.client is None and not run.profile
+    assert not store.cache and store.bytes == 0
+    final = engine._get_benchmark_status({'runId': result['id']})
+    assert final['status'] == terminal and final['processedCount'] == 2
+    assert final['historyTotals']['records'] == 2
+    assert final['resultSummary'] == run.state['resultSummary']
+    for control in (engine._pause_benchmark, engine._resume_benchmark, engine._stop_benchmark):
+        assert control({'runId': result['id']})['status'] == terminal
+    assert result['id'] not in engine._BENCHMARKS
+
+
+def test_paused_benchmark_keeps_owner_when_workers_are_idle(engine, monkeypatch, profile):
+    client = Mock()
+    started, release, recorded = threading.Event(), threading.Event(), threading.Event()
+    def put(**_):
+        started.set()
+        assert release.wait(timeout=5)
+        return {}
+    client.put_object.side_effect = put
+    monkeypatch.setattr(engine, '_build_client', lambda _: client)
+    runs = capture_benchmark_runs(engine, monkeypatch)
+    result = engine._start_benchmark({'profile': profile, 'config': {
+        'bucketName': 'fixture', 'testMode': 'operation-count', 'operationCount': 2,
+        'concurrentThreads': 1, 'workloadType': 'write-only', 'objectSizes': [8], 'dataCacheMb': 1}})
+    run = runs[0]
+    try:
+        assert started.wait(timeout=5)
+        engine._pause_benchmark({'runId': result['id']})
+        append = engine._append_benchmark_history
+        def observe(state, rows):
+            append(state, rows)
+            recorded.set()
+        monkeypatch.setattr(engine, '_append_benchmark_history', observe)
+        release.set()
+        assert recorded.wait(timeout=5)
+        with run.lock:
+            assert run.reserved == 0
+            assert run.payload_store.cache and run.client is client
+            assert engine._BENCHMARKS[result['id']] is run
+    finally:
+        release.set()
+        engine._stop_benchmark({'runId': result['id']})
+        for worker in run.threads: worker.join(timeout=5)
+
+
 def test_threaded_benchmark_timeline_stays_within_measured_runtime(engine, monkeypatch, profile):
     import time
     client = Mock()
@@ -436,12 +650,13 @@ def test_threaded_benchmark_timeline_stays_within_measured_runtime(engine, monke
         return {'ResponseMetadata': {'RetryAttempts': 0}}
     client.put_object.side_effect = put
     monkeypatch.setattr(engine, '_build_client', lambda _: client)
+    runs = capture_benchmark_runs(engine, monkeypatch)
     started = time.monotonic()
     result = engine._start_benchmark({'profile': profile, 'config': {
         'bucketName': 'fixture', 'testMode': 'operation-count', 'operationCount': 16,
         'concurrentThreads': 4, 'objectCount': 16, 'workloadType': 'write-only',
         'objectSizes': [8], 'randomData': False, 'reducedLogging': True}})
-    run = engine._BENCHMARKS[result['id']]
+    run = runs[0]
     for thread in run.threads:
         thread.join(timeout=2)
     wall_seconds = time.monotonic() - started
@@ -513,8 +728,9 @@ def test_benchmark_bounded_history_full_csv_totals_and_restart(engine, monkeypat
     client = Mock()
     client.put_object.return_value = {'ResponseMetadata': {'RetryAttempts': 1}}
     monkeypatch.setattr(engine, '_build_client', lambda _: client)
+    runs = capture_benchmark_runs(engine, monkeypatch)
     engine._resume_benchmark({'runId': 'bench-history', 'profile': profile})
-    run = engine._BENCHMARKS['bench-history']
+    run = runs[0]
     for thread in run.threads:
         thread.join(timeout=2)
     final = run.snapshot()

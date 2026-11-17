@@ -98,6 +98,8 @@ class RecordingMockEngineService extends MockEngineService {
     required Map<String, String> objectKeyByPath,
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
+    Map<String, Object?>? clientEncryption,
+    ObjectEncryption? encryption,
   }) {
     lastUploadChunkMiB = multipartChunkMiB;
     uploadCalls.add(List.of(filePaths));
@@ -227,6 +229,84 @@ const _secondProfile = EndpointProfile(
 );
 
 void main() {
+  test('unrelated settings preserve all benchmark draft overrides', () async {
+    final controller = AppController(
+        engineService: MockEngineService(),
+        initialSettings: _settings,
+        initialProfiles: const [_profile]);
+    addTearDown(controller.dispose);
+    final draft = controller.benchmarkDraft.copyWith(
+        concurrentThreads: 17,
+        connectTimeoutSeconds: 41,
+        readTimeoutSeconds: 83,
+        maxAttempts: 11,
+        maxPoolConnections: 987,
+        dataCacheMb: 345,
+        csvOutputPath: '/custom/results.csv',
+        jsonOutputPath: '/custom/results.json',
+        debugMode: !controller.settings.benchmarkDebugMode,
+        logFilePath: '/custom/benchmark.log');
+    controller.benchmarkDraft = draft;
+    await controller.updateSettings(controller.settings.copyWith(
+        darkMode: !controller.settings.darkMode,
+        browserInspectorVisible: !controller.settings.browserInspectorVisible));
+    final actual = controller.benchmarkDraft;
+    expect(actual.concurrentThreads, draft.concurrentThreads);
+    expect(actual.connectTimeoutSeconds, draft.connectTimeoutSeconds);
+    expect(actual.readTimeoutSeconds, draft.readTimeoutSeconds);
+    expect(actual.maxAttempts, draft.maxAttempts);
+    expect(actual.maxPoolConnections, draft.maxPoolConnections);
+    expect(actual.dataCacheMb, draft.dataCacheMb);
+    expect(actual.csvOutputPath, draft.csvOutputPath);
+    expect(actual.jsonOutputPath, draft.jsonOutputPath);
+    expect(actual.debugMode, draft.debugMode);
+    expect(actual.logFilePath, draft.logFilePath);
+
+    // A changed default updates only the matching field.
+    await controller.updateSettings(controller.settings.copyWith(
+        transferConcurrency: controller.settings.transferConcurrency + 1));
+    expect(controller.benchmarkDraft.concurrentThreads,
+        controller.settings.transferConcurrency);
+    expect(controller.benchmarkDraft.connectTimeoutSeconds,
+        draft.connectTimeoutSeconds);
+    expect(
+        controller.benchmarkDraft.maxPoolConnections, draft.maxPoolConnections);
+    expect(controller.benchmarkDraft.csvOutputPath, draft.csvOutputPath);
+    expect(controller.benchmarkDraft.debugMode, draft.debugMode);
+  });
+
+  test('changed benchmark defaults update the corresponding draft fields',
+      () async {
+    final controller = AppController(
+        engineService: MockEngineService(),
+        initialSettings: _settings,
+        initialProfiles: const [_profile]);
+    addTearDown(controller.dispose);
+    final settings = controller.settings;
+    final changed = settings.copyWith(
+        connectTimeoutSeconds: settings.connectTimeoutSeconds + 1,
+        readTimeoutSeconds: settings.readTimeoutSeconds + 1,
+        safeRetries: settings.safeRetries + 1,
+        maxPoolConnections: settings.maxPoolConnections + 1,
+        benchmarkDataCacheMb: settings.benchmarkDataCacheMb + 1,
+        tempPath: '/changed',
+        benchmarkDebugMode: !settings.benchmarkDebugMode,
+        benchmarkLogPath: '/changed/benchmark.log');
+    await controller.updateSettings(changed);
+    final draft = controller.benchmarkDraft;
+    expect(draft.connectTimeoutSeconds, changed.connectTimeoutSeconds);
+    expect(draft.readTimeoutSeconds, changed.readTimeoutSeconds);
+    expect(draft.maxAttempts, changed.safeRetries);
+    expect(draft.maxPoolConnections, changed.maxPoolConnections);
+    expect(draft.dataCacheMb, changed.benchmarkDataCacheMb);
+    expect(draft.csvOutputPath,
+        '/changed${Platform.pathSeparator}benchmark-results.csv');
+    expect(draft.jsonOutputPath,
+        '/changed${Platform.pathSeparator}benchmark-results.json');
+    expect(draft.debugMode, changed.benchmarkDebugMode);
+    expect(draft.logFilePath, changed.benchmarkLogPath);
+  });
+
   test('multi-file controller upload exposes one job and nested file events',
       () async {
     final dir = await Directory.systemTemp.createTemp('batch-controller-');

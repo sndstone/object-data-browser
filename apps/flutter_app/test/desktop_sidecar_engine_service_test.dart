@@ -1,3 +1,4 @@
+import 'google_cloud_storage_fixture.dart' show googleProfile;
 import 'dart:io';
 import 'dart:async';
 import 'dart:convert';
@@ -38,6 +39,138 @@ void main() {
             .having((error) => error.code, 'code', ErrorCode.engineUnavailable),
       ),
     );
+  });
+
+  test('S3 AWS and Azure retain their exact sidecar profile payloads',
+      () async {
+    await File('${emptyEngineRoot.path}/manifest.json')
+        .writeAsString(jsonEncode({
+      'engines': [
+        {'id': 'python', 'executable': 'fixture'}
+      ]
+    }));
+    final host = ProfilePayloadHost();
+    service.shutdown();
+    service = DesktopSidecarEngineService(
+        host: host, engineRoot: emptyEngineRoot.path);
+    for (final type in [
+      EndpointProfileType.s3Compatible,
+      EndpointProfileType.awsS3,
+      EndpointProfileType.azureBlob
+    ]) {
+      final value = profile.copyWith(endpointType: type);
+      await service.listBuckets(engineId: 'python', profile: value);
+      expect(host.profiles.last, {
+        'id': 'test',
+        'name': 'Test',
+        'endpointUrl': 'http://localhost:9000',
+        'region': 'us-east-1',
+        'endpointType': type.name,
+        'accessKey': 'access',
+        'secretKey': 'secret',
+        'sessionToken': null,
+        'pathStyle': true,
+        'verifyTls': false,
+        'signerOverride': null,
+        'connectTimeoutSeconds': 5,
+        'readTimeoutSeconds': 60,
+        'maxConcurrentRequests': 10,
+        'maxAttempts': 5,
+        'maxRequestsPerSecond': 0,
+        'authMode': 'static',
+        'awsProfileName': '',
+        'roleArn': '',
+        'externalId': '',
+        'roleSessionName': 'object-browser',
+        'knownBucket': '',
+        'requesterPays': false,
+        'expectedBucketOwner': '',
+        'caBundlePath': '',
+        'storageClasses': <String>[],
+        'diagnostics': {'enableApiLogging': false, 'enableDebugLogging': false},
+      });
+    }
+    final sas = profile.copyWith(
+        endpointType: EndpointProfileType.azureBlob,
+        sessionToken: 'sas',
+        connection: const ConnectionOptions(authMode: 'azureSas'));
+    await service.listBuckets(engineId: 'python', profile: sas);
+    expect(host.profiles.last['azureSasToken'], 'sas');
+    expect(host.profiles.last['sessionToken'], 'sas');
+  });
+
+  test('native copy workflows use the selected engine core methods', () async {
+    await File('${emptyEngineRoot.path}/manifest.json')
+        .writeAsString(jsonEncode({
+      'engines': [
+        {'id': 'go', 'executable': 'fixture'}
+      ]
+    }));
+    final host = ProfilePayloadHost();
+    service.shutdown();
+    service = DesktopSidecarEngineService(
+        host: host, engineRoot: emptyEngineRoot.path);
+    final actions = <String, Map<String, Object?>>{
+      'listObjects': {'bucketName': 'source', 'prefix': '', 'flat': true},
+      'ensureBucket': {'bucketName': 'target', 'versioningEnabled': true},
+      'copyObject': {
+        'sourceBucketName': 'source',
+        'sourceKey': 'file',
+        'destinationBucketName': 'target',
+        'destinationKey': 'file',
+        'conflictPolicy': 'fail'
+      },
+    };
+    for (final action in actions.entries) {
+      await service.nativeProviderAction(
+          engineId: 'go',
+          profile: googleProfile(),
+          action: action.key,
+          arguments: action.value);
+    }
+    await service.nativeProviderAction(
+        engineId: 'go',
+        profile: googleProfile(),
+        action: 'copyObject',
+        arguments: {...actions['copyObject']!, 'move': true});
+    expect(host.parameters[1]['enableVersioning'], isTrue);
+    expect(host.parameters.last['conflictPolicy'], 'fail');
+    expect(host.parameters.last['sourceKey'], 'file');
+    expect(host.methods,
+        ['listObjects', 'createBucket', 'copyObject', 'moveObject']);
+    expect(
+        host.profiles.every((p) => p['endpointType'] == 'googleCloudStorage'),
+        isTrue);
+    expect(host.profiles.last['secretKey'], googleProfile().secretKey);
+  });
+
+  test('provider template metadata never changes the sidecar engine payload',
+      () async {
+    await File('${emptyEngineRoot.path}/manifest.json').writeAsString(
+      jsonEncode({
+        'engines': [
+          {'id': 'python', 'executable': 'fixture'},
+        ],
+      }),
+    );
+    final host = ProfilePayloadHost();
+    service.shutdown();
+    service = DesktopSidecarEngineService(
+      host: host,
+      engineRoot: emptyEngineRoot.path,
+    );
+    await service.listBuckets(engineId: 'python', profile: profile);
+    await service.listBuckets(
+      engineId: 'python',
+      profile: profile.copyWith(
+          providerTemplateId: 'minio', useCustomAwsEndpoint: true),
+    );
+    expect(host.profiles, hasLength(2));
+    expect(host.profiles.last, host.profiles.first);
+    expect(host.profiles.last, isNot(contains('providerTemplateId')));
+    expect(host.profiles.last, isNot(contains('useCustomAwsEndpoint')));
+    expect(host.profiles.last['endpointUrl'], profile.endpointUrl);
+    expect(host.profiles.last['accessKey'], profile.accessKey);
   });
   test('cancel during manifest lookup prevents later dispatch or fallback',
       () async {
@@ -144,6 +277,37 @@ class CountingBucketFallback extends MockEngineService {
       {required String engineId, required EndpointProfile profile}) async {
     calls++;
     return [];
+  }
+}
+
+class ProfilePayloadHost extends DesktopEngineHost {
+  final methods = <String>[];
+  final parameters = <Map<String, Object?>>[];
+  final profiles = <Map<String, Object?>>[];
+  @override
+  Future<DesktopEngineHostResponse> send({
+    required String executablePath,
+    List<String> arguments = const [],
+    String? workingDirectory,
+    required Map<String, Object?> request,
+    void Function(Map<String, Object?>)? onEvent,
+    bool concurrentControls = false,
+    Duration? timeout,
+    ListingCancellation? listingCancellation,
+  }) async {
+    methods.add(request['method'] as String);
+    parameters.add(Map<String, Object?>.from(request['params'] as Map));
+    profiles.add(
+      Map<String, Object?>.from((request['params'] as Map)['profile'] as Map),
+    );
+    return const DesktopEngineHostResponse(
+      payload: {
+        'ok': true,
+        'result': {'items': []},
+      },
+      stdoutOutput: '',
+      stderrOutput: '',
+    );
   }
 }
 

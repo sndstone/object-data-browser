@@ -99,6 +99,84 @@
           ]
         }
       }
+    },
+    "objectEncryption": {
+      "description": "Optional per-request object encryption. See transport_contract.md, Object encryption.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "mode"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "bucketDefault",
+            "sse-s3",
+            "sse-kms",
+            "dsse-kms",
+            "sse-c",
+            "azure-scope",
+            "azure-cpk"
+          ]
+        },
+        "kmsKeyId": {
+          "type": "string"
+        },
+        "kmsEncryptionContext": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "bucketKeyEnabled": {
+          "type": "boolean"
+        },
+        "customerKey": {
+          "type": "string",
+          "description": "Base64 of exactly 32 bytes. Secret; never logged or persisted."
+        },
+        "encryptionScope": {
+          "type": "string"
+        }
+      }
+    },
+    "clientEncryption": {
+      "description": "Optional client-side (age v1) encryption for one file. See transport_contract.md, Client-side encryption.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "format",
+        "fileKey"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "const": "age-v1"
+        },
+        "header": {
+          "type": "string",
+          "description": "Upload only. Base64 of the complete age header."
+        },
+        "payloadNonce": {
+          "type": "string",
+          "description": "Upload only. Base64 of 16 bytes."
+        },
+        "headerLength": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65536,
+          "description": "Download only."
+        },
+        "fileKey": {
+          "type": "string",
+          "description": "Base64 of the 16-byte age file key. Secret; never logged or persisted."
+        }
+      }
     }
   },
   "allOf": [
@@ -119,6 +197,61 @@
         "required": [
           "params"
         ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "enum": [
+              "startUpload",
+              "createFolder",
+              "runPutTestData",
+              "copyObject",
+              "moveObject",
+              "startDownload",
+              "getObjectDetails",
+              "generatePresignedUrl"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "properties": {
+              "encryption": {
+                "$ref": "#/$defs/objectEncryption"
+              },
+              "sourceEncryption": {
+                "$ref": "#/$defs/objectEncryption"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "enum": [
+              "startUpload",
+              "startDownload"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "properties": {
+              "clientEncryption": {
+                "$ref": "#/$defs/clientEncryption"
+              }
+            }
+          }
+        }
       }
     }
   ]

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../models/domain_models.dart';
+import '../theme/app_motion.dart';
 import 'app_select_field.dart';
 import 'app_switch.dart';
 
@@ -12,8 +13,10 @@ class ConnectionOptionsEditor extends StatelessWidget {
     required this.value,
     required this.endpointType,
     required this.onChanged,
+    this.enableAnimations = true,
   });
 
+  final bool enableAnimations;
   final ConnectionOptions value;
   final EndpointProfileType endpointType;
   final ValueChanged<ConnectionOptions> onChanged;
@@ -39,6 +42,7 @@ class ConnectionOptionsEditor extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final gcs = endpointType.isGoogleCloudStorage;
     final azure = endpointType == EndpointProfileType.azureBlob;
     final modes = azure
         ? const [
@@ -58,56 +62,61 @@ class ConnectionOptionsEditor extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        AppSelectField<String>(
-          value: modes.any((mode) => mode.value == value.authMode)
-              ? value.authMode
-              : 'static',
-          items: modes,
-          decoration: const InputDecoration(labelText: 'Authentication'),
-          onChanged: (mode) {
-            if (mode != null) onChanged(value.update('authMode', mode));
-          },
-        ),
-        if (value.authMode == 'awsProfile' || value.authMode == 'assumeRole')
+        if (!gcs)
+          AppSelectField<String>(
+            value: modes.any((mode) => mode.value == value.authMode)
+                ? value.authMode
+                : 'static',
+            items: modes,
+            decoration: const InputDecoration(labelText: 'Authentication'),
+            onChanged: (mode) {
+              if (mode != null) onChanged(value.update('authMode', mode));
+            },
+          ),
+        if (!gcs &&
+            (value.authMode == 'awsProfile' || value.authMode == 'assumeRole'))
           _text(
               'awsProfileName',
               value.authMode == 'assumeRole'
-                  ? 'Source AWS profile (optional)'
+                  ? 'Source AWS profile'
                   : 'AWS profile name',
               value.awsProfileName,
               helper:
-                  'Use a profile configured on this computer. Complete any SSO sign-in before connecting.'),
-        if (value.authMode == 'assumeRole') ...[
+                  'Optional for a source profile. Use a profile configured on this computer. Complete any SSO sign-in before connecting.'),
+        if (!gcs && (value.authMode == 'assumeRole')) ...[
           _text('roleArn', 'Role ARN', value.roleArn),
-          _text('externalId', 'External ID (optional)', value.externalId),
+          _text('externalId', 'External ID', value.externalId,
+              helper: 'Optional external ID for the role.'),
           _text('roleSessionName', 'Role session name', value.roleSessionName),
         ],
-        if (value.authMode == 'awsDefault')
+        if (!gcs && (value.authMode == 'awsDefault'))
           const Padding(
             padding: EdgeInsets.only(top: 8),
             child: Text(
                 'Resolve credentials from this computer’s AWS configuration, environment or assigned role.'),
           ),
-        if (value.authMode == 'azureDefault')
+        if (!gcs && (value.authMode == 'azureDefault'))
           const Padding(
             padding: EdgeInsets.only(top: 8),
             child: Text(
                 'Use your local Azure sign-in, environment credentials or managed identity. Requires the Python engine with Azure Identity installed.'),
           ),
-        const SizedBox(height: 12),
+        const SizedBox(height: 18),
         ExpansionTile(
           title: const Text('Bucket access and endpoint capabilities'),
           tilePadding: EdgeInsets.zero,
+          expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
+          expansionAnimationStyle: AnimationStyle(
+            curve: Curves.easeOutCubic,
+            duration: AppMotion.duration(context,
+                enabled: enableAnimations, milliseconds: 240),
+          ),
           children: [
-            _text(
-                'knownBucket',
-                azure
-                    ? 'Known container (optional)'
-                    : 'Known bucket (optional)',
+            _text('knownBucket', azure ? 'Known container' : 'Known bucket',
                 value.knownBucket,
                 helper:
-                    'Connect directly when your permissions do not allow listing the entire account.'),
-            if (!azure) ...[
+                    'Optional. Connect directly when your permissions do not allow listing the entire account.'),
+            if (endpointType.isS3) ...[
               AppSwitchTile(
                 value: value.requesterPays,
                 onChanged: (enabled) =>
@@ -116,23 +125,19 @@ class ConnectionOptionsEditor extends StatelessWidget {
                 subtitle: const Text(
                     'Authorize request and transfer charges to the requesting account.'),
               ),
-              _text(
-                  'expectedBucketOwner',
-                  'Expected bucket owner account ID (optional)',
+              _text('expectedBucketOwner', 'Expected owner',
                   value.expectedBucketOwner,
                   helper:
-                      'Reject requests if the bucket is owned by another AWS account.'),
-              _text(
-                  'storageClasses',
-                  'Supported lifecycle storage classes (optional)',
+                      'Optional AWS account ID. Reject requests if the bucket is owned by another AWS account.'),
+              _text('storageClasses', 'Storage classes',
                   value.storageClasses.join(', '),
                   helper:
-                      'For compatible endpoints, list verified tier names separated by commas, such as STANDARD_IA, GLACIER.'),
+                      'Optional. For compatible endpoints, list verified tier names separated by commas, such as STANDARD_IA, GLACIER.'),
             ],
-            _text('caBundlePath', 'Trusted CA bundle path (optional)',
-                value.caBundlePath,
-                helper: 'Local PEM certificate bundle for a private endpoint.'),
-            const SizedBox(height: 12),
+            _text('caBundlePath', 'Trusted CA bundle', value.caBundlePath,
+                helper:
+                    'Optional local PEM certificate bundle for a private endpoint.'),
+            const SizedBox(height: 18),
           ],
         ),
       ],

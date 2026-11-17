@@ -159,6 +159,11 @@ class StoragePresets {
     if (!lifecycleLabels.containsKey(preset)) {
       throw const FormatException('Unknown lifecycle preset.');
     }
+    if (profile.endpointType.isGoogleCloudStorage) {
+      throw const FormatException(
+        'S3 presets are unavailable for Google Cloud Storage.',
+      );
+    }
     if (profile.endpointType == EndpointProfileType.azureBlob) {
       throw const FormatException(
           'Azure lifecycle is an account management policy.');

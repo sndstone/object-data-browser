@@ -27,6 +27,14 @@ final _object = ObjectEntry(
     modifiedAt: DateTime(2026),
     isFolder: false);
 
+final _otherObject = ObjectEntry(
+    key: 'other.bin',
+    name: 'other.bin',
+    size: 1,
+    storageClass: 'STANDARD',
+    modifiedAt: DateTime(2026),
+    isFolder: false);
+
 class DeferredInspectorEngine extends MockEngineService {
   final details = Completer<ObjectDetails>();
   final versions = Completer<ObjectVersionListResult>();
@@ -40,6 +48,7 @@ class DeferredInspectorEngine extends MockEngineService {
     required String bucketName,
     required String key,
     required Duration expiration,
+    ObjectEncryption? encryption,
   }) =>
       presign.future;
 
@@ -49,6 +58,7 @@ class DeferredInspectorEngine extends MockEngineService {
     required EndpointProfile profile,
     required String bucketName,
     required String key,
+    ObjectEncryption? encryption,
   }) async {
     if (defer) return details.future;
     return ObjectDetails(
@@ -117,6 +127,81 @@ void main() {
     controller.objects = [_object];
   });
   tearDown(() => controller.dispose());
+
+  for (final fail in [false, true]) {
+    for (final change in [
+      'object',
+      'bucket',
+      'profile',
+      'engine',
+      'round trip'
+    ]) {
+      test('stale share ${fail ? 'error' : 'result'} is ignored after $change',
+          () async {
+        await controller.setSelectedObject(_object, loadArtifacts: false);
+        controller.clearBanner();
+        final request = controller.generateSelectedPresignedUrl();
+        switch (change) {
+          case 'object':
+            await controller.setSelectedObject(_otherObject,
+                loadArtifacts: false);
+          case 'bucket':
+            controller.selectedBucket = const BucketSummary(
+                name: 'other',
+                region: 'us-east-1',
+                objectCountHint: 1,
+                versioningEnabled: true);
+          case 'profile':
+            controller.selectedProfile =
+                EndpointProfile.fromJson({..._profile.toJson(), 'id': 'other'});
+          case 'engine':
+            controller.activeEngineId = 'go';
+          case 'round trip':
+            // Even returning to the same identity must invalidate the request.
+            await controller.setSelectedObject(_otherObject,
+                loadArtifacts: false);
+            await controller.setSelectedObject(_object, loadArtifacts: false);
+        }
+        controller.inspectorTab = BrowserInspectorTab.versions;
+        controller.selectedObjectDetails = ObjectDetails(
+            key: controller.selectedObject!.key,
+            metadata: const {'current': 'details'},
+            headers: const {},
+            tags: const {},
+            debugEvents: const [],
+            apiCalls: const []);
+        final details = controller.selectedObjectDetails;
+        if (fail) {
+          engine.presign.completeError(const EngineException(
+              code: ErrorCode.authFailed, message: 'Old share denied'));
+        } else {
+          engine.presign.complete('https://example.invalid/original/same.bin');
+        }
+        await request;
+        expect(controller.selectedObjectDetails, same(details));
+        expect(controller.inspectorTab, BrowserInspectorTab.versions);
+        expect(controller.bannerMessage, isNull);
+        expect(
+            controller.eventLog.where((e) => e.category == 'Presign'), isEmpty);
+      });
+    }
+  }
+
+  test('current share attaches its URL and captured expiration', () async {
+    await controller.setSelectedObject(_object, loadArtifacts: false);
+    final expiration = controller.settings.defaultPresignMinutes;
+    final request = controller.generateSelectedPresignedUrl();
+    await controller.updateSettings(
+        controller.settings.copyWith(defaultPresignMinutes: expiration + 1));
+    engine.presign.complete('https://example.invalid/original/same.bin');
+    await request;
+    expect(controller.selectedObjectDetails!.presignedUrl!.url,
+        'https://example.invalid/original/same.bin');
+    expect(controller.selectedObjectDetails!.presignedUrl!.expirationMinutes,
+        expiration);
+    expect(controller.inspectorTab, BrowserInspectorTab.presign);
+    expect(controller.bannerMessage, 'Share link ready.');
+  });
 
   test('late details are ignored before the new context has loaded', () async {
     final selection = controller.setSelectedObject(_object);

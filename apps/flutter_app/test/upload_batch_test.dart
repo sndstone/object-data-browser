@@ -25,7 +25,9 @@ class FileEngine extends MockEngineService {
       required List<String> filePaths,
       required Map<String, String> objectKeyByPath,
       required int multipartThresholdMiB,
-      required int multipartChunkMiB}) async {
+      required int multipartChunkMiB,
+      Map<String, Object?>? clientEncryption,
+      ObjectEncryption? encryption}) async {
     expect(filePaths, hasLength(1));
     final index = requests.length;
     final path = filePaths.single;

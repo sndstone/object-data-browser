@@ -79,10 +79,8 @@ import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignReques
 
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
-import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.net.URI;
@@ -106,17 +104,23 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class Main {
-    private static final String ENGINE_VERSION = "2.3.5";
+    private static final String ENGINE_VERSION = "2.4.0";
     private static final int REQUEST_POOL_SIZE = 8;
+    // The desktop host normally sends one request per process. Allow a burst of 32 queued
+    // requests in addition to eight active requests, without retaining an unbounded backlog.
+    static final int REQUEST_QUEUE_SIZE = 32;
     private static final int DELETE_BATCH_LIMIT = 1000;
     private static final Object STDOUT_LOCK = new Object();
     private static final ConcurrentHashMap<String, JobControl> TRANSFER_REGISTRY = new ConcurrentHashMap<>();
@@ -185,7 +189,10 @@ public final class Main {
     private Main() {
     }
 
-    private static void emitStructuredLog(String level, String category, String message, String source) {
+    static void emitStructuredLog(String level, String category, String message, String source) {
+        message = SecretHygiene.text(message);
+        category = SecretHygiene.text(category);
+        source = SecretHygiene.text(source);
         try {
             System.err.println("S3_BROWSER_LOG " + MAPPER.writeValueAsString(orderedMap(
                 "level", level,
@@ -208,54 +215,103 @@ public final class Main {
     }
 
     public static void main(String[] args) throws Exception {
-        var reader = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
-        ExecutorService requestPool = Executors.newFixedThreadPool(REQUEST_POOL_SIZE);
-        String line;
+        SecretHygiene.disableWireLogging();
+        var reader = new InputFrames(System.in, InputFrames.MAX_BYTES);
+        ExecutorService requestPool = newRequestPool();
+        ExecutorService controlPool = newControlPool();
         try {
             // Read requests on the main thread and dispatch each to a bounded worker pool so the
             // engine stays responsive to control requests (pause/resume/cancel) while long-running
             // transfers execute. All stdout writes are serialized through writeLine, and the desktop
             // host correlates responses by requestId, so out-of-order responses are expected.
-            while ((line = reader.readLine()) != null) {
+            while (true) {
+                String line;
+                try { line = reader.read(); }
+                catch (InputFrames.TooLargeException error) {
+                    writeAdmissionError(null, "invalid_request", "Input frame exceeds the 64 MiB limit.");
+                    continue;
+                }
+                if (line == null) break;
                 final String request = line.trim();
                 if (request.isEmpty()) {
                     continue;
                 }
-                if (isControlPlaneRequest(request)) {
-                    // Handle control requests (pause/resume/cancel) synchronously on the reader
-                    // thread. They only mutate the in-memory registry and must never queue behind a
-                    // saturated worker pool -- in particular a paused transfer holds its worker thread
-                    // blocked, so routing control here guarantees a resume/cancel can always land.
-                    processRequest(request);
-                } else {
-                    requestPool.submit(() -> processRequest(request));
-                }
+                dispatchRequest(requestPool, controlPool, request);
             }
         } finally {
             requestPool.shutdown();
-            if (!requestPool.awaitTermination(60, TimeUnit.SECONDS)) {
-                requestPool.shutdownNow();
+            try {
+                if (!requestPool.awaitTermination(60, TimeUnit.SECONDS))
+                    BoundedTasks.shutdownAndAwait(requestPool);
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                BoundedTasks.shutdownAndAwait(requestPool);
+            } finally {
+                controlPool.shutdown();
+                try {
+                    if (!controlPool.awaitTermination(60, TimeUnit.SECONDS))
+                        BoundedTasks.shutdownAndAwait(controlPool);
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    BoundedTasks.shutdownAndAwait(controlPool);
+                }
             }
         }
     }
 
-    private static boolean isControlPlaneRequest(String line) {
+    static ThreadPoolExecutor newRequestPool() {
+        return new ThreadPoolExecutor(REQUEST_POOL_SIZE, REQUEST_POOL_SIZE, 0, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(REQUEST_QUEUE_SIZE));
+    }
+
+    static ThreadPoolExecutor newControlPool() {
+        // Benchmark controls can wait on a benchmark's state lock. Keep that wait off the
+        // reader so transfer resume/cancel can still land. A control flood applies reader
+        // backpressure instead of rejecting controls or retaining an unbounded queue.
+        return new ThreadPoolExecutor(4, 4, 0, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(REQUEST_QUEUE_SIZE), new ThreadPoolExecutor.CallerRunsPolicy());
+    }
+
+    static void dispatchRequest(ExecutorService requestPool, ExecutorService controlPool, String request) {
+        String method = requestMethod(request);
+        if ("pauseTransfer".equals(method) || "resumeTransfer".equals(method)
+                || "cancelTransfer".equals(method) || "cancelToolExecution".equals(method)) {
+            // A paused transfer holds a worker. Its controls must bypass request admission.
+            processRequest(request);
+        } else if ("getBenchmarkStatus".equals(method) || "pauseBenchmark".equals(method)
+                || "resumeBenchmark".equals(method) || "stopBenchmark".equals(method)) {
+            controlPool.execute(() -> processRequest(request));
+        } else {
+            try { requestPool.execute(() -> processRequest(request)); }
+            catch (RejectedExecutionException error) {
+                String requestId = null;
+                try { requestId = text(MAPPER.readTree(request), "requestId"); }
+                catch (IOException ignored) {}
+                writeAdmissionError(requestId, "overloaded", "Request queue is full; retry after active requests finish.");
+            }
+        }
+    }
+
+    private static void writeAdmissionError(String requestId, String code, String message) {
+        writeResponse(orderedMap("requestId", requestId, "ok", false,
+            "error", orderedMap("code", code, "message", message, "details", Map.of())));
+    }
+
+    private static String requestMethod(String line) {
         try {
-            String method = text(MAPPER.readTree(line), "method");
-            return "pauseTransfer".equals(method)
-                || "resumeTransfer".equals(method)
-                || "cancelTransfer".equals(method)
-                || "cancelToolExecution".equals(method);
+            return text(MAPPER.readTree(line), "method");
         } catch (IOException error) {
             // Malformed JSON: let the worker path parse it and emit the proper error response.
-            return false;
+            return "";
         }
     }
 
     private static void processRequest(String line) {
         String requestId = null;
+        SecretHygiene secrets = null;
         try {
             JsonNode payload = MAPPER.readTree(line);
+            secrets = new SecretHygiene(payload);
             requestId = text(payload, "requestId");
             Map<String, Object> result = handleRequest(payload);
             writeResponse(orderedMap(
@@ -274,6 +330,8 @@ public final class Main {
                     "details", mapped.details
                 )
             ));
+        } finally {
+            if (secrets != null) secrets.close();
         }
     }
 
@@ -288,7 +346,7 @@ public final class Main {
 
     private static void writeResponse(Map<String, Object> response) {
         try {
-            writeLine(MAPPER.writeValueAsString(response));
+            writeLine(MAPPER.writeValueAsString(SecretHygiene.clean(response)));
         } catch (IOException error) {
             emitStructuredLog("ERROR", "Transport",
                 "Failed to serialize response: " + error.getMessage(), "engine");
@@ -364,6 +422,13 @@ public final class Main {
                         capability("bucket.policy", "Bucket policy CRUD", "supported", null),
                         capability("bucket.cors", "Bucket CORS CRUD", "supported", null),
                         capability("bucket.encryption", "Bucket encryption", "supported", null),
+                        capability("object.encryption.sse-s3", "SSE-S3", "supported", null),
+                        capability("object.encryption.sse-kms", "SSE-KMS", "supported", null),
+                        capability("object.encryption.dsse-kms", "DSSE-KMS", "supported", null),
+                        capability("object.encryption.sse-c", "SSE-C", "supported", null),
+                        clientEncryptionCapability(),
+                        capability("object.encryption.azure-scope", "Azure encryption scope", "unsupported", "The Java engine has no Azure support."),
+                        capability("object.encryption.azure-cpk", "Azure customer key", "unsupported", "The Java engine has no Azure support."),
                         capability("bucket.tagging", "Bucket tagging", "supported", null),
                         capability("bucket.versioning", "Bucket versioning", "supported", null),
                         capability("object.copy_move", "Copy, move, rename", "supported", null),
@@ -954,6 +1019,7 @@ public final class Main {
     }
 
     private static Map<String, Object> getObjectDetails(JsonNode params) {
+        ObjectEncryption encryption = ObjectEncryption.parse(params, "encryption");
         BucketContext context = bucketContext(params);
         String key =
                 requiredText(
@@ -974,11 +1040,11 @@ public final class Main {
                             "HeadObject",
                             () ->
                                     client.headObject(
-                                            HeadObjectRequest.builder()
+                                            encryption.read(HeadObjectRequest.builder()
                                                     .bucket(context.bucketName())
                                                     .key(key)
                                                     .versionId(
-                                                            params.path("versionId").asText(null))
+                                                            params.path("versionId").asText(null)))
                                                     .build()));
             var tagging =
                     optionalBucketApi(
@@ -1013,7 +1079,7 @@ public final class Main {
                 "message", "Loaded metadata and " + tags.size() + " tag(s) for " + key + "."
             ));
 
-            return orderedMap(
+            Map<String, Object> result = orderedMap(
                     "key", key,
                     "metadata", metadata,
                     "headers", headers,
@@ -1032,10 +1098,14 @@ public final class Main {
                     "rawDiagnostics",
                             orderedMap(
                                     "bucketName", context.bucketName(), "engineState", "healthy"));
+            var reported = ObjectEncryption.reported(head);
+            if (!reported.isEmpty()) result.put("encryption", reported);
+            return result;
         }
     }
 
     private static Map<String, Object> createFolder(JsonNode params) {
+        ObjectEncryption encryption = ObjectEncryption.parse(params, "encryption");
         BucketContext context = bucketContext(params);
         String key =
                 requiredText(params, "key", "Bucket name and key are required to create a folder.");
@@ -1043,9 +1113,9 @@ public final class Main {
             key += "/";
         }
         try (S3Client client = context.client()) {
-            client.putObject(PutObjectRequest.builder()
+            client.putObject(encryption.write(PutObjectRequest.builder()
                     .bucket(context.bucketName())
-                    .key(key)
+                    .key(key))
                     .build(),
                 software.amazon.awssdk.core.sync.RequestBody.empty());
         }
@@ -1053,9 +1123,11 @@ public final class Main {
     }
 
     private static Map<String, Object> copyObject(JsonNode params) {
+        ObjectEncryption encryption = ObjectEncryption.parse(params, "encryption");
+        ObjectEncryption sourceEncryption = ObjectEncryption.parse(params, "sourceEncryption");
         Profile profile = parseProfile(params.path("profile"));
         try (S3Client client = buildClient(profile)) {
-            return ServerCopy.run(client, params, transferPoolSize(profile));
+            return ServerCopy.run(client, params, transferPoolSize(profile), encryption, sourceEncryption);
         }
     }
 
@@ -1223,10 +1295,12 @@ public final class Main {
     }
 
     private static Map<String, Object> startUpload(JsonNode params) throws IOException {
+        ObjectEncryption encryption = ObjectEncryption.parse(params, "encryption");
         Profile profile = parseProfile(params.path("profile"));
         String bucket = requiredText(params, "bucketName", "Bucket name is required.");
         List<Path> paths = stringArray(params.path("filePaths")).stream().map(Path::of).toList();
         if (paths.isEmpty()) throw new SidecarException("invalid_config", "File paths are required.");
+        ClientEncryption cipher = ClientEncryption.parse(params, true, paths.size());
         Map<String, String> names = stringMap(params.path("objectKeyByPath"));
         String prefix = params.path("prefix").asText("");
         long threshold = Math.max(params.path("multipartThresholdMiB").asInt(32), 1) * 1024L * 1024L;
@@ -1236,10 +1310,11 @@ public final class Main {
         int partCount = 0;
         for (Path path : paths) {
             var snapshot = UploadSource.Snapshot.capture(path);
-            validateUploadSize(snapshot.size(), threshold, chunk);
+            long size = cipher == null ? snapshot.size() : cipher.uploadLayout(snapshot.size()).ciphertext();
+            validateUploadSize(size, threshold, chunk);
             sources.put(path, snapshot);
-            total += snapshot.size();
-            if (snapshot.size() >= threshold) partCount += (int) ((snapshot.size() + chunk - 1) / chunk);
+            total += size;
+            if (size >= threshold) partCount += (int) ((size + chunk - 1) / chunk);
         }
         String job = "upload-" + UUID.randomUUID().toString().substring(0, 8);
         JobControl control = new JobControl();
@@ -1259,15 +1334,15 @@ public final class Main {
                 var snapshot = sources.get(path);
                 // Validation is repeated immediately before dispatch, not only during preparation.
                 try (UploadSource source = new UploadSource(path, snapshot)) {
-                    long size = snapshot.size();
+                    long size = cipher == null ? snapshot.size() : cipher.uploadLayout(snapshot.size()).ciphertext();
                     String name = names.getOrDefault(path.toString(), path.getFileName().toString())
                         .replace('\\', '/').replaceFirst("^/+", "");
                     String key = prefix.isBlank() ? name : prefix + name;
                     progress.line("Uploading " + path.getFileName() + " (" + size + " bytes) to " + key + ".");
                     if (size >= threshold) {
-                        String id = client.createMultipartUpload(CreateMultipartUploadRequest.builder()
-                            .bucket(bucket).key(key).build()).uploadId();
-                        try (MultipartUploadSession upload = new MultipartUploadSession(client, bucket, key, id)) {
+                        String id = client.createMultipartUpload(encryption.write(CreateMultipartUploadRequest.builder()
+                            .bucket(bucket).key(key)).build()).uploadId();
+                        try (MultipartUploadSession upload = new MultipartUploadSession(client, bucket, key, id, encryption)) {
                             List<CompletedPart> parts = new ArrayList<>();
                             try (BoundedTasks<CompletedPart> tasks = new BoundedTasks<>(executor, workers, parts::add)) {
                                 int count = (int) ((size + chunk - 1) / chunk);
@@ -1277,9 +1352,9 @@ public final class Main {
                                     final long length = Math.min(chunk, size - offset);
                                     tasks.submit(() -> {
                                         checkTransfer(control, progress);
-                                        var result = client.uploadPart(UploadPartRequest.builder().bucket(bucket)
-                                            .key(key).uploadId(id).partNumber(number).build(),
-                                            sourceBody(source, offset, length, control, progress));
+                                        var result = client.uploadPart(encryption.read(UploadPartRequest.builder().bucket(bucket)
+                                            .key(key).uploadId(id).partNumber(number)).build(),
+                                            sourceBody(source, offset, length, control, progress, cipher));
                                         progress.part(length, "Uploaded part " + number + " for " + path.getFileName() + ".");
                                         return CompletedPart.builder().partNumber(number).eTag(result.eTag()).build();
                                     });
@@ -1292,8 +1367,8 @@ public final class Main {
                             upload.complete(CompletedMultipartUpload.builder().parts(parts).build());
                         }
                     } else {
-                        client.putObject(PutObjectRequest.builder().bucket(bucket).key(key).build(),
-                            sourceBody(source, 0, size, control, progress));
+                        client.putObject(encryption.write(PutObjectRequest.builder().bucket(bucket).key(key)).build(),
+                            sourceBody(source, 0, size, control, progress, cipher));
                         source.verify();
                         progress.bytes(size);
                     }
@@ -1309,7 +1384,7 @@ public final class Main {
                 throw new java.io.InterruptedIOException("Upload interrupted.");
             } else throw unwrapTransferFailure(error instanceof ExecutionException ? error.getCause() : error);
         } finally {
-            executor.shutdownNow();
+            BoundedTasks.shutdownAndAwait(executor);
             TRANSFER_REGISTRY.remove(job);
         }
         progress.line(cancelled ? "Upload cancelled after " + progress.items + " of " + paths.size() + " file(s)."
@@ -1318,11 +1393,12 @@ public final class Main {
     }
 
     private static RequestBody sourceBody(UploadSource source, long offset, long length,
-                                           JobControl control, TransferProgress progress) {
+                                           JobControl control, TransferProgress progress, ClientEncryption cipher) {
         return RequestBody.fromContentProvider(() -> {
             try {
                 source.verify();
-                return new FilePartStream(source.channel, offset, length, () -> checkTransfer(control, progress));
+                return cipher == null ? new FilePartStream(source.channel, offset, length, () -> checkTransfer(control, progress))
+                    : cipher.stream(source, offset, length, () -> checkTransfer(control, progress));
             } catch (IOException error) { throw new java.io.UncheckedIOException(error); }
         }, length, "application/octet-stream");
     }
@@ -1396,8 +1472,10 @@ public final class Main {
     }
 
     private static Map<String, Object> startDownload(JsonNode params) throws IOException {
-        BucketContext context = bucketContext(params);
+        ObjectEncryption encryption = ObjectEncryption.parse(params, "encryption");
         List<String> keys = stringArray(params.path("keys"));
+        ClientEncryption cipher = ClientEncryption.parse(params, false, keys.size());
+        BucketContext context = bucketContext(params);
         String destinationPath = requiredText(params, "destinationPath", "Download directory is required.");
         if (keys.isEmpty()) throw new SidecarException("invalid_config", "Object keys are required.");
         Path destination = Path.of(destinationPath);
@@ -1421,7 +1499,7 @@ public final class Main {
             })) {
                 for (String key : keys) reads.submit(() -> {
                     if (!control.awaitRunnable()) throw new TransferCancelledException();
-                    return Map.entry(key, client.headObject(HeadObjectRequest.builder().bucket(context.bucketName()).key(key).versionId(version).build()));
+                    return Map.entry(key, client.headObject(encryption.read(HeadObjectRequest.builder().bucket(context.bucketName()).key(key).versionId(version)).build()));
                 });
                 reads.finish();
             } catch (Exception error) {
@@ -1430,10 +1508,11 @@ public final class Main {
             }
             for (String key : keys) {
                 long size = sizes.get(key); total += size;
-                if (size >= threshold) partCount += (int) ((size + chunk - 1) / chunk);
+                if (cipher != null) partCount += (int) cipher.downloadLayout(size).chunks();
+                else if (size >= threshold) partCount += (int) ((size + chunk - 1) / chunk);
             }
             TransferProgress progress = new TransferProgress(job, "Download " + keys.size() + " object(s) from "
-                + context.bucketName(), "download", total, keys.size(), chunk, partCount,
+                + context.bucketName(), "download", total, keys.size(), cipher == null ? chunk : ClientEncryption.SEALED, partCount,
                 params.path("progressIntervalMs").asInt(100));
             progress.item = keys.getFirst();
             progress.line("Queued " + keys.size() + " object(s) for download to " + destinationPath + ".");
@@ -1448,7 +1527,35 @@ public final class Main {
                     try (DownloadDestination staged = new DownloadDestination(destination);
                          FileChannel channel = FileChannel.open(staged.path, StandardOpenOption.WRITE)) {
                         progress.line("Downloading " + key + " (" + size + " bytes) to " + staged.path + ".");
-                        if (size > 0) {
+                        if (cipher != null) {
+                            var layout = cipher.downloadLayout(size);
+                            byte[] nonce = cipherRange(client, context, encryption, key, version, validators.get(key),
+                                size, cipher.headerLength, cipher.headerLength + 15L, control, progress);
+                            byte[] payloadKey = cipher.key(nonce);
+                            try {
+                                progress.bytes(layout.prefix());
+                                try (BoundedTasks<Void> tasks = new BoundedTasks<>(executor, workers, ignored -> {})) {
+                                    for (long index = 0; index < layout.chunks(); index++) {
+                                        final long part = index, from = layout.offset(index);
+                                        final long to = from + layout.plainLength(index) + ClientEncryption.TAG - 1;
+                                        tasks.submit(() -> {
+                                            byte[] sealed = cipherRange(client, context, encryption, key, version, validators.get(key),
+                                                size, from, to, control, progress);
+                                            byte[] plaintext = ClientEncryption.open(payloadKey, part, part == layout.chunks() - 1, sealed);
+                                            ByteBuffer bytes = ByteBuffer.wrap(plaintext);
+                                            long position = part * ClientEncryption.CHUNK;
+                                            while (bytes.hasRemaining()) {
+                                                checkTransfer(control, progress);
+                                                position += channel.write(bytes, position);
+                                            }
+                                            progress.part(sealed.length, "Authenticated chunk " + part + " for " + key + ".");
+                                            return null;
+                                        });
+                                    }
+                                    tasks.finish();
+                                }
+                            } finally { java.util.Arrays.fill(payloadKey, (byte) 0); }
+                        } else if (size > 0) {
                             boolean ranged = size >= threshold;
                             long rangeSize = ranged ? chunk : size;
                             try (BoundedTasks<Void> tasks = new BoundedTasks<>(executor, workers, ignored -> {})) {
@@ -1457,9 +1564,9 @@ public final class Main {
                                     tasks.submit(() -> {
                                         long bytes = RangedDownload.transfer(channel, from, to, size, validators.get(key),
                                             context.profile().maxAttempts(), ranged, () -> {
-                                                var response = client.getObject(GetObjectRequest.builder()
+                                                var response = client.getObject(encryption.read(GetObjectRequest.builder()
                                                     .bucket(context.bucketName()).key(key).versionId(version)
-                                                    .ifMatch(validators.get(key)).range(ranged ? "bytes=" + from + "-" + to : null).build());
+                                                    .ifMatch(validators.get(key)).range(ranged ? "bytes=" + from + "-" + to : null)).build());
                                                 return new RangedDownload.Response(response, response.response().contentRange(),
                                                     response.response().eTag(), response.response().contentLength());
                                             }, () -> checkTransfer(control, progress));
@@ -1472,13 +1579,23 @@ public final class Main {
                             }
                         }
                         checkTransfer(control, progress);
-                        if (channel.size() != size) throw new IOException("Download size mismatch; partial file discarded.");
+                        long expectedSize = cipher == null ? size : cipher.downloadLayout(size).plaintext();
+                        if (channel.size() != expectedSize) throw new IOException("Download size mismatch; partial file discarded.");
                         channel.force(true);
                         // Close the handle before publication, including on Windows.
                         channel.close();
-                        Path target = staged.publish(allocator, key, params.path("conflictPolicy").asText("keepBoth"));
+                        String publishKey = key;
+                        if (cipher != null) {
+                            String normalized = key.replace('\\', '/');
+                            publishKey = normalized.substring(normalized.lastIndexOf('/') + 1);
+                            if (publishKey.endsWith(".age") && publishKey.length() > 4) {
+                                publishKey = publishKey.substring(0, publishKey.length() - 4);
+                            }
+                        }
+                        if (cipher != null && cipher.fileName != null) publishKey = cipher.fileName;
+                        Path target = staged.publish(allocator, publishKey, params.path("conflictPolicy").asText("keepBoth"));
                         progress.line("Saved " + key + " to " + target + ".");
-                        progress.finished("Finished downloading " + key + ".");
+                        progress.finished("Finished downloading " + (cipher == null ? key : target.getFileName()) + ".");
                     }
                 }
             } catch (Exception error) {
@@ -1492,9 +1609,21 @@ public final class Main {
                 : "Downloaded " + keys.size() + " object(s) into " + destinationPath + ".");
             return progress.snapshot(cancelled ? "cancelled" : "completed");
         } finally {
-            executor.shutdownNow();
+            BoundedTasks.shutdownAndAwait(executor);
             TRANSFER_REGISTRY.remove(job);
         }
+    }
+
+    private static byte[] cipherRange(S3Client client, BucketContext context, ObjectEncryption encryption,
+                                      String key, String version, String etag, long size, long from, long to,
+                                      JobControl control, TransferProgress progress) throws IOException {
+        return RangedDownload.read(from, to, size, etag, context.profile().maxAttempts(), () -> {
+            var response = client.getObject(encryption.read(GetObjectRequest.builder()
+                .bucket(context.bucketName()).key(key).versionId(version).ifMatch(etag)
+                .range("bytes=" + from + "-" + to)).build());
+            return new RangedDownload.Response(response, response.response().contentRange(),
+                response.response().eTag(), response.response().contentLength());
+        }, () -> checkTransfer(control, progress));
     }
 
     private static Map<String, Object> transferControl(JsonNode params, String action) {
@@ -1545,6 +1674,8 @@ public final class Main {
     }
 
     private static Map<String, Object> generatePresignedUrl(JsonNode params) {
+        ObjectEncryption encryption = ObjectEncryption.parse(params, "encryption");
+        if (encryption.customer()) throw new SidecarException("unsupported_feature", "Customer-key encryption cannot be shared through a presigned URL.");
         Profile profile = parseProfile(params.path("profile"));
         String bucketName =
                 requiredText(
@@ -1588,6 +1719,7 @@ public final class Main {
     }
 
     private static Map<String, Object> runPutTestData(JsonNode params) {
+        ObjectEncryption encryption = ObjectEncryption.parse(params, "encryption");
         Profile profile = parseProfile(params.path("profile"));
         JsonNode config = params.path("config");
         String bucketName =
@@ -1609,15 +1741,15 @@ public final class Main {
             payload[index] = (byte) ('A' + (index % 26));
         }
         ExecutorService executor = Executors.newFixedThreadPool(threads);
-        try (S3Client client = buildClient(profile)) {
-            List<Future<?>> futures = new ArrayList<>(objectCount);
+        try (S3Client client = buildClient(profile);
+             BoundedTasks<Void> tasks = new BoundedTasks<>(executor, threads, ignored -> {})) {
             for (int index = 0; index < objectCount; index += 1) {
                 final String key = prefix + "testdata-" + String.format("%06d", index) + ".bin";
-                futures.add(executor.submit(() -> {
+                tasks.submit(() -> {
                     try {
                         for (int version = 0; version < versions; version += 1) {
                             client.putObject(
-                                PutObjectRequest.builder().bucket(bucketName).key(key).build(),
+                                encryption.write(PutObjectRequest.builder().bucket(bucketName).key(key)).build(),
                                 RequestBody.fromContentProvider(
                                     () -> new ByteArrayInputStream(payload),
                                     payload.length,
@@ -1633,11 +1765,10 @@ public final class Main {
                             failures.add("Failed " + key + ": " + mapException(error).message);
                         }
                     }
-                }));
+                    return null;
+                });
             }
-            for (Future<?> future : futures) {
-                future.get();
-            }
+            tasks.finish();
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();
             failedObjects.incrementAndGet();
@@ -1648,7 +1779,7 @@ public final class Main {
                 ? mapException(cause).message
                 : String.valueOf(error.getCause())));
         } finally {
-            executor.shutdownNow();
+            BoundedTasks.shutdownAndAwait(executor);
         }
         double durationSeconds = (System.nanoTime() - started) / 1_000_000_000.0;
         boolean failed = failedObjects.get() > 0;
@@ -1707,7 +1838,7 @@ public final class Main {
             throw new SidecarException("invalid_config", "Stop an existing benchmark before starting another (maximum four live runs).");
         String runId = "bench-" + UUID.randomUUID().toString().substring(0, 8);
         Map<String, Object> benchmarkConfig = benchmarkConfigWithRunDir(
-            MAPPER.convertValue(config, new TypeReference<Map<String, Object>>() {}),
+            MAPPER.convertValue(SecretHygiene.clean(config), new TypeReference<Map<String, Object>>() {}),
             runId
         );
         Map<String, Object> state =
@@ -1787,7 +1918,7 @@ public final class Main {
         Map<String, Object> clean = new LinkedHashMap<>(state);
         clean.remove("profile");
         clean.remove("workerGeneration");
-        return MAPPER.convertValue(clean, new TypeReference<Map<String, Object>>() {});
+        return MAPPER.convertValue(SecretHygiene.clean(clean), new TypeReference<Map<String, Object>>() {});
     }
 
     private static Map<String, Object> liveBenchmark(JsonNode params) throws IOException {
@@ -1948,6 +2079,18 @@ public final class Main {
                     "Azure Blob profiles are not supported by the java engine yet. Switch the"
                         + " engine to Go or Python in Settings.");
         }
+        // Only S3 profile types may reach the S3 client; a non-S3 secret must
+        // never be sent to an S3 endpoint as an access key.
+        String endpointType = payload.path("endpointType").asText("").trim();
+        if ("googleCloudStorage".equals(endpointType)) {
+            throw new SidecarException(
+                    "unsupported_feature",
+                    "Google Cloud Storage profiles are not supported by the java engine yet. Switch the"
+                        + " engine to Go or Python in Settings.");
+        }
+        if (!List.of("", "s3Compatible", "awsS3").contains(endpointType)) {
+            throw new SidecarException("invalid_config", "Unknown endpoint type.");
+        }
         String authMode = payload.path("authMode").asText("static");
         if (!List.of("static", "awsProfile", "awsDefault", "assumeRole").contains(authMode))
             throw new SidecarException("invalid_config", "Unknown authentication mode.");
@@ -2036,6 +2179,7 @@ public final class Main {
     }
 
     private static S3Client createClient(Profile profile) {
+        SecretHygiene.disableWireLogging();
         ApacheHttpClient.Builder httpClient = ApacheHttpClient.builder()
             .connectionTimeout(Duration.ofSeconds(profile.connectTimeoutSeconds))
             .socketTimeout(Duration.ofSeconds(profile.readTimeoutSeconds))
@@ -2050,7 +2194,9 @@ public final class Main {
                 "engine");
         }
         ClientOverrideConfiguration.Builder overrideBuilder = ClientOverrideConfiguration.builder()
-                .addExecutionInterceptor(new BenchmarkRuntime.Metrics());
+                .addExecutionInterceptor(new BenchmarkRuntime.Metrics())
+                .addExecutionInterceptor(new EncryptionErrors())
+                .addExecutionInterceptor(new RequestTimeouts(Duration.ofSeconds(profile.readTimeoutSeconds)));
         if (profile.requesterPays) overrideBuilder.putHeader("x-amz-request-payer", "requester");
         if (!profile.expectedBucketOwner.isBlank())
             overrideBuilder.putHeader("x-amz-expected-bucket-owner", profile.expectedBucketOwner);
@@ -2060,7 +2206,6 @@ public final class Main {
                                 RetryPolicy.builder()
                                         .numRetries(Math.max(profile.maxAttempts - 1, 0))
                                         .build())
-                        .apiCallAttemptTimeout(Duration.ofSeconds(profile.readTimeoutSeconds))
                         .build();
         return S3Client.builder()
             .endpointOverride(URI.create(profile.endpointUrl))
@@ -2254,14 +2399,17 @@ public final class Main {
                 if (!applyDefault.isMissingNode() && !applyDefault.isNull()) {
                     ServerSideEncryptionByDefault.Builder defaults = ServerSideEncryptionByDefault.builder();
                     putIfNotBlank(value ->
-                        defaults.sseAlgorithm(software.amazon.awssdk.services.s3.model.ServerSideEncryption.fromValue(value))
+                        defaults.sseAlgorithm(value)
                     , text(applyDefault, "SSEAlgorithm"));
                     putIfNotBlank(defaults::kmsMasterKeyID, text(applyDefault, "KMSMasterKeyID"));
                     rule.applyServerSideEncryptionByDefault(defaults.build());
                 }
-                if (ruleNode.has("BucketKeyEnabled")) {
+                if (ruleNode.hasNonNull("BucketKeyEnabled")) {
                     rule.bucketKeyEnabled(ruleNode.path("BucketKeyEnabled").asBoolean(false));
                 }
+                JsonNode blocked = ruleNode.path("BlockedEncryptionTypes");
+                if (blocked.isObject()) rule.blockedEncryptionTypes(software.amazon.awssdk.services.s3.model.BlockedEncryptionTypes.builder()
+                    .encryptionTypeWithStrings(stringArray(blocked.path("EncryptionType"))).build());
                 rules.add(rule.build());
             }
         }
@@ -2336,7 +2484,9 @@ public final class Main {
                                                                         rule.applyServerSideEncryptionByDefault()
                                                                                 .kmsMasterKeyID()),
                                                 "BucketKeyEnabled",
-                                                rule.bucketKeyEnabled()))
+                                                rule.bucketKeyEnabled(),
+                                                "BlockedEncryptionTypes", rule.blockedEncryptionTypes() == null ? null :
+                                                    orderedMap("EncryptionType", rule.blockedEncryptionTypes().encryptionTypeAsStrings())))
                         .toList());
     }
 
@@ -2384,10 +2534,10 @@ public final class Main {
 
     private static void emitTransferEvent(Map<String, Object> job) {
         try {
-            writeLine(MAPPER.writeValueAsString(orderedMap(
+            writeLine(MAPPER.writeValueAsString(SecretHygiene.clean(orderedMap(
                 "event", "transferProgress",
                 "job", job
-            )));
+            ))));
         } catch (IOException ignored) {
         }
     }
@@ -2557,6 +2707,7 @@ public final class Main {
     }
 
     private static void appendBenchmarkLog(Map<String, Object> state, String line) {
+        line = SecretHygiene.text(line);
         List<String> log = new ArrayList<>(stringList(state.get("liveLog")));
         log.add(line);
         if (log.size() > 60) {
@@ -3307,9 +3458,9 @@ public final class Main {
                     + record.getOrDefault("key", "")
             );
         }
-        if (!Files.exists(csvPath)) Files.writeString(csvPath, String.join("\n", csvLines) + "\n");
+        if (!Files.exists(csvPath)) Files.writeString(csvPath, SecretHygiene.text(String.join("\n", csvLines) + "\n"));
         Files.writeString(jsonPath, writeJson(state.get("resultSummary")));
-        Files.writeString(logPath, String.join("\n", stringList(state.get("liveLog"))));
+        Files.writeString(logPath, SecretHygiene.text(String.join("\n", stringList(state.get("liveLog")))));
     }
 
     private static double averageBenchmarkLatency(Map<String, Object> state) {
@@ -3347,24 +3498,46 @@ public final class Main {
         if (error instanceof SidecarException sidecar) {
             return sidecar;
         }
+        if (error instanceof com.fasterxml.jackson.core.JsonProcessingException) {
+            // Parser diagnostics may quote a malformed customerKey token before a scope exists.
+            return new SidecarException("unknown", "Invalid JSON request or configuration.");
+        }
         Throwable cause = error instanceof RuntimeException runtime && runtime.getCause() != null
             ? runtime.getCause()
             : error;
+        String encryptionHint = null;
+        for (Throwable nested = error; nested != null; nested = nested.getCause()) {
+            for (Throwable suppressed : nested.getSuppressed()) {
+                if (suppressed instanceof EncryptionErrors.Hint hint) {
+                    encryptionHint = hint.hint;
+                    cause = nested;
+                    break;
+                }
+            }
+            if (encryptionHint != null) break;
+        }
         if (cause instanceof S3Exception s3) {
-            String code =
-                    s3.awsErrorDetails() == null ? "Unknown" : s3.awsErrorDetails().errorCode();
+            // Bodiless responses such as a denied HEAD carry no error code.
+            String code = s3.awsErrorDetails() == null || s3.awsErrorDetails().errorCode() == null
+                    ? "Unknown" : s3.awsErrorDetails().errorCode();
             String message = s3.awsErrorDetails() == null ? s3.getMessage() : s3.awsErrorDetails().errorMessage();
+            Map<String, Object> details = orderedMap("awsCode", code);
+            // Only HEAD answers 400 without a body, so a code-less 400 is treated as a read.
+            boolean bodilessBadRequest = s3.statusCode() == 400
+                    && (s3.awsErrorDetails() == null || s3.awsErrorDetails().errorCode() == null);
+            if (encryptionHint == null) encryptionHint = EncryptionErrors.hint(s3, bodilessBadRequest, false);
+            if (encryptionHint != null) details.put("encryptionHint", encryptionHint);
             if (List.of("AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch")
                     .contains(code)) {
-                return new SidecarException("auth_failed", message, orderedMap("awsCode", code));
+                return new SidecarException("auth_failed", message, details);
             }
             if ("RequestTimeout".equals(code)) {
-                return new SidecarException("timeout", message, orderedMap("awsCode", code));
+                return new SidecarException("timeout", message, details);
             }
             if ("SlowDown".equals(code)) {
-                return new SidecarException("throttled", message, orderedMap("awsCode", code));
+                return new SidecarException("throttled", message, details);
             }
-            return new SidecarException("unknown", message, orderedMap("awsCode", code));
+            return new SidecarException("unknown", message, details);
         }
         if (cause instanceof SdkClientException client) {
             String message = client.getMessage() == null ? client.toString() : client.getMessage();
@@ -3381,6 +3554,12 @@ public final class Main {
         }
         return new SidecarException(
                 "unknown", error.getMessage() == null ? error.toString() : error.getMessage());
+    }
+
+    private static Map<String, Object> clientEncryptionCapability() {
+        var item = capability("object.clientEncryption", "Client-side encryption", "supported", null);
+        item.put("formats", List.of("age-v1"));
+        return item;
     }
 
     private static Map<String, Object> capability(String key, String label, String state, String reason) {
@@ -3506,7 +3685,7 @@ public final class Main {
 
     private static String writeJson(Object value) {
         try {
-            return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(value);
+            return MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(SecretHygiene.clean(value));
         } catch (Exception error) {
             return "{}";
         }
@@ -3642,19 +3821,19 @@ public final class Main {
         return false;
     }
 
-    private static final class SidecarException extends RuntimeException {
+    static final class SidecarException extends RuntimeException {
         private final String code;
         private final String message;
         private final Map<String, Object> details;
 
-        private SidecarException(String code, String message) {
+        SidecarException(String code, String message) {
             this(code, message, Map.of());
         }
 
-        private SidecarException(String code, String message, Map<String, Object> details) {
-            super(message);
+        SidecarException(String code, String message, Map<String, Object> details) {
+            super(SecretHygiene.text(message));
             this.code = code;
-            this.message = message;
+            this.message = SecretHygiene.text(message);
             this.details = details == null ? Map.of() : details;
         }
     }

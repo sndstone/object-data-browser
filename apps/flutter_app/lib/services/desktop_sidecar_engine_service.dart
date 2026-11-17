@@ -1,3 +1,4 @@
+import 'object_encryption.dart';
 import '../controllers/action_scope.dart';
 import 'dart:async';
 import 'dart:convert';
@@ -12,8 +13,10 @@ import 'transfer_log_accumulator.dart';
 import 'mock_engine_service.dart';
 
 class DesktopSidecarEngineService
+    with EngineEncryptionResolver
     implements
         EngineService,
+        NativeProviderActions,
         EngineLogSinkRegistrant,
         TransferJobSinkRegistrant,
         ListingCancellationRegistrant,
@@ -53,12 +56,53 @@ class DesktopSidecarEngineService
   final Map<String, EndpointProfile> _benchmarkProfiles = {};
 
   @override
+  Future<Map<String, Object?>> nativeProviderAction({
+    required String engineId,
+    required EndpointProfile profile,
+    required String action,
+    required Map<String, Object?> arguments,
+    EndpointProfile? destinationProfile,
+  }) async {
+    if (!profile.endpointType.isGoogleCloudStorage ||
+        (destinationProfile != null && destinationProfile.id != profile.id)) {
+      throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message:
+              'Native Cloud Storage copies require the same endpoint profile.');
+    }
+    final method = switch (action) {
+      'copyObject' => arguments['move'] == true ? 'moveObject' : 'copyObject',
+      'listObjects' => 'listObjects',
+      'ensureBucket' => 'createBucket',
+      _ => throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message:
+              'This administration action is unavailable for native Cloud Storage.'),
+    };
+    final entry = await _tryGetEngine(engineId);
+    if (entry == null) throw _engineUnavailable(engineId, method);
+    return _sendSidecarRequest(entry, method: method, params: {
+      ...arguments,
+      if (method == 'createBucket') ...{
+        'enableVersioning': arguments['versioningEnabled'] == true,
+        'enableObjectLock': false
+      },
+      'profile': _profileToJson(profile),
+    });
+  }
+
+  @override
   Future<Map<String, Object?>> storageAction({
     required EndpointProfile profile,
     required String action,
     Map<String, Object?> arguments = const {},
     EndpointProfile? destinationProfile,
   }) async {
+    arguments = await encryptionArguments(
+      profile,
+      destinationProfile,
+      arguments,
+    );
     // Advanced operations use the provider-aware reference adapter explicitly;
     // never replay an uncertain mutation on a different engine.
     final entry = await _tryGetEngine('python');
@@ -176,6 +220,7 @@ class DesktopSidecarEngineService
         available: entry != null || (_allowFallback && engine.available),
         desktopSupported: engine.desktopSupported,
         mobileSupported: engine.mobileSupported,
+        endpointTypes: entry?.endpointTypes ?? engine.endpointTypes,
       );
     }).toList(growable: false);
   }
@@ -640,11 +685,14 @@ class DesktopSidecarEngineService
     required EndpointProfile profile,
     required String bucketName,
     required String key,
-  }) {
+    ObjectEncryption? encryption,
+  }) async {
     return _sendWithFallback(
       engineId: engineId,
       method: 'getObjectDetails',
       params: {
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
         'profile': _profileToJson(profile),
         'bucketName': bucketName,
         'key': key,
@@ -653,6 +701,7 @@ class DesktopSidecarEngineService
       onFallback: () => _fallback.getObjectDetails(
         engineId: engineId,
         profile: profile,
+        encryption: encryption,
         bucketName: bucketName,
         key: key,
       ),
@@ -665,11 +714,14 @@ class DesktopSidecarEngineService
     required EndpointProfile profile,
     required String bucketName,
     required String key,
+    ObjectEncryption? encryption,
   }) async {
     await _sendWithFallback<void>(
       engineId: engineId,
       method: 'createFolder',
       params: {
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
         'profile': _profileToJson(profile),
         'bucketName': bucketName,
         'key': key,
@@ -678,6 +730,7 @@ class DesktopSidecarEngineService
       onFallback: () => _fallback.createFolder(
         engineId: engineId,
         profile: profile,
+        encryption: encryption,
         bucketName: bucketName,
         key: key,
       ),
@@ -692,11 +745,21 @@ class DesktopSidecarEngineService
     required String sourceKey,
     required String destinationBucketName,
     required String destinationKey,
-  }) {
+    ObjectEncryption? encryption,
+    ObjectEncryption? sourceEncryption,
+  }) async {
     return _objectWrite(
       engineId: engineId,
       method: 'copyObject',
       params: {
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
+        if (sourceEncryption != null)
+          'sourceEncryption': await encryptionPayload(
+            profile,
+            sourceEncryption,
+            source: true,
+          ),
         'profile': _profileToJson(profile),
         'sourceBucketName': sourceBucketName,
         'sourceKey': sourceKey,
@@ -706,6 +769,8 @@ class DesktopSidecarEngineService
       onFallback: () => _fallback.copyObject(
         engineId: engineId,
         profile: profile,
+        encryption: encryption,
+        sourceEncryption: sourceEncryption,
         sourceBucketName: sourceBucketName,
         sourceKey: sourceKey,
         destinationBucketName: destinationBucketName,
@@ -722,11 +787,21 @@ class DesktopSidecarEngineService
     required String sourceKey,
     required String destinationBucketName,
     required String destinationKey,
-  }) {
+    ObjectEncryption? encryption,
+    ObjectEncryption? sourceEncryption,
+  }) async {
     return _objectWrite(
       engineId: engineId,
       method: 'moveObject',
       params: {
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
+        if (sourceEncryption != null)
+          'sourceEncryption': await encryptionPayload(
+            profile,
+            sourceEncryption,
+            source: true,
+          ),
         'profile': _profileToJson(profile),
         'sourceBucketName': sourceBucketName,
         'sourceKey': sourceKey,
@@ -736,6 +811,8 @@ class DesktopSidecarEngineService
       onFallback: () => _fallback.moveObject(
         engineId: engineId,
         profile: profile,
+        encryption: encryption,
+        sourceEncryption: sourceEncryption,
         sourceBucketName: sourceBucketName,
         sourceKey: sourceKey,
         destinationBucketName: destinationBucketName,
@@ -750,7 +827,7 @@ class DesktopSidecarEngineService
     required EndpointProfile profile,
     required String bucketName,
     required List<String> keys,
-  }) {
+  }) async {
     return _objectWrite(
       engineId: engineId,
       method: 'deleteObjects',
@@ -804,11 +881,16 @@ class DesktopSidecarEngineService
     required Map<String, String> objectKeyByPath,
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
-  }) {
+    Map<String, Object?>? clientEncryption,
+    ObjectEncryption? encryption,
+  }) async {
     return _sendWithFallback(
       engineId: engineId,
       method: 'startUpload',
       params: {
+        if (clientEncryption != null) 'clientEncryption': clientEncryption,
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
         'profile': _profileToJson(profile),
         'bucketName': bucketName,
         'prefix': prefix,
@@ -822,6 +904,8 @@ class DesktopSidecarEngineService
       onFallback: () => _fallback.startUpload(
         engineId: engineId,
         profile: profile,
+        encryption: encryption,
+        clientEncryption: clientEncryption,
         bucketName: bucketName,
         prefix: prefix,
         filePaths: filePaths,
@@ -842,11 +926,16 @@ class DesktopSidecarEngineService
     String conflictPolicy = 'keepBoth',
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
-  }) {
+    Map<String, Object?>? clientEncryption,
+    ObjectEncryption? encryption,
+  }) async {
     return _sendWithFallback(
       engineId: engineId,
       method: 'startDownload',
       params: {
+        if (clientEncryption != null) 'clientEncryption': clientEncryption,
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
         'profile': _profileToJson(profile),
         'bucketName': bucketName,
         'keys': keys,
@@ -860,6 +949,8 @@ class DesktopSidecarEngineService
       onFallback: () => _fallback.startDownload(
         engineId: engineId,
         profile: profile,
+        encryption: encryption,
+        clientEncryption: clientEncryption,
         bucketName: bucketName,
         keys: keys,
         destinationPath: destinationPath,
@@ -922,11 +1013,19 @@ class DesktopSidecarEngineService
     required String bucketName,
     required String key,
     required Duration expiration,
+    ObjectEncryption? encryption,
   }) async {
+    if (encryption?.mode.isCustomerKey == true) {
+      throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message: 'Customer-key objects cannot use presigned URLs.');
+    }
     return _sendWithFallback(
       engineId: engineId,
       method: 'generatePresignedUrl',
       params: {
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
         'profile': _profileToJson(profile),
         'bucketName': bucketName,
         'key': key,
@@ -936,6 +1035,7 @@ class DesktopSidecarEngineService
       onFallback: () => _fallback.generatePresignedUrl(
         engineId: engineId,
         profile: profile,
+        encryption: encryption,
         bucketName: bucketName,
         key: key,
         expiration: expiration,
@@ -948,11 +1048,14 @@ class DesktopSidecarEngineService
     required String engineId,
     required EndpointProfile profile,
     required TestDataToolConfig config,
-  }) {
+    ObjectEncryption? encryption,
+  }) async {
     return _sendWithFallback(
       engineId: engineId,
       method: 'runPutTestData',
       params: {
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
         'profile': _profileToJson(profile),
         'config': {
           'bucketName': config.bucketName,
@@ -971,6 +1074,7 @@ class DesktopSidecarEngineService
       onFallback: () => _fallback.runPutTestData(
         engineId: engineId,
         profile: profile,
+        encryption: encryption,
         config: config,
       ),
     );
@@ -981,7 +1085,7 @@ class DesktopSidecarEngineService
     required String engineId,
     required EndpointProfile profile,
     required DeleteAllToolConfig config,
-  }) {
+  }) async {
     return _sendWithFallback(
       engineId: engineId,
       method: 'runDeleteAll',
@@ -1371,7 +1475,8 @@ class DesktopSidecarEngineService
         'method': method,
         'requestId': requestId,
       };
-      final requestBody = _sanitizeForLogging(request['params']);
+      final requestBody = _sanitizeForLogging(
+          DiagnosticSafety.forNameEncryptedRequest(request['params'], params));
       _log(
         level: 'API',
         category: 'EngineRequest',
@@ -1416,7 +1521,8 @@ class DesktopSidecarEngineService
               _jobEngines.remove(_jobEngines.keys.first);
             }
           }
-          onEvent?.call(event);
+          onEvent?.call(Map<String, Object?>.from(
+              DiagnosticSafety.forNameEncryptedRequest(event, params) as Map));
         },
       );
     } finally {
@@ -1431,7 +1537,8 @@ class DesktopSidecarEngineService
         'ok': response.payload['ok'],
         'requestId': requestId,
       };
-      final responseBody = _sanitizeForLogging(response.payload);
+      final responseBody = _sanitizeForLogging(
+          DiagnosticSafety.forNameEncryptedRequest(response.payload, params));
       _log(
         level: 'API',
         category: 'EngineResponse',
@@ -1450,7 +1557,9 @@ class DesktopSidecarEngineService
       );
     }
 
-    final payload = response.payload;
+    final payload = Map<String, Object?>.from(
+        DiagnosticSafety.forNameEncryptedRequest(response.payload, params)
+            as Map);
     ActionScope.current?.check();
     final ok = payload['ok'] as bool? ?? false;
     if (!ok) {
@@ -1506,7 +1615,9 @@ class DesktopSidecarEngineService
       EngineLogRecord(
         level: level,
         category: category,
-        message: message,
+        message: DiagnosticSafety.text(
+            DiagnosticSafety.forNameEncryptedRequest(message, params)
+                as String),
         profileId: _profileIdFromParams(params),
         bucketName: _bucketNameFromParams(params),
         objectKey: _objectKeyFromParams(params),
@@ -1517,8 +1628,9 @@ class DesktopSidecarEngineService
         method: method,
         responseStatus: responseStatus,
         latencyMs: latencyMs,
-        traceHead: traceHead,
-        traceBody: traceBody,
+        traceHead: DiagnosticSafety.trace(traceHead),
+        traceBody: DiagnosticSafety.trace(
+            DiagnosticSafety.forNameEncryptedRequest(traceBody, params)),
       ),
     );
   }
@@ -1600,12 +1712,12 @@ class DesktopSidecarEngineService
   }
 
   Object? _sanitizeForLogging(Object? value) {
-    return DiagnosticSafety.sanitize(value);
+    return DiagnosticSafety.trace(value);
   }
 
   String _stringifyForLogging(Object? value) {
     const maxLength = 2000;
-    final encoded = jsonEncode(value);
+    final encoded = jsonEncode(DiagnosticSafety.trace(value));
     if (encoded.length <= maxLength) {
       return encoded;
     }
@@ -1938,6 +2050,7 @@ class DesktopSidecarEngineService
   }
 
   static ObjectDetails _objectDetailsFromJson(Map<String, Object?> json) {
+    json = Map<String, Object?>.from(DiagnosticSafety.sanitize(json) as Map);
     final metadata = Map<String, String>.from(
       (json['metadata'] as Map?)?.map(
             (key, value) => MapEntry(key.toString(), value.toString()),
@@ -1972,6 +2085,11 @@ class DesktopSidecarEngineService
             .toList();
 
     return ObjectDetails(
+      encryption: json['encryption'] is Map
+          ? ObjectEncryptionInfo.fromJson(
+              Map<String, Object?>.from(json['encryption'] as Map),
+            )
+          : null,
       key: (json['key'] as String?) ?? '',
       metadata: metadata,
       headers: headers,
@@ -2034,6 +2152,7 @@ class DesktopSidecarEngineService
   }
 
   static TransferJob _transferJobFromJson(Map<String, Object?> json) {
+    json = Map<String, Object?>.from(DiagnosticSafety.sanitize(json) as Map);
     return TransferJob(
       id: (json['id'] as String?) ?? '',
       label: (json['label'] as String?) ?? '',
@@ -2062,6 +2181,7 @@ class DesktopSidecarEngineService
 
   static ToolExecutionState _toolExecutionStateFromJson(
       Map<String, Object?> json) {
+    json = Map<String, Object?>.from(DiagnosticSafety.sanitize(json) as Map);
     return ToolExecutionState(
       label: (json['label'] as String?) ?? '',
       running: json['running'] as bool? ?? false,
@@ -2260,6 +2380,7 @@ class DesktopSidecarEngineService
       'object_conflict' => ErrorCode.objectConflict,
       'partial_batch_failure' => ErrorCode.partialBatchFailure,
       'engine_unavailable' => ErrorCode.engineUnavailable,
+      'decryption_failed' => ErrorCode.decryptionFailed,
       _ => ErrorCode.unknown,
     };
   }
@@ -2272,6 +2393,7 @@ class _EngineManifestEntry {
     required this.executable,
     required this.arguments,
     this.workingDirectory,
+    this.endpointTypes,
   });
 
   final String id;
@@ -2279,6 +2401,7 @@ class _EngineManifestEntry {
   final String executable;
   final List<String> arguments;
   final String? workingDirectory;
+  final List<String>? endpointTypes;
 
   factory _EngineManifestEntry.fromJson(Map<String, Object?> json) {
     return _EngineManifestEntry(
@@ -2289,6 +2412,7 @@ class _EngineManifestEntry {
           .map((item) => item.toString())
           .toList(),
       workingDirectory: json['workingDirectory'] as String?,
+      endpointTypes: (json['endpointTypes'] as List?)?.cast<String>(),
     );
   }
 }

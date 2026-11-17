@@ -30,6 +30,13 @@ class StorageHttpClient {
   bool get azure => profile.endpointType == EndpointProfileType.azureBlob;
 
   static HttpClient _createClient(EndpointProfile profile) {
+    if (profile.endpointType.isGoogleCloudStorage) {
+      throw const EngineException(
+        code: ErrorCode.unsupportedFeature,
+        message:
+            'Google Cloud Storage profiles are available on desktop in this version',
+      );
+    }
     SecurityContext? context;
     if (profile.connection.caBundlePath.isNotEmpty) {
       context = SecurityContext(withTrustedRoots: true)
@@ -602,8 +609,40 @@ class StorageHttpException extends EngineException {
               501 || 405 => ErrorCode.unsupportedFeature,
               _ => ErrorCode.unknown,
             },
+            details: _encryptionErrorDetails(response),
             message:
                 'Storage request failed (HTTP ${response.status}, ${_errorCode(response)}).');
+  static Map<String, Object?>? _encryptionErrorDetails(
+    StorageHttpResponse response,
+  ) {
+    final code = _errorCode(response).toLowerCase();
+    final text = response.text.toLowerCase();
+    final hint = code.contains('customerencryptionkeymismatch') ||
+            code.contains('md5mismatch')
+        ? 'sse_c_key_mismatch'
+        : code.contains('customerencryptionkeyrequired') ||
+                code.contains('blobusescustomerprovidedkey')
+            ? 'sse_c_key_required'
+            : code.contains('kms') &&
+                    (code.contains('accessdenied') ||
+                        text.contains('access denied'))
+                ? 'kms_access_denied'
+                : code.contains('kms')
+                    ? 'kms_key_unavailable'
+                    : text.contains('sse-c') &&
+                            (text.contains('blocked') ||
+                                text.contains('disabled'))
+                        ? 'sse_c_blocked'
+                        : text.contains('encryption') && text.contains('policy')
+                            ? 'encryption_required_by_policy'
+                            : text.contains('encryption') &&
+                                    (code == 'notimplemented' ||
+                                        code == 'unsupportedheader')
+                                ? 'unsupported_by_endpoint'
+                                : null;
+    return hint == null ? null : {'encryptionHint': hint};
+  }
+
   final StorageHttpResponse response;
   String get serviceCode => _errorCode(response);
   static String _errorCode(StorageHttpResponse response) {

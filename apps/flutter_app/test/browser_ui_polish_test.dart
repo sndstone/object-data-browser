@@ -25,6 +25,28 @@ Future<void> _pumpApp(WidgetTester tester, dynamic controller,
 }
 
 void main() {
+  test('breadcrumb targets preserve exact prefix substrings', () {
+    expect(objectPrefixBreadcrumbs(''), isEmpty);
+    expect(objectPrefixBreadcrumbs('///'), isEmpty);
+    expect(objectPrefixBreadcrumbs('a/b/'), [
+      (label: 'a', prefix: 'a/'),
+      (label: 'b', prefix: 'a/b/'),
+    ]);
+    expect(objectPrefixBreadcrumbs('a//b/c/'), [
+      (label: 'a', prefix: 'a/'),
+      (label: 'b', prefix: 'a//b/'),
+      (label: 'c', prefix: 'a//b/c/'),
+    ]);
+    expect(objectPrefixBreadcrumbs('//a///b//c'), [
+      (label: 'a', prefix: '//a/'),
+      (label: 'b', prefix: '//a///b/'),
+      (label: 'c', prefix: '//a///b//c'),
+    ]);
+    expect(objectPrefixBreadcrumbs('é/ spaced /'), [
+      (label: 'é', prefix: 'é/'),
+      (label: ' spaced ', prefix: 'é/ spaced /'),
+    ]);
+  });
   inspectorMain();
   keyboardNavMain();
   phoneNavMain();
@@ -83,7 +105,8 @@ class _BareDetailsEngine extends fixture.TestingEngine {
       {required String engineId,
       required EndpointProfile profile,
       required String bucketName,
-      required String key}) async {
+      required String key,
+      ObjectEncryption? encryption}) async {
     final details = await super.getObjectDetails(
         engineId: engineId, profile: profile, bucketName: bucketName, key: key);
     return details.copyWith(metadata: const {}, tags: const {});
@@ -206,7 +229,8 @@ class _FailingDetailsEngine extends fixture.TestingEngine {
       {required String engineId,
       required EndpointProfile profile,
       required String bucketName,
-      required String key}) async {
+      required String key,
+      ObjectEncryption? encryption}) async {
     if (fail) {
       throw const EngineException(
           code: ErrorCode.unknown, message: 'Fixture details failure');

@@ -1,3 +1,4 @@
+import '../services/crypto/age_primitives.dart' show ageWipe;
 import 'ordered_records.dart';
 import '../services/bucket_copy_journal.dart';
 import 'transfer_presentation.dart';
@@ -8,6 +9,11 @@ import 'persistence_state.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
+import '../services/client_encryption.dart';
+import '../services/crypto/age.dart';
+import '../services/crypto/vault_names.dart';
+import '../services/vault_name_codec.dart';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
@@ -16,13 +22,22 @@ import '../models/domain_models.dart';
 import '../services/app_state_repository.dart';
 import '../services/app_platform.dart';
 import '../services/engine_service.dart';
+import '../services/object_encryption.dart';
+import '../services/encryption_key_store.dart';
+import '../services/key_file_sync.dart';
+import '../services/key_file_sync_transport.dart';
+
 import '../services/multipart_sizing.dart';
 import '../services/source_preview.dart';
 import '../services/listing_cancellation.dart';
 import 'object_selection.dart';
 import 'object_query.dart';
 import 'upload_batch.dart';
+import 'download_batch.dart';
 import '../services/diagnostic_safety.dart';
+
+part 'encryption_controller.dart';
+part 'client_encryption_controller.dart';
 
 const List<String> kAwsRegions = <String>[
   'us-east-1',
@@ -112,6 +127,31 @@ String azureEndpointForAccount(String accountName) {
 }
 
 EndpointProfile normalizeEndpointProfile(EndpointProfile profile) {
+  if (profile.endpointType.isGoogleCloudStorage) {
+    final endpoint = profile.endpointUrl.trim();
+    profile = EndpointProfile.fromJson({
+      ...profile.toJson(),
+      'sessionToken': null,
+      'signerOverride': null,
+    });
+    return profile.copyWith(
+      endpointUrl: endpoint.isEmpty
+          ? ''
+          : normalizeEndpointUrl(endpoint, preferHttps: true),
+      region: profile.region.trim(),
+      pathStyle: false,
+      verifyTls: endpoint.isEmpty || endpointUsesHttps(endpoint, fallback: true)
+          ? profile.verifyTls
+          : false,
+      signerOverride: null,
+      sessionToken: null,
+      connection: ConnectionOptions(
+        knownBucket: profile.connection.knownBucket,
+        caBundlePath: profile.connection.caBundlePath,
+      ),
+      uploadEncryption: null,
+    );
+  }
   if (profile.endpointType == EndpointProfileType.azureBlob) {
     // accessKey carries the storage account name; an empty endpoint URL means
     // the engine derives https://<account>.blob.core.windows.net. A custom
@@ -148,7 +188,11 @@ EndpointProfile normalizeEndpointProfile(EndpointProfile profile) {
           profile.endpointUrl,
           fallback: profile.verifyTls,
         );
-  final normalizedEndpoint = profile.endpointType == EndpointProfileType.awsS3
+  // Preserve region-derived endpoints for existing profiles. Template editors
+  // explicitly opt in to retaining an editable AWS URL.
+  final normalizedEndpoint = profile.endpointType ==
+              EndpointProfileType.awsS3 &&
+          (!profile.useCustomAwsEndpoint || profile.endpointUrl.trim().isEmpty)
       ? awsEndpointForRegion(normalizedRegion)
       : normalizeEndpointUrl(
           profile.endpointUrl,
@@ -194,6 +238,24 @@ class _TextPreviewResult {
   final int loadedBytes;
 }
 
+/// Destination captured before upload pickers, traversal or file sizing begin.
+@immutable
+class UploadTarget {
+  const UploadTarget({
+    required this.engineId,
+    required this.profile,
+    required this.bucketName,
+    required this.prefix,
+    required this.listAll,
+  });
+
+  final String engineId;
+  final EndpointProfile profile;
+  final String bucketName;
+  final String prefix;
+  final bool listAll;
+}
+
 class AppController extends ChangeNotifier {
   AppController({
     required EngineService engineService,
@@ -202,6 +264,9 @@ class AppController extends ChangeNotifier {
     String? initialSelectedProfileId,
     String? initialCredentialStoreError,
     AppStateRepository? appStateRepository,
+    EncryptionKeyStore? encryptionKeyStore,
+    KeyFileSyncTransport Function(EndpointProfile)? keyFileSyncTransportFactory,
+    PreviewRangeFetcher? previewRangeFetcher,
     Future<BucketCopyJournal> Function()? bucketCopyJournalProvider,
   })  : _bucketCopyJournalProvider =
             bucketCopyJournalProvider ?? BucketCopyJournal.open,
@@ -211,6 +276,16 @@ class AppController extends ChangeNotifier {
         _appStateRepository = appStateRepository,
         settings = initialSettings,
         profiles = initialProfiles.map(normalizeEndpointProfile).toList() {
+    _encryptionKeyStore = encryptionKeyStore;
+    encryptionKeyStore?.addListener(_nameKeysChanged);
+    _keyFileSyncTransportFactory =
+        keyFileSyncTransportFactory ?? S3KeyFileSyncTransport.new;
+    _previewRangeFetcher = previewRangeFetcher;
+    _nameKeysChanged();
+    if (engineService is EngineEncryptionResolver) {
+      (engineService as EngineEncryptionResolver).customerKeyResolver =
+          (id) async => (await ensureEncryptionKeyStore()).customerKey(id);
+    }
     _persistedProfiles
         .addEntries(profiles.map((profile) => MapEntry(profile.id, profile)));
     final bootstrapProfileId = profiles.isEmpty ? '' : profiles.first.id;
@@ -280,6 +355,31 @@ class AppController extends ChangeNotifier {
     _syncDiagnosticsOptions();
   }
 
+  PreviewRangeFetcher? _previewRangeFetcher;
+  final Map<String, ({int storedSize, String? etag, int plaintextSize})>
+      _clientPlaintextSizes = {};
+  final Set<ObjectPreview> _retainedClientPreviews = {};
+  late final KeyFileSyncTransport Function(EndpointProfile)
+      _keyFileSyncTransportFactory;
+  KeyFileSync? _keyFileSync;
+  EncryptionKeyStore? _encryptionKeyStore;
+  Future<EncryptionKeyStore>? _encryptionKeyStoreFuture;
+  bool encryptionKeyFileExists = false;
+  final Map<String, VaultNameKeys> _vaultNameKeys = {};
+  final Map<String, String> _activeDownloadNames = {};
+  int _nameKeyGeneration = 0;
+  Future<void>? _nameKeysLoading;
+  List<ObjectEntry>? _nameQueryObjects;
+  List<String>? _nameQueryKeys;
+  int _nameQueryGeneration = -1;
+  Object? _nameQueryContext;
+  final Map<String, ObjectEncryptionInfo> _objectEncryption = {};
+  final Set<String> _customerKeyRequiredObjects = {};
+
+  void _notifyEncryptionChanged() {
+    if (!_disposed) notifyListeners();
+  }
+
   final EngineService _engineService;
   final String? _initialSelectedProfileId;
   final AppStateRepository? _appStateRepository;
@@ -331,10 +431,16 @@ class AppController extends ChangeNotifier {
 
   bool _benchmarkPollErrorReported = false;
   int _selectionArtifactsSequence = 0;
+  int _presignRequestSequence = 0;
   int _previewRequestSequence = 0;
   HttpClient? _textPreviewClient;
   void _cancelTextPreview() {
     _previewRequestSequence++;
+    final decrypted = selectedObjectPreview?.bytes;
+    if (decrypted != null &&
+        !_retainedClientPreviews.contains(selectedObjectPreview)) {
+      ageWipe(decrypted);
+    }
     _textPreviewClient?.close(force: true);
     _textPreviewClient = null;
   }
@@ -735,6 +841,20 @@ class AppController extends ChangeNotifier {
       'Switching to endpoint profile ${profile.name}...',
       () async {
         selectedProfile = profile;
+        if (profile.endpointType.isGoogleCloudStorage &&
+            !supportsProfile(profile)) {
+          capabilities = const [];
+          buckets = const [];
+          selectedBucket = null;
+          objects = const [];
+          adminState = null;
+          versions = const [];
+          selectedObject = null;
+          selectedObjectDetails = null;
+          selectedObjectPreview = null;
+          _blockUnsupportedProfile(profile);
+          return;
+        }
         currentPrefix = '';
         _syncObjectFilterWithPrefix();
         _addEvent(
@@ -768,6 +888,10 @@ class AppController extends ChangeNotifier {
     if (profile == null) {
       return;
     }
+    if (_blockUnsupportedProfile(profile)) {
+      capabilities = const [];
+      return;
+    }
     capabilities = await _engineService.getCapabilities(
       engineId: activeEngineId,
       profile: profile,
@@ -787,6 +911,7 @@ class AppController extends ChangeNotifier {
     if (profile == null) {
       return;
     }
+    if (_blockUnsupportedProfile(profile)) return;
     await _runBusy('refresh-buckets', 'Listing buckets for ${profile.name}...',
         () async {
       await _guard('Buckets', () async {
@@ -1332,14 +1457,21 @@ class AppController extends ChangeNotifier {
       _addEvent(
         level: 'INFO',
         category: 'Objects',
-        message:
-            'Updated object filter to "$value" in ${objectFilterMode.name} mode.',
+        message: 'Updated object filter in ${objectFilterMode.name} mode.',
         includeSelectionContext: true,
         source: 'object-browser',
       );
     }
     if (objectFilterMode == BrowserFilterMode.prefix) {
-      await refreshObjects(prefix: value);
+      try {
+        await refreshObjects(prefix: await _storedListingPrefix(value));
+        objectFilterValue = value;
+      } catch (error) {
+        objectFilterError = error is FormatException
+            ? error.message
+            : 'Cannot translate this prefix.';
+      }
+      notifyListeners();
       return;
     }
     notifyListeners();
@@ -1460,6 +1592,25 @@ class AppController extends ChangeNotifier {
     if (profile == null || bucket == null) {
       throw StateError('Select a bucket first.');
     }
+    final sourceRule = clientRuleFor(sourceKey);
+    final destinationRule = clientRuleFor(destinationKey) ?? sourceRule;
+    if (!sourceKey.endsWith('.age') && destinationRule?.encryptsNames == true) {
+      throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message:
+              'This object is not vault-encrypted, so it cannot be renamed inside a location that encrypts names. Download it and upload it again.');
+    }
+    if (destinationRule != null) {
+      await _uploadNameKeys(destinationRule);
+      destinationKey = translateVaultKey(
+          visible: destinationKey,
+          reference: sourceKey,
+          rule: destinationRule,
+          keys: _vaultNameKeys,
+          encryptedFile: sourceKey.endsWith('.age'));
+    } else {
+      validateStoredKey(destinationKey);
+    }
     await runFormAction(() => _runBusy(
         'rename-object',
         'Renaming $sourceKey...',
@@ -1503,11 +1654,30 @@ class AppController extends ChangeNotifier {
     }
     final normalizedName =
         trimmedName.endsWith('/') ? trimmedName : '$trimmedName/';
-    final folderKey = currentPrefix.isEmpty
+    var folderKey = currentPrefix.isEmpty
         ? normalizedName
         : '$currentPrefix$normalizedName';
     await _runBusy('create-folder', 'Creating folder marker...', () async {
       await _guard('Objects', () async {
+        // On the key as typed, whatever rule it matches: an engine that
+        // trims it may put it under another one.
+        _guardTrimmedVaultKey(profile, bucket.name, folderKey);
+        final rule = clientRuleFor(folderKey);
+        // The rule's own prefix is never encrypted: its marker is created as
+        // typed, under every policy.
+        if (rule != null && !_isVaultRootMarker(rule, folderKey)) {
+          if (rule.randomNames) throw const FormatException(vaultStrictFolders);
+          final nameKeys = await _uploadNameKeys(rule);
+          if (rule.encryptsNames) {
+            folderKey = encodeVaultObjectKey(
+                rule: rule,
+                keys: nameKeys,
+                destinationPrefix: currentPrefix,
+                relativeName: normalizedName,
+                folder: true);
+          }
+        }
+        validateStoredKey(folderKey);
         _appendBusyTaskLine(
           'create-folder',
           'Creating prefix $folderKey in bucket ${bucket.name}.',
@@ -1517,6 +1687,7 @@ class AppController extends ChangeNotifier {
           profile: profile,
           bucketName: bucket.name,
           key: folderKey,
+          encryption: await _effectiveUploadEncryption(profile, activeEngineId),
         );
         bannerMessage = 'Created folder marker $folderKey.';
         _addEvent(
@@ -1587,43 +1758,99 @@ class AppController extends ChangeNotifier {
     });
   }
 
-  Future<void> startSampleUpload(
-    List<String> filePaths, {
-    Map<String, String> objectKeyByPath = const <String, String>{},
-  }) async {
+  UploadTarget? captureUploadTarget() {
     final profile = selectedProfile;
     final bucket = selectedBucket;
-    if (profile == null || bucket == null || filePaths.isEmpty) {
+    if (profile == null || bucket == null) return null;
+    return UploadTarget(
+      engineId: activeEngineId,
+      profile: profile,
+      bucketName: bucket.name,
+      prefix: currentPrefix,
+      listAll: listAllKeys,
+    );
+  }
+
+  Future<void> startSampleUpload(
+    List<String> filePaths, {
+    UploadTarget? target,
+    Map<String, String> objectKeyByPath = const <String, String>{},
+  }) async {
+    final uploadTarget = target ?? captureUploadTarget();
+    if (uploadTarget == null || filePaths.isEmpty) {
       return;
     }
+    final profile = uploadTarget.profile;
+    final bucket = uploadTarget.bucketName;
+    final requestEngine = uploadTarget.engineId;
+    final requestPrefix = uploadTarget.prefix;
     await _runPreparingTransfer(
         TransferStatusDirection.upload, filePaths.length, () async {
       await _guard('Transfers', () async {
-        if (filePaths.length > 1) {
-          await _startUploadBatch(
-              profile, bucket.name, filePaths, objectKeyByPath);
+        // Engines may read a name differently from how it is matched here.
+        for (final path in filePaths) {
+          final name =
+              objectKeyByPath[path] ?? path.split(Platform.pathSeparator).last;
+          if (vaultTargetIsAmbiguous(
+              profile.clientEncryptionRules, bucket, '$requestPrefix$name',
+              uploadPrefix: requestPrefix, uploadName: name)) {
+            throw const FormatException(vaultAmbiguousTarget);
+          }
+        }
+        final vaultUpload = filePaths.any(
+          (path) =>
+              matchingClientEncryptionRule(
+                profile.clientEncryptionRules,
+                bucket,
+                '$requestPrefix${objectKeyByPath[path] ?? path.split(Platform.pathSeparator).last}',
+              ) !=
+              null,
+        );
+        if (vaultUpload) {
+          for (final path in filePaths) {
+            final rule = matchingClientEncryptionRule(
+                profile.clientEncryptionRules,
+                bucket,
+                '$requestPrefix${objectKeyByPath[path] ?? path.split(Platform.pathSeparator).last}');
+            if (rule != null) {
+              final nameKeys = await _uploadNameKeys(rule);
+              encodeVaultObjectKey(
+                  rule: rule,
+                  keys: nameKeys,
+                  destinationPrefix: requestPrefix,
+                  relativeName: objectKeyByPath[path] ??
+                      path.split(Platform.pathSeparator).last);
+            }
+          }
+          await _requireClientEncryptionCapability(profile, requestEngine);
+        }
+        if (filePaths.length > 1 || vaultUpload) {
+          await _startUploadBatch(uploadTarget, filePaths, objectKeyByPath);
           return;
         }
         final uploadChunkMiB = await _uploadChunkSizeMiB(filePaths);
-        final requestEngine = activeEngineId;
-        final requestPrefix = currentPrefix;
         final job = await _engineService.startUpload(
           engineId: requestEngine,
           profile: profile,
-          bucketName: bucket.name,
+          encryption: await _effectiveUploadEncryption(
+            profile,
+            requestEngine,
+          ),
+          bucketName: bucket,
           prefix: requestPrefix,
           filePaths: filePaths,
           objectKeyByPath: objectKeyByPath,
           multipartThresholdMiB: settings.multipartThresholdMiB,
           multipartChunkMiB: uploadChunkMiB,
         );
+        _jobEngineOwners[job.id] = requestEngine;
         _pendingUploadRelists[job.id] = _PendingObjectRelist(
           profileId: profile.id,
-          bucketName: bucket.name,
+          bucketName: bucket,
           prefix: requestPrefix,
-          listAll: listAllKeys,
+          listAll: uploadTarget.listAll,
         );
-        _registerUploadRetry(job.id, profile.id, bucket.name, requestEngine,
+        _registerUploadRetry(job.id, profile.id, bucket, requestEngine,
             requestPrefix, filePaths, objectKeyByPath);
         transferJobs = [job, ...transferJobs];
         _trackTransferJob(job);
@@ -1639,8 +1866,10 @@ class AppController extends ChangeNotifier {
           level: 'INFO',
           category: 'Transfers',
           message:
-              'Started upload job ${job.id} for ${filePaths.length} file(s) into ${bucket.name} with ${settings.dynamicMultipartSizing ? 'dynamic' : 'manual'} $uploadChunkMiB MiB parts.',
-          includeSelectionContext: true,
+              'Started upload job ${job.id} for ${filePaths.length} file(s) into $bucket with ${settings.dynamicMultipartSizing ? 'dynamic' : 'manual'} $uploadChunkMiB MiB parts.',
+          profileId: profile.id,
+          bucketName: bucket,
+          engineId: requestEngine,
           source: 'task-tray',
         );
       });
@@ -1686,29 +1915,45 @@ class AppController extends ChangeNotifier {
   }
 
   UploadBatch? _uploadBatch;
+  DownloadBatch? _downloadBatch;
 
-  Future<void> _startUploadBatch(EndpointProfile profile, String bucket,
-      List<String> paths, Map<String, String> keys) async {
+  Future<void> _startUploadBatch(
+      UploadTarget target, List<String> paths, Map<String, String> keys) async {
     final id = 'upload-batch-${DateTime.now().microsecondsSinceEpoch}';
-    final engineId = activeEngineId;
-    final prefix = currentPrefix;
+    final profile = target.profile;
+    final bucket = target.bucketName;
+    final engineId = target.engineId;
+    final prefix = target.prefix;
     _registerUploadRetry(id, profile.id, bucket, engineId, prefix, paths, keys);
-    final batch = UploadBatch(
+    late final UploadBatch batch;
+    batch = UploadBatch(
         id: id,
+        encryption: await _effectiveUploadEncryption(profile, engineId),
         engine: _engineService,
         engineId: engineId,
         profile: profile,
         bucket: bucket,
         prefix: prefix,
         paths: List.of(paths),
+        encodeName: (rule, relative) async => encodeVaultObjectKey(
+            rule: rule,
+            keys: await _uploadNameKeys(rule),
+            destinationPrefix: prefix,
+            relativeName: relative),
         objectKeys: Map.of(keys),
         settings: settings,
         onUpdate: (job) {
+          _jobEngineOwners[job.id] = engineId;
           bannerTaskId = id;
           _replaceTransfer(job);
           _trackTransferJob(job);
         },
         onFile: (index, path, status, message, job) {
+          final targetKey = batch.storedKeyFor(path);
+          final nameEncrypted = matchingClientEncryptionRule(
+                      profile.clientEncryptionRules, bucket, targetKey)
+                  ?.encryptsNames ==
+              true;
           _addEvent(
               level: status == 'failed' || status == 'error' ? 'ERROR' : 'INFO',
               category: 'Transfers',
@@ -1719,11 +1964,10 @@ class AppController extends ChangeNotifier {
               profileId: profile.id,
               bucketName: bucket,
               engineId: engineId,
-              objectKey:
-                  '$prefix${keys[path] ?? path.split(Platform.pathSeparator).last}',
+              objectKey: targetKey,
               responseStatus: status,
               traceBody: {
-                'file': path,
+                'file': nameEncrypted ? targetKey : path,
                 'status': status,
                 if (job != null) 'bytesTransferred': job.bytesTransferred,
                 if (job != null) 'partsCompleted': job.partsCompleted,
@@ -1734,10 +1978,11 @@ class AppController extends ChangeNotifier {
     await batch.prepare();
     _uploadBatch = batch;
     _pendingUploadRelists[id] = _PendingObjectRelist(
-        profileId: profile.id,
-        bucketName: bucket,
-        prefix: prefix,
-        listAll: listAllKeys);
+      profileId: profile.id,
+      bucketName: bucket,
+      prefix: prefix,
+      listAll: target.listAll,
+    );
     _addEvent(
         level: 'INFO',
         category: 'Transfers',
@@ -1768,13 +2013,20 @@ class AppController extends ChangeNotifier {
     }
   }
 
-  Future<void> startSampleDownload() async {
+  Future<void> startSampleDownload({
+    String? key,
+    bool encryptedCopy = false,
+    List<String>? keysOverride,
+  }) async {
     final profile = selectedProfile;
     final bucket = selectedBucket;
     final object = selectedObject;
-    final keys = objectSelection.isEmpty
-        ? [if (object != null && !object.isFolder) object.key]
-        : objectSelection.keys.toList();
+    final keys = keysOverride ??
+        (key != null
+            ? [key]
+            : objectSelection.isEmpty
+                ? [if (object != null && !object.isFolder) object.key]
+                : objectSelection.keys.toList());
     if (profile == null || bucket == null || keys.isEmpty) {
       return;
     }
@@ -1787,64 +2039,108 @@ class AppController extends ChangeNotifier {
             AppPlatform.isMobile ? 'keepBoth' : settings.downloadConflictPolicy;
         final retryThreshold = settings.multipartThresholdMiB;
         final retryChunk = settings.multipartChunkMiB;
-        final retryKeys = List<String>.of(keys);
-        final job = await _engineService.startDownload(
-          engineId: retryEngine,
-          profile: profile,
-          bucketName: bucket.name,
-          keys: retryKeys,
-          destinationPath: retryDestination,
-          conflictPolicy: retryConflictPolicy,
-          multipartThresholdMiB: retryThreshold,
-          multipartChunkMiB: retryChunk,
-        );
-        Future<void> replay() async {
-          if (activeEngineId != retryEngine ||
-              selectedProfile?.id != profile.id ||
-              selectedBucket?.name != bucket.name) {
-            showBannerMessage(
-                'Select the original connection, engine and bucket before retrying.',
-                severity: BannerSeverity.warning);
-            return;
+        final hasClientObjects = !encryptedCopy &&
+            keys.any(
+              (downloadKey) =>
+                  clientRuleFor(
+                        downloadKey,
+                        profile: profile,
+                        bucket: bucket.name,
+                      ) !=
+                      null &&
+                  downloadKey.endsWith('.age'),
+            );
+        if (hasClientObjects) {
+          if (keys.length == 1) {
+            await _startClientDownload(
+              profile,
+              bucket.name,
+              keys.single,
+              retryEngine,
+            );
+          } else {
+            await _startClientDownloadBatch(
+              profile,
+              bucket.name,
+              List.of(keys),
+              retryEngine,
+            );
           }
-          await _guard('Transfers', () async {
-            final next = await _engineService.startDownload(
-                engineId: retryEngine,
-                profile: selectedProfile!,
-                bucketName: bucket.name,
-                keys: retryKeys,
-                destinationPath: retryDestination,
-                conflictPolicy: retryConflictPolicy,
-                multipartThresholdMiB: retryThreshold,
-                multipartChunkMiB: retryChunk);
-            _retryTransfers[next.id] = replay;
-            transferJobs = [next, ...transferJobs];
-            bannerTaskId = next.id;
-            _trackTransferJob(next);
-          });
+          return;
         }
-
-        _retryTransfers[job.id] = replay;
-        transferJobs = [job, ...transferJobs];
-        _trackTransferJob(job);
-        bannerTaskId = job.id;
-        bannerMessage = transferBannerMessage(job);
-        bannerSeverity = job.status == 'failed'
-            ? BannerSeverity.error
-            : job.status == 'completed'
-                ? BannerSeverity.success
-                : BannerSeverity.info;
-        final destinationLabel =
-            AppPlatform.isMobile ? 'Downloads' : settings.downloadPath;
-        _addEvent(
-          level: 'INFO',
-          category: 'Transfers',
-          message:
-              'Started download job ${job.id} for ${keys.length} object(s) into $destinationLabel.',
-          includeSelectionContext: true,
-          objectKey: object?.key,
-          source: 'task-tray',
+        final plainKeys = keys;
+        final groups = await _downloadEncryptionGroups(
+          profile,
+          bucket.name,
+          plainKeys,
         );
+        for (final group in groups) {
+          final retryKeys = List<String>.of(group.keys);
+          final downloadEncryption = group.encryption;
+          final job = await _engineService.startDownload(
+            encryption: downloadEncryption,
+            engineId: retryEngine,
+            profile: profile,
+            bucketName: bucket.name,
+            keys: retryKeys,
+            destinationPath: retryDestination,
+            conflictPolicy: retryConflictPolicy,
+            multipartThresholdMiB: retryThreshold,
+            multipartChunkMiB: retryChunk,
+          );
+          Future<void> replay() async {
+            if (activeEngineId != retryEngine ||
+                selectedProfile?.id != profile.id ||
+                selectedBucket?.name != bucket.name) {
+              showBannerMessage(
+                  'Select the original connection, engine and bucket before retrying.',
+                  severity: BannerSeverity.warning);
+              return;
+            }
+            await _guard('Transfers', () async {
+              final next = await _engineService.startDownload(
+                  encryption: await _downloadEncryption(
+                    selectedProfile!,
+                    bucket.name,
+                    retryKeys,
+                  ),
+                  engineId: retryEngine,
+                  profile: selectedProfile!,
+                  bucketName: bucket.name,
+                  keys: retryKeys,
+                  destinationPath: retryDestination,
+                  conflictPolicy: retryConflictPolicy,
+                  multipartThresholdMiB: retryThreshold,
+                  multipartChunkMiB: retryChunk);
+              _retryTransfers[next.id] = replay;
+              transferJobs = [next, ...transferJobs];
+              bannerTaskId = next.id;
+              _trackTransferJob(next);
+            });
+          }
+
+          _retryTransfers[job.id] = replay;
+          transferJobs = [job, ...transferJobs];
+          _trackTransferJob(job);
+          bannerTaskId = job.id;
+          bannerMessage = transferBannerMessage(job);
+          bannerSeverity = job.status == 'failed'
+              ? BannerSeverity.error
+              : job.status == 'completed'
+                  ? BannerSeverity.success
+                  : BannerSeverity.info;
+          final destinationLabel =
+              AppPlatform.isMobile ? 'Downloads' : settings.downloadPath;
+          _addEvent(
+            level: 'INFO',
+            category: 'Transfers',
+            message:
+                'Started download job ${job.id} for ${retryKeys.length} object(s) into $destinationLabel.',
+            includeSelectionContext: true,
+            objectKey: object?.key,
+            source: 'task-tray',
+          );
+        }
       });
     }, trackTask: AppPlatform.isMobile);
   }
@@ -1898,11 +2194,14 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> cancelTransfer(String jobId) async {
-    if (jobId.startsWith('mobile-') || _uploadBatch?.id == jobId) {
+    if (jobId.startsWith('mobile-') ||
+        _uploadBatch?.id == jobId ||
+        _downloadBatch?.id == jobId) {
       final job = transferJobs.where((job) => job.id == jobId).firstOrNull;
       final direction = job?.direction ?? 'upload';
       _actionScopes[_busyTaskIds[direction]]?.cancel();
       if (_uploadBatch?.id == jobId) await _uploadBatch!.control('cancel');
+      if (_downloadBatch?.id == jobId) await _downloadBatch!.cancel();
       return;
     }
     await _runTransferControl(
@@ -2023,6 +2322,7 @@ class AppController extends ChangeNotifier {
       }
     }
     if (_uploadBatch != null) unawaited(_uploadBatch!.control('cancel'));
+    if (_downloadBatch != null) unawaited(_downloadBatch!.cancel());
     if (stopped) {
       bannerMessage =
           'Transfer stopped when the app entered the background. Check Jobs before retrying.';
@@ -2075,19 +2375,45 @@ class AppController extends ChangeNotifier {
     if (profile == null || bucket == null || object == null) {
       return;
     }
+    if (isBusy('presign')) return;
+    final engineId = activeEngineId;
+    final requestId = ++_presignRequestSequence;
+    final selectionId = _selectionArtifactsSequence;
+    final expirationMinutes = settings.defaultPresignMinutes;
+    bool isCurrent() =>
+        requestId == _presignRequestSequence &&
+        selectionId == _selectionArtifactsSequence &&
+        activeEngineId == engineId &&
+        selectedProfile?.id == profile.id &&
+        selectedBucket?.name == bucket.name &&
+        selectedObject?.key == object.key;
     await _runBusy('presign', 'Generating presigned URL...', () async {
       await _guard('Presign', () async {
-        final expiration = Duration(minutes: settings.defaultPresignMinutes);
-        final url = await _engineService.generatePresignedUrl(
-          engineId: activeEngineId,
-          profile: profile,
-          bucketName: bucket.name,
-          key: object.key,
-          expiration: expiration,
-        );
+        if (_usesCustomerEncryption(profile, bucket.name, object.key)) {
+          throw const EngineException(
+            code: ErrorCode.unsupportedFeature,
+            message:
+                'Objects encrypted with a customer key cannot be shared through a presigned URL.',
+          );
+        }
+        final expiration = Duration(minutes: expirationMinutes);
+        final String url;
+        try {
+          url = await _engineService.generatePresignedUrl(
+            engineId: engineId,
+            profile: profile,
+            bucketName: bucket.name,
+            key: object.key,
+            expiration: expiration,
+          );
+        } catch (_) {
+          if (!isCurrent()) return;
+          rethrow;
+        }
+        if (!isCurrent()) return;
         final bundle = PresignedUrlBundle(
           url: url,
-          expirationMinutes: settings.defaultPresignMinutes,
+          expirationMinutes: expirationMinutes,
           curlCommand: 'curl -L "$url" -o "${object.name}"',
         );
         selectedObjectDetails = (selectedObjectDetails ??
@@ -2101,17 +2427,18 @@ class AppController extends ChangeNotifier {
                 ))
             .copyWith(presignedUrl: bundle);
         inspectorTab = BrowserInspectorTab.presign;
+        bannerMessage = 'Share link ready.';
         _addEvent(
           level: 'INFO',
           category: 'Presign',
           message:
-              'Generated presigned URL for ${object.key} with ${settings.defaultPresignMinutes} minute expiration.',
+              'Generated presigned URL for ${object.key} with $expirationMinutes minute expiration.',
           includeSelectionContext: true,
           objectKey: object.key,
           source: 'presign',
         );
       });
-    }, doneMessage: 'Share link ready.');
+    });
   }
 
   Future<void> refreshSelectedObjectPreview() async {
@@ -2161,8 +2488,23 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> runPutTestDataTool() async {
+    if (!profileCapability('tools')) {
+      bannerMessage = profileCapabilityReason('tools');
+      bannerSeverity = BannerSeverity.warning;
+      notifyListeners();
+      return;
+    }
     final profile = selectedProfile;
     if (profile == null) {
+      return;
+    }
+    final refusal = _vaultGeneratedDataRefusal(
+        profile, testDataConfig.bucketName.trim(), testDataConfig.prefix,
+        benchmark: false);
+    if (refusal != null) {
+      bannerMessage = refusal;
+      bannerSeverity = BannerSeverity.warning;
+      notifyListeners();
       return;
     }
     final taskId = _nextTaskId('put-testdata');
@@ -2192,6 +2534,10 @@ class AppController extends ChangeNotifier {
               engineId: activeEngineId,
               profile: profile,
               config: testDataConfig,
+              encryption: await _effectiveUploadEncryption(
+                profile,
+                activeEngineId,
+              ),
             );
           } on ListingCancelled {
             final current = _taskById(taskId)!;
@@ -2245,6 +2591,12 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> runDeleteAllTool() async {
+    if (!profileCapability('tools')) {
+      bannerMessage = profileCapabilityReason('tools');
+      bannerSeverity = BannerSeverity.warning;
+      notifyListeners();
+      return;
+    }
     final profile = selectedProfile;
     if (profile == null || deleteAllState.running) {
       return;
@@ -2329,6 +2681,12 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> startBenchmark() async {
+    if (!profileCapability('benchmark')) {
+      bannerMessage = profileCapabilityReason('benchmark');
+      bannerSeverity = BannerSeverity.warning;
+      notifyListeners();
+      return;
+    }
     if (benchmarkRun != null &&
         {'starting', 'running', 'pausing', 'paused', 'resuming', 'stopping'}
             .contains(benchmarkRun!.status)) {
@@ -2356,6 +2714,15 @@ class AppController extends ChangeNotifier {
         profileId: profile.id,
         source: 'benchmark',
       );
+      notifyListeners();
+      return;
+    }
+    final refusal = _vaultGeneratedDataRefusal(
+        profile, benchmarkDraft.bucketName.trim(), benchmarkDraft.prefix,
+        benchmark: true);
+    if (refusal != null) {
+      bannerMessage = refusal;
+      bannerSeverity = BannerSeverity.warning;
       notifyListeners();
       return;
     }
@@ -2521,6 +2888,21 @@ class AppController extends ChangeNotifier {
     if (run == null || run.status != 'paused') {
       return;
     }
+    // A vault rule may have been added while the run was paused.
+    final owner =
+        profiles.where((p) => p.id == run.config.profileId).firstOrNull ??
+            selectedProfile;
+    final refusal = owner == null
+        ? null
+        : _vaultGeneratedDataRefusal(
+            owner, run.config.bucketName.trim(), run.config.prefix,
+            benchmark: true);
+    if (refusal != null) {
+      bannerMessage = refusal;
+      bannerSeverity = BannerSeverity.warning;
+      notifyListeners();
+      return;
+    }
     benchmarkRun = run.copyWith(
       status: 'resuming',
       liveLog: [...run.liveLog, 'Resume requested...'],
@@ -2594,22 +2976,50 @@ class AppController extends ChangeNotifier {
   }
 
   Future<bool> updateSettings(AppSettings value) async {
+    final previous = settings;
     settings = value;
+    if (jsonEncode(previous.keyFileSync?.toJson()) !=
+        jsonEncode(value.keyFileSync?.toJson())) {
+      _keyFileSync?.dispose();
+      _keyFileSync = null;
+      _ensureKeyFileSync();
+    }
     _syncPerformanceOptions();
     _syncDiagnosticsOptions();
     benchmarkDraft = benchmarkDraft.copyWith(
-      concurrentThreads: value.transferConcurrency,
-      connectTimeoutSeconds: value.connectTimeoutSeconds,
-      readTimeoutSeconds: value.readTimeoutSeconds,
-      maxAttempts: value.safeRetries,
-      maxPoolConnections: value.maxPoolConnections,
-      dataCacheMb: value.benchmarkDataCacheMb,
-      csvOutputPath:
-          '${value.tempPath}${Platform.pathSeparator}benchmark-results.csv',
-      jsonOutputPath:
-          '${value.tempPath}${Platform.pathSeparator}benchmark-results.json',
-      debugMode: value.benchmarkDebugMode,
-      logFilePath: value.benchmarkLogPath,
+      concurrentThreads:
+          previous.transferConcurrency != value.transferConcurrency
+              ? value.transferConcurrency
+              : null,
+      connectTimeoutSeconds:
+          previous.connectTimeoutSeconds != value.connectTimeoutSeconds
+              ? value.connectTimeoutSeconds
+              : null,
+      readTimeoutSeconds:
+          previous.readTimeoutSeconds != value.readTimeoutSeconds
+              ? value.readTimeoutSeconds
+              : null,
+      maxAttempts:
+          previous.safeRetries != value.safeRetries ? value.safeRetries : null,
+      maxPoolConnections:
+          previous.maxPoolConnections != value.maxPoolConnections
+              ? value.maxPoolConnections
+              : null,
+      dataCacheMb: previous.benchmarkDataCacheMb != value.benchmarkDataCacheMb
+          ? value.benchmarkDataCacheMb
+          : null,
+      csvOutputPath: previous.tempPath != value.tempPath
+          ? '${value.tempPath}${Platform.pathSeparator}benchmark-results.csv'
+          : null,
+      jsonOutputPath: previous.tempPath != value.tempPath
+          ? '${value.tempPath}${Platform.pathSeparator}benchmark-results.json'
+          : null,
+      debugMode: previous.benchmarkDebugMode != value.benchmarkDebugMode
+          ? value.benchmarkDebugMode
+          : null,
+      logFilePath: previous.benchmarkLogPath != value.benchmarkLogPath
+          ? value.benchmarkLogPath
+          : null,
     );
     _addEvent(
       level: 'INFO',
@@ -2633,6 +3043,11 @@ class AppController extends ChangeNotifier {
             .map((item) => item.id == profile.id ? profile : item)
             .toList()
         : [...profiles, profile];
+    if (settings.keyFileSync?.profileId == profile.id) {
+      _keyFileSync?.dispose();
+      _keyFileSync = null;
+      _ensureKeyFileSync();
+    }
     if (selectedProfile?.id == profile.id) {
       selectedProfile = profile;
       testDataConfig = testDataConfig.copyWith(
@@ -2653,18 +3068,83 @@ class AppController extends ChangeNotifier {
   Future<void> testProfileById(String profileId) =>
       testProfileDraft(profiles.firstWhere((item) => item.id == profileId));
 
-  bool supportsProfile(EndpointProfile profile) {
+  bool supportsProfile(EndpointProfile profile, {String? engineId}) {
+    final engine = engineId ?? activeEngineId;
+    if (profile.endpointType.isGoogleCloudStorage) {
+      if (AppPlatform.isMobile) return false;
+      final descriptor = engines.where((item) => item.id == engine).firstOrNull;
+      if (descriptor?.desktopSupported == false) return false;
+      if (descriptor?.endpointTypes != null) {
+        return descriptor!.endpointTypes!.contains(profile.endpointType.name);
+      }
+      return const {'python', 'go'}.contains(engine);
+    }
     if (AppPlatform.isMobile &&
         !const {'static', 'azureSas'}.contains(profile.connection.authMode)) {
       return false;
     }
     if (profile.endpointType != EndpointProfileType.azureBlob) return true;
-    return AppPlatform.isMobile ||
-        const {'python', 'go'}.contains(activeEngineId);
+    return AppPlatform.isMobile || const {'python', 'go'}.contains(engine);
+  }
+
+  String profileSupportReason(EndpointProfile profile) {
+    final engine =
+        engines.where((item) => item.id == activeEngineId).firstOrNull;
+    return profile.endpointType.isGoogleCloudStorage &&
+            (AppPlatform.isMobile ||
+                (engine?.desktopSupported == false &&
+                    engine?.mobileSupported == true))
+        ? 'Google Cloud Storage profiles are available on desktop in this version'
+        : '${profile.endpointType.displayLabel} requires a compatible desktop engine (Python or Go).';
+  }
+
+  /// Honor reported capabilities; native GCS defaults conservatively when an
+  /// older engine omits a descriptor. Existing S3/Azure behavior is unchanged.
+  bool profileCapability(String key) {
+    if (selectedProfile?.endpointType.isGoogleCloudStorage != true) return true;
+    final capability = capabilities
+        .where((item) =>
+            item.key == key ||
+            (key == 'tools' && item.key == 'tools.bulk-delete'))
+        .firstOrNull;
+    if (capability != null) {
+      return capability.state == CapabilityState.supported;
+    }
+    if (const {
+      'bucket.browse',
+      'bucket.versioning',
+      'bucket.admin_mutation',
+    }.contains(key)) {
+      return true;
+    }
+    return !key.startsWith('bucket.') &&
+        !key.startsWith('object.encryption.') &&
+        !const {
+          'storage.admin',
+          'benchmark',
+          'tools',
+          'object.tags',
+        }.contains(key);
+  }
+
+  String profileCapabilityReason(String key) =>
+      capabilities.where((item) => item.key == key).firstOrNull?.reason ??
+      '${selectedProfile?.endpointType.displayLabel ?? 'This profile'} does not support this feature in this version.';
+
+  bool _blockUnsupportedProfile(EndpointProfile profile) {
+    if (!profile.endpointType.isGoogleCloudStorage ||
+        supportsProfile(profile)) {
+      return false;
+    }
+    bannerMessage = profileSupportReason(profile);
+    bannerSeverity = BannerSeverity.warning;
+    notifyListeners();
+    return true;
   }
 
   Future<void> testProfileDraft(EndpointProfile draft) async {
     final profile = normalizeEndpointProfile(draft);
+    if (_blockUnsupportedProfile(profile)) return;
     final engine = activeEngineId;
     await _runBusy('test-profile-${profile.id}', 'Testing ${profile.name}...',
         () async {
@@ -2686,6 +3166,8 @@ class AppController extends ChangeNotifier {
 
   Future<bool> saveProfile(EndpointProfile profile) async {
     profile = normalizeEndpointProfile(profile);
+    final previous = profiles.where((p) => p.id == profile.id).firstOrNull;
+    if (previous != null) _rebaseDraftEncryption(previous, profile);
     updateProfile(profile);
     if (selectedProfile == null) {
       selectedProfile = profile;
@@ -2705,7 +3187,10 @@ class AppController extends ChangeNotifier {
       allowCredentialStoreRecovery: true,
       explicitProfileIds: {profile.id},
     );
-    if (persisted) _credentialStoreError = null;
+    if (persisted) {
+      _credentialStoreError = null;
+      _ensureKeyFileSync();
+    }
     _lastProfileSaveSucceeded = persisted;
     persistenceState.recordProfile(profile.id, persisted);
     _addEvent(
@@ -2726,11 +3211,35 @@ class AppController extends ChangeNotifier {
     return persisted;
   }
 
+  /// Encryption can be saved from the bucket dialog and Settings → Encryption
+  /// while the Connections editor holds an unsaved draft of the same profile.
+  /// Carry the saved encryption into that draft unless the draft edited the
+  /// same field, so saving the draft later cannot silently turn it off.
+  void _rebaseDraftEncryption(EndpointProfile before, EndpointProfile after) {
+    EndpointProfile rebase(EndpointProfile value) => value.copyWith(
+          uploadEncryption: value.uploadEncryption == before.uploadEncryption
+              ? after.uploadEncryption
+              : value.uploadEncryption,
+          clientEncryptionRules: listEquals(
+                  value.clientEncryptionRules, before.clientEncryptionRules)
+              ? after.clientEncryptionRules
+              : value.clientEncryptionRules,
+        );
+    final draft = profileDrafts[after.id];
+    if (draft != null) profileDrafts[after.id] = rebase(draft);
+    final base = profileDraftBases[after.id];
+    if (base != null) profileDraftBases[after.id] = rebase(base);
+  }
+
   Future<void> deleteProfile(String profileId) async {
     profileDrafts.remove(profileId);
     profileDraftBases.remove(profileId);
     invalidProfileDrafts.remove(profileId);
     profiles = profiles.where((item) => item.id != profileId).toList();
+    if (settings.keyFileSync?.profileId == profileId) {
+      _keyFileSync?.dispose();
+      _keyFileSync = null;
+    }
     if (selectedProfile?.id == profileId) {
       selectedProfile = profiles.isEmpty ? null : profiles.first;
       buckets = const [];
@@ -3184,7 +3693,8 @@ class AppController extends ChangeNotifier {
       objectFilterMode,
       objectFilterValue,
       objectSortField,
-      objectSortDescending);
+      objectSortDescending,
+      visibleKeys: _visibleQueryKeys);
 
   List<ObjectEntry> get pagedVisibleObjects {
     final results = visibleObjects;
@@ -3241,8 +3751,26 @@ class AppController extends ChangeNotifier {
     }
     notifyListeners();
   });
-  List<ObjectVersionEntry> get visibleVersions =>
-      _versionQuery.resolve(versions, versionBrowserOptions);
+  List<ObjectVersionEntry>? _nameQueryVersions;
+  List<String>? _nameVersionKeys;
+  int _nameVersionGeneration = -1;
+  Object? _nameVersionContext;
+  List<ObjectVersionEntry> get visibleVersions {
+    final context =
+        (selectedProfile?.clientEncryptionRules, selectedBucket?.name);
+    if (_nameVersionContext != context ||
+        !identical(_nameQueryVersions, versions) ||
+        _nameVersionKeys?.length != versions.length ||
+        _nameVersionGeneration != _nameKeyGeneration) {
+      _nameVersionContext = context;
+      _nameQueryVersions = versions;
+      _nameVersionGeneration = _nameKeyGeneration;
+      _nameVersionKeys = versions.map((v) => visibleStoredKey(v.key)).toList();
+    }
+    return _versionQuery.resolve(versions, versionBrowserOptions,
+        visibleKeys: _nameVersionKeys);
+  }
+
   bool get filteringVersions => _versionQuery.loading;
   int get displayedVersionCount => visibleVersions.length;
   List<ObjectVersionEntry>? _countedVersions;
@@ -3557,12 +4085,7 @@ class AppController extends ChangeNotifier {
       final count = activity.kind == BannerActivityKind.listing
           ? (_listingLoadedCount > 0 ? _listingLoadedCount : null)
           : activity.count;
-      return (
-        kind: activity.kind,
-        phase: phase,
-        progress: null,
-        count: count,
-      );
+      return (kind: activity.kind, phase: phase, progress: null, count: count);
     }
     return (
       kind: BannerActivityKind.message,
@@ -3583,8 +4106,11 @@ class AppController extends ChangeNotifier {
     final message = itemCount > 1
         ? 'Preparing $actionKey of $itemCount ${upload ? 'files' : 'objects'}…'
         : 'Preparing $actionKey…';
-    final preparing =
-        (direction: direction, itemCount: itemCount, message: message);
+    final preparing = (
+      direction: direction,
+      itemCount: itemCount,
+      message: message,
+    );
     _preparingTransfer = preparing;
     try {
       await _runBusy(actionKey, message, operation, trackTask: trackTask);
@@ -3718,13 +4244,20 @@ class AppController extends ChangeNotifier {
         cancellableListing ? _awaitListing(request) : request();
     Future<void> readVersions() async {
       try {
+        // No asynchronous gap outside a vault location: the request must be
+        // issued in the same turn, as before.
+        var options = versionBrowserOptions;
+        if (_versionPrefixNeedsTranslation(options)) {
+          options = await _versionOptionsForStorage(options);
+          if (!isCurrent()) return;
+        }
         final versionResult =
             await read(() => _engineService.listObjectVersions(
                   engineId: engineId,
                   profile: profile,
                   bucketName: bucket.name,
                   key: object?.key,
-                  options: versionBrowserOptions,
+                  options: options,
                 ));
         if (!isCurrent()) return;
         versions = versionResult.items;
@@ -3753,7 +4286,7 @@ class AppController extends ChangeNotifier {
         return;
       }
       try {
-        final details = await read(() => _engineService.getObjectDetails(
+        final details = await read(() => _loadEncryptedObjectDetails(
             engineId: engineId,
             profile: profile,
             bucketName: bucket.name,
@@ -3767,6 +4300,17 @@ class AppController extends ChangeNotifier {
       } on EngineException catch (error) {
         if (!isCurrent()) return;
         selectedObjectDetails = null;
+        bannerMessage =
+            encryptionHintMessage(error.details?['encryptionHint']) ??
+                error.message;
+        bannerSeverity = BannerSeverity.error;
+        if (error.details?['encryptionHint'] == 'sse_c_key_required') {
+          selectedObjectPreview = ObjectPreview.unsupported(
+            key: object.key,
+            message:
+                'Preview is unavailable for objects encrypted with a customer key. Download to view.',
+          );
+        }
         _addEvent(
             level: 'WARN',
             category: 'Objects',
@@ -3803,7 +4347,29 @@ class AppController extends ChangeNotifier {
     final kind = _previewKindFor(object, contentType);
     _cancelTextPreview();
     final requestId = _previewRequestSequence;
-    if (object.isFolder) {
+    if (isClientEncrypted(object)) {
+      selectedObjectPreview = ObjectPreview.loading(
+        key: object.key,
+        kind: ObjectPreviewKind.text,
+        contentType: contentType,
+      );
+      unawaited(_loadClientPreview(object, requestId));
+    } else if ((selectedObjectDetails?.key == object.key &&
+            selectedObjectDetails?.encryption?.isCustomerKey == true) ||
+        (selectedProfile != null &&
+            selectedBucket != null &&
+            _usesCustomerEncryption(
+              selectedProfile!,
+              selectedBucket!.name,
+              object.key,
+            ))) {
+      selectedObjectPreview = ObjectPreview.unsupported(
+        key: object.key,
+        contentType: contentType,
+        message:
+            'Preview is unavailable for objects encrypted with a customer key. Download to view.',
+      );
+    } else if (object.isFolder) {
       selectedObjectPreview = ObjectPreview.unsupported(
         key: object.key,
         contentType: contentType,
@@ -4035,7 +4601,8 @@ class AppController extends ChangeNotifier {
     } on EngineException catch (error) {
       _formErrors?.add(error);
       _guardErrorSequence += 1;
-      bannerMessage = '${error.code.displayLabel}: ${error.message}';
+      bannerMessage = encryptionHintMessage(error.details?['encryptionHint']) ??
+          '${error.code.displayLabel}: ${error.message}';
       bannerSeverity = BannerSeverity.error;
       _addEvent(
         level: 'ERROR',
@@ -4240,7 +4807,13 @@ class AppController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _clearClientPreviewBytes();
     _disposed = true;
+    _keyFileSync?.dispose();
+    _encryptionKeyStore?.lock();
+    _encryptionKeyStore?.removeListener(_nameKeysChanged);
+    _clearNameKeys();
+    _activeDownloadNames.clear();
     _transferNotifyTimer?.cancel();
     objectSearchFocus.dispose();
     inspectorToggleRequest.dispose();
@@ -4256,6 +4829,11 @@ class AppController extends ChangeNotifier {
   /// Releases long-lived engine resources (desktop sidecar processes). Safe to
   /// call multiple times; also invoked on desktop app-exit requests.
   void shutdownEngines() {
+    _keyFileSync?.dispose();
+    _encryptionKeyStore?.lock();
+    if (_engineService is EngineEncryptionResolver) {
+      (_engineService as EngineEncryptionResolver).customerKeyResolver = null;
+    }
     _engineService.shutdown();
   }
 
@@ -4360,8 +4938,8 @@ class AppController extends ChangeNotifier {
         method: method,
         responseStatus: responseStatus,
         latencyMs: latencyMs,
-        traceHead: DiagnosticSafety.sanitize(traceHead),
-        traceBody: DiagnosticSafety.sanitize(traceBody),
+        traceHead: DiagnosticSafety.trace(traceHead),
+        traceBody: DiagnosticSafety.trace(traceBody),
       ),
       ...eventLog,
     ];
@@ -4493,6 +5071,13 @@ class AppController extends ChangeNotifier {
     );
   }
 
+  /// Directory paths returned by a provider, see [_rememberListedPaths].
+  final _listedStoragePaths = <String>{};
+
+  /// Counts completed reads of the bucket admin state, so a form can tell a
+  /// fresh read from a failed or skipped one before it replaces a document.
+  int bucketAdminReads = 0;
+
   Future<void> refreshBucketAdminState(
       {bool cancellableListing = false}) async {
     final engineId = activeEngineId;
@@ -4540,6 +5125,7 @@ class AppController extends ChangeNotifier {
           return;
         }
         adminState = result;
+        bucketAdminReads += 1;
         notifyListeners();
       });
     });
@@ -4635,6 +5221,18 @@ class AppController extends ChangeNotifier {
     );
   }
 
+  Future<void> deleteBucketEncryption() async {
+    await _mutateBucketAdmin(
+      actionKey: 'bucket-encryption',
+      busyMessage: 'Removing explicit encryption configuration...',
+      operation: (profile, bucket) => _engineService.deleteBucketEncryption(
+        engineId: activeEngineId,
+        profile: profile,
+        bucketName: bucket.name,
+      ),
+    );
+  }
+
   Future<void> saveBucketTags(Map<String, String> tags) async {
     await _mutateBucketAdmin(
       actionKey: 'bucket-tags',
@@ -4658,27 +5256,117 @@ class AppController extends ChangeNotifier {
   }) async {
     final source = profile ?? selectedProfile;
     if (source == null) throw StateError('Select an endpoint first.');
+    _guardVaultStorageAction(action, arguments, destinationProfile ?? source,
+        sameProfile:
+            destinationProfile == null || destinationProfile.id == source.id);
     ActionScope.current?.check();
-    return _engineService.storageAction(
+    if (source.endpointType.isGoogleCloudStorage) {
+      final service = _engineService;
+      if (service is! NativeProviderActions) {
+        throw const EngineException(
+            code: ErrorCode.unsupportedFeature,
+            message:
+                'Native Cloud Storage actions require a compatible desktop engine.');
+      }
+      // The interface is unrelated to EngineService, so the check above
+      // cannot promote the variable.
+      return (service as NativeProviderActions).nativeProviderAction(
+          engineId: activeEngineId,
+          profile: source,
+          action: action,
+          arguments: arguments,
+          destinationProfile: destinationProfile);
+    }
+    if (action == 'presignVersion' &&
+        arguments['bucketName'] is String &&
+        arguments['key'] is String &&
+        _usesCustomerEncryption(
+          source,
+          arguments['bucketName'] as String,
+          arguments['key'] as String,
+        )) {
+      throw const EngineException(
+        code: ErrorCode.unsupportedFeature,
+        message:
+            'Objects encrypted with a customer key cannot be shared through a presigned URL.',
+      );
+    }
+    if (action == 'copyObject' && !arguments.containsKey('encryption')) {
+      final bucket = arguments['sourceBucketName'] as String?;
+      final key = arguments['sourceKey'] as String?;
+      if (bucket != null && key != null) {
+        final info =
+            _objectEncryption[_encryptionIdentity(source, bucket, key)];
+        if (info?.isCustomerKey == true) await ensureEncryptionKeyStore();
+        final encryption = _preservedEncryption(info);
+        if (encryption != null) {
+          await _requireEncryptionCapability(
+            destinationProfile ?? source,
+            activeEngineId,
+            encryption,
+          );
+          arguments = {
+            ...arguments,
+            'encryption': encryption,
+            if (encryption.mode.isCustomerKey) 'sourceEncryption': encryption,
+          };
+        }
+      }
+    }
+    final result = await _engineService.storageAction(
         profile: source,
         action: action,
         arguments: arguments,
         destinationProfile: destinationProfile);
+    if (action == 'listDirectories') {
+      _rememberListedPaths(source, arguments['bucketName'], result['items']);
+    }
+    return result;
   }
 
   Future<void> applyAccessPreset(String policy, String expectedPolicy,
       {String? acl}) async {
     final bucket = selectedBucket;
     if (bucket == null) return;
-    await _runBusy('access-preset', 'Applying access preset...', () async {
-      await storageAction('putAccess', arguments: {
-        'bucketName': bucket.name,
-        'policyJson': policy,
-        'expectedPolicyJson': expectedPolicy,
-        if (acl != null) 'acl': acl,
+    await _runBusy(
+      'access-preset',
+      'Applying access preset...',
+      () async {
+        await storageAction('putAccess', arguments: {
+          'bucketName': bucket.name,
+          'policyJson': policy,
+          'expectedPolicyJson': expectedPolicy,
+          if (acl != null) 'acl': acl,
+        });
+        await refreshBucketAdminState();
+      },
+      doneMessage: 'Access preset applied.',
+    );
+  }
+
+  Future<void> deleteGeneration(ObjectVersionEntry version) async {
+    final profile = selectedProfile;
+    final bucket = selectedBucket;
+    if (profile == null || bucket == null) return;
+    await _runBusy('delete-generation', 'Deleting generation...', () async {
+      await _guard('Versions', () async {
+        final result = await _engineService.deleteObjectVersions(
+          engineId: activeEngineId,
+          profile: profile,
+          bucketName: bucket.name,
+          versions: [
+            ObjectVersionRef(key: version.key, versionId: version.versionId),
+          ],
+        );
+        if (result.failureCount > 0) {
+          throw const EngineException(
+            code: ErrorCode.partialBatchFailure,
+            message: 'The generation could not be deleted.',
+          );
+        }
+        await refreshObjects();
       });
-      await refreshBucketAdminState();
-    }, doneMessage: 'Access preset applied.');
+    });
   }
 
   Future<void> loadMoreVersions() async {
@@ -4704,13 +5392,18 @@ class AppController extends ChangeNotifier {
       await _guard('Versions', () async {
         final ObjectVersionListResult page;
         try {
+          var storedOptions = options;
+          if (_versionPrefixNeedsTranslation(options)) {
+            storedOptions = await _versionOptionsForStorage(options);
+            if (!isCurrent()) return;
+          }
           page = await _engineService.listObjectVersions(
               engineId: engineId,
               profile: profile,
               bucketName: bucket.name,
               key: objectKey,
               cursor: cursor,
-              options: options);
+              options: storedOptions);
         } catch (_) {
           if (!isCurrent()) return;
           rethrow;
@@ -4761,7 +5454,9 @@ class AppController extends ChangeNotifier {
     String endpoint(EndpointProfile p) =>
         p.endpointType == EndpointProfileType.azureBlob && p.endpointUrl.isEmpty
             ? azureEndpointForAccount(p.accessKey)
-            : p.endpointUrl;
+            : p.endpointType.isGoogleCloudStorage && p.endpointUrl.isEmpty
+                ? 'https://storage.googleapis.com'
+                : p.endpointUrl;
     String endpointIdentity(EndpointProfile p) {
       final uri = Uri.parse(endpoint(p));
       return jsonEncode([
@@ -4789,6 +5484,7 @@ class AppController extends ChangeNotifier {
         'Copying $sourceBucketName to ${destination.name}/$bucket...',
         () async {
       await _guard('Buckets', () async {
+        _guardVaultCopyPrefix(profile, sourceBucketName, prefix);
         final journal = await _bucketCopyJournalProvider();
         final configuration = <String, Object?>{
           'sourceProfileId': profile.id,
@@ -5069,7 +5765,7 @@ class AppController extends ChangeNotifier {
 
   void _syncObjectFilterWithPrefix() {
     if (objectFilterMode == BrowserFilterMode.prefix) {
-      objectFilterValue = currentPrefix;
+      objectFilterValue = visiblePrefix(currentPrefix);
     }
   }
 
@@ -5236,8 +5932,10 @@ class AppController extends ChangeNotifier {
   bool _disposed = false;
   Timer? _transferNotifyTimer;
   void _handleTransferJobUpdate(TransferJob job) {
+    job = _safeDownloadJob(job);
     job = preserveTransferCancellation(_transfers.byId(job.id), job);
     if (_uploadBatch?.consume(job) ?? false) return;
+    if (_downloadBatch?.consume(job) ?? false) return;
     if (_busyActions.contains(job.direction)) {
       bannerTaskId = job.id;
     }
@@ -5329,6 +6027,16 @@ class AppController extends ChangeNotifier {
     if (profile == null || bucket == null) {
       return;
     }
+    final capabilityKey = actionKey == 'bucket-tags'
+        ? 'bucket.tagging'
+        : actionKey.replaceFirst('bucket-', 'bucket.');
+    if (profile.endpointType.isGoogleCloudStorage &&
+        !profileCapability(capabilityKey)) {
+      bannerMessage = profileCapabilityReason(capabilityKey);
+      bannerSeverity = BannerSeverity.warning;
+      notifyListeners();
+      return;
+    }
     await _runBusy(actionKey, busyMessage, () async {
       await _guard('Buckets', () async {
         final sectionName = switch (actionKey) {
@@ -5408,7 +6116,7 @@ class AppController extends ChangeNotifier {
     if (object.isFolder) {
       return 'inode/directory';
     }
-    final key = object.name.toLowerCase();
+    final key = visibleObjectName(object).toLowerCase();
     if (key.endsWith('.json')) {
       return 'application/json';
     }

@@ -377,6 +377,11 @@ func copyObjectAdvanced(params map[string]interface{}) (map[string]interface{}, 
 	if err != nil {
 		return nil, err
 	}
+	client, err = encryptedS3Client(params, p, client, true)
+	if err != nil {
+		return nil, err
+	}
+
 	head, err := client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(sourceBucket), Key: aws.String(sourceKey), VersionId: stringPtr(asString(params["sourceVersionId"]))})
 	if err != nil {
 		return nil, err

@@ -1,7 +1,17 @@
+import 'dart:typed_data';
+import 'key_file_sync_models.dart';
+export 'key_file_sync_models.dart';
+import 'client_encryption.dart';
+export 'client_encryption.dart';
+import 'object_encryption.dart';
+export 'object_encryption.dart';
 import 'performance_settings.dart';
 export 'performance_settings.dart';
 import 'connection_options.dart';
 export 'connection_options.dart';
+import 'provider_templates.dart' show providerTemplateById;
+
+const _unchangedProviderTemplateId = Object();
 
 enum BannerSeverity { info, success, warning, error }
 
@@ -14,6 +24,7 @@ extension ErrorCodeLabel on ErrorCode {
         ErrorCode.unsupportedFeature => 'Feature unavailable',
         ErrorCode.invalidConfig => 'Invalid configuration',
         ErrorCode.objectConflict => 'Object conflict',
+        ErrorCode.decryptionFailed => 'Object integrity check failed',
         ErrorCode.partialBatchFailure => 'Some operations failed',
         ErrorCode.engineUnavailable => 'Engine unavailable',
         ErrorCode.unknown => 'Operation failed',
@@ -36,6 +47,7 @@ enum ErrorCode {
   unsupportedFeature,
   invalidConfig,
   objectConflict,
+  decryptionFailed,
   partialBatchFailure,
   engineUnavailable,
   unknown,
@@ -47,30 +59,34 @@ enum CapabilityState {
   unknown,
 }
 
-enum EndpointProfileType {
-  s3Compatible,
-  awsS3,
-  azureBlob,
-}
+enum EndpointProfileType { s3Compatible, awsS3, azureBlob, googleCloudStorage }
 
 extension EndpointProfileTypeInfo on EndpointProfileType {
   bool get isAzure => this == EndpointProfileType.azureBlob;
+  bool get isGoogleCloudStorage =>
+      this == EndpointProfileType.googleCloudStorage;
+  bool get isS3 =>
+      this == EndpointProfileType.s3Compatible ||
+      this == EndpointProfileType.awsS3;
 
   String get displayLabel => switch (this) {
         EndpointProfileType.s3Compatible => 'S3 compatible',
         EndpointProfileType.awsS3 => 'AWS S3',
         EndpointProfileType.azureBlob => 'Azure Blob Storage',
+        EndpointProfileType.googleCloudStorage => 'Google Cloud Storage',
       };
 
   /// Label for the field stored in [EndpointProfile.accessKey].
   String get accessKeyLabel => switch (this) {
         EndpointProfileType.azureBlob => 'Storage account name',
+        EndpointProfileType.googleCloudStorage => 'Service account email',
         _ => 'Access key',
       };
 
   /// Label for the field stored in [EndpointProfile.secretKey].
   String get secretKeyLabel => switch (this) {
         EndpointProfileType.azureBlob => 'Account access key',
+        EndpointProfileType.googleCloudStorage => 'Service account key (JSON)',
         _ => 'Secret key',
       };
 }
@@ -197,6 +213,10 @@ class EndpointProfile {
     required this.pathStyle,
     required this.verifyTls,
     this.endpointType = EndpointProfileType.s3Compatible,
+    this.providerTemplateId,
+    this.uploadEncryption,
+    this.clientEncryptionRules = const [],
+    this.useCustomAwsEndpoint = false,
     this.sessionToken,
     this.signerOverride,
     this.notes,
@@ -217,6 +237,15 @@ class EndpointProfile {
   final bool pathStyle;
   final bool verifyTls;
   final EndpointProfileType endpointType;
+
+  /// Non-secret editor metadata, excluded from engine requests.
+  final String? providerTemplateId;
+  final ObjectEncryption? uploadEncryption;
+  final List<ClientEncryptionRule> clientEncryptionRules;
+
+  /// Retains a template's editable AWS URL, including after choosing Custom.
+  /// Absent on older profiles so their region-derived behavior stays intact.
+  final bool useCustomAwsEndpoint;
   final String? sessionToken;
   final String? signerOverride;
   final String? notes;
@@ -239,6 +268,8 @@ class EndpointProfile {
       pathStyle == other.pathStyle &&
       verifyTls == other.verifyTls &&
       endpointType == other.endpointType &&
+      providerTemplateId == other.providerTemplateId &&
+      useCustomAwsEndpoint == other.useCustomAwsEndpoint &&
       sessionToken == other.sessionToken &&
       signerOverride == other.signerOverride &&
       notes == other.notes &&
@@ -247,7 +278,12 @@ class EndpointProfile {
       maxConcurrentRequests == other.maxConcurrentRequests &&
       maxAttempts == other.maxAttempts &&
       maxRequestsPerSecond == other.maxRequestsPerSecond &&
-      connection == other.connection;
+      connection == other.connection &&
+      uploadEncryption == other.uploadEncryption &&
+      clientEncryptionRules.length == other.clientEncryptionRules.length &&
+      List.generate(clientEncryptionRules.length, (i) => i).every(
+        (i) => clientEncryptionRules[i] == other.clientEncryptionRules[i],
+      );
   @override
   int get hashCode => Object.hashAll([
         id,
@@ -259,6 +295,10 @@ class EndpointProfile {
         pathStyle,
         verifyTls,
         endpointType,
+        providerTemplateId,
+        uploadEncryption,
+        Object.hashAll(clientEncryptionRules),
+        useCustomAwsEndpoint,
         sessionToken,
         signerOverride,
         notes,
@@ -282,6 +322,13 @@ class EndpointProfile {
       'pathStyle': pathStyle,
       'verifyTls': verifyTls,
       'endpointType': endpointType.name,
+      if (providerTemplateId != null) 'providerTemplateId': providerTemplateId,
+      if (uploadEncryption != null)
+        'uploadEncryption': uploadEncryption!.toJson(),
+      if (clientEncryptionRules.isNotEmpty)
+        'clientEncryptionRules':
+            clientEncryptionRules.map((r) => r.toJson()).toList(),
+      if (useCustomAwsEndpoint) 'useCustomAwsEndpoint': true,
       'signerOverride': signerOverride,
       'notes': notes,
       'connectTimeoutSeconds': connectTimeoutSeconds,
@@ -298,6 +345,21 @@ class EndpointProfile {
     final embeddedSas = json['endpointType'] == 'azureBlob' &&
         endpoint?.queryParameters.containsKey('sig') == true;
     return EndpointProfile(
+      clientEncryptionRules:
+          (json['clientEncryptionRules'] as List? ?? const [])
+              .map(
+                (r) => ClientEncryptionRule.fromJson(
+                  Map<String, Object?>.from(r as Map),
+                ),
+              )
+              .toList(),
+      providerTemplateId: providerTemplateById(json['providerTemplateId'])?.id,
+      uploadEncryption: json['uploadEncryption'] is Map
+          ? ObjectEncryption.fromJson(
+              Map<String, Object?>.from(json['uploadEncryption'] as Map),
+            )
+          : null,
+      useCustomAwsEndpoint: json['useCustomAwsEndpoint'] == true,
       id: (json['id'] as String?) ?? '',
       name: (json['name'] as String?) ?? '',
       endpointUrl: embeddedSas
@@ -322,6 +384,7 @@ class EndpointProfile {
       endpointType: switch (json['endpointType'] as String? ?? 's3Compatible') {
         'awsS3' => EndpointProfileType.awsS3,
         'azureBlob' => EndpointProfileType.azureBlob,
+        'googleCloudStorage' => EndpointProfileType.googleCloudStorage,
         _ => EndpointProfileType.s3Compatible,
       },
       signerOverride: json['signerOverride'] as String?,
@@ -346,6 +409,10 @@ class EndpointProfile {
     bool? pathStyle,
     bool? verifyTls,
     EndpointProfileType? endpointType,
+    Object? providerTemplateId = _unchangedProviderTemplateId,
+    Object? uploadEncryption = _unchangedProviderTemplateId,
+    List<ClientEncryptionRule>? clientEncryptionRules,
+    bool? useCustomAwsEndpoint,
     String? sessionToken,
     String? signerOverride,
     String? notes,
@@ -357,7 +424,13 @@ class EndpointProfile {
     ConnectionOptions? connection,
   }) {
     return EndpointProfile(
+      clientEncryptionRules:
+          clientEncryptionRules ?? this.clientEncryptionRules,
       id: id,
+      uploadEncryption:
+          identical(uploadEncryption, _unchangedProviderTemplateId)
+              ? this.uploadEncryption
+              : uploadEncryption as ObjectEncryption?,
       name: name ?? this.name,
       endpointUrl: endpointUrl ?? this.endpointUrl,
       region: region ?? this.region,
@@ -366,6 +439,11 @@ class EndpointProfile {
       pathStyle: pathStyle ?? this.pathStyle,
       verifyTls: verifyTls ?? this.verifyTls,
       endpointType: endpointType ?? this.endpointType,
+      providerTemplateId:
+          identical(providerTemplateId, _unchangedProviderTemplateId)
+              ? this.providerTemplateId
+              : providerTemplateId as String?,
+      useCustomAwsEndpoint: useCustomAwsEndpoint ?? this.useCustomAwsEndpoint,
       sessionToken: sessionToken ?? this.sessionToken,
       signerOverride: signerOverride ?? this.signerOverride,
       notes: notes ?? this.notes,
@@ -390,6 +468,7 @@ class EngineDescriptor {
     required this.available,
     required this.desktopSupported,
     required this.mobileSupported,
+    this.endpointTypes,
   });
 
   final String id;
@@ -399,6 +478,7 @@ class EngineDescriptor {
   final bool available;
   final bool desktopSupported;
   final bool mobileSupported;
+  final List<String>? endpointTypes;
 }
 
 class CapabilityDescriptor {
@@ -718,11 +798,13 @@ class ObjectDetails {
     required this.debugEvents,
     required this.apiCalls,
     this.presignedUrl,
+    this.encryption,
     this.debugLogExcerpt = const [],
     this.rawDiagnostics = const {},
   });
 
   final String key;
+  final ObjectEncryptionInfo? encryption;
   final Map<String, String> metadata;
   final Map<String, String> headers;
   final Map<String, String> tags;
@@ -733,6 +815,7 @@ class ObjectDetails {
   final Map<String, Object?> rawDiagnostics;
 
   ObjectDetails copyWith({
+    ObjectEncryptionInfo? encryption,
     Map<String, String>? metadata,
     Map<String, String>? headers,
     Map<String, String>? tags,
@@ -744,6 +827,7 @@ class ObjectDetails {
   }) {
     return ObjectDetails(
       key: key,
+      encryption: encryption ?? this.encryption,
       metadata: metadata ?? this.metadata,
       headers: headers ?? this.headers,
       tags: tags ?? this.tags,
@@ -766,6 +850,7 @@ class ObjectPreview {
     this.contentType,
     this.url,
     this.text,
+    this.bytes,
     this.truncated = false,
     this.loadedBytes = 0,
   });
@@ -778,6 +863,7 @@ class ObjectPreview {
   final String? contentType;
   final String? url;
   final String? text;
+  final Uint8List? bytes;
   final bool truncated;
   final int loadedBytes;
 
@@ -803,6 +889,7 @@ class ObjectPreview {
     String? contentType,
     String? url,
     String? text,
+    Uint8List? bytes,
     bool truncated = false,
     int loadedBytes = 0,
   }) {
@@ -815,6 +902,7 @@ class ObjectPreview {
       contentType: contentType,
       url: url,
       text: text,
+      bytes: bytes,
       truncated: truncated,
       loadedBytes: loadedBytes,
     );
@@ -1303,6 +1391,7 @@ class TransferJob {
   final List<String> outputLines;
 
   TransferJob copyWith({
+    String? label,
     double? progress,
     String? status,
     int? bytesTransferred,
@@ -1321,7 +1410,7 @@ class TransferJob {
   }) {
     return TransferJob(
       id: id,
-      label: label,
+      label: label ?? this.label,
       direction: direction,
       progress: progress ?? this.progress,
       status: status ?? this.status,
@@ -1495,6 +1584,9 @@ class AppSettings {
     required this.darkMode,
     required this.defaultEngineId,
     this.defaultProfileId = '',
+    this.keyFileDeviceId = '',
+    this.keyFileSync,
+    this.keyFileSyncState = const KeyFileSyncState(),
     required this.downloadPath,
     this.downloadConflictPolicy = 'keepBoth',
     required this.tempPath,
@@ -1533,6 +1625,9 @@ class AppSettings {
   final bool darkMode;
   final String defaultEngineId;
   final String defaultProfileId;
+  final String keyFileDeviceId;
+  final KeyFileSyncConfig? keyFileSync;
+  final KeyFileSyncState keyFileSyncState;
   final String downloadPath;
   final String downloadConflictPolicy;
   final String tempPath;
@@ -1575,6 +1670,9 @@ class AppSettings {
       'browserInspectorVisible': browserInspectorVisible,
       'defaultEngineId': defaultEngineId,
       'defaultProfileId': defaultProfileId,
+      'keyFileDeviceId': keyFileDeviceId,
+      if (keyFileSync != null) 'keyFileSync': keyFileSync!.toJson(),
+      'keyFileSyncState': keyFileSyncState.toJson(),
       'downloadPath': downloadPath,
       'downloadConflictPolicy': downloadConflictPolicy,
       'tempPath': tempPath,
@@ -1618,6 +1716,13 @@ class AppSettings {
       darkMode: json['darkMode'] as bool? ?? false,
       defaultEngineId: (json['defaultEngineId'] as String?) ?? 'python',
       defaultProfileId: (json['defaultProfileId'] as String?) ?? '',
+      keyFileDeviceId: json['keyFileDeviceId'] as String? ?? '',
+      keyFileSync: json['keyFileSync'] is Map
+          ? KeyFileSyncConfig.fromJson(
+              Map<String, Object?>.from(json['keyFileSync'] as Map))
+          : null,
+      keyFileSyncState: KeyFileSyncState.fromJson(
+          Map<String, Object?>.from(json['keyFileSyncState'] as Map? ?? {})),
       downloadPath: (json['downloadPath'] as String?) ?? '',
       downloadConflictPolicy:
           json['downloadConflictPolicy'] == 'replace' ? 'replace' : 'keepBoth',
@@ -1683,6 +1788,10 @@ class AppSettings {
     bool? darkMode,
     String? defaultEngineId,
     String? defaultProfileId,
+    String? keyFileDeviceId,
+    KeyFileSyncConfig? keyFileSync,
+    bool clearKeyFileSync = false,
+    KeyFileSyncState? keyFileSyncState,
     String? downloadPath,
     String? downloadConflictPolicy,
     String? tempPath,
@@ -1722,6 +1831,9 @@ class AppSettings {
       darkMode: darkMode ?? this.darkMode,
       defaultEngineId: defaultEngineId ?? this.defaultEngineId,
       defaultProfileId: defaultProfileId ?? this.defaultProfileId,
+      keyFileDeviceId: keyFileDeviceId ?? this.keyFileDeviceId,
+      keyFileSync: clearKeyFileSync ? null : keyFileSync ?? this.keyFileSync,
+      keyFileSyncState: keyFileSyncState ?? this.keyFileSyncState,
       downloadPath: downloadPath ?? this.downloadPath,
       downloadConflictPolicy:
           downloadConflictPolicy ?? this.downloadConflictPolicy,
@@ -1778,8 +1890,11 @@ class EngineException implements Exception {
   final String message;
   final Map<String, Object?>? details;
 
+  String get userMessage =>
+      encryptionHintMessage(details?['encryptionHint']) ?? message;
+
   @override
-  String toString() => 'EngineException($code, $message)';
+  String toString() => 'EngineException($code, $userMessage)';
 }
 
 enum InspectorGroup { object, bucket, diagnostics }

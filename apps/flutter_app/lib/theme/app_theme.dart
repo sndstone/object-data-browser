@@ -147,10 +147,10 @@ class AppTheme {
     final fieldRadius = isUltraCompact ? 6.0 : (desktopCompact ? 8.0 : 10.0);
     final buttonRadius = isUltraCompact ? 6.0 : (desktopCompact ? 7.0 : 8.0);
     final fieldPadding = isUltraCompact
-        ? const EdgeInsets.fromLTRB(10, 14, 10, 8)
+        ? const EdgeInsets.fromLTRB(10, 20, 10, 12)
         : desktopCompact
-            ? const EdgeInsets.fromLTRB(12, 16, 12, 9)
-            : const EdgeInsets.fromLTRB(14, 18, 14, 10);
+            ? const EdgeInsets.fromLTRB(12, 20, 12, 12)
+            : const EdgeInsets.fromLTRB(14, 22, 14, 14);
     final buttonPadding = isUltraCompact
         ? const EdgeInsets.symmetric(horizontal: 10, vertical: 7)
         : desktopCompact
@@ -252,7 +252,7 @@ class AppTheme {
             fontFamily: 'Inter',
             fontWeight: FontWeight.w700,
             letterSpacing: 0,
-            fontSize: desktopCompact ? 11.75 : 12.5,
+            fontSize: desktopCompact ? 12.5 : 13.0,
             height: 1.2,
             color: scheme.onSurfaceVariant,
           ),
@@ -324,9 +324,11 @@ class AppTheme {
           fontWeight: FontWeight.w700,
           height: 1.15,
         ),
+        // InputDecorator scales floating captions by 0.75. Compensate here so
+        // the painted caption matches bodySmall (13 desktop / 13.75 touch).
         floatingLabelStyle: textTheme.labelLarge?.copyWith(
           color: scheme.primary,
-          fontSize: textTheme.labelLarge?.fontSize ?? 14,
+          fontSize: textTheme.bodySmall!.fontSize! / 0.75,
           fontWeight: FontWeight.w800,
           height: 1.15,
         ),
@@ -335,11 +337,12 @@ class AppTheme {
           fontWeight: FontWeight.w500,
         ),
         helperStyle: textTheme.bodyMedium?.copyWith(
-          color: scheme.onSurfaceVariant.withValues(alpha: 0.78),
+          color: scheme.onSurfaceVariant,
           fontSize: textTheme.bodySmall?.fontSize ?? 12.5,
           height: 1.35,
         ),
-        helperMaxLines: 3,
+        helperMaxLines: 100,
+        errorMaxLines: 100,
         prefixIconColor: scheme.onSurfaceVariant,
         suffixIconColor: scheme.onSurfaceVariant,
         border: OutlineInputBorder(
@@ -427,6 +430,8 @@ class AppTheme {
         ),
       ),
       listTileTheme: ListTileThemeData(
+        titleTextStyle: textTheme.bodyMedium,
+        subtitleTextStyle: textTheme.bodySmall,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(
             isUltraCompact ? 8 : (desktopCompact ? 10 : 14),
@@ -594,8 +599,7 @@ class AppOperationColors extends ThemeExtension<AppOperationColors> {
         (theme.brightness == Brightness.dark ? dark : light);
   }
 
-  Color forOperation(String operation) =>
-      switch (operation.toUpperCase()) {
+  Color forOperation(String operation) => switch (operation.toUpperCase()) {
         'PUT' => put,
         'GET' => get,
         'DELETE' => delete,
@@ -665,7 +669,10 @@ class AppTerminalColors extends ThemeExtension<AppTerminalColors> {
 
   @override
   AppTerminalColors copyWith(
-          {Color? background, Color? foreground, Color? muted, Color? border}) =>
+          {Color? background,
+          Color? foreground,
+          Color? muted,
+          Color? border}) =>
       AppTerminalColors(
           background: background ?? this.background,
           foreground: foreground ?? this.foreground,

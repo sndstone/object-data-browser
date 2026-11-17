@@ -1,3 +1,7 @@
+import 'bucket_encryption_dialog.dart';
+import '../settings/encryption_settings.dart';
+import 'browser_content_signature.dart';
+import '../widgets/controller_content_frame.dart';
 import '../widgets/bounded_preview_image.dart';
 import 'storage_preset_dialog.dart';
 import 'bucket_copy_dialog.dart';
@@ -168,7 +172,9 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     );
   }
 
-  Future<void> _pickFilesAndUpload() async {
+  Future<void> _pickFilesAndUpload({UploadTarget? target}) async {
+    target ??= controller.captureUploadTarget();
+    if (target == null) return;
     final picked = await FilePicker.platform.pickFiles(
       allowMultiple: true,
     );
@@ -180,10 +186,12 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     if (paths.isEmpty) {
       return;
     }
-    await controller.startSampleUpload(paths);
+    await controller.startSampleUpload(paths, target: target);
   }
 
-  Future<void> _pickFolderAndUpload() async {
+  Future<void> _pickFolderAndUpload({UploadTarget? target}) async {
+    target ??= controller.captureUploadTarget();
+    if (target == null) return;
     final folderPath = await FilePicker.platform.getDirectoryPath(
       dialogTitle: 'Select folder to upload',
     );
@@ -233,11 +241,14 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     };
     await controller.startSampleUpload(
       filePaths,
+      target: target,
       objectKeyByPath: objectKeyByPath,
     );
   }
 
   Future<void> _uploadPaths(List<String> paths) async {
+    final target = controller.captureUploadTarget();
+    if (target == null) return;
     final filePaths = <String>[];
     final objectKeyByPath = <String, String>{};
     for (final path in paths) {
@@ -266,43 +277,63 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     }
     await controller.startSampleUpload(
       filePaths,
+      target: target,
       objectKeyByPath: objectKeyByPath,
     );
   }
 
-  Future<void> _showUploadPicker(BuildContext context) async {
-    final selected = await showModalBottomSheet<String>(
-      context: context,
-      showDragHandle: true,
-      builder: (context) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ListTile(
-                leading: const Icon(Icons.file_upload_outlined),
-                title: const Text('Upload files'),
-                onTap: () => Navigator.of(context).pop('files'),
-              ),
+  Future<void> _showUploadPicker(BuildContext context,
+      {required bool compact}) async {
+    final target = controller.captureUploadTarget();
+    if (target == null) return;
+    final selected = !compact
+        ? await showAppMenu<String>(
+            context: context,
+            anchor: globalRectOf(context),
+            items: [
+              appMenuItem(
+                  value: 'files',
+                  label: 'Upload files',
+                  icon: Icons.file_upload_outlined),
               if (!Platform.isIOS)
-                ListTile(
-                  leading: const Icon(Icons.drive_folder_upload_outlined),
-                  title: const Text('Upload folder'),
-                  onTap: () => Navigator.of(context).pop('folder'),
-                ),
+                appMenuItem(
+                    value: 'folder',
+                    label: 'Upload folder',
+                    icon: Icons.drive_folder_upload_outlined),
             ],
-          ),
-        ),
-      ),
-    );
+          )
+        : await showModalBottomSheet<String>(
+            context: context,
+            showDragHandle: true,
+            builder: (context) => SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    ListTile(
+                      leading: const Icon(Icons.file_upload_outlined),
+                      title: const Text('Upload files'),
+                      onTap: () => Navigator.of(context).pop('files'),
+                    ),
+                    if (!Platform.isIOS)
+                      ListTile(
+                        leading: const Icon(Icons.drive_folder_upload_outlined),
+                        title: const Text('Upload folder'),
+                        onTap: () => Navigator.of(context).pop('folder'),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          );
     if (!mounted || selected == null) {
       return;
     }
     if (selected == 'folder') {
-      await _pickFolderAndUpload();
+      await _pickFolderAndUpload(target: target);
     } else {
-      await _pickFilesAndUpload();
+      await _pickFilesAndUpload(target: target);
     }
   }
 
@@ -595,7 +626,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     final targetContext = (
       controller.activeEngineId,
       controller.selectedProfile,
-      controller.selectedBucket?.name
+      controller.selectedBucket?.name,
     );
     controller.clearObjectSelection();
     await controller.setSelectedObject(
@@ -622,15 +653,24 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             icon: Icons.download_outlined,
             label: 'Download',
           ),
+          if (controller.isClientEncrypted(object))
+            appMenuItem(
+              value: 'encrypted-copy',
+              icon: Icons.lock_outline,
+              label: 'Download encrypted copy',
+            ),
           appMenuItem(
             value: 'presign',
             icon: Icons.link,
             label: 'Generate presigned URL',
+            enabled: controller.profileCapability('object.presign'),
           ),
         ],
         if (!object.isFolder &&
-            controller.selectedProfile?.endpointType ==
-                EndpointProfileType.awsS3)
+            (controller.selectedProfile?.endpointType ==
+                    EndpointProfileType.awsS3 ||
+                controller.selectedProfile?.endpointType.isGoogleCloudStorage ==
+                    true))
           appMenuItem(
               value: 'rename',
               icon: Icons.drive_file_rename_outline,
@@ -644,7 +684,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         appMenuItem(
           value: 'copy-uri',
           icon: Icons.storage_outlined,
-          label: 'Copy s3:// URI',
+          label:
+              controller.selectedProfile?.endpointType.isGoogleCloudStorage ==
+                      true
+                  ? 'Copy gs:// URI'
+                  : 'Copy s3:// URI',
         ),
         if (!object.isFolder &&
             controller.selectedProfile?.endpointType !=
@@ -653,6 +697,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             value: 'copy-url',
             icon: Icons.add_link,
             label: 'Copy presigned URL',
+            enabled: controller.profileCapability('object.presign'),
           ),
         appMenuDivider(),
         appMenuItem(
@@ -669,7 +714,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         (
           controller.activeEngineId,
           controller.selectedProfile,
-          controller.selectedBucket?.name
+          controller.selectedBucket?.name,
         )) {
       return;
     }
@@ -682,7 +727,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         await showDialog<String>(
             context: context,
             builder: (_) => RenameDialog(
-                  path: object.key,
+                  path: controller.visibleObjectKey(object),
                   onSave: (target) =>
                       controller.renameObject(object.key, target),
                 ));
@@ -691,8 +736,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         await copyValue(controller, 'Key', object.key);
         return;
       case 'copy-uri':
-        await copyValue(controller, 'S3 URI',
-            's3://${controller.selectedBucket?.name}/${object.key}');
+        await copyValue(
+          controller,
+          'S3 URI',
+          '${controller.selectedProfile?.endpointType.isGoogleCloudStorage == true ? 'gs' : 's3'}://${controller.selectedBucket?.name}/${object.key}',
+        );
         return;
       case 'copy-url':
         await controller.generateSelectedPresignedUrl();
@@ -720,6 +768,12 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               controller.settings.copyWith(browserInspectorVisible: true));
         }
         return;
+      case 'encrypted-copy':
+        await controller.startSampleDownload(
+          key: object.key,
+          encryptedCopy: true,
+        );
+        return;
       case 'download':
         await controller.startSampleDownload();
         return;
@@ -746,9 +800,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             maxWidth: math.min(MediaQuery.sizeOf(context).width - 48, 920),
             maxHeight: MediaQuery.sizeOf(context).height * 0.88,
           ),
-          child: AnimatedBuilder(
-            animation: controller,
-            builder: (context, _) => _inspectorPanel(context, compact: false),
+          child: ControllerContentFrame(
+            controller: controller,
+            signature: () =>
+                browserContentSignature(controller, compact: false),
+            builder: (context) => _inspectorPanel(context, compact: false),
           ),
         ),
       ),
@@ -813,14 +869,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             : '{}',
         onSave: controller.saveBucketPolicy,
       ),
-      onEditBucketEncryption: (bucket) => _showJsonEditorDialog(
-        context,
-        title: 'Encryption JSON',
-        initialValue: controller.adminState?.bucketName == bucket.name
-            ? controller.adminState!.encryptionJson
-            : '{}',
-        onSave: controller.saveBucketEncryption,
-      ),
+      onEditBucketEncryption: (bucket) =>
+          showBucketEncryptionDialog(context, controller),
       onEditBucketTags: (bucket) => _showTagEditorDialog(
         context,
         initialTags: controller.adminState?.bucketName == bucket.name
@@ -840,13 +890,18 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     );
   }
 
-  Future<void> _confirmDeleteObjects(BuildContext context) async {
-    final keys = controller.objectSelection.isEmpty
-        ? [
-            if (controller.selectedObject != null)
-              controller.selectedObject!.key
-          ]
-        : controller.objectSelection.keys.toList();
+  Future<void> _confirmDeleteObjects(
+    BuildContext context, {
+    String? key,
+  }) async {
+    final keys = key != null
+        ? [key]
+        : controller.objectSelection.isEmpty
+            ? [
+                if (controller.selectedObject != null)
+                  controller.selectedObject!.key
+              ]
+            : controller.objectSelection.keys.toList();
     if (keys.isEmpty) return;
     final profileId = controller.selectedProfile?.id;
     final bucketName = controller.selectedBucket?.name;
@@ -857,7 +912,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                 title: Text('Delete ${keys.length} object(s)?'),
                 scrollable: true,
                 content: Text(
-                    'Bucket: $bucketName\n${keys.take(5).join('\n')}${keys.length > 5 ? '\n…' : ''}\n\nIn versioned buckets this may create delete markers. Permanent deletion cannot always be undone.'),
+                  'Bucket: $bucketName\n${keys.take(5).map(controller.visibleStoredKey).join('\n')}${keys.length > 5 ? '\n…' : ''}\n\n${controller.selectedProfile?.endpointType.isGoogleCloudStorage == true ? 'Cloud Storage keeps noncurrent generations when versioning is enabled.' : 'In versioned buckets this may create delete markers.'} Permanent deletion cannot always be undone.',
+                ),
                 actions: [
                   TextButton(
                       onPressed: () => Navigator.pop(context, false),
@@ -929,7 +985,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   Widget _objectPanel(BuildContext context, {required bool compact}) {
     final panel = ObjectPanel(
         controller: controller,
-        onUpload: () => _showUploadPicker(context),
+        onUpload: (buttonContext) =>
+            _showUploadPicker(buttonContext, compact: compact),
         onDelete: () => _confirmDeleteObjects(context),
         onCreatePrefix: () => _showCreatePrefixDialog(context),
         onInspector: _toggleInspector,
@@ -940,7 +997,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
 
   Widget _inspectorPanel(BuildContext context, {required bool compact}) {
     final phone = Breakpoints.isPhone(MediaQuery.sizeOf(context).width);
-    // Object versioning and presigned URLs are S3-only features.
+    // Keep the existing Azure tabs; Cloud Storage exposes generations and signed links.
     final isAzure = controller.selectedProfile?.endpointType ==
         EndpointProfileType.azureBlob;
     final contextualTabs = controller.selectedObject == null
@@ -959,9 +1016,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         BrowserInspectorTab.bucketInfo,
       if (!contextualTabs.contains(BrowserInspectorTab.bucketAdmin))
         BrowserInspectorTab.bucketAdmin,
-      BrowserInspectorTab.tools,
+      if (controller.profileCapability('tools')) BrowserInspectorTab.tools,
       BrowserInspectorTab.eventsAndDebug,
-      if (controller.selectedObject != null && !isAzure)
+      if (controller.selectedObject != null &&
+          !isAzure &&
+          controller.profileCapability('object.presign'))
         BrowserInspectorTab.presign,
     ]);
     final availableTabs = contextualTabs
@@ -1029,7 +1088,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               if (controller.selectedObject != null) ...[
                 Icon(
                     ObjectTable.objectTypeIcon(
-                        controller.selectedObject!.key,
+                        controller.visibleObjectKey(controller.selectedObject!),
                         controller
                             .objectContentType(controller.selectedObject!)),
                     size: 18,
@@ -1038,7 +1097,10 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               ],
               Expanded(
                   child: Text(
-                      controller.selectedObject?.name ?? 'Bucket inspector',
+                      controller.selectedObject == null
+                          ? 'Bucket inspector'
+                          : controller
+                              .visibleObjectName(controller.selectedObject!),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: controller.selectedObject == null
@@ -1111,9 +1173,14 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       BrowserInspectorTab.bucketInfo => 'Bucket info',
       BrowserInspectorTab.objectDetails => 'Details',
       BrowserInspectorTab.objectPreview => 'Preview',
-      BrowserInspectorTab.versions => controller.versions.isEmpty
-          ? 'Versions'
-          : 'Versions · ${controller.versions.length}',
+      BrowserInspectorTab.versions =>
+        controller.selectedProfile?.endpointType.isGoogleCloudStorage == true
+            ? (controller.versions.isEmpty
+                ? 'Generations'
+                : 'Generations · ${controller.versions.length}')
+            : controller.versions.isEmpty
+                ? 'Versions'
+                : 'Versions · ${controller.versions.length}',
       BrowserInspectorTab.presign => 'Share',
       BrowserInspectorTab.tools => 'Tools',
       BrowserInspectorTab.eventsAndDebug => 'Events & Debug',
@@ -1143,61 +1210,101 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       key: const ValueKey('bucket-admin'),
       children: [
         ..._configurationWarnings(admin),
+        if (controller.selectedProfile?.endpointType.isGoogleCloudStorage ==
+            true) ...[
+          const Text(
+            'Cloud Storage bucket administration is limited to versioning in this version.',
+          ),
+          AppSwitchTile(
+            value: admin.versioningEnabled,
+            title: const Text('Enable versioning'),
+            onChanged: controller.profileCapability('bucket.admin_mutation')
+                ? controller.setBucketVersioning
+                : null,
+          ),
+        ],
         Wrap(spacing: 8, runSpacing: 8, children: [
-          FilledButton.tonal(
+          if (controller.selectedProfile?.endpointType.isGoogleCloudStorage !=
+                  true &&
+              controller.profileCapability('bucket.policy'))
+            FilledButton.tonal(
               onPressed: () => showDialog<void>(
                   context: context,
                   builder: (_) => StoragePresetDialog(
                       controller: controller, lifecycle: false)),
-              child: const Text('Access presets')),
-          FilledButton.tonal(
-              onPressed: () => showDialog<void>(
-                  context: context,
-                  builder: (_) => StoragePresetDialog(
-                      controller: controller, lifecycle: true)),
-              child: const Text('Lifecycle presets')),
-          OutlinedButton(
-              onPressed: () => showDialog<void>(
-                  context: context,
-                  builder: (_) => StorageAdminDialog(controller: controller)),
-              child: const Text('Advanced administration')),
-          OutlinedButton(
-              onPressed: () => _showJsonEditorDialog(context,
-                  title: 'Lifecycle JSON',
-                  initialValue: admin.lifecycleJson,
-                  onSave: controller.saveBucketLifecycle),
-              child: const Text('Edit lifecycle')),
-          OutlinedButton(
+              child: const Text('Access presets'),
+            ),
+          if (controller.selectedProfile?.endpointType.isGoogleCloudStorage !=
+                  true &&
+              controller.profileCapability('bucket.lifecycle'))
+            FilledButton.tonal(
+                onPressed: () => showDialog<void>(
+                    context: context,
+                    builder: (_) => StoragePresetDialog(
+                        controller: controller, lifecycle: true)),
+                child: const Text('Lifecycle presets')),
+          if (controller.profileCapability('storage.admin'))
+            OutlinedButton(
+                onPressed: () => showDialog<void>(
+                    context: context,
+                    builder: (_) => StorageAdminDialog(controller: controller)),
+                child: const Text('Advanced administration')),
+          if (controller.profileCapability('bucket.lifecycle'))
+            OutlinedButton(
+                onPressed: () => _showJsonEditorDialog(context,
+                    title: 'Lifecycle JSON',
+                    initialValue: admin.lifecycleJson,
+                    onSave: controller.saveBucketLifecycle),
+                child: const Text('Edit lifecycle')),
+          if (controller.profileCapability('bucket.policy'))
+            OutlinedButton(
               onPressed: () => _showJsonEditorDialog(context,
                   title: 'Policy JSON',
                   initialValue: admin.policyJson,
                   onSave: controller.saveBucketPolicy),
-              child: const Text('Edit policy')),
-          OutlinedButton(
-              onPressed: () => _showJsonEditorDialog(context,
-                  title: 'Encryption JSON',
-                  initialValue: admin.encryptionJson,
-                  onSave: controller.saveBucketEncryption),
-              child: const Text('Edit encryption')),
+              child: const Text('Edit policy'),
+            ),
+          if (controller.profileCapability('bucket.encryption') ||
+              controller.capabilities.any((c) =>
+                  c.key == 'object.clientEncryption' &&
+                  c.state == CapabilityState.supported))
+            OutlinedButton(
+                onPressed: () =>
+                    showBucketEncryptionDialog(context, controller),
+                child: const Text('Edit encryption')),
         ]),
         const SizedBox(height: 12),
         _inlineStat('Selected bucket', admin.bucketName),
         const Divider(height: 16),
-        Text('Lifecycle JSON', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        _jsonBlock(admin.lifecycleJson),
+        if (controller.profileCapability('bucket.lifecycle')) ...[
+          Text('Lifecycle JSON',
+              style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          _jsonBlock(admin.lifecycleJson),
+        ],
         const SizedBox(height: 12),
-        Text('Policy JSON', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        _jsonBlock(admin.policyJson),
+        if (controller.profileCapability('bucket.policy')) ...[
+          Text('Policy JSON', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          _jsonBlock(admin.policyJson),
+        ],
         const SizedBox(height: 12),
-        Text('CORS JSON', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        _jsonBlock(admin.corsJson),
+        if (controller.profileCapability('bucket.cors')) ...[
+          Text('CORS JSON', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          _jsonBlock(admin.corsJson),
+        ],
         const SizedBox(height: 12),
-        Text('Encryption JSON', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        _jsonBlock(admin.encryptionJson),
+        if (controller.profileCapability('bucket.encryption')) ...[
+          Text('Encryption JSON',
+              style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          _jsonBlock(admin.encryptionJson),
+          const SizedBox(height: 12),
+          TextButton(
+              onPressed: () => showBucketEncryptionDialog(context, controller),
+              child: const Text('Bucket encryption…')),
+        ],
       ],
     );
   }
@@ -1224,11 +1331,18 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             runSpacing: 8,
             children: [
               _pill('Versioning', admin.versioningEnabled),
-              _pill('Object lock', admin.objectLockEnabled),
-              _pill('Lifecycle', admin.lifecycleEnabled),
-              _pill('Policy', admin.policyAttached),
-              _pill('CORS', admin.corsEnabled),
-              _pill('Encryption', admin.encryptionEnabled),
+              if (controller
+                      .selectedProfile?.endpointType.isGoogleCloudStorage !=
+                  true)
+                _pill('Object lock', admin.objectLockEnabled),
+              if (controller.profileCapability('bucket.lifecycle'))
+                _pill('Lifecycle', admin.lifecycleEnabled),
+              if (controller.profileCapability('bucket.policy'))
+                _pill('Policy', admin.policyAttached),
+              if (controller.profileCapability('bucket.cors'))
+                _pill('CORS', admin.corsEnabled),
+              if (controller.profileCapability('bucket.encryption'))
+                _pill('Encryption', admin.encryptionEnabled),
             ],
           ),
         if (admin != null) const SizedBox(height: 12),
@@ -1244,7 +1358,9 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         _inlineStat('Approx objects', '~${bucket.objectCountHint}'),
         _inlineStat(
           'Current prefix',
-          controller.currentPrefix.isEmpty ? 'Root' : controller.currentPrefix,
+          controller.currentPrefix.isEmpty
+              ? 'Root'
+              : controller.visiblePrefix(controller.currentPrefix),
         ),
         _inlineStat('Visible objects', '${controller.visibleObjects.length}'),
         if (admin != null) ...[
@@ -1256,18 +1372,25 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
                   ? 'Enabled'
                   : '${admin.objectLockMode} - ${admin.objectLockRetentionYears ?? admin.objectLockRetentionDays ?? 0} ${admin.objectLockRetentionYears != null ? 'year' : 'day'} retention',
             ),
-          _inlineStat('Encryption', admin.encryptionSummary),
-          _inlineStat('Bucket tags', '${admin.tags.length} tags'),
-          _inlineStat(
-              'Lifecycle rules', '${admin.lifecycleRules.length} rules'),
-          _inlineStat(
-            'Bucket policy',
-            admin.policyAttached ? 'Attached' : 'Not attached',
-          ),
-          _inlineStat(
-            'CORS',
-            admin.corsEnabled ? 'Configured' : 'Not configured',
-          ),
+          if (controller.profileCapability('bucket.encryption'))
+            _inlineStat('Encryption', admin.encryptionSummary),
+          if (controller.profileCapability('bucket.tagging'))
+            _inlineStat('Bucket tags', '${admin.tags.length} tags'),
+          if (controller.profileCapability('bucket.lifecycle'))
+            _inlineStat(
+              'Lifecycle rules',
+              '${admin.lifecycleRules.length} rules',
+            ),
+          if (controller.profileCapability('bucket.policy'))
+            _inlineStat(
+              'Bucket policy',
+              admin.policyAttached ? 'Attached' : 'Not attached',
+            ),
+          if (controller.profileCapability('bucket.cors'))
+            _inlineStat(
+              'CORS',
+              admin.corsEnabled ? 'Configured' : 'Not configured',
+            ),
         ] else
           Padding(
             padding: const EdgeInsets.only(top: 8),
@@ -1276,70 +1399,75 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               style: Theme.of(context).textTheme.bodyMedium,
             ),
           ),
-        const Divider(height: 16),
-        Text('Bucket tags', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        if (admin == null)
-          const Text('Loading tags...')
-        else if (admin.tags.isEmpty)
-          const Text('No bucket tags configured.')
-        else
-          ...admin.tags.entries.map(
-            (entry) => ListTile(
-              contentPadding: EdgeInsets.zero,
-              dense: true,
-              title: Text(entry.key),
-              trailing: Text(entry.value),
+        if (controller.profileCapability('bucket.tagging')) ...[
+          const Divider(height: 16),
+          Text('Bucket tags', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          if (admin == null)
+            const Text('Loading tags...')
+          else if (admin.tags.isEmpty)
+            const Text('No bucket tags configured.')
+          else
+            ...admin.tags.entries.map(
+              (entry) => ListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                title: Text(entry.key),
+                trailing: Text(entry.value),
+              ),
             ),
-          ),
-        const Divider(height: 16),
-        Text('Lifecycle rules', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        if (admin == null)
-          const Text('Loading lifecycle rules...')
-        else if (admin.lifecycleRules.isEmpty)
-          const Text('No lifecycle rules configured.')
-        else
-          ...admin.lifecycleRules.map(
-            (rule) => Card(
-              child: Padding(
-                padding: const EdgeInsets.all(10),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
+        ],
+        if (controller.profileCapability('bucket.lifecycle')) ...[
+          const Divider(height: 16),
+          Text('Lifecycle rules',
+              style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          if (admin == null)
+            const Text('Loading lifecycle rules...')
+          else if (admin.lifecycleRules.isEmpty)
+            const Text('No lifecycle rules configured.')
+          else
+            ...admin.lifecycleRules.map(
+              (rule) => Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(10),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Text(
+                            rule.id,
+                            style: Theme.of(context).textTheme.titleSmall,
+                          ),
+                          const Spacer(),
+                          Chip(
+                            label: Text(rule.enabled ? 'Enabled' : 'Disabled'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Text('Prefix: ${rule.prefix}'),
+                      if (rule.expirationDays != null)
+                        Text('Expiration: ${rule.expirationDays} days'),
+                      if (rule.transitionStorageClass != null)
                         Text(
-                          rule.id,
-                          style: Theme.of(context).textTheme.titleSmall,
+                          'Transition: ${rule.transitionStorageClass} after ${rule.transitionDays} days',
                         ),
-                        const Spacer(),
-                        Chip(
-                          label: Text(rule.enabled ? 'Enabled' : 'Disabled'),
+                      if (rule.nonCurrentExpirationDays != null)
+                        Text(
+                          'Non-current expiration: ${rule.nonCurrentExpirationDays} days',
                         ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Text('Prefix: ${rule.prefix}'),
-                    if (rule.expirationDays != null)
-                      Text('Expiration: ${rule.expirationDays} days'),
-                    if (rule.transitionStorageClass != null)
-                      Text(
-                        'Transition: ${rule.transitionStorageClass} after ${rule.transitionDays} days',
-                      ),
-                    if (rule.nonCurrentExpirationDays != null)
-                      Text(
-                        'Non-current expiration: ${rule.nonCurrentExpirationDays} days',
-                      ),
-                    if (rule.abortIncompleteMultipartUploadDays != null)
-                      Text(
-                        'Abort incomplete multipart uploads after ${rule.abortIncompleteMultipartUploadDays} days',
-                      ),
-                  ],
+                      if (rule.abortIncompleteMultipartUploadDays != null)
+                        Text(
+                          'Abort incomplete multipart uploads after ${rule.abortIncompleteMultipartUploadDays} days',
+                        ),
+                    ],
+                  ),
                 ),
               ),
             ),
-          ),
+        ],
       ],
     );
   }
@@ -1390,11 +1518,55 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       context,
       key: const ValueKey('object-details'),
       children: [
-        _inlineStat('Key', object.key),
+        _inlineStat('Key', controller.visibleObjectKey(object)),
         _inlineStat('Size', formatBytes(object.size)),
+        if (controller.isClientEncrypted(object)) ...[
+          _inlineStat('Contents', 'Client-side encrypted (age)'),
+          _inlineStat('Vault key', controller.clientRuleFor(object.key)!.label),
+          if (controller.clientPlaintextSize(object.key) case final size?)
+            _inlineStat('Plaintext size', formatBytes(size)),
+          TextButton(
+            onPressed: () => controller.startSampleDownload(
+              key: object.key,
+              encryptedCopy: true,
+            ),
+            child: const Text('Download encrypted copy'),
+          ),
+          if (controller.encryptionKeyStore?.isUnlocked != true)
+            TextButton(
+              onPressed: () async {
+                await showEncryptionKeyFileDialog(context, controller);
+                controller.refreshSelectedObjectPreview();
+              },
+              child: const Text('Unlock key file…'),
+            ),
+        ],
         _inlineStat('Last modified', formatDateTime(object.modifiedAt)),
         _inlineStat('Content type', controller.objectContentType(object)),
         _inlineStat('Storage class', object.storageClass),
+        if (details.encryption case final encryption?) ...[
+          _inlineStat('Encryption', encryption.modeLabel),
+          if (encryption.kmsKeyId != null)
+            CopyableValue(
+              label: 'KMS key',
+              value: encryption.kmsKeyId!,
+              controller: controller,
+              shorten: true,
+            ),
+          if (encryption.bucketKeyEnabled != null)
+            _inlineStat(
+              'Bucket key',
+              encryption.bucketKeyEnabled! ? 'Enabled' : 'Disabled',
+            ),
+          if (encryption.encryptionScope != null)
+            _inlineStat('Encryption scope', encryption.encryptionScope!),
+          if (encryption.isCustomerKey)
+            _inlineStat(
+              'Customer key',
+              controller.matchingEncryptionKey(encryption)?.label ??
+                  'key not in key file',
+            ),
+        ],
         if (object.etag != null && object.etag!.isNotEmpty)
           _inlineStat('ETag', object.etag!),
         const Divider(height: 12),
@@ -1402,17 +1574,20 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             empty: 'No user metadata'),
         _detailSection(context, object, 'Headers', details.headers,
             empty: 'No headers returned'),
-        _detailSection(context, object, 'Tags', details.tags, empty: 'No tags'),
+        if (controller.profileCapability('object.tags'))
+          _detailSection(context, object, 'Tags', details.tags,
+              empty: 'No tags'),
         const SizedBox(height: 12),
-        Align(
-            alignment: Alignment.centerLeft,
-            child: TextButton.icon(
-                onPressed: () => showDialog<void>(
-                    context: context,
-                    builder: (_) => StorageAdminDialog(
-                        controller: controller, objectKey: object.key)),
-                icon: const Icon(Icons.tune, size: 16),
-                label: const Text('Manage object'))),
+        if (controller.profileCapability('storage.admin'))
+          Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                  onPressed: () => showDialog<void>(
+                      context: context,
+                      builder: (_) => StorageAdminDialog(
+                          controller: controller, objectKey: object.key)),
+                  icon: const Icon(Icons.tune, size: 16),
+                  label: const Text('Manage object'))),
       ],
     );
   }
@@ -1552,17 +1727,44 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     if (!preview.supported || preview.kind == ObjectPreviewKind.unsupported) {
       body = Center(
           child: Padding(
-              padding: const EdgeInsets.all(12), child: Text(preview.message)));
-    } else if (preview.kind == ObjectPreviewKind.image && preview.url != null) {
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(preview.message),
+                  if (controller.isClientEncrypted(object)) ...[
+                    if (controller.encryptionKeyStore?.isUnlocked != true &&
+                        !AppPlatform.isMobile)
+                      TextButton(
+                        onPressed: () async {
+                          await showEncryptionKeyFileDialog(
+                              context, controller);
+                          controller.refreshSelectedObjectPreview();
+                        },
+                        child: const Text('Unlock key file…'),
+                      ),
+                    TextButton(
+                      onPressed: () => controller.startSampleDownload(
+                        key: object.key,
+                        encryptedCopy: true,
+                      ),
+                      child: const Text('Download encrypted copy'),
+                    ),
+                  ],
+                ],
+              )));
+    } else if (preview.kind == ObjectPreviewKind.image &&
+        (preview.url != null || preview.bytes != null)) {
       body = BoundedPreviewImage(
-          url: preview.url!,
+          url: preview.url,
+          bytes: preview.bytes,
           etag: object.etag,
           maximumMegapixels:
               controller.settings.performance.imagePreviewMegapixels);
     } else if (preview.kind == ObjectPreviewKind.text) {
       body = PreviewSourceView(
           source: visibleText,
-          objectKey: object.key,
+          objectKey: controller.visibleObjectKey(object),
           contentType: preview.contentType,
           compact: true);
     } else if (preview.kind == ObjectPreviewKind.video && preview.url != null) {
@@ -1586,7 +1788,9 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
               Row(children: [
                 Expanded(
                     child: Text(
-                        sourcePreviewLanguage(object.key, preview.contentType)
+                        sourcePreviewLanguage(
+                                    controller.visibleObjectKey(object),
+                                    preview.contentType)
                                 ?.toUpperCase() ??
                             preview.contentType ??
                             'Preview',
@@ -1637,7 +1841,8 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   Widget _versionsView(BuildContext context) {
     final options = controller.versionBrowserOptions;
     final versions = controller.visibleVersions;
-    final hasSelectedObject = controller.selectedObject != null;
+    final object = controller.selectedObject;
+    final hasSelectedObject = object != null;
 
     final controls = <Widget>[
       Wrap(
@@ -1662,14 +1867,18 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             label: const Text('Refresh versions'),
           ),
           OutlinedButton.icon(
-            onPressed:
-                hasSelectedObject ? controller.startSampleDownload : null,
+            onPressed: hasSelectedObject &&
+                    (!AppPlatform.isMobile ||
+                        !controller.isClientEncrypted(object))
+                ? () => controller.startSampleDownload(key: object.key)
+                : null,
             icon: const Icon(Icons.download),
             label: const Text('Download current object'),
           ),
           OutlinedButton.icon(
-            onPressed:
-                hasSelectedObject ? () => _confirmDeleteObjects(context) : null,
+            onPressed: hasSelectedObject
+                ? () => _confirmDeleteObjects(context, key: object.key)
+                : null,
             icon: const Icon(Icons.delete_outline),
             label: const Text('Delete current object'),
           ),
@@ -1743,27 +1952,37 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             options.copyWith(showVersions: value),
           );
         },
-        title: const Text('Show versions'),
+        title: Text(
+            controller.selectedProfile?.endpointType.isGoogleCloudStorage ==
+                    true
+                ? 'Show generations'
+                : 'Show versions'),
       ),
-      AppSwitchTile(
-        value: options.showDeleteMarkers,
-        onChanged: (value) {
-          controller.updateVersionBrowserOptions(
-            options.copyWith(showDeleteMarkers: value),
-          );
-        },
-        title: const Text('Show delete markers'),
-      ),
+      if (controller.selectedProfile?.endpointType.isGoogleCloudStorage != true)
+        AppSwitchTile(
+          value: options.showDeleteMarkers,
+          onChanged: (value) {
+            controller.updateVersionBrowserOptions(
+              options.copyWith(showDeleteMarkers: value),
+            );
+          },
+          title: const Text('Show delete markers'),
+        ),
       ListTile(
         contentPadding: EdgeInsets.zero,
         title: Text('Displayed entries: ${controller.displayedVersionCount}'),
-        subtitle: Text(
-          'Delete markers: ${controller.visibleDeleteMarkerCount}',
-        ),
+        subtitle:
+            controller.selectedProfile?.endpointType.isGoogleCloudStorage ==
+                    true
+                ? const Text('Versions are Cloud Storage generations.')
+                : Text(
+                    'Delete markers: ${controller.visibleDeleteMarkerCount}',
+                  ),
       ),
       const Divider(height: 20),
-      const Text(
-          'Select a version below to inspect, download, share, restore or delete that exact version.'),
+      if (controller.selectedProfile?.endpointType.isGoogleCloudStorage != true)
+        const Text(
+            'Select a version below to inspect, download, share, restore or delete that exact version.'),
     ];
     return ListView.builder(
       key: const ValueKey('versions'),
@@ -1783,26 +2002,81 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         return ListTile(
           contentPadding: EdgeInsets.zero,
           dense: true,
-          title:
-              Text(version.key, maxLines: 1, overflow: TextOverflow.ellipsis),
+          title: Text(controller.visibleStoredKey(version.key),
+              maxLines: 1, overflow: TextOverflow.ellipsis),
           subtitle:
               Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text(
                 '${formatBytes(version.size)} · ${formatDateTime(version.modifiedAt)} · ${version.storageClass}'),
             CopyableValue(
-                label: 'Version ID',
+                label: controller.selectedProfile?.endpointType
+                            .isGoogleCloudStorage ==
+                        true
+                    ? 'Generation'
+                    : 'Version ID',
                 value: version.versionId,
                 controller: controller,
                 monospace: true,
                 shorten: true),
           ]),
-          onTap: () => showDialog<void>(
-              context: context,
-              builder: (_) => StorageAdminDialog(
-                  controller: controller,
-                  objectKey: version.key,
-                  versionId: version.versionId,
-                  deleteMarker: version.deleteMarker)),
+          onTap: () => controller
+                      .selectedProfile?.endpointType.isGoogleCloudStorage ==
+                  true
+              ? showDialog<void>(
+                  context: context,
+                  builder: (dialogContext) => AlertDialog(
+                    title: const Text('Cloud Storage generation'),
+                    content: SelectableText(
+                      '${controller.visibleStoredKey(version.key)}\nGeneration: ${version.versionId}\n${formatBytes(version.size)}',
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(dialogContext),
+                        child: const Text('Close'),
+                      ),
+                      TextButton(
+                        onPressed: () async {
+                          final confirmed = await showDialog<bool>(
+                            context: dialogContext,
+                            builder: (context) => AlertDialog(
+                              title: const Text(
+                                'Permanently delete generation?',
+                              ),
+                              content: const Text(
+                                'This deletes this exact generation and cannot be undone.',
+                              ),
+                              actions: [
+                                TextButton(
+                                  onPressed: () =>
+                                      Navigator.pop(context, false),
+                                  child: const Text('Cancel'),
+                                ),
+                                TextButton(
+                                  onPressed: () => Navigator.pop(context, true),
+                                  child: const Text('Delete generation'),
+                                ),
+                              ],
+                            ),
+                          );
+                          if (confirmed == true) {
+                            await controller.deleteGeneration(version);
+                            if (dialogContext.mounted) {
+                              Navigator.pop(dialogContext);
+                            }
+                          }
+                        },
+                        child: const Text('Delete generation…'),
+                      ),
+                    ],
+                  ),
+                )
+              : showDialog<void>(
+                  context: context,
+                  builder: (_) => StorageAdminDialog(
+                      controller: controller,
+                      objectKey: version.key,
+                      versionId: version.versionId,
+                      deleteMarker: version.deleteMarker)),
           trailing: Chip(
               label: Text(version.deleteMarker
                   ? 'Delete marker'
@@ -1818,11 +2092,23 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   Widget _presignView(BuildContext context) {
+    if (!controller.profileCapability('object.presign')) {
+      return Center(
+          child: Text(controller.profileCapabilityReason('object.presign')));
+    }
     final bundle = controller.selectedObjectDetails?.presignedUrl;
     return _adaptivePanelListView(
       context,
       key: const ValueKey('presign'),
       children: [
+        if (controller.selectedObject != null &&
+            controller.isClientEncrypted(controller.selectedObject!))
+          const Padding(
+            padding: EdgeInsets.only(bottom: 12),
+            child: Text(
+              'This link returns the encrypted file. The recipient needs the vault key and the standard age tool to decrypt its contents.',
+            ),
+          ),
         _numberField(
           label: 'Expiration (minutes)',
           min: 1,
@@ -1861,6 +2147,9 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
   }
 
   Widget _toolsView(BuildContext context) {
+    if (!controller.profileCapability('tools')) {
+      return Center(child: Text(controller.profileCapabilityReason('tools')));
+    }
     final testData = controller.testDataConfig;
     final deleteAll = controller.deleteAllConfig;
 
@@ -2097,62 +2386,90 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     }).toList();
     final debugEvents = details?.debugEvents ?? const <DiagnosticEvent>[];
 
-    return _adaptivePanelListView(
-      context,
+    return CustomScrollView(
+      primary: false,
       key: const ValueKey('events-and-debug'),
-      children: [
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            FilledButton.icon(
-              onPressed: controller.isBusy('export-diagnostics')
-                  ? null
-                  : controller.exportDiagnostics,
-              icon: const Icon(Icons.download_for_offline_outlined),
-              label: Text(
-                controller.isBusy('export-diagnostics')
-                    ? 'Exporting...'
-                    : 'Export debug log',
+      slivers: [
+        SliverToBoxAdapter(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  FilledButton.icon(
+                    onPressed: controller.isBusy('export-diagnostics')
+                        ? null
+                        : controller.exportDiagnostics,
+                    icon: const Icon(Icons.download_for_offline_outlined),
+                    label: Text(
+                      controller.isBusy('export-diagnostics')
+                          ? 'Exporting...'
+                          : 'Export debug log',
+                    ),
+                  ),
+                  OutlinedButton.icon(
+                    onPressed: controller.clearDiagnostics,
+                    icon: const Icon(Icons.clear_all),
+                    label: const Text('Clear object logs'),
+                  ),
+                ],
               ),
-            ),
-            OutlinedButton.icon(
-              onPressed: controller.clearDiagnostics,
-              icon: const Icon(Icons.clear_all),
-              label: const Text('Clear object logs'),
-            ),
-          ],
+              const SizedBox(height: 16),
+              Text('Trace log', style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 8),
+            ],
+          ),
         ),
-        const SizedBox(height: 16),
-        Text('Trace log', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
         StructuredLogList(
           entries: scopedEvents,
           textScalePercent: controller.settings.logTextScalePercent,
           emptyMessage: 'No bucket-scoped trace events recorded yet.',
-          embedded: true,
+          sliver: true,
         ),
-        const Divider(height: 16),
-        Text('Object debug events',
-            style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        if (debugEvents.isEmpty)
-          const Text('No object-specific debug events recorded.')
-        else
-          ...debugEvents.map(
-            (event) => ListTile(
-              contentPadding: EdgeInsets.zero,
-              dense: true,
-              title: Text('[${event.level}] ${event.message}'),
-              subtitle: Text(formatDateTime(event.timestamp)),
-            ),
+        SliverToBoxAdapter(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Divider(height: 16),
+              Text('Object debug events',
+                  style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 8),
+              if (debugEvents.isEmpty)
+                const Text('No object-specific debug events recorded.'),
+            ],
           ),
-        if ((details?.debugLogExcerpt ?? const <String>[]).isNotEmpty) ...[
-          const Divider(height: 16),
-          Text('Debug excerpt', style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 8),
-          _jsonBlock((details?.debugLogExcerpt ?? const <String>[]).join('\n')),
-        ],
+        ),
+        if (debugEvents.isNotEmpty)
+          SliverList.builder(
+            itemCount: debugEvents.length,
+            itemBuilder: (context, index) {
+              final event = debugEvents[index];
+              return ListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                title: Text('[${event.level}] ${event.message}'),
+                subtitle: Text(formatDateTime(event.timestamp)),
+              );
+            },
+          ),
+        SliverToBoxAdapter(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if ((details?.debugLogExcerpt ?? const <String>[])
+                  .isNotEmpty) ...[
+                const Divider(height: 16),
+                Text('Debug excerpt',
+                    style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 8),
+                _jsonBlock(
+                    (details?.debugLogExcerpt ?? const <String>[]).join('\n')),
+              ],
+            ],
+          ),
+        ),
       ],
     );
   }
@@ -2475,8 +2792,7 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
     BucketSummary bucket,
     Rect anchor,
   ) async {
-    // Versioning, lifecycle, policy, encryption, and tagging are S3-only
-    // bucket admin features.
+    // Native Cloud Storage retains versioning; advanced panels follow capabilities.
     final isAzure = widget.controller.selectedProfile?.endpointType ==
         EndpointProfileType.azureBlob;
     final selected = await showAppMenu<String>(
@@ -2506,27 +2822,45 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
                 ? 'Suspend versioning'
                 : 'Enable versioning',
           ),
-          appMenuItem(
-            value: 'lifecycle',
-            icon: Icons.schedule_outlined,
-            label: 'Lifecycle policy',
-          ),
-          appMenuItem(
-            value: 'policy',
-            icon: Icons.policy_outlined,
-            label: 'Bucket policy',
-          ),
+          if (widget.controller.profileCapability('bucket.lifecycle'))
+            appMenuItem(
+              value: 'lifecycle',
+              icon: Icons.schedule_outlined,
+              label: 'Lifecycle policy',
+            ),
+          if (widget.controller.profileCapability('bucket.policy'))
+            appMenuItem(
+              value: 'policy',
+              icon: Icons.policy_outlined,
+              label: 'Bucket policy',
+            ),
+          if (widget.controller.profileCapability('bucket.encryption') ||
+              widget.controller.capabilities.any((c) =>
+                  c.key == 'object.clientEncryption' &&
+                  c.state == CapabilityState.supported))
+            appMenuItem(
+              value: 'encryption',
+              icon: Icons.lock_outline,
+              label: 'Bucket encryption',
+            ),
+          if (widget.controller.profileCapability('bucket.tagging'))
+            appMenuItem(
+              value: 'tags',
+              icon: Icons.sell_outlined,
+              label: 'Bucket tagging',
+            ),
+        ],
+        // Azure has no bucket default to edit, but vault encryption by this
+        // app works there too and is set up in the same dialog.
+        if (isAzure &&
+            widget.controller.capabilities.any((c) =>
+                c.key == 'object.clientEncryption' &&
+                c.state == CapabilityState.supported))
           appMenuItem(
             value: 'encryption',
             icon: Icons.lock_outline,
             label: 'Bucket encryption',
           ),
-          appMenuItem(
-            value: 'tags',
-            icon: Icons.sell_outlined,
-            label: 'Bucket tagging',
-          ),
-        ],
         appMenuDivider(),
         appMenuItem(
           value: 'delete',
@@ -2539,6 +2873,7 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
           icon: Icons.delete_forever_outlined,
           destructive: true,
           label: 'Force delete bucket',
+          enabled: widget.controller.profileCapability('tools'),
         ),
       ],
     );

@@ -1,8 +1,25 @@
 part of 'mobile_storage_admin.dart';
 
+/// Sealed age chunks fetched per ranged request on encrypted downloads.
+const _ageChunksPerRequest = 64;
+
 extension MobileStorageTransfers on MobileStorageAdmin {
   Future<Map<String, Object?>> copyStorageObject(EndpointProfile source,
       EndpointProfile destination, Map<String, Object?> args) async {
+    final sourceHeaders = objectEncryptionHeaders(
+      source,
+      args['sourceEncryption'],
+      read: true,
+    );
+    final copySourceHeaders = objectEncryptionHeaders(
+      source,
+      args['sourceEncryption'],
+      source: args['sourceEncryption'] != null,
+    );
+    final destinationHeaders = objectEncryptionHeaders(
+      destination,
+      args['encryption'],
+    );
     final from = client(source), to = client(destination);
     final sourceBucket = '${args['sourceBucketName']}',
         sourceKey = '${args['sourceKey']}';
@@ -27,8 +44,13 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       if (version != null) from.azure ? 'versionid' : 'versionId': version
     };
     final deleteQuery = Map<String, String>.of(query);
-    final head =
-        await from.request('HEAD', sourceBucket, key: sourceKey, query: query);
+    final head = await from.request(
+      'HEAD',
+      sourceBucket,
+      key: sourceKey,
+      query: query,
+      headers: sourceHeaders,
+    );
     final copiedVersion = version ??
         head.headers[from.azure ? 'x-ms-version-id' : 'x-amz-version-id'];
     if (copiedVersion != null) {
@@ -150,6 +172,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
           key: sourceKey,
           query: query,
           headers: {
+            ...sourceHeaders,
             'range': 'bytes=$start-${start + count - 1}',
             'if-match': etag
           },
@@ -176,6 +199,8 @@ extension MobileStorageTransfers on MobileStorageAdmin {
             '${copiedVersion == null ? '' : '?versionId=${storageUriEncode(copiedVersion)}'}';
         final copied = await to.request('PUT', bucket, key: key, headers: {
           ...headers,
+          ...destinationHeaders,
+          ...copySourceHeaders,
           'x-amz-copy-source': sourceLocation,
           'x-amz-copy-source-if-match': etag,
           'x-amz-metadata-directive': 'REPLACE',
@@ -193,6 +218,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       } else {
         response = await _writeObject(to, bucket, key, size, read,
             headers: headers,
+            encryption: args['encryption'],
             conflict: conflict,
             expectedDestinationETag: selfCopy && version == null ? etag : null);
       }
@@ -204,10 +230,17 @@ extension MobileStorageTransfers on MobileStorageAdmin {
             message:
                 'The copy response omitted its destination identity. Inspect the destination before retrying.');
       }
-      final verified = await to.request('HEAD', bucket, key: key, query: {
-        if (destinationVersion != null)
-          to.azure ? 'versionid' : 'versionId': destinationVersion
-      });
+      final verified = await to.request('HEAD', bucket,
+          key: key,
+          headers: objectEncryptionHeaders(
+            destination,
+            args['encryption'],
+            read: true,
+          ),
+          query: {
+            if (destinationVersion != null)
+              to.azure ? 'versionid' : 'versionId': destinationVersion
+          });
       if (int.tryParse(verified.headers['content-length'] ?? '') != size ||
           (response.headers['etag'] != null &&
               response.headers['etag'] != verified.headers['etag'])) {
@@ -324,13 +357,20 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       int size,
       Future<List<int>> Function(int start, int count) read,
       {Map<String, String> headers = const {},
+      Object? encryption,
       String conflict = 'replace',
       String? expectedDestinationETag,
       Future<void> Function()? verifySource,
       int partBytes = 8 * 1024 * 1024,
       int streamReadBytes = 8 * 1024 * 1024,
       int? multipartThresholdBytes,
-      void Function(int)? onProgress}) async {
+      void Function(int)? onProgress,
+      bool clientEncrypted = false}) async {
+    final encryptionHeaders = objectEncryptionHeaders(http.profile, encryption);
+    final partEncryptionHeaders = http.azure
+        ? encryptionHeaders
+        : objectEncryptionHeaders(http.profile, encryption, read: true);
+    headers = {...headers, ...encryptionHeaders};
     if (size > 50000 * 1024 * 1024 * 1024) {
       MobileStorageAdmin._invalid(
           'Object exceeds the supported transfer limit.');
@@ -350,7 +390,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
     Future<StorageHttpResponse> sendPart(int offset, int count,
         Map<String, String> query, Map<String, String> partHeaders,
         {bool retrySafe = true}) async {
-      if (!http.azure && count <= 8 * 1024 * 1024) {
+      if (!clientEncrypted && !http.azure && count <= 8 * 1024 * 1024) {
         final bytes = await read(offset, count);
         if (!retrySafe) await verifySource?.call();
         final response = await http.request('PUT', bucket,
@@ -363,11 +403,13 @@ extension MobileStorageTransfers on MobileStorageAdmin {
         return response;
       }
       Stream<List<int>> stream() async* {
+        if (clientEncrypted) await verifySource?.call();
         final chunk = streamReadBytes.clamp(64 * 1024, 8 * 1024 * 1024);
         for (var index = 0; index < count; index += chunk) {
           ActionScope.current?.check();
           yield await read(offset + index, min(chunk, count - index));
         }
+        if (clientEncrypted) await verifySource?.call();
       }
 
       final hash = await http.hashPayload(stream());
@@ -417,7 +459,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
         final id = base64Encode(
             utf8.encode('$prefix-${number.toString().padLeft(6, '0')}'));
         await sendPart(offset, min(partSize, size - offset),
-            {'comp': 'block', 'blockid': id}, {});
+            {'comp': 'block', 'blockid': id}, partEncryptionHeaders);
         return id;
       });
       await verifySource?.call();
@@ -446,8 +488,11 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       final parts = await _parallelParts<Map<String, Object?>>(count, workers,
           (number) async {
         final offset = number * partSize;
-        final part = await sendPart(offset, min(partSize, size - offset),
-            {'uploadId': uploadId, 'partNumber': '${number + 1}'}, {});
+        final part = await sendPart(
+            offset,
+            min(partSize, size - offset),
+            {'uploadId': uploadId, 'partNumber': '${number + 1}'},
+            partEncryptionHeaders);
         if (part.headers['etag'] == null) {
           throw StateError('An uploaded part has no ETag.');
         }
@@ -458,7 +503,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       final result = await http.request('POST', bucket,
           key: key,
           query: {'uploadId': uploadId},
-          headers: condition,
+          headers: {...condition, ...partEncryptionHeaders},
           body: storageXml('CompleteMultipartUpload', {'Parts': parts}));
       if (result.xml.name.local == 'Error') {
         throw StorageHttpException(
@@ -485,6 +530,18 @@ extension MobileStorageTransfers on MobileStorageAdmin {
 
   Future<Map<String, Object?>> downloadStorageObject(
       EndpointProfile profile, Map<String, Object?> args) async {
+    validateClientDownloadName(args['clientEncryption']);
+    final config =
+        MobileClientEncryption.parse(args['clientEncryption'], upload: false);
+    try {
+      return await _downloadStorageObject(profile, args, config);
+    } finally {
+      config?.dispose();
+    }
+  }
+
+  Future<Map<String, Object?>> _downloadStorageObject(EndpointProfile profile,
+      Map<String, Object?> args, MobileClientEncryption? config) async {
     final http = client(profile),
         bucket = '${args['bucketName']}',
         key = '${args['key']}';
@@ -492,13 +549,36 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       if (args['versionId'] != null)
         http.azure ? 'versionid' : 'versionId': '${args['versionId']}'
     };
+    final readEncryptionHeaders = objectEncryptionHeaders(
+      profile,
+      args['encryption'],
+      read: true,
+    );
     final head = (args['_heads'] as Map?)?[key] as StorageHttpResponse? ??
-        await http.request('HEAD', bucket, key: key, query: query);
-    final size = int.parse(head.headers['content-length']!),
-        etag = head.headers['etag'];
+        await http.request(
+          'HEAD',
+          bucket,
+          key: key,
+          query: query,
+          headers: readEncryptionHeaders,
+        );
+    final size = config == null
+        ? int.parse(head.headers['content-length']!)
+        : int.tryParse(head.headers['content-length'] ?? '') ?? -1;
+    if (config != null && size < 0) mobileDecryptionFailed(0);
+    final etag = head.headers['etag'];
     if (etag == null) {
       MobileStorageAdmin._conflict(
           'The endpoint did not return an ETag for a consistent download.');
+    }
+    var plaintextSize = size;
+    if (config != null) {
+      try {
+        plaintextSize = agePlaintextLength(
+            headerLength: config.headerLength, ciphertextLength: size);
+      } on AgeException {
+        mobileDecryptionFailed(0);
+      }
     }
     final directory =
         Directory('${args['destinationDirectory'] ?? args['destinationPath']}');
@@ -507,6 +587,14 @@ extension MobileStorageTransfers on MobileStorageAdmin {
     }
     final resolved = await directory.resolveSymbolicLinks();
     var name = key.split('/').last;
+    final suppliedName = config == null
+        ? null
+        : (args['clientEncryption'] as Map)['fileName'] as String?;
+    if (suppliedName != null) {
+      name = suppliedName;
+    } else if (config != null && name.endsWith('.age') && name.length > 4) {
+      name = name.substring(0, name.length - 4);
+    }
     if (name.isEmpty || {'.', '..'}.contains(name)) {
       name =
           'object-${sha256.convert(utf8.encode(key)).toString().substring(0, 12)}';
@@ -517,40 +605,118 @@ extension MobileStorageTransfers on MobileStorageAdmin {
     final temp = File('${staging.path}/download');
     final file = await temp.open(mode: FileMode.write);
     File? reservation;
+    MobileAgeWorker? cipher;
     try {
-      final range =
-          ((args['multipartChunkMiB'] as num?)?.toInt() ?? 8).clamp(5, 5120) *
-              1024 *
-              1024;
-      Future<void> writes = Future.value();
-      await _parallelParts((size + range - 1) ~/ range,
-          profile.maxConcurrentRequests.clamp(1, 8), (index) async {
-        final start = index * range;
-        final count = min(range, size - start);
-        var received = 0;
-        final data = await http.requestStream('GET', bucket,
-            key: key,
-            query: query,
-            headers: {
-              'range': 'bytes=$start-${start + count - 1}',
-              'if-match': etag
-            },
-            maxResponseBytes: count, onResponseStart: () async {
-          received = 0;
-        }, onResponseChunk: (chunk) async {
-          final offset = start + received;
-          received += chunk.length;
-          // Serialize disk writes while bounded network streams run together.
-          writes = writes.then((_) async {
-            await file.setPosition(offset);
-            await file.writeFrom(chunk);
-          });
-          await writes;
+      if (config != null) {
+        Future<Uint8List> read(int start, int count) async {
+          final response = await http.request('GET', bucket,
+              key: key,
+              query: query,
+              headers: {
+                ...readEncryptionHeaders,
+                'range': 'bytes=$start-${start + count - 1}',
+                'if-match': etag
+              },
+              maxResponseBytes: count);
+          _validateRange(response, start, count, size, etag);
+          return Uint8List.fromList(response.body);
+        }
+
+        final nonce = await read(config.headerLength, agePayloadNonceLength);
+        final worker = cipher = MobileAgeWorker(config.key, nonce);
+        (args['_progress'] as void Function(int)?)
+            ?.call(config.headerLength + agePayloadNonceLength);
+        final chunks = ageChunkCount(plaintextSize);
+        Future<void> writes = Future.value();
+        final workers = min(chunks, profile.maxConcurrentRequests.clamp(1, 8));
+        var nextChunk = 0, failed = false;
+        await _parallelParts(workers, workers, (_) async {
+          try {
+            while (!failed && nextChunk < chunks) {
+              // Claim a run of chunks per request: one request per 64 KiB
+              // chunk would cost a round trip each. The cap bounds what a
+              // worker holds to about 4 MiB of ciphertext.
+              final first = nextChunk;
+              final end = min(first + _ageChunksPerRequest, chunks);
+              nextChunk = end;
+              ActionScope.current?.check();
+              final start = ageChunkOffset(
+                  headerLength: config.headerLength, index: first);
+              final stop = end == chunks
+                  ? size
+                  : ageChunkOffset(
+                      headerLength: config.headerLength, index: end);
+              final batch = await read(start, stop - start);
+              for (var index = first; index < end && !failed; index++) {
+                final offset =
+                    (index - first) * (ageChunkSize + ageChunkOverhead);
+                final count =
+                    min(ageChunkSize + ageChunkOverhead, batch.length - offset);
+                final sealed =
+                    Uint8List.sublistView(batch, offset, offset + count);
+                Uint8List plain;
+                try {
+                  plain = await worker.chunk(index, sealed,
+                      last: index == chunks - 1, seal: false);
+                } on AgeException {
+                  mobileDecryptionFailed(index);
+                }
+                try {
+                  writes = writes.then((_) async {
+                    ActionScope.current?.check();
+                    await file.setPosition(index * ageChunkSize);
+                    await file.writeFrom(plain);
+                  });
+                  await writes;
+                } finally {
+                  ageWipe(plain);
+                }
+                (args['_progress'] as void Function(int)?)?.call(count);
+              }
+            }
+          } catch (_) {
+            failed = true;
+            rethrow;
+          }
+          return true;
         });
-        _validateRange(data, start, count, size, etag, receivedBytes: received);
-        (args['_progress'] as void Function(int)?)?.call(count);
-        return true;
-      });
+      } else {
+        final range =
+            ((args['multipartChunkMiB'] as num?)?.toInt() ?? 8).clamp(5, 5120) *
+                1024 *
+                1024;
+        Future<void> writes = Future.value();
+        await _parallelParts((size + range - 1) ~/ range,
+            profile.maxConcurrentRequests.clamp(1, 8), (index) async {
+          final start = index * range;
+          final count = min(range, size - start);
+          var received = 0;
+          final data = await http.requestStream('GET', bucket,
+              key: key,
+              query: query,
+              headers: {
+                ...readEncryptionHeaders,
+                'range': 'bytes=$start-${start + count - 1}',
+                'if-match': etag
+              },
+              maxResponseBytes: count, onResponseStart: () async {
+            received = 0;
+          }, onResponseChunk: (chunk) async {
+            final offset = start + received;
+            received += chunk.length;
+            // Serialize disk writes while bounded network streams run together.
+            writes = writes.then((_) async {
+              await file.setPosition(offset);
+              await file.writeFrom(chunk);
+            });
+            await writes;
+          });
+          _validateRange(data, start, count, size, etag,
+              receivedBytes: received);
+          (args['_progress'] as void Function(int)?)?.call(count);
+          return true;
+        });
+      }
       await file.flush();
       await file.close();
       ActionScope.current?.check();
@@ -586,12 +752,13 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       return {
         'status': 'completed',
         'path': output.path,
-        'fileSize': size,
+        'fileSize': plaintextSize,
         'completedBytes': size,
         'successCount': 1,
         'failureCount': 0
       };
     } finally {
+      cipher?.close();
       try {
         await file.close();
       } catch (_) {}
@@ -620,55 +787,85 @@ extension MobileStorageTransfers on MobileStorageAdmin {
   Future<Map<String, Object?>> uploadStorageFile(
       EndpointProfile profile, Map<String, Object?> args) async {
     final paths = List<String>.from(args['filePaths'] as List? ?? []);
-    var total = 0;
-    for (final path in paths) {
-      final file = File(path), before = await File(path).stat();
-      Future<void> verifySource() async {
-        final current = await file.stat();
-        if (current.size != before.size ||
-            current.modified != before.modified) {
-          MobileStorageAdmin._conflict('The local file changed during upload.');
-        }
-      }
-
-      {
-        final key = (args['objectKeyByPath'] as Map?)?[path] as String? ??
-            '${args['prefix'] ?? ''}${file.uri.pathSegments.last}';
-        await _writeObject(
-            client(profile), '${args['bucketName']}', key, before.size,
-            (start, count) async {
-          await verifySource();
-          final handle = await file.open();
-          late List<int> data;
-          try {
-            await handle.setPosition(start);
-            data = await handle.read(count);
-          } finally {
-            await handle.close();
-          }
-          await verifySource();
-          if (data.length != count) {
+    if (args['clientEncryption'] != null && paths.length != 1) {
+      MobileStorageAdmin._invalid(
+          'Client encryption requires exactly one file.');
+    }
+    final config =
+        MobileClientEncryption.parse(args['clientEncryption'], upload: true);
+    final cipher =
+        config == null ? null : MobileAgeWorker(config.key, config.nonce);
+    try {
+      var total = 0;
+      for (final path in paths) {
+        final file = File(path), before = await File(path).stat();
+        Future<void> verifySource() async {
+          final current = await file.stat();
+          if (current.size != before.size ||
+              current.modified != before.modified) {
             MobileStorageAdmin._conflict(
                 'The local file changed during upload.');
           }
-          return data;
-        },
-            verifySource: verifySource,
-            onProgress: args['_progress'] as void Function(int)?,
-            streamReadBytes: 256 * 1024,
-            multipartThresholdBytes:
-                ((args['multipartThresholdMiB'] as num?)?.toInt() ?? 32)
-                        .clamp(1, 5120) *
-                    1024 *
-                    1024,
-            partBytes: ((args['multipartChunkMiB'] as num?)?.toInt() ?? 8)
-                    .clamp(5, 5120) *
-                1024 *
-                1024);
-        total += before.size;
+        }
+
+        {
+          // As in the desktop engines, a mapped name is relative to the prefix.
+          final key = '${args['prefix'] ?? ''}'
+              '${(args['objectKeyByPath'] as Map?)?[path] as String? ?? file.uri.pathSegments.last}';
+          Future<List<int>> read(int start, int count) async {
+            await verifySource();
+            final handle = await file.open();
+            late List<int> data;
+            try {
+              await handle.setPosition(start);
+              data = await handle.read(count);
+            } finally {
+              await handle.close();
+            }
+            await verifySource();
+            if (data.length != count) {
+              MobileStorageAdmin._conflict(
+                  'The local file changed during upload.');
+            }
+            return data;
+          }
+
+          final storedSize = config == null
+              ? before.size
+              : ageCiphertextLength(
+                  headerLength: config.headerLength,
+                  plaintextLength: before.size);
+          await _writeObject(
+              client(profile),
+              '${args['bucketName']}',
+              key,
+              storedSize,
+              config == null
+                  ? read
+                  : (start, count) => cipher!
+                      .readCiphertext(config, before.size, start, count, read),
+              clientEncrypted: config != null,
+              encryption: args['encryption'],
+              verifySource: verifySource,
+              onProgress: args['_progress'] as void Function(int)?,
+              streamReadBytes: config == null ? 256 * 1024 : 64 * 1024,
+              multipartThresholdBytes:
+                  ((args['multipartThresholdMiB'] as num?)?.toInt() ?? 32)
+                          .clamp(1, 5120) *
+                      1024 *
+                      1024,
+              partBytes: ((args['multipartChunkMiB'] as num?)?.toInt() ?? 8)
+                      .clamp(5, 5120) *
+                  1024 *
+                  1024);
+          total += storedSize;
+        }
       }
+      return transferResult('upload', total);
+    } finally {
+      cipher?.close();
+      config?.dispose();
     }
-    return transferResult('upload', total);
   }
 
   Map<String, Object?> transferResult(String direction, int size) => {
@@ -708,4 +905,36 @@ Future<List<T>> _parallelParts<T>(
   }));
   if (error != null) Error.throwWithStackTrace(error!, trace!);
   return results.cast<T>();
+}
+
+/// Validate before mobile services enter trackedTransfer (which performs HEAD).
+void validateClientDownloadName(Object? option) {
+  if (option is! Map || !option.containsKey('fileName')) return;
+  final name = option['fileName'];
+  if (name is! String ||
+      name.isEmpty ||
+      name == '.' ||
+      name == '..' ||
+      name.contains(RegExp(r'[/\\\x00]'))) {
+    MobileStorageAdmin._invalid('Invalid client encryption fileName.');
+  }
+}
+
+/// Keep hidden names out of mobile service diagnostics, including nested traces.
+Object? redactClientDownloadName(Object? value, [Object? option]) {
+  final name = option is Map ? option['fileName'] : null;
+  if (value is Map) {
+    return value.map((key, item) => MapEntry(
+        key,
+        key == 'fileName'
+            ? '[redacted]'
+            : redactClientDownloadName(item, option)));
+  }
+  if (value is List) {
+    return value.map((item) => redactClientDownloadName(item, option)).toList();
+  }
+  if (value is String && name is String && name.isNotEmpty) {
+    return value.replaceAll(name, '[redacted]');
+  }
+  return value;
 }

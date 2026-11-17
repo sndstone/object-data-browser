@@ -1,5 +1,14 @@
 #[cfg(test)]
 mod review_regressions;
+mod request_transport;
+mod secret_hygiene;
+#[macro_use]
+mod object_encryption;
+#[cfg(test)]
+mod object_encryption_tests;
+use object_encryption::Encryption;
+mod client_encryption;
+use client_encryption::ClientEncryption;
 mod benchmark_runtime;
 mod transfer_workers;
 mod source_snapshot;
@@ -49,7 +58,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-const ENGINE_VERSION: &str = "2.3.5";
+const ENGINE_VERSION: &str = "2.4.0";
 
 const SUPPORTED_METHODS: &[&str] = &[
     "health",
@@ -95,7 +104,7 @@ const SUPPORTED_METHODS: &[&str] = &[
     "exportBenchmarkResults",
 ];
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct Request {
     #[serde(rename = "requestId")]
     request_id: String,
@@ -153,7 +162,7 @@ impl SidecarError {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
-            message: message.into(),
+            message: secret_hygiene::text(&message.into()),
             details: Value::Object(Map::new()),
         }
     }
@@ -161,8 +170,8 @@ impl SidecarError {
     fn with_details(code: &'static str, message: impl Into<String>, details: Value) -> Self {
         Self {
             code,
-            message: message.into(),
-            details,
+            message: secret_hygiene::text(&message.into()),
+            details: secret_hygiene::value(details),
         }
     }
 }
@@ -211,36 +220,82 @@ struct BenchmarkTaskResult {
 fn main() {
     let runtime = Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
-        use tokio::io::AsyncBufReadExt;
-        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-        let slots = Arc::new(Semaphore::new(8));
+        let mut input = tokio::io::BufReader::new(tokio::io::stdin());
+        let slots = Arc::new(Semaphore::new(request_transport::MAX_ACTIVE_REQUESTS));
+        let admission = request_transport::Admission::new();
         let mut tasks = JoinSet::new();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let line = line.trim();
-            if line.is_empty() { continue; }
-            let request = match serde_json::from_str::<Request>(line) {
+        while let Ok(Some(frame)) = request_transport::read_frame(&mut input, request_transport::MAX_FRAME_BYTES).await {
+            while tasks.try_join_next().is_some() {}
+            let bytes = match frame {
+                request_transport::Frame::Data(bytes) => bytes,
+                request_transport::Frame::Oversized => {
+                    println!("{}", json!({"requestId":null,"ok":false,"error":{"code":"invalid_request","message":"Input frame exceeds the 64 MiB limit."}}));
+                    continue;
+                }
+            };
+            if bytes.iter().all(u8::is_ascii_whitespace) { continue; }
+            let request = match serde_json::from_slice::<Request>(&bytes) {
                 Ok(r) => r,
                 Err(_) => { println!("{}", json!({"requestId":null,"ok":false,"error":{"code":"invalid_config","message":"Malformed JSON request."}})); continue; }
             };
+            drop(bytes);
+            let permit = match admission.admit(&request.method) {
+                Ok(permit) => permit,
+                Err(error) => {
+                    write_response(request.request_id, Err(error));
+                    continue;
+                }
+            };
+            // Execute the cheap/control path directly: it never waits for a transfer
+            // slot, and a flood of controls cannot create an unbounded task queue.
+            if permit.is_none() {
+                execute_request(request).await;
+                continue;
+            }
             let slots = slots.clone();
             tasks.spawn(async move {
-                let request_id = request.request_id.clone();
-                let control = matches!(request.method.as_str(), "cancelToolExecution"|"pauseBenchmark"|"resumeBenchmark"|"stopBenchmark");
-                let _permit = if control { None } else { Some(slots.acquire_owned().await.unwrap()) };
-                let response = match tokio::spawn(handle_request(request)).await {
-                    Ok(Ok(result)) => Response { request_id, ok:true, result:Some(result), error:None },
-                    Ok(Err(error)) => Response { request_id, ok:false, result:None, error:Some(json!({"code":error.code,"message":error.message,"details":error.details})) },
-                    Err(error) => Response { request_id, ok:false, result:None, error:Some(json!({"code":"internal_error","message":error.to_string()})) },
-                };
-                if let Ok(output) = serde_json::to_string(&response) { println!("{output}"); }
+                let _admission = permit;
+                let _slot = slots.acquire_owned().await.unwrap();
+                execute_request(request).await;
             });
-            while tasks.try_join_next().is_some() {}
         }
         while tasks.join_next().await.is_some() {}
     });
 }
 
+async fn execute_request(request: Request) {
+    let request_id = request.request_id.clone();
+    let result = match tokio::spawn(handle_request(request)).await {
+        Ok(result) => result,
+        Err(error) => Err(SidecarError::new("internal_error", error.to_string())),
+    };
+    write_response(request_id, result);
+}
+
+fn write_response(request_id: String, result: SidecarResult) {
+    let response = match result {
+        Ok(result) => Response { request_id, ok:true, result:Some(result), error:None },
+        Err(error) => Response { request_id, ok:false, result:None, error:Some(json!({"code":error.code,"message":error.message,"details":error.details})) },
+    };
+    if let Ok(output) = serde_json::to_string(&response) {
+        #[cfg(test)] secret_hygiene::capture(&output);
+        println!("{output}");
+    }
+}
+
 async fn handle_request(request: Request) -> SidecarResult {
+    let secrets = secret_hygiene::collect(&request.params);
+    secret_hygiene::SECRETS.scope(secrets, async {
+        match dispatch_request(request).await {
+            Ok(value) => Ok(secret_hygiene::value(value)),
+            Err(error) => Err(SidecarError::with_details(error.code, error.message, error.details)),
+        }
+    }).await
+}
+
+async fn dispatch_request(request: Request) -> SidecarResult {
+    // SDK futures are large. Keep them behind a pointer at the dispatch
+    // boundary so debug poll frames do not reserve space for every method.
     match request.method.as_str() {
         "health" => Ok(json!({
             "engine": "rust",
@@ -258,6 +313,13 @@ async fn handle_request(request: Request) -> SidecarResult {
                 {"key": "bucket.encryption", "label": "Bucket encryption", "state": "supported"},
                 {"key": "bucket.tagging", "label": "Bucket tagging", "state": "supported"},
                 {"key": "bucket.versioning", "label": "Bucket versioning", "state": "supported"},
+                {"key":"object.clientEncryption", "label":"Client-side encryption", "state":"supported", "formats":["age-v1"]},
+                {"key":"object.encryption.sse-s3", "label":"sse-s3", "state":"supported"},
+                {"key":"object.encryption.sse-kms", "label":"sse-kms", "state":"supported"},
+                {"key":"object.encryption.dsse-kms", "label":"dsse-kms", "state":"supported"},
+                {"key":"object.encryption.sse-c", "label":"sse-c", "state":"supported"},
+                {"key":"object.encryption.azure-scope", "label":"azure-scope", "state":"unsupported", "reason":"The Rust engine does not support Azure Blob profiles."},
+                {"key":"object.encryption.azure-cpk", "label":"azure-cpk", "state":"unsupported", "reason":"The Rust engine does not support Azure Blob profiles."},
                 {"key": "object.copy_move", "label": "Copy, move, rename", "state": "supported"},
                 {"key": "object.resumable", "label": "Resumable transfer jobs", "state": "unknown", "reason": "Desktop host currently uses one request per sidecar process."},
                 {"key": "tools.bulk-delete", "label": "Delete-all maintenance tool", "state": "supported"},
@@ -265,63 +327,63 @@ async fn handle_request(request: Request) -> SidecarResult {
             ]
         })),
         "testProfile" => {
-            test_profile(
+            Box::pin(test_profile(
                 request
                     .params
                     .get("profile")
                     .cloned()
                     .unwrap_or(Value::Null),
-            )
+            ))
             .await
         }
         "listBuckets" => {
-            list_buckets(
+            Box::pin(list_buckets(
                 request
                     .params
                     .get("profile")
                     .cloned()
                     .unwrap_or(Value::Null),
-            )
+            ))
             .await
         }
-        "createBucket" => create_bucket(request.params).await,
-        "deleteBucket" => delete_bucket(request.params).await,
-        "setBucketVersioning" => set_bucket_versioning(request.params).await,
-        "putBucketLifecycle" => put_bucket_lifecycle(request.params).await,
-        "deleteBucketLifecycle" => delete_bucket_lifecycle(request.params).await,
-        "putBucketPolicy" => put_bucket_policy(request.params).await,
-        "deleteBucketPolicy" => delete_bucket_policy(request.params).await,
-        "putBucketCors" => put_bucket_cors(request.params).await,
-        "deleteBucketCors" => delete_bucket_cors(request.params).await,
-        "putBucketEncryption" => put_bucket_encryption(request.params).await,
-        "deleteBucketEncryption" => delete_bucket_encryption(request.params).await,
-        "putBucketTagging" => put_bucket_tagging(request.params).await,
-        "deleteBucketTagging" => delete_bucket_tagging(request.params).await,
-        "listObjects" => list_objects(request.params).await,
-        "getBucketAdminState" => get_bucket_admin_state(request.params).await,
-        "listObjectVersions" => list_object_versions(request.params).await,
-        "getObjectDetails" => get_object_details(request.params).await,
-        "createFolder" => create_folder(request.params).await,
-        "copyObject" => copy_object(request.params).await,
-        "moveObject" => move_object(request.params).await,
-        "deleteObjects" => delete_objects(request.params).await,
-        "deleteObjectVersions" => delete_object_versions(request.params).await,
-        "startUpload" => start_upload(request.params).await,
-        "startDownload" => start_download(request.params).await,
+        "createBucket" => Box::pin(create_bucket(request.params)).await,
+        "deleteBucket" => Box::pin(delete_bucket(request.params)).await,
+        "setBucketVersioning" => Box::pin(set_bucket_versioning(request.params)).await,
+        "putBucketLifecycle" => Box::pin(put_bucket_lifecycle(request.params)).await,
+        "deleteBucketLifecycle" => Box::pin(delete_bucket_lifecycle(request.params)).await,
+        "putBucketPolicy" => Box::pin(put_bucket_policy(request.params)).await,
+        "deleteBucketPolicy" => Box::pin(delete_bucket_policy(request.params)).await,
+        "putBucketCors" => Box::pin(put_bucket_cors(request.params)).await,
+        "deleteBucketCors" => Box::pin(delete_bucket_cors(request.params)).await,
+        "putBucketEncryption" => Box::pin(put_bucket_encryption(request.params)).await,
+        "deleteBucketEncryption" => Box::pin(delete_bucket_encryption(request.params)).await,
+        "putBucketTagging" => Box::pin(put_bucket_tagging(request.params)).await,
+        "deleteBucketTagging" => Box::pin(delete_bucket_tagging(request.params)).await,
+        "listObjects" => Box::pin(list_objects(request.params)).await,
+        "getBucketAdminState" => Box::pin(get_bucket_admin_state(request.params)).await,
+        "listObjectVersions" => Box::pin(list_object_versions(request.params)).await,
+        "getObjectDetails" => Box::pin(get_object_details(request.params)).await,
+        "createFolder" => Box::pin(create_folder(request.params)).await,
+        "copyObject" => Box::pin(copy_object(request.params)).await,
+        "moveObject" => Box::pin(move_object(request.params)).await,
+        "deleteObjects" => Box::pin(delete_objects(request.params)).await,
+        "deleteObjectVersions" => Box::pin(delete_object_versions(request.params)).await,
+        "startUpload" => Box::pin(start_upload(request.params)).await,
+        "startDownload" => Box::pin(start_download(request.params)).await,
         "pauseTransfer" | "resumeTransfer" | "cancelTransfer" => Err(SidecarError::new(
             "unsupported_feature",
             "Interactive transfer control is unavailable in the sequential Rust engine.",
         )),
-        "generatePresignedUrl" => generate_presigned_url(request.params).await,
-        "runPutTestData" => run_put_test_data(request.params).await,
-        "runDeleteAll" => run_delete_all(request.params).await,
+        "generatePresignedUrl" => Box::pin(generate_presigned_url(request.params)).await,
+        "runPutTestData" => Box::pin(run_put_test_data(request.params)).await,
+        "runDeleteAll" => Box::pin(run_delete_all(request.params)).await,
         "cancelToolExecution" => Ok(cancel_tool_execution(&request.params)),
-        "startBenchmark" => start_benchmark(request.params).await,
-        "getBenchmarkStatus" => get_benchmark_status(request.params).await,
-        "pauseBenchmark" => pause_benchmark(request.params).await,
-        "resumeBenchmark" => resume_benchmark(request.params).await,
-        "stopBenchmark" => stop_benchmark(request.params).await,
-        "exportBenchmarkResults" => export_benchmark_results(request.params).await,
+        "startBenchmark" => Box::pin(start_benchmark(request.params)).await,
+        "getBenchmarkStatus" => Box::pin(get_benchmark_status(request.params)).await,
+        "pauseBenchmark" => Box::pin(pause_benchmark(request.params)).await,
+        "resumeBenchmark" => Box::pin(resume_benchmark(request.params)).await,
+        "stopBenchmark" => Box::pin(stop_benchmark(request.params)).await,
+        "exportBenchmarkResults" => Box::pin(export_benchmark_results(request.params)).await,
         _ => Err(SidecarError::new(
             "unsupported_feature",
             format!(
@@ -759,53 +821,53 @@ async fn get_bucket_admin_state(params: Value) -> SidecarResult {
     let (_, bucket_name, client) = bucket_context(&params).await?;
     let mut api_calls: Vec<Value> = Vec::new();
 
-    let versioning = optional_api(
+    let versioning = Box::pin(optional_api(
         &mut api_calls,
         "GetBucketVersioning",
         client.get_bucket_versioning().bucket(&bucket_name).send(),
-    )
+    ))
     .await?;
-    let encryption = optional_api(
+    let encryption = Box::pin(optional_api(
         &mut api_calls,
         "GetBucketEncryption",
         client.get_bucket_encryption().bucket(&bucket_name).send(),
-    )
+    ))
     .await?;
-    let lifecycle = optional_api(
+    let lifecycle = Box::pin(optional_api(
         &mut api_calls,
         "GetBucketLifecycleConfiguration",
         client
             .get_bucket_lifecycle_configuration()
             .bucket(&bucket_name)
             .send(),
-    )
+    ))
     .await?;
-    let policy = optional_api(
+    let policy = Box::pin(optional_api(
         &mut api_calls,
         "GetBucketPolicy",
         client.get_bucket_policy().bucket(&bucket_name).send(),
-    )
+    ))
     .await?;
-    let cors = optional_api(
+    let cors = Box::pin(optional_api(
         &mut api_calls,
         "GetBucketCors",
         client.get_bucket_cors().bucket(&bucket_name).send(),
-    )
+    ))
     .await?;
-    let tagging = optional_api(
+    let tagging = Box::pin(optional_api(
         &mut api_calls,
         "GetBucketTagging",
         client.get_bucket_tagging().bucket(&bucket_name).send(),
-    )
+    ))
     .await?;
-    let object_lock = optional_api(
+    let object_lock = Box::pin(optional_api(
         &mut api_calls,
         "GetObjectLockConfiguration",
         client
             .get_object_lock_configuration()
             .bucket(&bucket_name)
             .send(),
-    )
+    ))
     .await?;
 
     let lifecycle_rules: Vec<Value> = lifecycle
@@ -1020,6 +1082,7 @@ async fn list_object_versions(params: Value) -> SidecarResult {
 }
 
 async fn get_object_details(params: Value) -> SidecarResult {
+    let encryption = Encryption::parse(&params["encryption"], &params["profile"], false)?;
     let (profile, bucket_name, client) = bucket_context(&params).await?;
     let key = required_text(
         &params,
@@ -1033,15 +1096,16 @@ async fn get_object_details(params: Value) -> SidecarResult {
         "message": format!("Fetching object diagnostics for {bucket_name}/{key}."),
     })];
 
-    let head = record_api(
+    let head = record_api_with(
         &mut api_calls,
         "HeadObject",
-        client
+        encryption_customer!(client
             .head_object()
             .bucket(&bucket_name)
             .key(&key)
-            .set_version_id(params["versionId"].as_str().map(str::to_owned))
-            .send(),
+            .set_version_id(params["versionId"].as_str().map(str::to_owned)), &encryption)
+        .send(),
+        |error| object_encryption::read_error(error, encryption.customer()),
     )
     .await?;
     let tagging = optional_api(
@@ -1122,7 +1186,7 @@ async fn get_object_details(params: Value) -> SidecarResult {
         "message": format!("Loaded metadata and {} tag(s) for {key}.", tags.len()),
     }));
 
-    Ok(json!({
+    let mut result = json!({
         "key": key,
         "metadata": metadata,
         "headers": headers,
@@ -1138,10 +1202,13 @@ async fn get_object_details(params: Value) -> SidecarResult {
             "bucketName": bucket_name,
             "engineState": "healthy"
         }
-    }))
+    });
+    if let Some(encryption) = object_encryption::reported(&head) { result["encryption"] = encryption; }
+    Ok(result)
 }
 
 async fn create_folder(params: Value) -> SidecarResult {
+    let encryption = Encryption::parse(&params["encryption"], &params["profile"], false)?;
     let (_, bucket_name, client) = bucket_context(&params).await?;
     let mut key = required_text(
         &params,
@@ -1151,11 +1218,11 @@ async fn create_folder(params: Value) -> SidecarResult {
     if !key.ends_with('/') {
         key.push('/');
     }
-    client
+    encryption_write!(client
         .put_object()
         .bucket(bucket_name)
         .key(&key)
-        .body(ByteStream::from(Vec::<u8>::new()))
+        .body(ByteStream::from(Vec::<u8>::new())), &encryption)
         .send()
         .await
         .map_err(map_sdk_error)?;
@@ -1424,12 +1491,20 @@ async fn upload_file_multipart(
     concurrency: usize,
     progress: &Arc<TransferProgress>,
     file_name: &str,
+    encryption: &Encryption,
+    client_encryption: Option<&ClientEncryption>,
+    source_snapshot: &SourceSnapshot,
 ) -> Result<(), SidecarError> {
-    let snapshot = SourceSnapshot::capture(path)?;
-    let upload_id = client
+    let snapshot = if client_encryption.is_some() {
+        source_snapshot.check(path)?;
+        source_snapshot.clone()
+    } else {
+        SourceSnapshot::capture(path)?
+    };
+    let upload_id = encryption_write!(client
         .create_multipart_upload()
         .bucket(bucket_name)
-        .key(key)
+        .key(key), &encryption)
         .send()
         .await
         .map_err(map_sdk_error)?
@@ -1458,26 +1533,35 @@ async fn upload_file_multipart(
             let progress = Arc::clone(progress);
             let file_name = file_name.to_string();
             let snapshot = snapshot.clone();
+            let encryption = encryption.clone();
+            let client_encryption = client_encryption.cloned();
             async move {
                 snapshot.check(&path)?;
-                let body = ByteStream::read_from()
-                    .path(&path)
-                    .offset(offset)
-                    .length(aws_sdk_s3::primitives::Length::Exact(length))
-                    .buffer_size(UPLOAD_FILE_BUFFER_BYTES)
-                    .build()
-                    .await
-                    .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
-                let output = client
+                let body = if let Some(config) = &client_encryption {
+                    config.body(&path, &snapshot, config.plaintext_length(file_size)?, offset, length)
+                } else {
+                    ByteStream::read_from()
+                        .path(&path)
+                        .offset(offset)
+                        .length(aws_sdk_s3::primitives::Length::Exact(length))
+                        .buffer_size(UPLOAD_FILE_BUFFER_BYTES)
+                        .build()
+                        .await
+                        .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?
+                };
+                let output = encryption_customer!(client
                     .upload_part()
                     .bucket(&bucket_name)
                     .key(&key)
                     .upload_id(&upload_id)
                     .part_number(part_number)
-                    .body(with_transfer_activity(body, &progress))
+                    .body(with_transfer_activity(body, &progress)), &encryption)
                     .send()
                     .await
                     .map_err(map_sdk_error)?;
+                if client_encryption.is_some() {
+                    snapshot.check(&path)?;
+                }
                 {
                     let mut state = progress.state.lock().unwrap();
                     state.bytes_transferred += length;
@@ -1508,7 +1592,7 @@ async fn upload_file_multipart(
                         .build()
                 })
                 .collect::<Vec<_>>();
-            client
+            encryption_customer!(client
                 .complete_multipart_upload()
                 .bucket(bucket_name)
                 .key(key)
@@ -1517,7 +1601,7 @@ async fn upload_file_multipart(
                     CompletedMultipartUpload::builder()
                         .set_parts(Some(completed_parts))
                         .build(),
-                )
+                ), &encryption)
                 .send()
                 .await
                 .map(|_| ())
@@ -1556,11 +1640,13 @@ fn validate_upload_size(size: u64, threshold: u64, chunk: u64) -> Result<(), Sid
 }
 
 async fn start_upload(params: Value) -> SidecarResult {
+    let encryption = Encryption::parse(&params["encryption"], &params["profile"], false)?;
     let profile = parse_profile(&params["profile"])?;
     let bucket_name = required_text(&params, "bucketName", "Bucket name is required.")?;
     let prefix = params["prefix"].as_str().unwrap_or_default();
     let file_paths = string_array(params.get("filePaths").unwrap_or(&Value::Null));
     let object_key_by_path = string_map(params.get("objectKeyByPath").unwrap_or(&Value::Null));
+    let client_encryption = ClientEncryption::parse(&params["clientEncryption"], true, file_paths.len())?;
     if file_paths.is_empty() {
         return Err(SidecarError::new(
             "invalid_config",
@@ -1585,15 +1671,19 @@ async fn start_upload(params: Value) -> SidecarResult {
     for path in &paths {
         let metadata = fs::metadata(path)
             .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+        let size = match &client_encryption {
+            Some(config) => config.object_length(metadata.len())?,
+            None => metadata.len(),
+        };
         validate_upload_size(
-            metadata.len(),
+            size,
             multipart_threshold_bytes,
             multipart_chunk_bytes,
         )?;
-        total_bytes += metadata.len();
-        if metadata.len() >= multipart_threshold_bytes {
+        total_bytes += size;
+        if size >= multipart_threshold_bytes {
             uses_multipart = true;
-            parts_total += metadata.len().div_ceil(multipart_chunk_bytes);
+            parts_total += size.div_ceil(multipart_chunk_bytes);
         }
     }
     let client = build_client(&profile).await?;
@@ -1672,6 +1762,11 @@ async fn start_upload(params: Value) -> SidecarResult {
         let file_size = fs::metadata(path)
             .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?
             .len();
+        let plaintext_size = file_size;
+        let file_size = match &client_encryption {
+            Some(config) => config.object_length(plaintext_size)?,
+            None => plaintext_size,
+        };
         {
             let mut state = progress.state.lock().unwrap();
             state.output_lines.push(format!(
@@ -1689,20 +1784,28 @@ async fn start_upload(params: Value) -> SidecarResult {
                 concurrency,
                 &progress,
                 &file_name,
+                &encryption,
+                client_encryption.as_ref(),
+                snapshot,
             )
             .await?;
         } else {
-            let body = ByteStream::read_from()
-                .path(path)
-                .buffer_size(UPLOAD_FILE_BUFFER_BYTES)
-                .build()
-                .await
-                .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
-            client
-                .put_object()
-                .bucket(&bucket_name)
-                .key(&key)
-                .body(with_transfer_activity(body, &progress))
+            let body = if let Some(config) = &client_encryption {
+                config.body(path, snapshot, plaintext_size, 0, file_size)
+            } else {
+                ByteStream::read_from()
+                    .path(path)
+                    .buffer_size(UPLOAD_FILE_BUFFER_BYTES)
+                    .build()
+                    .await
+                    .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?
+            };
+            let mut request = client.put_object().bucket(&bucket_name).key(&key)
+                .body(with_transfer_activity(body, &progress));
+            if client_encryption.is_some() {
+                request = request.content_length(file_size as i64);
+            }
+            encryption_write!(request, &encryption)
                 .send()
                 .await
                 .map_err(map_sdk_error)?;
@@ -1774,6 +1877,7 @@ async fn download_object_ranged(
     concurrency: usize,
     max_attempts: u32,
     progress: &Arc<TransferProgress>,
+    encryption: &Encryption,
 ) -> Result<(), SidecarError> {
     {
         let file = tokio::fs::File::create(target)
@@ -1788,6 +1892,7 @@ async fn download_object_ranged(
         let start = index * chunk_bytes;
         let end = (start + chunk_bytes - 1).min(object_size.saturating_sub(1));
         let client = client.clone();
+        let encryption = encryption.clone();
         let validator = validator.clone();
         let version_id = version_id.clone();
         let bucket_name = bucket_name.to_string();
@@ -1798,16 +1903,16 @@ async fn download_object_ranged(
             let mut attempt = 0;
             let range_bytes = loop {
                 let result: Result<u64, SidecarError> = async {
-            let output = client
+            let output = encryption_customer!(client
                 .get_object()
                 .bucket(&bucket_name)
                 .key(&key)
                 .range(format!("bytes={start}-{end}"))
                 .set_if_match(validator.clone())
-                .set_version_id(version_id.clone())
+                .set_version_id(version_id.clone()), &encryption)
                 .send()
                 .await
-                .map_err(map_sdk_error)?;
+                .map_err(|error| object_encryption::read_error(error, encryption.customer()))?;
             if validator.as_deref().is_some_and(|etag| output.e_tag() != Some(etag)) {
                 return Err(SidecarError::new("object_conflict", "Download ETag mismatch; partial file discarded."));
             }
@@ -1872,8 +1977,10 @@ async fn download_object_ranged(
 }
 
 async fn start_download(params: Value) -> SidecarResult {
-    let (profile, bucket_name, client) = bucket_context(&params).await?;
+    let encryption = Encryption::parse(&params["encryption"], &params["profile"], false)?;
     let keys = string_array(params.get("keys").unwrap_or(&Value::Null));
+    let client_encryption = ClientEncryption::parse(&params["clientEncryption"], false, keys.len())?;
+    let (profile, bucket_name, client) = bucket_context(&params).await?;
     let destination_path = required_text(
         &params,
         "destinationPath",
@@ -1903,11 +2010,12 @@ async fn start_download(params: Value) -> SidecarResult {
     let mut validators = BTreeMap::new();
     run_bounded(keys.len() as u64, transfer_concurrency(&profile), |index| {
         let client = client.clone();
+        let encryption = encryption.clone();
         let bucket = bucket_name.clone();
         let key = keys[index as usize].clone();
         let version = params["versionId"].as_str().map(str::to_owned);
         async move {
-            let head = client.head_object().bucket(bucket).key(&key).set_version_id(version).send().await.map_err(map_sdk_error)?;
+            let head = encryption_customer!(client.head_object().bucket(bucket).key(&key).set_version_id(version), &encryption).send().await.map_err(|error| object_encryption::read_error(error, encryption.customer()))?;
             Ok((key, head))
         }
     }, |(key, head)| {
@@ -1920,12 +2028,19 @@ async fn start_download(params: Value) -> SidecarResult {
             parts_total += size.div_ceil(multipart_chunk_bytes);
         }
     }).await?;
+    if let Some(config) = &client_encryption {
+        parts_total = 0;
+        uses_multipart = true;
+        for size in object_sizes.values() {
+            parts_total += client_encryption::chunk_count(config.plaintext_length(*size)?);
+        }
+    }
     let concurrency = transfer_concurrency(&profile);
     let job_id = format!("download-{}", short_uuid());
     let label = format!("Download {} object(s) from {bucket_name}", keys.len());
     let strategy_label = transfer_strategy_label("download", uses_multipart);
     let part_size_bytes = if parts_total > 0 {
-        Some(multipart_chunk_bytes)
+        Some(if client_encryption.is_some() { client_encryption::SEALED } else { multipart_chunk_bytes })
     } else {
         None
     };
@@ -1977,7 +2092,11 @@ async fn start_download(params: Value) -> SidecarResult {
                 target
             ));
         }
-        if object_size >= multipart_threshold_bytes {
+        if let Some(config) = &client_encryption {
+            client_encryption::download(config, &client, &bucket_name, key, &target, object_size,
+                validators.get(key).cloned().flatten(), params["versionId"].as_str().map(str::to_owned),
+                concurrency, profile.max_attempts, &progress, &encryption).await?;
+        } else if object_size >= multipart_threshold_bytes {
             download_object_ranged(
                 &client,
                 validators.get(key).cloned().flatten(),
@@ -1990,18 +2109,19 @@ async fn start_download(params: Value) -> SidecarResult {
                 concurrency,
                 profile.max_attempts,
                 &progress,
+                &encryption,
             )
             .await?;
         } else {
-            let output = client
+            let output = encryption_customer!(client
                 .get_object()
                 .bucket(&bucket_name)
                 .key(key)
                 .set_version_id(params["versionId"].as_str().map(str::to_owned))
-                .set_if_match(validators.get(key).cloned().flatten())
+                .set_if_match(validators.get(key).cloned().flatten()), &encryption)
                 .send()
                 .await
-                .map_err(map_sdk_error)?;
+                .map_err(|error| object_encryption::read_error(error, encryption.customer()))?;
             let mut file = tokio::fs::File::create(&target)
                 .await
                 .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
@@ -2047,10 +2167,19 @@ async fn start_download(params: Value) -> SidecarResult {
             .sync_all()
             .await
             .map_err(|e| SidecarError::new("invalid_config", e.to_string()))?;
+        let published_key = if let Some(name) = client_encryption.as_ref().and_then(|config| config.file_name.as_deref()) {
+            name
+        } else if client_encryption.is_some() {
+            key.strip_suffix(".age")
+                .filter(|name| !name.rsplit(['/', '\\']).next().unwrap_or_default().is_empty())
+                .unwrap_or(key)
+        } else {
+            key
+        };
         let final_path = staged
             .publish_with_index(
                 &mut destination_index,
-                key,
+                published_key,
                 params["conflictPolicy"].as_str().unwrap_or("keepBoth"),
             )
             .map_err(|e| SidecarError::new("invalid_config", e.to_string()))?;
@@ -2105,8 +2234,9 @@ async fn start_download(params: Value) -> SidecarResult {
 }
 
 async fn generate_presigned_url(params: Value) -> SidecarResult {
-    let (profile, bucket_name, client) = bucket_context(&params).await?;
-    let _ = profile;
+    let encryption = Encryption::parse(&params["encryption"], &params["profile"], false)?;
+    if encryption.customer() { return Err(SidecarError::new("unsupported_feature", "Customer-provided encryption requires secret headers and cannot be shared as a presigned URL.")); }
+    let (_, bucket_name, client) = bucket_context(&params).await?;
     let key = required_text(
         &params,
         "key",
@@ -2140,6 +2270,7 @@ fn tool_state(label: &str, status: String, output_lines: Vec<String>, exit_code:
 }
 
 async fn run_put_test_data(params: Value) -> SidecarResult {
+    let encryption = Encryption::parse(&params["encryption"], &params["profile"], false)?;
     let profile = parse_profile(&params["profile"])?;
     let config = &params["config"];
     let bucket_name = config["bucketName"]
@@ -2173,13 +2304,14 @@ async fn run_put_test_data(params: Value) -> SidecarResult {
             let bucket = bucket_name.clone();
             let key = format!("{prefix}testdata-{index:06}.bin");
             let payload = payload.clone();
+            let encryption = encryption.clone();
             async move {
                 for _ in 0..versions {
-                    client
+                    encryption_write!(client
                         .put_object()
                         .bucket(&bucket)
                         .key(&key)
-                        .body(ByteStream::from(payload.clone()))
+                        .body(ByteStream::from(payload.clone())), &encryption)
                         .send()
                         .await
                         .map_err(map_sdk_error)?;
@@ -2238,8 +2370,9 @@ async fn start_benchmark(params: Value) -> SidecarResult {
         return Err(SidecarError::new("invalid_config", "Stop an existing benchmark before starting another (maximum four live runs)."));
     }
     let run_id = format!("bench-{}", short_uuid());
+    let clean_params = secret_hygiene::value(params.clone());
     let config_map = benchmark_config_with_run_dir(
-        &params
+        &clean_params
             .get("config")
             .and_then(Value::as_object)
             .cloned()
@@ -2248,8 +2381,8 @@ async fn start_benchmark(params: Value) -> SidecarResult {
     );
     let state = json!({
         "id": run_id,
-        "profile": params["profile"],
-        "profileId": params["profile"]["id"],
+        "profile": clean_params["profile"],
+        "profileId": clean_params["profile"]["id"],
         "config": Value::Object(config_map.clone()),
         "status": "running",
         "processedCount": 0,
@@ -2289,7 +2422,7 @@ async fn start_benchmark(params: Value) -> SidecarResult {
     state["workerGeneration"] = json!(generation);
     write_benchmark_state(&state)?;
     let result = public_benchmark_state(&state);
-    let live = Arc::new(tokio::sync::Mutex::new(state));
+    let live = Arc::new(BenchmarkOwner::new(state));
     LIVE_BENCHMARKS
         .get_or_init(Default::default)
         .lock()
@@ -2299,7 +2432,57 @@ async fn start_benchmark(params: Value) -> SidecarResult {
     Ok(result)
 }
 
-type LiveBenchmark = Arc<tokio::sync::Mutex<Value>>;
+struct BenchmarkControl {
+    published: Value,
+    pending: Option<&'static str>,
+}
+
+struct BenchmarkOwner {
+    state: tokio::sync::Mutex<Value>,
+    control: Mutex<BenchmarkControl>,
+}
+
+impl BenchmarkOwner {
+    fn new(state: Value) -> Self {
+        Self {
+            control: Mutex::new(BenchmarkControl { published: public_benchmark_state(&state), pending: None }),
+            state: tokio::sync::Mutex::new(state),
+        }
+    }
+
+    // Never acquire the execution lock here: a network batch may own it.
+    fn acknowledge(&self, action: Option<&'static str>) -> Value {
+        let mut control = self.control.lock().unwrap();
+        if control.published["status"] == "running" && control.pending != Some("stopped") {
+            if let Some(action) = action {
+                // Resume while still running cancels a pending pause.
+                control.pending = if action == "running" { None } else { Some(action) };
+            }
+        }
+        let mut snapshot = control.published.clone();
+        if let Some(pending) = control.pending {
+            snapshot["controlPending"] = json!(pending);
+        }
+        snapshot
+    }
+
+    fn publish(&self, state: &Value) {
+        self.control.lock().unwrap().published = public_benchmark_state(state);
+    }
+
+    fn settle_controls(&self, state: &mut Value) -> Result<(), SidecarError> {
+        let mut control = self.control.lock().unwrap();
+        if let Some(action) = control.pending.take() {
+            if state["status"] == "running" {
+                apply_benchmark_control(state, action)?;
+            }
+            control.published = public_benchmark_state(state);
+        }
+        Ok(())
+    }
+}
+
+type LiveBenchmark = Arc<BenchmarkOwner>;
 static LIVE_BENCHMARKS: OnceLock<Mutex<BTreeMap<String, LiveBenchmark>>> = OnceLock::new();
 
 fn public_benchmark_state(state: &Value) -> Value {
@@ -2309,7 +2492,7 @@ fn public_benchmark_state(state: &Value) -> Value {
         map.remove("workerGeneration");
         map.remove("_lastPersistUnixMs");
     }
-    result
+    secret_hygiene::value(result)
 }
 
 async fn live_benchmark(params: &Value) -> Result<LiveBenchmark, SidecarError> {
@@ -2326,8 +2509,9 @@ async fn live_benchmark(params: &Value) -> Result<LiveBenchmark, SidecarError> {
             "Engine restarted; resume with the owning endpoint credentials.",
         );
     }
-    let live = Arc::new(tokio::sync::Mutex::new(state));
-    if live.lock().await["status"] == "paused" {
+    let paused = state["status"] == "paused";
+    let live = Arc::new(BenchmarkOwner::new(state));
+    if paused {
         let mut registry = registry.lock().unwrap();
         if registry.len() >= 4 { return Err(SidecarError::new("invalid_config", "Maximum four live benchmark runs.")); }
         registry.insert(id, live.clone());
@@ -2337,14 +2521,19 @@ async fn live_benchmark(params: &Value) -> Result<LiveBenchmark, SidecarError> {
 
 fn spawn_benchmark_worker(live: LiveBenchmark, generation: String) {
     tokio::spawn(async move {
-        let resources = { let state = live.lock().await; Arc::new(benchmark_runtime::Resources::new(&state["config"])) };
+        let resources = { let state = live.state.lock().await; Arc::new(benchmark_runtime::Resources::new(&state["config"])) };
         loop {
             {
-                let mut state = live.lock().await;
+                let mut state = live.state.lock().await;
+                if let Err(error) = live.settle_controls(&mut state) {
+                    state["status"] = json!("failed");
+                    append_benchmark_log(&mut state, &format!("Benchmark control failed: {}", error.message));
+                    live.publish(&state);
+                }
                 if state["status"] != "running" || state["workerGeneration"] != generation {
                     break;
                 }
-                match materialize_benchmark_state(state.clone(), resources.clone()).await {
+                match materialize_benchmark_state(state.clone(), resources.clone(), &live).await {
                     Ok(next) => *state = next,
                     Err(error) => {
                         state["status"] = json!("failed");
@@ -2355,48 +2544,63 @@ fn spawn_benchmark_worker(live: LiveBenchmark, generation: String) {
                         let _ = write_benchmark_state(&state);
                     }
                 }
+                if let Err(error) = live.settle_controls(&mut state) {
+                    state["status"] = json!("failed");
+                    append_benchmark_log(&mut state, &format!("Benchmark control failed: {}", error.message));
+                }
+                live.publish(&state);
                 if state["status"] != "running" {
                     break;
                 }
             }
             tokio::task::yield_now().await;
         }
-        let mut state = live.lock().await;
-        if state["status"] != "running" {
+        let mut state = live.state.lock().await;
+        // A resume may already have installed a new worker generation.
+        if state["status"] != "running" && (state["workerGeneration"] == generation || state["workerGeneration"].is_null()) {
             state.as_object_mut().unwrap().remove("profile");
-            let id = state["id"].as_str().unwrap_or_default();
-            LIVE_BENCHMARKS.get_or_init(Default::default).lock().unwrap().remove(id);
+            if state["status"] != "paused" {
+                let id = state["id"].as_str().unwrap_or_default();
+                LIVE_BENCHMARKS.get_or_init(Default::default).lock().unwrap().remove(id);
+            }
+            live.publish(&state);
         }
     });
 }
 
 async fn get_benchmark_status(params: Value) -> SidecarResult {
     let live = live_benchmark(&params).await?;
-    let state = live.lock().await;
-    Ok(public_benchmark_state(&state))
+    Ok(live.acknowledge(None))
 }
 
 async fn pause_benchmark(params: Value) -> SidecarResult {
     let live = live_benchmark(&params).await?;
-    let mut state = live.lock().await;
+    let mut state = match live.state.try_lock() {
+        Ok(state) => state,
+        Err(_) => {
+            let snapshot = live.acknowledge(Some("paused"));
+            if snapshot["status"] == "running" { return Ok(snapshot); }
+            live.state.lock().await
+        }
+    };
+    live.settle_controls(&mut state)?;
     if state["status"] == "running" {
-        refresh_benchmark_snapshot(&mut state);
-        state["status"] = json!("paused");
-        state["workerGeneration"] = Value::Null;
-        state.as_object_mut().unwrap().remove("profile");
-        append_benchmark_log(&mut state, "Benchmark paused by user.");
-        persist_benchmark_outputs(&state)?;
-        write_benchmark_state(&state)?;
+        apply_benchmark_control(&mut state, "paused")?;
     }
+    live.publish(&state);
     Ok(public_benchmark_state(&state))
 }
 
 async fn resume_benchmark(params: Value) -> SidecarResult {
     let live = live_benchmark(&params).await?;
+    let snapshot = live.acknowledge(Some("running"));
+    if snapshot["status"] == "running" {
+        return Ok(snapshot);
+    }
     let generation = Uuid::new_v4().to_string();
     let result;
     {
-        let mut state = live.lock().await;
+        let mut state = live.state.lock().await;
         if state["status"] != "paused" {
             return Ok(public_benchmark_state(&state));
         }
@@ -2414,6 +2618,7 @@ async fn resume_benchmark(params: Value) -> SidecarResult {
         append_benchmark_log(&mut state, "Benchmark resumed by user.");
         write_benchmark_state(&state)?;
         result = public_benchmark_state(&state);
+        live.publish(&state);
     }
     spawn_benchmark_worker(live, generation);
     Ok(result)
@@ -2421,19 +2626,36 @@ async fn resume_benchmark(params: Value) -> SidecarResult {
 
 async fn stop_benchmark(params: Value) -> SidecarResult {
     let live = live_benchmark(&params).await?;
-    let mut state = live.lock().await;
+    let mut state = match live.state.try_lock() {
+        Ok(state) => state,
+        Err(_) => {
+            let snapshot = live.acknowledge(Some("stopped"));
+            if snapshot["status"] == "running" { return Ok(snapshot); }
+            live.state.lock().await
+        }
+    };
+    live.settle_controls(&mut state)?;
+    apply_benchmark_control(&mut state, "stopped")?;
+    live.publish(&state);
+    LIVE_BENCHMARKS.get_or_init(Default::default).lock().unwrap()
+        .remove(state["id"].as_str().unwrap_or_default());
+    Ok(public_benchmark_state(&state))
+}
+
+fn apply_benchmark_control(state: &mut Value, action: &str) -> Result<(), SidecarError> {
     if state["status"] == "running" {
-        refresh_benchmark_snapshot(&mut state);
+        refresh_benchmark_snapshot(state);
     }
-    state["status"] = json!("stopped");
+    state["status"] = json!(action);
     state["workerGeneration"] = Value::Null;
     state.as_object_mut().unwrap().remove("profile");
-    state["completedAt"] = json!(now_iso());
-    state["resultSummary"] = benchmark_summary_from_state(&state);
-    append_benchmark_log(&mut state, "Benchmark stopped by user.");
-    persist_benchmark_outputs(&state)?;
-    write_benchmark_state(&state)?;
-    Ok(public_benchmark_state(&state))
+    if action == "stopped" {
+        state["completedAt"] = json!(now_iso());
+        state["resultSummary"] = benchmark_summary_from_state(state);
+    }
+    append_benchmark_log(state, &format!("Benchmark {action} by user."));
+    persist_benchmark_outputs(state)?;
+    write_benchmark_state(state)
 }
 
 async fn export_benchmark_results(params: Value) -> SidecarResult {
@@ -2553,6 +2775,23 @@ fn parse_profile(value: &Value) -> Result<Profile, SidecarError> {
             "Azure Blob profiles are not supported by the rust engine yet. Switch the engine to Go or Python in Settings.",
         ));
     }
+    // Only S3 profile types may reach the S3 client; a non-S3 secret must
+    // never be sent to an S3 endpoint as an access key.
+    match value["endpointType"].as_str().unwrap_or_default().trim() {
+        "" | "s3Compatible" | "awsS3" => {}
+        "googleCloudStorage" => {
+            return Err(SidecarError::new(
+                "unsupported_feature",
+                "Google Cloud Storage profiles are not supported by the rust engine yet. Switch the engine to Go or Python in Settings.",
+            ));
+        }
+        _ => {
+            return Err(SidecarError::new(
+                "invalid_config",
+                "Unknown endpoint type.",
+            ));
+        }
+    }
     let auth_mode = value["authMode"].as_str().unwrap_or("static");
     if !matches!(
         auth_mode,
@@ -2661,6 +2900,15 @@ async fn record_api<T, E>(
 where
     E: Into<aws_sdk_s3::Error>,
 {
+    record_api_with(api_calls, operation, future, map_sdk_error).await
+}
+
+async fn record_api_with<T, E>(
+    api_calls: &mut Vec<Value>,
+    operation: &str,
+    future: impl std::future::Future<Output = Result<T, E>>,
+    map_error: impl FnOnce(E) -> SidecarError,
+) -> Result<T, SidecarError> {
     let started = std::time::Instant::now();
     match future.await {
         Ok(result) => {
@@ -2679,7 +2927,7 @@ where
                 "status": "ERROR",
                 "latencyMs": started.elapsed().as_millis()
             }));
-            Err(map_sdk_error(error))
+            Err(map_error(error))
         }
     }
 }
@@ -2815,6 +3063,15 @@ fn parse_encryption_configuration(
         if let Some(bucket_key_enabled) = item.get("BucketKeyEnabled").and_then(Value::as_bool) {
             builder = builder.bucket_key_enabled(bucket_key_enabled);
         }
+        if let Some(blocked) = item.get("BlockedEncryptionTypes").filter(|v| !v.is_null()) {
+            let types = blocked["EncryptionType"].as_array().ok_or_else(|| SidecarError::new("invalid_config", "BlockedEncryptionTypes.EncryptionType must be an array."))?;
+            let mut block = aws_sdk_s3::types::BlockedEncryptionTypes::builder();
+            for value in types {
+                let value = value.as_str().ok_or_else(|| SidecarError::new("invalid_config", "Blocked encryption types must be strings."))?;
+                block = block.encryption_type(aws_sdk_s3::types::EncryptionType::from(value));
+            }
+            builder = builder.blocked_encryption_types(block.build());
+        }
         rules.push(builder.build());
     }
     ServerSideEncryptionConfiguration::builder()
@@ -2860,6 +3117,7 @@ fn encryption_raw(config: &ServerSideEncryptionConfiguration) -> Value {
                 "KMSMasterKeyID": value.kms_master_key_id(),
             })),
             "BucketKeyEnabled": rule.bucket_key_enabled(),
+            "BlockedEncryptionTypes": rule.blocked_encryption_types().map(|blocked| json!({"EncryptionType":blocked.encryption_type().iter().map(|value| value.as_str()).collect::<Vec<_>>()})),
         })).collect::<Vec<_>>()
     })
 }
@@ -2940,6 +3198,8 @@ fn emit_transfer_event(job: &Value) {
         "job": job,
     });
     if let Ok(serialized) = serde_json::to_string(&payload) {
+        let serialized = secret_hygiene::text(&serialized);
+        #[cfg(test)] secret_hygiene::capture(&serialized);
         println!("{serialized}");
         let _ = io::stdout().flush();
     }
@@ -3030,7 +3290,7 @@ fn refresh_benchmark_snapshot(state: &mut Value) {
     });
 }
 
-async fn materialize_benchmark_state(mut state: Value, resources: Arc<benchmark_runtime::Resources>) -> SidecarResult {
+async fn materialize_benchmark_state(mut state: Value, resources: Arc<benchmark_runtime::Resources>, owner: &BenchmarkOwner) -> SidecarResult {
     if matches!(
         state["status"].as_str(),
         Some("paused" | "completed" | "stopped" | "failed")
@@ -3106,6 +3366,11 @@ async fn materialize_benchmark_state(mut state: Value, resources: Arc<benchmark_
         let previous_errors = resources.metrics.errors.load(AtomicOrdering::Relaxed);
         let previous_retries = resources.metrics.retries.load(AtomicOrdering::Relaxed);
         while call_started.elapsed().as_secs_f64() < execution_budget_seconds {
+            // Pause/stop acknowledge immediately; already dispatched work settles
+            // before applying the control, with no additional batch dispatched.
+            if owner.control.lock().unwrap().pending.is_some() {
+                break;
+            }
             if test_mode == "operation-count"
                 && state["processedCount"].as_u64().unwrap_or(0) as usize >= operation_count
             {
@@ -3203,6 +3468,7 @@ async fn materialize_benchmark_state(mut state: Value, resources: Arc<benchmark_
 }
 
 fn persist_benchmark_outputs(state: &Value) -> Result<(), SidecarError> {
+    let state = secret_hygiene::value(state.clone());
     let config = state["config"].as_object().cloned().unwrap_or_default();
     let csv_path = config
         .get("csvOutputPath")
@@ -4399,12 +4665,15 @@ fn emit_structured_log(level: &str, category: &str, message: String, source: &st
         "message": message,
         "source": source,
     });
-    eprintln!("S3_BROWSER_LOG {}", payload);
+    let output = format!("S3_BROWSER_LOG {}", secret_hygiene::value(payload));
+    #[cfg(test)] secret_hygiene::capture(&output);
+    eprintln!("{output}");
 }
 
 fn sanitize_header_value(name: &str, value: &str) -> String {
     let lower = name.to_ascii_lowercase();
-    if lower.contains("authorization")
+    if secret_hygiene::sensitive(name)
+        || lower.contains("authorization")
         || lower.contains("security-token")
         || lower.contains("access-key")
         || lower.contains("secret")
@@ -4412,7 +4681,7 @@ fn sanitize_header_value(name: &str, value: &str) -> String {
     {
         "[redacted]".to_string()
     } else {
-        value.to_string()
+        secret_hygiene::text(value)
     }
 }
 
@@ -4441,12 +4710,17 @@ fn summarize_body(content_type: &str, body: &[u8]) -> String {
     match std::str::from_utf8(body) {
         Ok(text) => {
             let text = text.trim();
+            let text = if let Ok(value) = serde_json::from_str::<Value>(text) {
+                secret_hygiene::value(value).to_string()
+            } else {
+                secret_hygiene::text(text)
+            };
             if text.is_empty() {
                 "null".to_string()
             } else if text.len() > 16000 {
-                format!("{}...(truncated)", &text[..16000])
+                format!("{}...(truncated)", text.chars().take(16000).collect::<String>())
             } else {
-                text.to_string()
+                text
             }
         }
         Err(_) => "[omitted binary body]".to_string(),
@@ -4588,10 +4862,11 @@ where
         .or_else(|| messages.first().cloned())
         .unwrap_or_else(|| "Unknown engine error.".to_string());
     let lowered = message.to_ascii_lowercase();
-    let details = json!({
+    let mut details = json!({
         "awsCode": code,
         "errorChain": messages,
     });
+    if let Some(hint) = object_encryption::hint(&code, &messages.join(" ")) { details["encryptionHint"] = json!(hint); }
     match code.as_str() {
         "AccessDenied" | "InvalidAccessKeyId" | "SignatureDoesNotMatch" => {
             SidecarError::with_details("auth_failed", message, details)
@@ -4772,6 +5047,7 @@ mod advanced_regressions {
                 1,
                 3,
                 &progress,
+                &Encryption::default(),
             ),
         )
         .await

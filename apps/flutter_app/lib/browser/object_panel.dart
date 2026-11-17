@@ -10,6 +10,17 @@ import 'empty_bucket_state.dart';
 import '../utils/format.dart';
 import '../widgets/app_menu.dart';
 
+/// Friendly labels paired with untouched navigation prefixes.
+List<({String label, String prefix})> objectPrefixBreadcrumbs(String prefix) {
+  final crumbs = <({String label, String prefix})>[];
+  final segments = RegExp(r'[^/]+').allMatches(prefix);
+  for (final segment in segments) {
+    final end = segment.end < prefix.length ? segment.end + 1 : segment.end;
+    crumbs.add((label: segment.group(0)!, prefix: prefix.substring(0, end)));
+  }
+  return crumbs;
+}
+
 class ObjectPanel extends StatefulWidget {
   const ObjectPanel(
       {super.key,
@@ -20,7 +31,8 @@ class ObjectPanel extends StatefulWidget {
       required this.onInspector,
       required this.onContextMenu});
   final AppController controller;
-  final VoidCallback onUpload, onDelete, onCreatePrefix, onInspector;
+  final ValueChanged<BuildContext> onUpload;
+  final VoidCallback onDelete, onCreatePrefix, onInspector;
   final Future<void> Function(ObjectEntry, Rect) onContextMenu;
 
   @override
@@ -101,7 +113,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
   }
 
   AppController get controller => widget.controller;
-  VoidCallback get onUpload => widget.onUpload;
+  ValueChanged<BuildContext> get onUpload => widget.onUpload;
   VoidCallback get onDelete => widget.onDelete;
   VoidCallback get onCreatePrefix => widget.onCreatePrefix;
   VoidCallback get onInspector => widget.onInspector;
@@ -246,7 +258,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
                                       c.objectFilterError == null
                                   ? EmptyBucketState(
                                       destination:
-                                          '${c.selectedBucket!.name}/${c.currentPrefix}',
+                                          '${c.selectedBucket!.name}/${c.visiblePrefix(c.currentPrefix)}',
                                       isRoot: c.currentPrefix.isEmpty,
                                       onUpload:
                                           c.isBusy('upload') ? null : onUpload,
@@ -268,25 +280,34 @@ class _ObjectPanelState extends State<ObjectPanel> {
                                                   : c.objects.isEmpty
                                                       ? 'Upload files to get started.'
                                                       : 'Change the filter or load more keys.',
-                                          action: TextButton(
-                                              onPressed:
-                                                  c.selectedProfile == null
-                                                      ? () => c.selectTab(
-                                                          WorkspaceTab.settings)
-                                                      : !hasBucket
-                                                          ? c.refreshBuckets
-                                                          : c.objects.isEmpty
-                                                              ? onUpload
-                                                              : _clearSearch,
-                                              child: Text(c.selectedProfile ==
-                                                      null
-                                                  ? 'Create profile'
-                                                  : !hasBucket
-                                                      ? 'Refresh buckets'
-                                                      : c.objects.isEmpty
-                                                          ? 'Upload files'
-                                                          : 'Clear filter')))
+                                          action: Builder(
+                                              builder: (buttonContext) =>
+                                                  TextButton(
+                                                      onPressed: c.selectedProfile ==
+                                                              null
+                                                          ? () => c.selectTab(
+                                                              WorkspaceTab
+                                                                  .settings)
+                                                          : !hasBucket
+                                                              ? c.refreshBuckets
+                                                              : c.objects
+                                                                      .isEmpty
+                                                                  ? () => onUpload(
+                                                                      buttonContext)
+                                                                  : _clearSearch,
+                                                      child: Text(c
+                                                                  .selectedProfile ==
+                                                              null
+                                                          ? 'Create profile'
+                                                          : !hasBucket
+                                                              ? 'Refresh buckets'
+                                                              : c.objects.isEmpty
+                                                                  ? 'Upload files'
+                                                                  : 'Clear filter'))))
                                       : ObjectTable(
+                                          visibleNameFor: c.visibleObjectName,
+                                          visibleKeyFor: c.visibleObjectKey,
+                                          isClientEncrypted: c.isClientEncrypted,
                                           objects: objects,
                                           selectedKey: c.selectedObject?.key,
                                           selectedKeys: c.objectSelection.keys,
@@ -303,13 +324,10 @@ class _ObjectPanelState extends State<ObjectPanel> {
                                               c.setObjectSortField(field);
                                             }
                                           },
-                                          onToggle: (o, range) =>
-                                              c.toggleObjectSelection(o,
-                                                  range: range),
+                                          onToggle: (o, range) => c.toggleObjectSelection(o, range: range),
                                           contentTypeFor: c.objectContentType,
                                           onSelect: c.setSelectedObject,
-                                          onShowContextMenu:
-                                              widget.onContextMenu)),
+                                          onShowContextMenu: widget.onContextMenu)),
                       // The listing summary only means something once a
                       // bucket is open.
                       if (hasBucket) ...[
@@ -526,10 +544,14 @@ class _ObjectPanelState extends State<ObjectPanel> {
       {required bool hasBucket, required bool busy}) {
     final c = controller;
     return Row(mainAxisSize: MainAxisSize.min, children: [
-      FilledButton.icon(
-          onPressed: hasBucket && !c.isBusy('upload') ? onUpload : null,
-          icon: const Icon(Icons.upload_file),
-          label: const Text('Upload')),
+      Builder(
+          builder: (buttonContext) => FilledButton.icon(
+              key: const ValueKey('object-upload-button'),
+              onPressed: hasBucket && !c.isBusy('upload')
+                  ? () => onUpload(buttonContext)
+                  : null,
+              icon: const Icon(Icons.upload_file),
+              label: const Text('Upload'))),
       const SizedBox(width: 8),
       MergeSemantics(
           child: Semantics(
@@ -564,11 +586,16 @@ class _ObjectPanelState extends State<ObjectPanel> {
       final bytes = c.selectedObjectBytes;
       label = '${keys.length} selected · ${formatBytes(bytes)}';
     } else {
-      label = object!.name;
+      label = c.visibleObjectName(object!);
     }
     final single = keys.isEmpty && object != null && !object.isFolder;
+    final encryptedSelection = keys.isNotEmpty
+        ? keys
+            .any((key) => key.endsWith('.age') && c.clientRuleFor(key) != null)
+        : object != null && c.isClientEncrypted(object);
     final canDownload = keys.isNotEmpty || single;
     final canShare = single &&
+        c.profileCapability('object.presign') &&
         c.selectedProfile?.endpointType != EndpointProfileType.azureBlob;
     return DecoratedBox(
         decoration: BoxDecoration(
@@ -592,6 +619,13 @@ class _ObjectPanelState extends State<ObjectPanel> {
                           color: theme.colorScheme.onPrimaryContainer,
                           fontWeight: FontWeight.w700))),
               const SizedBox(width: 10),
+              if (encryptedSelection)
+                IconButton(
+                    tooltip: 'Download encrypted copy',
+                    icon: const Icon(Icons.lock_outline),
+                    onPressed: c.isBusy('download')
+                        ? null
+                        : () => c.startSampleDownload(encryptedCopy: true)),
               if (labeled) ...[
                 OutlinedButton.icon(
                     onPressed: canDownload && !c.isBusy('download')
@@ -643,8 +677,7 @@ class _ObjectPanelState extends State<ObjectPanel> {
   Widget _breadcrumbBar(BuildContext context, {required bool hasBucket}) {
     final c = controller;
     final theme = Theme.of(context);
-    final parts =
-        c.currentPrefix.split('/').where((p) => p.isNotEmpty).toList();
+    final parts = objectPrefixBreadcrumbs(c.currentPrefix);
     final separator = Text('/',
         style: theme.textTheme.titleSmall
             ?.copyWith(color: theme.colorScheme.onSurfaceVariant));
@@ -677,9 +710,13 @@ class _ObjectPanelState extends State<ObjectPanel> {
                         padding: const EdgeInsets.symmetric(horizontal: 6)),
                     onPressed: i == parts.length - 1
                         ? null
-                        : () => c.refreshObjects(
-                            prefix: '${parts.take(i + 1).join('/')}/'),
-                    child: Text(parts[i],
+                        : () => c.refreshObjects(prefix: parts[i].prefix),
+                    child: Text(
+                        c
+                            .visiblePrefix(parts[i].prefix)
+                            .replaceFirst(RegExp(r'/$'), '')
+                            .split('/')
+                            .last,
                         style: i == parts.length - 1
                             ? theme.textTheme.titleSmall?.copyWith(
                                 color: theme.colorScheme.onSurface,

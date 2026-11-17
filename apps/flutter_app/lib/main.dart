@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 
 import 'app/s3_browser_app.dart';
 import 'services/app_bootstrap.dart';
+import 'controllers/app_controller.dart';
+import 'theme/app_theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -37,23 +39,77 @@ Future<void> main() async {
     );
   };
 
-  try {
-    final controller = await AppBootstrap.initialize();
-    runApp(S3BrowserApp(controller: controller));
-  } catch (error, stack) {
-    runApp(
-      MaterialApp(
-        home: Scaffold(
-          body: Center(
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: SelectableText(
-                'Failed to start the app.\n\n$error\n\n$stack',
-                style: const TextStyle(color: Colors.red, fontSize: 13),
-                textAlign: TextAlign.center,
-              ),
-            ),
-          ),
+  runApp(const BootstrapApp());
+}
+
+/// Paint a window before platform I/O or a Keychain authorization can begin.
+class BootstrapApp extends StatefulWidget {
+  const BootstrapApp({super.key, this.initialize = AppBootstrap.initialize});
+
+  final Future<AppController> Function() initialize;
+
+  @override
+  State<BootstrapApp> createState() => _BootstrapAppState();
+}
+
+class _BootstrapAppState extends State<BootstrapApp> {
+  AppController? _controller;
+  Object? _error;
+  StackTrace? _stack;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _start();
+    });
+  }
+
+  Future<void> _start() async {
+    try {
+      final controller = await widget.initialize();
+      if (!mounted) {
+        controller.dispose();
+        return;
+      }
+      setState(() => _controller = controller);
+    } catch (error, stack) {
+      if (!mounted) return;
+      setState(() {
+        _error = error;
+        _stack = stack;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = _controller;
+    if (controller != null) return S3BrowserApp(controller: controller);
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      theme: AppTheme.light(
+        scalePercent: 100,
+        desktopCompact: AppTheme.isDesktopPlatform(defaultTargetPlatform),
+      ),
+      home: Scaffold(
+        body: Center(
+          child: _error == null
+              ? const Text('Loading…')
+              : Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: SelectableText(
+                    'Failed to start the app.\n\n$_error\n\n$_stack',
+                    style: const TextStyle(color: Colors.red, fontSize: 13),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
         ),
       ),
     );

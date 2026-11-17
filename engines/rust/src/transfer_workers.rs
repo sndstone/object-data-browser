@@ -21,7 +21,12 @@ where
     let mut next = 0;
     loop {
         while next < count && tasks.len() < limit {
-            tasks.spawn(task(next));
+            let secrets = crate::secret_hygiene::SECRETS.try_with(Clone::clone).unwrap_or_default();
+            let future = crate::secret_hygiene::SECRETS.scope(secrets, task(next));
+            #[cfg(test)]
+            let future = crate::secret_hygiene::CAPTURE.scope(
+                crate::secret_hygiene::CAPTURE.try_with(Clone::clone).unwrap_or_default(), future);
+            tasks.spawn(future);
             next += 1;
         }
         match tasks.join_next().await {

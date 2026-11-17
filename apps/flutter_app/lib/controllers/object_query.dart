@@ -9,6 +9,7 @@ class ObjectQuery {
   final void Function(String? error) onChanged;
   Object? _signature;
   List<ObjectEntry>? _input;
+  List<String>? _visibleInput;
   List<ObjectEntry> _result = const [];
   Isolate? _worker;
   ReceivePort? _port;
@@ -20,26 +21,31 @@ class ObjectQuery {
   bool _disposed = false;
 
   List<ObjectEntry> resolve(List<ObjectEntry> objects, BrowserFilterMode mode,
-      String value, BrowserObjectSortField sort, bool descending) {
-    final signature = (objects, mode, value, sort, descending);
+      String value, BrowserObjectSortField sort, bool descending,
+      {List<String>? visibleKeys}) {
+    final signature = (objects, mode, value, sort, descending, visibleKeys);
     if (_signature == signature) return _result;
     _signature = signature;
     final generation = ++_generation;
-    if (!identical(objects, _input)) {
+    if (!identical(objects, _input) || !identical(visibleKeys, _visibleInput)) {
       _resetWorker();
       _result = const [];
       _input = objects;
+      _visibleInput = visibleKeys;
     }
-    final spec = (objects, mode, value, sort, descending);
     if (mode != BrowserFilterMode.regex && objects.length < 5000) {
       loading = false;
-      return _result = queryObjects(spec);
+      return _result = _queryIndices(_deriveObjects(objects, visibleKeys), mode,
+              value, sort, descending)
+          .map((index) => objects[index])
+          .toList();
     }
     loading = true;
     scheduleMicrotask(() async {
       if (_disposed || generation != _generation) return;
       try {
-        final commands = await (_starting ??= _startWorker(objects));
+        final commands =
+            await (_starting ??= _startWorker(objects, visibleKeys));
         if (_disposed || generation != _generation) return;
         final response = Completer<Object>();
         _pending[generation] = response;
@@ -68,7 +74,8 @@ class ObjectQuery {
     return _result;
   }
 
-  Future<SendPort> _startWorker(List<ObjectEntry> objects) async {
+  Future<SendPort> _startWorker(
+      List<ObjectEntry> objects, List<String>? visibleKeys) async {
     final epoch = _workerEpoch;
     final ready = Completer<SendPort>();
     final port = ReceivePort();
@@ -83,8 +90,8 @@ class ObjectQuery {
         }
       }
     });
-    final worker =
-        await Isolate.spawn(_objectDatasetWorker, (port.sendPort, objects));
+    final worker = await Isolate.spawn(
+        _objectDatasetWorker, (port.sendPort, objects, visibleKeys));
     if (_disposed || epoch != _workerEpoch) {
       worker.kill(priority: Isolate.immediate);
       port.close();
@@ -111,6 +118,16 @@ class ObjectQuery {
     _pending.clear();
   }
 
+  void invalidate() {
+    loading = false;
+    _generation++;
+    _signature = null;
+    _input = null;
+    _visibleInput = null;
+    _result = const [];
+    _resetWorker();
+  }
+
   void dispose() {
     _disposed = true;
     _generation++;
@@ -118,8 +135,9 @@ class ObjectQuery {
   }
 }
 
-void _objectDatasetWorker((SendPort, List<ObjectEntry>) initial) {
-  final data = _deriveObjects(initial.$2);
+void _objectDatasetWorker(
+    (SendPort, List<ObjectEntry>, List<String>?) initial) {
+  final data = _deriveObjects(initial.$2, initial.$3);
   final commands = ReceivePort();
   initial.$1.send(commands.sendPort);
   commands.listen((message) {
@@ -145,14 +163,19 @@ typedef ObjectQuerySpec = (
   BrowserObjectSortField,
   bool
 );
-typedef _DerivedObject = (int, ObjectEntry, String, String);
-List<_DerivedObject> _deriveObjects(List<ObjectEntry> objects) => [
+typedef _DerivedObject = (int, ObjectEntry, String, String, String);
+List<_DerivedObject> _deriveObjects(List<ObjectEntry> objects,
+        [List<String>? visibleKeys]) =>
+    [
       for (var i = 0; i < objects.length; i++)
         (
           i,
           objects[i],
-          objects[i].name.toLowerCase(),
-          queryContentType(objects[i])
+          (visibleKeys?[i] ?? objects[i].name)
+              .replaceFirst(RegExp(r'/$'), '')
+              .toLowerCase(),
+          queryContentType(objects[i]),
+          visibleKeys?[i] ?? objects[i].key
         )
     ];
 
@@ -164,11 +187,12 @@ List<int> _queryIndices(List<_DerivedObject> data, BrowserFilterMode mode,
   final query = value.toLowerCase();
   final result = data
       .where((entry) =>
-          mode == BrowserFilterMode.prefix ||
           query.isEmpty ||
           (regex != null
-              ? regex.hasMatch(entry.$2.key)
-              : entry.$2.key.toLowerCase().contains(query)))
+              ? regex.hasMatch(entry.$5)
+              : mode == BrowserFilterMode.prefix
+                  ? entry.$5.startsWith(value)
+                  : entry.$5.toLowerCase().contains(query)))
       .toList();
   result.sort((a, b) {
     if (a.$2.isFolder != b.$2.isFolder) return a.$2.isFolder ? -1 : 1;
@@ -207,14 +231,16 @@ class VersionQuery {
   bool loading = false;
 
   List<ObjectVersionEntry> resolve(
-      List<ObjectVersionEntry> versions, VersionBrowserOptions options) {
+      List<ObjectVersionEntry> versions, VersionBrowserOptions options,
+      {List<String>? visibleKeys}) {
     final signature = (
       versions,
       versions.length,
       options.filterMode,
       options.filterValue,
       options.showDeleteMarkers,
-      options.showVersions
+      options.showVersions,
+      visibleKeys
     );
     if (_signature == signature) return _result;
     final datasetChanged = !identical(_input, versions);
@@ -227,7 +253,7 @@ class VersionQuery {
     if (options.filterMode != BrowserFilterMode.regex ||
         options.filterValue.trim().isEmpty) {
       loading = false;
-      return _result = _filterVersions(versions, options);
+      return _result = _filterVersions(versions, options, visibleKeys);
     }
     loading = true;
     scheduleMicrotask(() async {
@@ -236,8 +262,8 @@ class VersionQuery {
       _port = port;
       Isolate? worker;
       try {
-        worker = await Isolate.spawn(
-            _versionWorker, (port.sendPort, versions.toList(), options));
+        worker = await Isolate.spawn(_versionWorker,
+            (port.sendPort, versions.toList(), options, visibleKeys));
         if (_disposed || generation != _generation) return;
         _worker = worker;
         final message = await port.first.timeout(const Duration(seconds: 2));
@@ -263,6 +289,16 @@ class VersionQuery {
     return _result;
   }
 
+  void invalidate() {
+    loading = false;
+    _generation++;
+    _signature = null;
+    _input = null;
+    _result = const [];
+    _worker?.kill(priority: Isolate.immediate);
+    _port?.close();
+  }
+
   void dispose() {
     _disposed = true;
     _generation++;
@@ -272,34 +308,44 @@ class VersionQuery {
 }
 
 List<ObjectVersionEntry> _filterVersions(
-    List<ObjectVersionEntry> versions, VersionBrowserOptions options) {
+    List<ObjectVersionEntry> versions, VersionBrowserOptions options,
+    [List<String>? visibleKeys]) {
   final value = options.filterValue.trim();
   final regex =
       options.filterMode == BrowserFilterMode.regex && value.isNotEmpty
           ? RegExp(value, caseSensitive: false)
           : null;
   final query = value.toLowerCase();
+  var index = -1;
   return versions.where((item) {
+    index++;
+    final key = visibleKeys?[index] ?? item.key;
     if ((!options.showDeleteMarkers && item.deleteMarker) ||
         (!options.showVersions && !item.deleteMarker)) {
       return false;
     }
     if (value.isEmpty) return true;
     if (regex != null) {
-      return regex.hasMatch(item.key) || regex.hasMatch(item.versionId);
+      return regex.hasMatch(key) || regex.hasMatch(item.versionId);
     }
     if (options.filterMode == BrowserFilterMode.prefix) {
-      return item.key.startsWith(value);
+      return key.startsWith(value);
     }
-    return item.key.toLowerCase().contains(query) ||
+    return key.toLowerCase().contains(query) ||
         item.versionId.toLowerCase().contains(query);
   }).toList();
 }
 
 void _versionWorker(
-    (SendPort, List<ObjectVersionEntry>, VersionBrowserOptions) message) {
+    (
+      SendPort,
+      List<ObjectVersionEntry>,
+      VersionBrowserOptions,
+      List<String>?
+    ) message) {
   try {
-    final filtered = _filterVersions(message.$2, message.$3).toSet();
+    final filtered =
+        _filterVersions(message.$2, message.$3, message.$4).toSet();
     message.$1.send([
       for (var i = 0; i < message.$2.length; i++)
         if (filtered.contains(message.$2[i])) i

@@ -194,7 +194,8 @@ void main() {
         'cancelled');
   });
   test('settings include performance and preserve old deep links', () {
-    expect(settingsSections.length, 7);
+    expect(settingsSections.length, 8);
+    expect(settingsSections, contains('Encryption'));
     expect(settingsSections, contains('Performance'));
     expect(canonicalSettingsSection('General'), 'Connections');
     expect(canonicalSettingsSection('Downloads & Temp Storage'),

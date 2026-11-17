@@ -1,3 +1,8 @@
+import 'google_service_account_editor.dart';
+import '../models/google_service_account.dart';
+import 'client_encryption_editor.dart';
+import 'encryption_settings.dart';
+import 'upload_encryption_editor.dart';
 import 'settings_sections.dart';
 import 'dart:async';
 import '../widgets/setting_fields.dart';
@@ -6,6 +11,7 @@ import '../widgets/danger_button.dart';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'dart:convert';
 import 'package:flutter/services.dart';
@@ -14,6 +20,7 @@ import 'package:share_plus/share_plus.dart';
 import '../app/version_details.dart';
 import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
+import '../models/provider_templates.dart';
 import '../theme/app_motion.dart';
 import '../services/app_platform.dart';
 import '../widgets/app_select_field.dart';
@@ -43,6 +50,8 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
   static const _sectionDescriptions = {
     'Connections':
         'Endpoint profiles and credentials. Exports never include secrets.',
+    'Encryption':
+        'Optional: a passphrase-protected key file, its keys and key-file sync. Nothing here is on until you set it up.',
     'General': 'Startup preferences and application behavior.',
     'Transfers': 'Upload sizing, concurrency and retry behavior.',
     'Performance': 'Balance memory, responsiveness and warm engine startup.',
@@ -80,6 +89,16 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
           220 * MediaQuery.textScalerOf(context).scale(14) / 14;
       final wide = constraints.maxWidth >= navigationWidth + 650;
       final rawSections = <_SettingsSection>[
+        _SettingsSection(
+          'Encryption',
+          Icons.key_outlined,
+          'Optional provider encryption and a portable, passphrase-protected key file.',
+          () => _section(
+            context,
+            title: 'Encryption',
+            children: () => [EncryptionSettings(controller: controller)],
+          ),
+        ),
         _SettingsSection(
             'General',
             Icons.settings_outlined,
@@ -136,7 +155,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                       if (constraints.maxWidth < 560) {
                         return Column(children: [
                           engine,
-                          const SizedBox(height: 12),
+                          const SizedBox(height: 18),
                           endpoint
                         ]);
                       }
@@ -171,13 +190,13 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                                       '${controller.settings.downloadPath}${Platform.pathSeparator}s3-browser-profiles.json';
                                   final exportPath = isMobile
                                       ? defaultPath
-                                      : (await FilePicker.platform.saveFile(
-                                            dialogTitle: 'Export profiles',
-                                            fileName: defaultPath
-                                                .split(Platform.pathSeparator)
-                                                .last,
-                                          ) ??
-                                          defaultPath);
+                                      : await FilePicker.platform.saveFile(
+                                          dialogTitle: 'Export profiles',
+                                          fileName: defaultPath
+                                              .split(Platform.pathSeparator)
+                                              .last,
+                                        );
+                                  if (exportPath == null) return;
                                   await controller
                                       .exportProfilesToPath(exportPath);
                                   if (Platform.isIOS && context.mounted) {
@@ -242,14 +261,14 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                         ),
                       ],
                     ),
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 18),
                     Text(
                       'Exports contain endpoint settings only, never credentials. Keys in an imported file move into secure storage.',
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
                           color:
                               Theme.of(context).colorScheme.onSurfaceVariant),
                     ),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 18),
                     if (controller.profiles.isEmpty)
                       const ListTile(
                         contentPadding: EdgeInsets.zero,
@@ -312,11 +331,12 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                 children: () => [
                       const Text(
                           'Lower listing limits release rows sooner; all objects remain available through the next window.'),
-                      const SizedBox(height: 12),
+                      const SizedBox(height: 18),
                       _pairedFields(
                           context,
                           _numberField(
-                              label: 'Progress update interval (ms)',
+                              label: 'Progress interval',
+                              helper: 'Milliseconds between progress updates.',
                               min: 50,
                               max: 2000,
                               initialValue:
@@ -326,7 +346,8 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                                       performance: settings.performance
                                           .copyWith(progressIntervalMs: v)))),
                           _numberField(
-                              label: 'Objects per listing window',
+                              label: 'Listing window',
+                              helper: 'Objects retained per listing window.',
                               min: 1000,
                               max: 100000,
                               initialValue:
@@ -337,12 +358,13 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                                           .copyWith(
                                               listingWindowObjects: v))))),
                       if (AppPlatform.isDesktop) ...[
-                        const SizedBox(height: 12),
+                        const SizedBox(height: 18),
                         _pairedFields(
                             context,
                             _numberField(
-                                label:
-                                    'Idle engine lifetime (seconds, 0 keeps warm)',
+                                label: 'Engine idle time',
+                                helper:
+                                    'Seconds before an idle engine stops; 0 keeps it warm.',
                                 min: 0,
                                 max: 3600,
                                 initialValue:
@@ -352,8 +374,9 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                                         performance: settings.performance
                                             .copyWith(engineIdleSeconds: v)))),
                             _numberField(
-                                label:
-                                    'Server copy observation timeout (seconds)',
+                                label: 'Copy observation',
+                                helper:
+                                    'Seconds to wait while observing a server copy.',
                                 min: 5,
                                 max: 3600,
                                 initialValue:
@@ -364,9 +387,10 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                                             .copyWith(
                                                 copyTimeoutSeconds: v))))),
                       ],
-                      const SizedBox(height: 12),
+                      const SizedBox(height: 18),
                       _numberField(
-                          label: 'Image preview detail (megapixels)',
+                          label: 'Image preview detail',
+                          helper: 'Maximum image preview size in megapixels.',
                           min: 4,
                           max: 64,
                           initialValue:
@@ -375,10 +399,10 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                               settings.copyWith(
                                   performance: settings.performance
                                       .copyWith(imagePreviewMegapixels: v)))),
-                      const SizedBox(height: 8),
+                      const SizedBox(height: 18),
                       const Text(
                           'Higher image limits retain more detail when zooming and use more memory.'),
-                      const SizedBox(height: 12),
+                      const SizedBox(height: 18),
                       const Text(
                           'Longer progress intervals reduce update overhead. Transfer part sizes and connection limits remain available in Transfers & Storage and Connections.'),
                       if (AppPlatform.isDesktop)
@@ -399,31 +423,33 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                           title: const Text('Automatically size upload parts'),
                           subtitle: const Text(
                               'Choose an S3-compliant part size for each file. Disable this to use manual upload parts.')),
-                      const SizedBox(height: 12),
+                      const SizedBox(height: 18),
                       _pairedFields(
                           context,
                           _numberField(
-                              label: 'Multipart threshold (MiB)',
+                              label: 'Multipart threshold',
+                              helper: 'MiB before multipart upload is used.',
                               initialValue: settings.multipartThresholdMiB,
                               onSubmitted: (value) => controller.updateSettings(
                                   settings.copyWith(
                                       multipartThresholdMiB: value))),
                           _numberField(
-                              label: settings.dynamicMultipartSizing
-                                  ? 'Manual chunk size (MiB, downloads and fallback)'
-                                  : 'Manual multipart chunk size (MiB)',
+                              label: 'Manual chunk size',
+                              helper: settings.dynamicMultipartSizing
+                                  ? 'MiB per download chunk and fallback upload part.'
+                                  : 'MiB per download chunk and manual upload part.',
                               min: 5,
                               max: 5120,
                               initialValue: settings.multipartChunkMiB,
                               onSubmitted: (value) => controller.updateSettings(
                                   settings.copyWith(
                                       multipartChunkMiB: value)))),
-                      const SizedBox(height: 12),
-                      Text(controller.selectedProfile?.endpointType !=
-                              EndpointProfileType.azureBlob
+                      const SizedBox(height: 18),
+                      Text(controller.selectedProfile?.endpointType.isS3 !=
+                              false
                           ? 'Files: one at a time. Parallel S3 parts: up to ${(controller.selectedProfile?.maxConcurrentRequests ?? 8).clamp(1, 8)}. Change the limit in connection settings.'
                           : 'Files: one at a time. Parallel parts are managed by this engine.'),
-                      const SizedBox(height: 8),
+                      const SizedBox(height: 18),
                       AppSwitchTile(
                           value: settings.relistObjectsAfterMutation,
                           onChanged: (value) => controller.updateSettings(
@@ -458,7 +484,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                                     downloadConflictPolicy: value));
                               }
                             }),
-                      const SizedBox(height: 8),
+                      const SizedBox(height: 18),
                       const Text(
                           'Downloads are validated before publishing. Failed downloads preserve existing files.'),
                       const SizedBox(height: 16),
@@ -506,13 +532,13 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                       title: const Text('Dark mode'),
                     ),
                     const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 8),
+                        padding: EdgeInsets.symmetric(vertical: 12),
                         child: Text(
-                            'Desktop uses a rail; mobile uses segmented navigation. The browser, benchmark, and settings screens keep the same structure across platforms.')),
+                            'Choose whether object details appear below or to the right of the object panel.')),
                     AppSelectField<BrowserInspectorLayout>(
                       value: settings.browserInspectorLayout,
                       decoration: const InputDecoration(
-                        labelText: 'Browser inspector placement',
+                        labelText: 'Inspector placement',
                       ),
                       items: const [
                         AppSelectItem(
@@ -533,7 +559,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                         );
                       },
                     ),
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 18),
                     AppSettingSlider(
                       title: 'Inspector panel size',
                       subtitle:
@@ -592,10 +618,10 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                   children: () => [
                     const Text(
                         'Credentials are stored securely and excluded from profile exports. A failed save remains session-only until retried successfully.'),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 18),
                     const Text(
                         'Cancellation preserves completed work. Unconfirmed remote changes must be inspected before retrying. Engine restarts do not resume interrupted transfers.'),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 18),
                     const Text(
                         'Transport timeouts and maximum attempts belong to each connection. Benchmark overrides are configured in Benchmark.'),
                   ],
@@ -619,21 +645,22 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                           settings.copyWith(transferConcurrency: value),
                         ),
                       ),
-                      const SizedBox(height: 12),
+                      const SizedBox(height: 18),
                       _numberField(
-                        label: 'Benchmark maximum attempts',
+                        label: 'Maximum attempts',
                         min: 1,
                         max: 100,
                         initialValue: settings.safeRetries,
                         onSubmitted: (value) => controller.updateSettings(
                             settings.copyWith(safeRetries: value)),
                       ),
-                      const SizedBox(height: 12),
-                      phone
+                      const SizedBox(height: 18),
+                      MediaQuery.textScalerOf(context).scale(14) > 18 || phone
                           ? Column(
                               children: [
                                 _numberField(
-                                  label: 'Benchmark connect timeout (s)',
+                                  label: 'Connect timeout',
+                                  helper: 'Connection timeout in seconds.',
                                   initialValue: settings.connectTimeoutSeconds,
                                   onSubmitted: (value) =>
                                       controller.updateSettings(
@@ -641,9 +668,10 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                                         connectTimeoutSeconds: value),
                                   ),
                                 ),
-                                const SizedBox(height: 12),
+                                const SizedBox(height: 18),
                                 _numberField(
-                                  label: 'Benchmark read timeout (s)',
+                                  label: 'Read timeout',
+                                  helper: 'Read timeout in seconds.',
                                   initialValue: settings.readTimeoutSeconds,
                                   onSubmitted: (value) =>
                                       controller.updateSettings(
@@ -657,7 +685,8 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                               children: [
                                 Expanded(
                                   child: _numberField(
-                                    label: 'Benchmark connect timeout (s)',
+                                    label: 'Connect timeout',
+                                    helper: 'Connection timeout in seconds.',
                                     initialValue:
                                         settings.connectTimeoutSeconds,
                                     onSubmitted: (value) =>
@@ -670,7 +699,8 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                                 const SizedBox(width: 12),
                                 Expanded(
                                   child: _numberField(
-                                    label: 'Benchmark read timeout (s)',
+                                    label: 'Read timeout',
+                                    helper: 'Read timeout in seconds.',
                                     initialValue: settings.readTimeoutSeconds,
                                     onSubmitted: (value) =>
                                         controller.updateSettings(
@@ -681,15 +711,16 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                                 ),
                               ],
                             ),
-                      const SizedBox(height: 12),
+                      const SizedBox(height: 18),
                       _numberField(
-                        label: 'Benchmark connection pool',
+                        label: 'Connection pool',
+                        helper: 'Maximum benchmark connections.',
                         initialValue: settings.maxPoolConnections,
                         onSubmitted: (value) => controller.updateSettings(
                           settings.copyWith(maxPoolConnections: value),
                         ),
                       ),
-                      const SizedBox(height: 12),
+                      const SizedBox(height: 18),
                       AppSwitchTile(
                         value: settings.benchmarkChartSmoothing,
                         onChanged: (value) => controller.updateSettings(
@@ -705,11 +736,12 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                         title: const Text('Benchmark debug mode'),
                       ),
                       const Padding(
-                          padding: EdgeInsets.symmetric(vertical: 8),
+                          padding: EdgeInsets.symmetric(vertical: 12),
                           child: Text(
                               'Benchmark mode always uses the currently selected endpoint profile and backend engine from the app header.')),
                       _numberField(
-                        label: 'Benchmark data cache (MB)',
+                        label: 'Data cache',
+                        helper: 'Benchmark cache size in MB.',
                         min: 0,
                         max: 2147483647,
                         initialValue: settings.benchmarkDataCacheMb,
@@ -717,7 +749,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                           settings.copyWith(benchmarkDataCacheMb: value),
                         ),
                       ),
-                      const SizedBox(height: 12),
+                      const SizedBox(height: 18),
                       _textField(
                         label: 'Benchmark log path',
                         initialValue: settings.benchmarkLogPath,
@@ -757,16 +789,19 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                       ),
                       title: const Text('Debug logging in Event Log'),
                     ),
-                    const ListTile(
+                    const SizedBox(height: 18),
+                    ListTile(
                       contentPadding: EdgeInsets.zero,
-                      title: Text('Diagnostic logging'),
+                      title: const Text('Diagnostic logging'),
                       subtitle: Text(
                         'API logging records redacted request and response envelopes. Debug logging adds broader trace details in Event Log.',
+                        style: Theme.of(context).textTheme.bodySmall,
                       ),
                     ),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 18),
                     _numberField(
-                      label: 'Default presign expiration (minutes)',
+                      label: 'Presign expiration',
+                      helper: 'Share link lifetime in minutes.',
                       min: 1,
                       max: 10080,
                       initialValue: settings.defaultPresignMinutes,
@@ -798,14 +833,14 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                       subtitle:
                           Text('$kApplicationVersion ($kApplicationBuild)'),
                     ),
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 18),
                     Text(
                       isMobile
                           ? 'Mobile app dependencies'
                           : 'Flutter dependencies',
                       style: Theme.of(context).textTheme.titleMedium,
                     ),
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 18),
                     ...dependencyVersions.entries.map(
                       (entry) => ListTile(
                         dense: true,
@@ -820,7 +855,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                         isMobile ? 'Mobile engines' : 'Bundled engines',
                         style: Theme.of(context).textTheme.titleMedium,
                       ),
-                      const SizedBox(height: 8),
+                      const SizedBox(height: 18),
                       ...bundledComponentVersions.entries.map(
                         (entry) => ListTile(
                           dense: true,
@@ -937,8 +972,10 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
       LayoutBuilder(builder: (context, constraints) {
         final scale = MediaQuery.textScalerOf(context).scale(14) / 14;
         return constraints.maxWidth < 560 * (scale < 1 ? 1 : scale)
-            ? Column(children: [leading, const SizedBox(height: 12), trailing])
-            : Row(children: [
+            ? Column(children: [leading, const SizedBox(height: 18), trailing])
+            // Top-aligned: helper texts of different lengths must not push
+            // one field lower than its neighbour.
+            : Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 Expanded(child: leading),
                 const SizedBox(width: 12),
                 Expanded(child: trailing)
@@ -985,7 +1022,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
                               _ => title
                             },
                             style: theme.textTheme.titleMedium),
-                        const SizedBox(height: 8),
+                        const SizedBox(height: 18),
                       ],
                       ...children(),
                     ],
@@ -1015,7 +1052,7 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
           Text(title, style: theme.textTheme.headlineSmall),
           const SizedBox(height: 6),
           Text(description, style: theme.textTheme.bodyMedium),
-          if (!wide) const SizedBox(height: 12),
+          if (!wide) const SizedBox(height: 18),
           if (!wide)
             AppSelectField<String>(
                 value: _sectionName,
@@ -1049,12 +1086,14 @@ class _SettingsWorkspaceState extends State<SettingsWorkspace> {
       {required String label,
       required int initialValue,
       required FutureOr<Object?> Function(int) onSubmitted,
+      String? helper,
       int min = 1,
       int max = 2147483647}) {
     return SettingNumberField(
         key: ValueKey(label),
         label: label,
         value: initialValue,
+        helper: helper,
         min: min,
         max: max,
         onCommit: onSubmitted);
@@ -1093,6 +1132,11 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   late final TextEditingController _readTimeoutController;
   late final TextEditingController _notesController;
   late EndpointProfileType _endpointType;
+  String? _providerTemplateId;
+  bool _awsEndpointEditable = false;
+  final _providerInputs = <String, TextEditingController>{};
+  ObjectEncryption? _uploadEncryption;
+  List<ClientEncryptionRule> _clientEncryptionRules = const [];
   late ConnectionOptions _connection;
   late int _connectionLimit;
   late int _maxAttempts;
@@ -1192,6 +1236,20 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
     }
     if (oldWidget.profile != widget.profile &&
         !_saving &&
+        widget.controller.profileDrafts.containsKey(widget.profile.id)) {
+      // A draft is open and the profile was saved elsewhere (bucket dialog,
+      // Settings → Encryption). Keep the draft, but take over encryption it
+      // did not edit so saving it cannot silently switch encryption off.
+      if (_uploadEncryption == oldWidget.profile.uploadEncryption) {
+        _uploadEncryption = widget.profile.uploadEncryption;
+      }
+      if (listEquals(
+          _clientEncryptionRules, oldWidget.profile.clientEncryptionRules)) {
+        _clientEncryptionRules = widget.profile.clientEncryptionRules;
+      }
+    }
+    if (oldWidget.profile != widget.profile &&
+        !_saving &&
         !widget.controller.profileDrafts.containsKey(widget.profile.id)) {
       _syncingProfile = true;
       widget.onDraftChanged(null);
@@ -1210,7 +1268,10 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
       _syncText(_readTimeoutController, '${widget.profile.readTimeoutSeconds}');
       _syncText(_notesController, widget.profile.notes ?? '');
       _endpointType = widget.profile.endpointType;
+      _loadProviderInputs(widget.profile);
       _connection = widget.profile.connection;
+      _uploadEncryption = widget.profile.uploadEncryption;
+      _clientEncryptionRules = widget.profile.clientEncryptionRules;
       _connectionLimit = widget.profile.maxConcurrentRequests;
       _maxAttempts = widget.profile.maxAttempts;
       _pathStyle = widget.profile.pathStyle;
@@ -1226,6 +1287,8 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
 
   void _syncFromProfile() {
     final profile = widget.initialDraft ?? widget.profile;
+    _uploadEncryption = profile.uploadEncryption;
+    _clientEncryptionRules = profile.clientEncryptionRules;
     _nameController = TextEditingController(text: profile.name);
     _endpointController = TextEditingController(text: profile.endpointUrl);
     _regionController = TextEditingController(text: profile.region);
@@ -1241,6 +1304,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
     );
     _notesController = TextEditingController(text: profile.notes ?? '');
     _endpointType = profile.endpointType;
+    _loadProviderInputs(profile);
     _connection = profile.connection;
     _pathStyle = profile.pathStyle;
     _useHttps = endpointUsesHttps(
@@ -1305,6 +1369,16 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
 
   void _setEndpointType(EndpointProfileType value) {
     setState(() {
+      if (_endpointType != value &&
+          (value.isGoogleCloudStorage || _endpointType.isGoogleCloudStorage)) {
+        _secretKeyController.clear();
+        _accessKeyController.clear();
+        _sessionTokenController.clear();
+        _connection = const ConnectionOptions();
+        _uploadEncryption = null;
+        _endpointController.clear();
+        _regionController.clear();
+      }
       _endpointType = value;
       final azureAuth = _connection.authMode.startsWith('azure');
       if ((value == EndpointProfileType.azureBlob && !azureAuth) ||
@@ -1318,12 +1392,86 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
         if (_regionController.text.trim().isEmpty) {
           _regionController.text = 'us-east-1';
         }
-      } else if (_endpointType == EndpointProfileType.azureBlob) {
+      } else if (_endpointType == EndpointProfileType.azureBlob ||
+          _endpointType.isGoogleCloudStorage) {
         _useHttps = true;
         _verifyTls = true;
         _pathStyle = false;
       }
     });
+  }
+
+  ProviderTemplate? get _providerTemplate =>
+      providerTemplateById(_providerTemplateId);
+
+  void _clearProviderInputs() {
+    for (final input in _providerInputs.values) {
+      input.dispose();
+    }
+    _providerInputs.clear();
+  }
+
+  void _loadProviderInputs(EndpointProfile profile) {
+    _clearProviderInputs();
+    _providerTemplateId = providerTemplateById(profile.providerTemplateId)?.id;
+    _awsEndpointEditable = profile.useCustomAwsEndpoint;
+    final template = _providerTemplate;
+    if (template == null) return;
+    final values = providerPlaceholderValues(
+      template,
+      profile.endpointUrl,
+      profile.region,
+    );
+    for (final placeholder in template.placeholders) {
+      _providerInputs[placeholder.name] = TextEditingController(
+        text: values[placeholder.name] ?? placeholder.defaultValue,
+      );
+    }
+  }
+
+  void _applyProviderInputs() {
+    final template = _providerTemplate;
+    if (template == null) return;
+    final expanded = expandProviderTemplate(template, {
+      for (final input in _providerInputs.entries) input.key: input.value.text,
+    });
+    _pathStyle = expanded.pathStyle;
+    _regionController.text = expanded.region;
+    _endpointController.text = expanded.endpointUrl;
+  }
+
+  void _selectProvider(String? id) {
+    final template = providerTemplateById(id);
+    _syncingProfile = true;
+    try {
+      if (template != null) _setEndpointType(template.endpointType);
+      setState(() {
+        _clearProviderInputs();
+        _providerTemplateId = template?.id;
+        if (template == null) return; // Custom keeps the current fields.
+        _awsEndpointEditable =
+            template.endpointType == EndpointProfileType.awsS3;
+        for (final placeholder in template.placeholders) {
+          _providerInputs[placeholder.name] = TextEditingController(
+            text: placeholder.defaultValue,
+          );
+        }
+        _applyProviderInputs();
+      });
+    } finally {
+      _syncingProfile = false;
+    }
+    _publishDraft();
+  }
+
+  void _providerInputChanged(String _) {
+    _syncingProfile = true;
+    try {
+      setState(_applyProviderInputs);
+    } finally {
+      _syncingProfile = false;
+    }
+    _publishDraft();
   }
 
   void _setUseHttps(bool value) {
@@ -1336,12 +1484,16 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   }
 
   String get _normalizedEndpointPreview {
-    if (_endpointType == EndpointProfileType.awsS3) {
+    if (_endpointType == EndpointProfileType.awsS3 && !_awsEndpointEditable) {
       return awsEndpointForRegion(_regionController.text);
     }
     if (_endpointType == EndpointProfileType.azureBlob &&
         _endpointController.text.trim().isEmpty) {
       return azureEndpointForAccount(_accessKeyController.text);
+    }
+    if (_endpointType.isGoogleCloudStorage &&
+        _endpointController.text.trim().isEmpty) {
+      return 'https://storage.googleapis.com';
     }
     return normalizeEndpointUrl(
       _endpointController.text,
@@ -1361,11 +1513,22 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
     return normalizeEndpointProfile(
       EndpointProfile(
         id: widget.profile.id,
+        clientEncryptionRules: _clientEncryptionRules,
+        uploadEncryption: !_endpointType.isGoogleCloudStorage &&
+                _uploadEncryption != null &&
+                _uploadEncryption!.mode.isAzure == _endpointType.isAzure
+            ? _uploadEncryption
+            : null,
         name: _nameController.text.trim(),
         endpointUrl: switch (_endpointType) {
-          EndpointProfileType.awsS3 =>
-            awsEndpointForRegion(_regionController.text),
-          EndpointProfileType.azureBlob =>
+          EndpointProfileType.awsS3 => _awsEndpointEditable
+              ? normalizeEndpointUrl(
+                  _endpointController.text,
+                  preferHttps: true,
+                )
+              : awsEndpointForRegion(_regionController.text),
+          EndpointProfileType.azureBlob ||
+          EndpointProfileType.googleCloudStorage =>
             _endpointController.text.trim().isEmpty
                 ? ''
                 : normalizeEndpointUrl(
@@ -1379,7 +1542,9 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
         },
         region: _regionController.text.trim(),
         accessKey: _accessKeyController.text.trim(),
-        secretKey: _secretKeyController.text.trim(),
+        secretKey: _endpointType.isGoogleCloudStorage
+            ? _secretKeyController.text
+            : _secretKeyController.text.trim(),
         sessionToken: (_sessionTokenController.text.trim().isEmpty)
             ? null
             : _sessionTokenController.text.trim(),
@@ -1390,6 +1555,9 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
             ? true
             : (_useHttps && _verifyTls),
         endpointType: _endpointType,
+        providerTemplateId: _providerTemplateId,
+        useCustomAwsEndpoint:
+            _endpointType == EndpointProfileType.awsS3 && _awsEndpointEditable,
         connectTimeoutSeconds:
             int.tryParse(_connectTimeoutController.text.trim()) ?? 5,
         readTimeoutSeconds:
@@ -1411,9 +1579,17 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
 
   bool _looksConfigured(EndpointProfile profile) {
     final hasEndpoint = profile.endpointType == EndpointProfileType.awsS3 ||
+        profile.endpointType.isGoogleCloudStorage ||
         profile.endpointUrl.trim().isNotEmpty ||
         (profile.endpointType == EndpointProfileType.azureBlob &&
             profile.accessKey.trim().isNotEmpty);
+    if (profile.endpointType.isGoogleCloudStorage) {
+      try {
+        GoogleServiceAccount.parse(profile.secretKey);
+      } on FormatException {
+        return false;
+      }
+    }
     final credentialsReady = switch (profile.connection.authMode) {
       'static' => profile.accessKey.trim().isNotEmpty &&
           profile.secretKey.trim().isNotEmpty,
@@ -1430,6 +1606,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
   void dispose() {
     _draftReady = false;
     _revealTimer?.cancel();
+    _clearProviderInputs();
     _endpointController.removeListener(_handleEndpointInputChanged);
     _accessKeyController.removeListener(_handleAccessKeyChanged);
     _editorExpansion.dispose();
@@ -1480,10 +1657,11 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
 
     return Card(
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        padding: const EdgeInsets.all(12),
         child: ExpansionTile(
           controller: _editorExpansion,
           initiallyExpanded: _expanded,
+          tilePadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
           // Form rows and the action bar align with the field edges instead
           // of ExpansionTile's default centring.
           expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1502,12 +1680,20 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
           ),
           subtitle:
               Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(
+            Tooltip(
+              message: _normalizedEndpointPreview,
+              child: Text(
                 _normalizedEndpointPreview.isEmpty
                     ? 'Connection details not configured yet.'
                     : _normalizedEndpointPreview,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis),
+                style: Theme.of(context).textTheme.bodySmall,
+                maxLines: _normalizedEndpointPreview.isEmpty ? null : 2,
+                overflow: _normalizedEndpointPreview.isEmpty
+                    ? TextOverflow.visible
+                    : TextOverflow.ellipsis,
+              ),
+            ),
+            const SizedBox(height: 8),
             Wrap(
               spacing: 8,
               crossAxisAlignment: WrapCrossAlignment.center,
@@ -1548,17 +1734,18 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
           childrenPadding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
           children: [
             if (!widget.controller.supportsProfile(_buildProfile()))
-              const ListTile(
-                  leading: Icon(Icons.info_outline),
-                  title: Text('This engine does not support Azure.'),
-                  subtitle: Text(
-                      'Select Python or Go on desktop before testing or activating this connection.')),
+              ListTile(
+                  leading: const Icon(Icons.info_outline),
+                  title: Text(
+                    widget.controller.profileSupportReason(_buildProfile()),
+                  )),
             if (!AppPlatform.isMobile &&
                 !widget.controller.supportsProfile(_buildProfile()))
               Wrap(spacing: 8, children: [
                 for (final engine in widget.controller.engines)
                   if (engine.available &&
-                      const {'python', 'go'}.contains(engine.id))
+                      widget.controller.supportsProfile(_buildProfile(),
+                          engineId: engine.id))
                     TextButton(
                         onPressed: () => widget.controller.setEngine(engine.id),
                         child: Text('Switch to ${engine.label}')),
@@ -1567,7 +1754,90 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
               controller: _nameController,
               decoration: const InputDecoration(labelText: 'Profile name'),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 18),
+            // The provider choice drives the fields below it, so it stays in
+            // view rather than inside a collapsed group.
+            AppSelectField<String>(
+              key: ValueKey('provider-${widget.profile.id}'),
+              value: _providerTemplateId ?? '',
+              decoration: const InputDecoration(labelText: 'Provider'),
+              items: [
+                const AppSelectItem(value: '', label: 'Custom'),
+                for (final template in providerTemplates)
+                  AppSelectItem(
+                    value: template.id,
+                    label: template.displayName,
+                  ),
+              ],
+              onChanged: _selectProvider,
+            ),
+            MotionSize(
+              duration: AppMotion.duration(context,
+                  enabled: widget.controller.settings.enableAnimations,
+                  milliseconds: 240),
+              alignment: Alignment.topCenter,
+              curve: Curves.easeOutCubic,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (_providerTemplate case final template?) ...[
+                    for (final placeholder in template.placeholders) ...[
+                      const SizedBox(height: 18),
+                      TextField(
+                        key: ValueKey(
+                            'provider-${template.id}-${placeholder.name}'),
+                        controller: _providerInputs[placeholder.name],
+                        autocorrect: false,
+                        enableSuggestions: false,
+                        decoration: InputDecoration(
+                          labelText: placeholder.label,
+                          helperText: [
+                            placeholder.hint,
+                            if (placeholder.examples.isNotEmpty)
+                              'Examples: ${placeholder.examples.join(', ')}',
+                          ].join('\n'),
+                          helperMaxLines: 8,
+                        ),
+                        onChanged: _providerInputChanged,
+                      ),
+                    ],
+                    const SizedBox(height: 18),
+                    if (template.needsReview)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 6),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Icon(Icons.info_outline,
+                                size: 18,
+                                color: Theme.of(context)
+                                    .colorScheme
+                                    .onSurfaceVariant),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                "Check these values against your provider's documentation",
+                                style: Theme.of(context).textTheme.bodySmall,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    Align(
+                      alignment: AlignmentDirectional.centerStart,
+                      child: Text(
+                        [
+                          template.credentialsHint,
+                          ...template.gotchas,
+                        ].join('\n'),
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(height: 18),
             AppSelectField<EndpointProfileType>(
               value: _endpointType,
               decoration: const InputDecoration(labelText: 'Endpoint type'),
@@ -1584,6 +1854,10 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                   value: EndpointProfileType.azureBlob,
                   label: 'Azure Blob Storage',
                 ),
+                AppSelectItem(
+                  value: EndpointProfileType.googleCloudStorage,
+                  label: 'Google Cloud Storage',
+                ),
               ],
               onChanged: (value) {
                 if (value != null) {
@@ -1591,7 +1865,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 }
               },
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 18),
             if (_endpointType == EndpointProfileType.s3Compatible) ...[
               TextField(
                 controller: _endpointController,
@@ -1603,7 +1877,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                       'Paste a full URL or just a host:port. The scheme is added automatically when missing.',
                 ),
               ),
-              const SizedBox(height: 12),
+              const SizedBox(height: 18),
               AppSwitchTile(
                 value: _useHttps,
                 onChanged: _setUseHttps,
@@ -1618,13 +1892,33 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 controller: _regionController,
                 decoration: const InputDecoration(labelText: 'Region'),
               ),
+            ] else if (_endpointType.isGoogleCloudStorage) ...[
+              TextField(
+                controller: _endpointController,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: const InputDecoration(
+                  labelText: 'Endpoint URL',
+                  helperText:
+                      'Optional. Leave empty to use the standard endpoint.',
+                  hintText: 'https://storage.googleapis.com',
+                ),
+              ),
+              const SizedBox(height: 18),
+              TextField(
+                controller: _regionController,
+                decoration: const InputDecoration(
+                  labelText: 'Bucket location',
+                  helperText: 'Optional default location for new buckets.',
+                ),
+              ),
             ] else if (_endpointType == EndpointProfileType.azureBlob) ...[
               TextField(
                 controller: _endpointController,
                 autocorrect: false,
                 enableSuggestions: false,
                 decoration: const InputDecoration(
-                  labelText: 'Custom blob endpoint (optional)',
+                  labelText: 'Blob endpoint',
                   helperText:
                       'Leave blank to use https://<account>.blob.core.windows.net. '
                       'Set this for Azurite or sovereign clouds.',
@@ -1642,6 +1936,17 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                   ),
                 ),
             ] else ...[
+              if (_awsEndpointEditable) ...[
+                TextField(
+                  controller: _endpointController,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  decoration: const InputDecoration(
+                    labelText: 'Endpoint host or URL',
+                  ),
+                ),
+                const SizedBox(height: 18),
+              ],
               AppSelectField<String>(
                 value: _awsRegionOptions.contains(_regionController.text.trim())
                     ? (_regionController.text.trim().isEmpty
@@ -1661,12 +1966,15 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                   if (value != null) {
                     setState(() {
                       _regionController.text = value;
+                      if (_awsEndpointEditable) {
+                        _endpointController.text = awsEndpointForRegion(value);
+                      }
                     });
                   }
                 },
               ),
             ],
-            const SizedBox(height: 12),
+            const SizedBox(height: 18),
             if (_normalizedEndpointPreview.isNotEmpty)
               ListTile(
                 contentPadding: EdgeInsets.zero,
@@ -1676,20 +1984,24 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 title: Text(switch (_endpointType) {
                   EndpointProfileType.awsS3 => 'AWS endpoint',
                   EndpointProfileType.azureBlob => 'Blob service endpoint',
+                  EndpointProfileType.googleCloudStorage =>
+                    'Cloud Storage endpoint',
                   EndpointProfileType.s3Compatible => 'Normalized endpoint',
                 }),
                 subtitle: Text(_normalizedEndpointPreview),
               ),
             if (_normalizedEndpointPreview.isNotEmpty)
-              const SizedBox(height: 12),
+              const SizedBox(height: 18),
+            const SizedBox(height: 18),
             ConnectionOptionsEditor(
+              enableAnimations: widget.controller.settings.enableAnimations,
               key: ValueKey(
                   '${widget.profile.id}-${widget.profile.connection.hashCode}'),
               value: _connection,
               endpointType: _endpointType,
               onChanged: (value) => setState(() => _connection = value),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 18),
             if (_endpointType == EndpointProfileType.azureBlob &&
                 _connection.authMode != 'static')
               TextField(
@@ -1701,8 +2013,17 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                     helperText:
                         'Optional when a custom blob endpoint is configured.'),
               ),
-            if (_connection.authMode == 'static')
-              phone
+            if (_endpointType.isGoogleCloudStorage)
+              GoogleServiceAccountEditor(
+                value: _secretKeyController.text,
+                onChanged: (json, identity) => setState(() {
+                  _secretKeyController.text = json;
+                  _accessKeyController.text = identity.email;
+                }),
+              ),
+            if (!_endpointType.isGoogleCloudStorage &&
+                _connection.authMode == 'static')
+              MediaQuery.textScalerOf(context).scale(14) > 18 || phone
                   ? Column(
                       children: [
                         TextField(
@@ -1713,7 +2034,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                             labelText: _endpointType.accessKeyLabel,
                           ),
                         ),
-                        const SizedBox(height: 8),
+                        const SizedBox(height: 18),
                         TextField(
                           controller: _secretKeyController,
                           autocorrect: false,
@@ -1773,10 +2094,11 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         ),
                       ],
                     ),
-            const SizedBox(height: 12),
-            if ((_endpointType != EndpointProfileType.azureBlob &&
-                    _connection.authMode == 'static') ||
-                _connection.authMode == 'azureSas')
+            const SizedBox(height: 18),
+            if (!_endpointType.isGoogleCloudStorage &&
+                ((_endpointType != EndpointProfileType.azureBlob &&
+                        _connection.authMode == 'static') ||
+                    _connection.authMode == 'azureSas'))
               TextField(
                 controller: _sessionTokenController,
                 autocorrect: false,
@@ -1794,10 +2116,10 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                           : Icons.visibility)),
                   labelText: _connection.authMode == 'azureSas'
                       ? 'SAS token'
-                      : 'Session token (optional)',
+                      : 'Session token',
                   helperText: _connection.authMode == 'azureSas'
                       ? 'Saved securely with your credentials; excluded from profile exports.'
-                      : null,
+                      : 'Optional temporary session token; saved securely with your credentials.',
                 ),
               ),
             ExpansionTile(
@@ -1814,15 +2136,15 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                 children: [
                   if (!AppPlatform.isMobile) ...[
                     SettingNumberField(
-                        label:
-                            'Connection pool limit (part workers capped at 8)',
+                        label: 'Connection limit',
+                        helper: 'Parallel part workers are capped at 8.',
                         value: _connectionLimit,
                         commitLabel: 'Draft',
                         min: 1,
                         max: 256,
                         onCommit: (value) =>
                             setState(() => _connectionLimit = value)),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 18),
                     SettingNumberField(
                         label: 'Maximum attempts',
                         value: _maxAttempts,
@@ -1831,25 +2153,29 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                         max: 100,
                         onCommit: (value) =>
                             setState(() => _maxAttempts = value)),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 18),
                   ] else
                     const Text(
                         'This engine manages connection pools and retry limits.'),
-                  AppSwitchTile(
-                    value: _pathStyle,
-                    onChanged: _endpointType == EndpointProfileType.s3Compatible
-                        ? (value) => setState(() => _pathStyle = value)
-                        : null,
-                    title: const Text('Force path-style requests'),
-                    subtitle: Text(switch (_endpointType) {
-                      EndpointProfileType.awsS3 =>
-                        'AWS S3 uses the standard virtual-hosted endpoint layout.',
-                      EndpointProfileType.azureBlob =>
-                        'Not applicable to Azure Blob Storage.',
-                      EndpointProfileType.s3Compatible =>
-                        'Useful for MinIO and other S3-compatible endpoints.',
-                    }),
-                  ),
+                  if (!_endpointType.isGoogleCloudStorage)
+                    AppSwitchTile(
+                      value: _pathStyle,
+                      onChanged:
+                          _endpointType == EndpointProfileType.s3Compatible
+                              ? (value) => setState(() => _pathStyle = value)
+                              : null,
+                      title: const Text('Force path-style requests'),
+                      subtitle: Text(switch (_endpointType) {
+                        EndpointProfileType.awsS3 =>
+                          'AWS S3 uses the standard virtual-hosted endpoint layout.',
+                        EndpointProfileType.googleCloudStorage =>
+                          'Not applicable to Google Cloud Storage.',
+                        EndpointProfileType.azureBlob =>
+                          'Not applicable to Azure Blob Storage.',
+                        EndpointProfileType.s3Compatible =>
+                          'Useful for MinIO and other S3-compatible endpoints.',
+                      }),
+                    ),
                   AppSwitchTile(
                     value: _verifyTls,
                     onChanged: (_endpointType != EndpointProfileType.awsS3 &&
@@ -1865,7 +2191,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                               : 'TLS verification is off because this endpoint uses HTTP.'),
                     ),
                   ),
-                  phone
+                  MediaQuery.textScalerOf(context).scale(14) > 18 || phone
                       ? Column(
                           children: [
                             TextField(
@@ -1879,7 +2205,7 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                                 labelText: 'Connect timeout (s)',
                               ),
                             ),
-                            const SizedBox(height: 8),
+                            const SizedBox(height: 18),
                             TextField(
                               controller: _readTimeoutController,
                               keyboardType: TextInputType.number,
@@ -1925,13 +2251,32 @@ class _ProfileEditorCardState extends State<_ProfileEditorCard> {
                           ],
                         ),
                 ]),
-            const SizedBox(height: 8),
+            // Optional encryption follows the connection and credential fields.
+            const SizedBox(height: 18),
+            if (!_endpointType.isGoogleCloudStorage)
+              UploadEncryptionEditor(
+                key: ValueKey(
+                  'upload-encryption-${widget.profile.id}-${_endpointType.name}',
+                ),
+                controller: widget.controller,
+                profile: _buildProfile(),
+                value: _uploadEncryption,
+                onChanged: (value) => setState(() => _uploadEncryption = value),
+              ),
+            ClientEncryptionEditor(
+              controller: widget.controller,
+              profileId: widget.profile.id,
+              rules: _clientEncryptionRules,
+              onChanged: (value) =>
+                  setState(() => _clientEncryptionRules = value),
+            ),
+            const SizedBox(height: 18),
             TextField(
               controller: _notesController,
               maxLines: 2,
               decoration: const InputDecoration(labelText: 'Notes'),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 18),
             Wrap(
               spacing: 8,
               runSpacing: 8,

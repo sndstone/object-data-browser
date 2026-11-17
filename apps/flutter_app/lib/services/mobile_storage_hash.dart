@@ -34,7 +34,8 @@ class MobilePayloadHasher {
           } else {
             _closed = true;
             if (!ready.isCompleted) {
-              ready.completeError(StateError('Payload hashing worker stopped.'));
+              ready
+                  .completeError(StateError('Payload hashing worker stopped.'));
             }
             _failPending();
           }

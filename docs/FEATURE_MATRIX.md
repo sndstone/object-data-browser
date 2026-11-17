@@ -4,13 +4,14 @@ This file records platform and provider support for 2.3.0. Desktop advanced admi
 
 ## Storage Providers
 
-Profiles carry an `endpointType` of `s3Compatible`, `awsS3`, or `azureBlob`.
+Profiles carry an `endpointType` of `s3Compatible`, `awsS3`, `azureBlob`, or `googleCloudStorage`. An unknown type is rejected; it is never treated as S3.
 
 | Provider | Auth | Python | Go | Rust | Java |
 | --- | --- | --- | --- | --- | --- |
 | S3-compatible (MinIO, Ceph, etc.) | Access/secret key (SigV4) | Supported | Supported | Supported | Supported |
 | AWS S3 | Access/secret key (SigV4) | Supported | Supported | Supported | Supported |
 | Azure Blob Storage | Account name + access key (Shared Key) | Supported | Supported | `unsupported_feature` error | `unsupported_feature` error |
+| Google Cloud Storage (native JSON API) | Service-account key file | Supported | Supported | `unsupported_feature` error | `unsupported_feature` error |
 
 Azure notes:
 
@@ -26,6 +27,41 @@ Legend:
 - `Capability-Gated`: UI may expose only when the target reports support
 - `Desktop Only`: required on Windows, macOS, and Linux
 - `Shared REST` / `Shared runtime`: implemented in the common Android/iOS adapter
+
+Google Cloud Storage notes:
+
+- The profile's secret is the complete service-account key file. It is stored only in secure storage, like every other credential.
+- Listing, upload (simple and resumable), ranged download, copy, move, delete, folder markers, generations as versions, bucket versioning and V4 signed links are supported on desktop with the Python and Go engines. Lifecycle, policy, CORS, default encryption, tagging, tools and benchmarks are not.
+- Both engines were run end to end against the `fake-gcs-server` emulator. They have not been run against the live Google service.
+- Google Cloud Storage reached with HMAC keys remains an ordinary S3-compatible profile and works with all four engines.
+- Mobile does not support native Google Cloud Storage profiles in this version.
+
+Provider templates in the profile editor prefill the endpoint, signing region and addressing style for 21 services. They make no capability claims; entries whose values could not be confirmed in current provider documentation carry a "check these values" note.
+
+## Optional encryption
+
+Nothing in this section is enabled by default.
+
+| Feature | Python | Go | Rust | Java | Android / iOS |
+| --- | --- | --- | --- | --- | --- |
+| SSE-S3, SSE-KMS, DSSE-KMS on upload, copy, folder creation | Supported | Supported | Supported | Supported | Shared REST |
+| SSE-C (customer key) upload, download, details, copy | Supported | Supported | Supported | Supported | Shared REST |
+| Azure encryption scope and customer-provided key | Supported | Supported | N/A | N/A | Shared REST |
+| Object encryption shown in the inspector | Supported | Supported | Supported | Supported | Shared REST |
+| Client-side encryption (age v1 payload cipher) | Supported | Supported | Supported | Supported | Shared REST |
+| Passphrase-protected key file with backup and import | App | App | App | App | App |
+| Key file sync through an assigned bucket | App | App | App | App | App |
+
+Encryption notes:
+- Bucket encryption has forms for SSE-S3, SSE-KMS and DSSE-KMS alongside the JSON editor, plus bucket/prefix vault rules with Default, optional name encryption, and Strict protection. Settings → Encryption offers per-connection editing and a six-part setup guide; opening it does not probe providers.
+
+- Key creation shows the exact generated key before saving, with Copy and Generate another actions. Imports can be revealed, and key-file dialogs can generate and copy a random 125-bit passphrase. Secrets remain in the dialog and encrypted key file.
+- Header transmission and client-side ciphertext are covered by loopback fixtures and shared vectors in every engine. Provider acceptance of each mode (KMS permissions, SSE-C blocking, compatible stores) has not been tested against live endpoints.
+- Key file sync runs in the app on every platform, independent of the selected engine. The sync bucket must be on an S3-type profile with static access keys. It was run against a loopback test server and the `gofakes3` emulator, not against a live provider.
+- Customer-key objects cannot be previewed or shared by link; they must be downloaded.
+- Benchmarks and the resumable-transfer workflows do not take encryption options.
+- Client-encrypted objects carry a `.age` suffix and can be decrypted outside the app with the `age` tool and the vault key. Name protection is optional and off by default. Default keeps names visible; Default with names encrypted preserves folders using deterministic encrypted segments; Strict uses a random encrypted name for each upload, flattens folders, and never overwrites. Encrypted names require an unlocked key file for uploads and display. Sizes, counts and dates remain visible; deterministic names also reveal folder structure, lengths and equality, while Strict reveals path length rounded to 16 bytes. The destination prefix stays visible. Some S3-compatible stores limit segments to 255 characters (about 170 UTF-8 bytes per deterministic name or 143 bytes per Strict path). Name recovery from the vault key is documented in `contracts/transport_contract.md`.
+- Mobile encrypts and decrypts in Dart and reproduces the shared vectors byte for byte. It has not been run on a physical device; on this development Mac the cipher path handles about 42 MiB/s, and phones will be slower.
 
 ## Core Browser Features
 

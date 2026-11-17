@@ -21,6 +21,9 @@ class TasksWorkspace extends StatelessWidget {
         tasks.isEmpty ? null : tasks[selectedIndex < 0 ? 0 : selectedIndex];
     final duration = AppMotion.duration(context,
         enabled: controller.settings.enableAnimations, milliseconds: 180);
+    // Filters are ordered destinations, timed like workspace navigation.
+    final viewDuration = AppMotion.duration(context,
+        enabled: controller.settings.enableAnimations, milliseconds: 300);
     return LayoutBuilder(builder: (context, constraints) {
       final split = constraints.maxWidth >= 1000 &&
           MediaQuery.textScalerOf(context).scale(14) < 22;
@@ -60,73 +63,82 @@ class TasksWorkspace extends StatelessWidget {
                 ]),
             const SizedBox(height: 12),
             Expanded(
-                child: tasks.isEmpty
-                    ? EmptyState(
-                        icon: Icons.task_alt,
-                        title: switch (view) {
-                          BrowserTaskView.running => 'No running tasks.',
-                          BrowserTaskView.failed => 'No failed tasks.',
-                          BrowserTaskView.all => 'No task history yet.'
-                        },
-                        message: 'Upload or download objects from the browser.',
-                        action: TextButton(
-                            onPressed: () =>
-                                controller.selectTab(WorkspaceTab.browser),
-                            child: const Text('Open browser')))
-                    : Row(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                            Expanded(
-                                flex: split ? 4 : 1,
-                                child: DirectionalSwitcher(
-                                    replaceContent: true,
-                                    position: view.index,
-                                    duration: duration,
-                                    layoutBuilder: (current, previous) =>
-                                        current ?? const SizedBox.shrink(),
-                                    child: ListView.separated(
-                                        key: ValueKey('jobs-list-${view.name}'),
-                                        itemCount: tasks.length,
-                                        separatorBuilder: (_, __) =>
-                                            const SizedBox(height: 8),
-                                        itemBuilder: (context, index) =>
-                                            _TaskCard(
-                                                key: ValueKey(tasks[index].id),
-                                                controller: controller,
-                                                task: tasks[index],
-                                                split: split,
-                                                selected: split
-                                                    ? tasks[index].id ==
-                                                        selected?.id
-                                                    : tasks[index].id ==
-                                                        controller
-                                                            .selectedTaskId)))),
-                            if (split) ...[
-                              const SizedBox(width: 10),
-                              Expanded(
-                                  flex: 7,
-                                  child: Card(
-                                      clipBehavior: Clip.antiAlias,
-                                      child: DirectionalSwitcher(
-                                          replaceContent: true,
-                                          axis: Axis.vertical,
-                                          replacementBackground:
-                                              Theme.of(context).cardTheme.color,
-                                          position: selectedIndex < 0
-                                              ? 0
-                                              : selectedIndex,
-                                          duration: duration,
-                                          layoutBuilder: (current, previous) =>
-                                              current ??
-                                              const SizedBox.shrink(),
-                                          child: _TaskDetails(
-                                              key: ValueKey(
-                                                  'job-detail-${selected!.id}'),
-                                              controller: controller,
-                                              task: selected,
-                                              showActions: true)))),
-                            ],
-                          ])),
+                // One switcher owns the whole destination. A filter with no
+                // jobs pushes in and out exactly like a populated one.
+                child: DirectionalSwitcher(
+                    replaceContent: true,
+                    position: view.index,
+                    duration: viewDuration,
+                    child: KeyedSubtree(
+                        key: ValueKey('jobs-view-${view.name}'),
+                        child: tasks.isEmpty
+                            ? EmptyState(
+                                icon: Icons.task_alt,
+                                title: switch (view) {
+                                  BrowserTaskView.running =>
+                                    'No running tasks.',
+                                  BrowserTaskView.failed => 'No failed tasks.',
+                                  BrowserTaskView.all => 'No task history yet.'
+                                },
+                                message:
+                                    'Upload or download objects from the browser.',
+                                action: TextButton(
+                                    onPressed: () => controller
+                                        .selectTab(WorkspaceTab.browser),
+                                    child: const Text('Open browser')))
+                            : Row(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                    Expanded(
+                                        flex: split ? 4 : 1,
+                                        child: ListView.separated(
+                                            key: ValueKey(
+                                                'jobs-list-${view.name}'),
+                                            itemCount: tasks.length,
+                                            separatorBuilder: (_, __) =>
+                                                const SizedBox(height: 8),
+                                            itemBuilder: (context, index) =>
+                                                _TaskCard(
+                                                    key: ValueKey(
+                                                        tasks[index].id),
+                                                    controller: controller,
+                                                    task: tasks[index],
+                                                    split: split,
+                                                    selected: split
+                                                        ? tasks[index].id ==
+                                                            selected?.id
+                                                        : tasks[index].id ==
+                                                            controller
+                                                                .selectedTaskId))),
+                                    if (split) ...[
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                          flex: 7,
+                                          child: Card(
+                                              clipBehavior: Clip.antiAlias,
+                                              child: DirectionalSwitcher(
+                                                  replaceContent: true,
+                                                  axis: Axis.vertical,
+                                                  replacementBackground:
+                                                      Theme.of(context)
+                                                          .cardTheme
+                                                          .color,
+                                                  position: selectedIndex < 0
+                                                      ? 0
+                                                      : selectedIndex,
+                                                  duration: duration,
+                                                  layoutBuilder: (current,
+                                                          previous) =>
+                                                      current ??
+                                                      const SizedBox.shrink(),
+                                                  child: _TaskDetails(
+                                                      key: ValueKey(
+                                                          'job-detail-${selected!.id}'),
+                                                      controller: controller,
+                                                      task: selected,
+                                                      showActions: true)))),
+                                    ],
+                                  ])))),
           ]));
     });
   }
@@ -203,7 +215,9 @@ class _TaskCard extends StatelessWidget {
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Expanded(
-                                  child: Text(_taskLabel(task),
+                                  child: Text(
+                                      controller.visibleTransferText(
+                                          _taskLabel(task)),
                                       maxLines: 2,
                                       overflow: TextOverflow.ellipsis,
                                       style: theme.textTheme.titleSmall)),
@@ -249,7 +263,8 @@ class _TaskCard extends StatelessWidget {
                               child: Text(
                                   task.outputLines.isEmpty
                                       ? 'This operation failed. Open details before retrying.'
-                                      : task.outputLines.last,
+                                      : controller.visibleTransferText(
+                                          task.outputLines.last),
                                   maxLines: 2,
                                   overflow: TextOverflow.ellipsis,
                                   style: TextStyle(
@@ -358,7 +373,7 @@ class _TaskDetails extends StatelessWidget {
           const Icon(Icons.info_outline, size: 20),
           const SizedBox(width: 8),
           Expanded(
-              child: Text(_taskLabel(task),
+              child: Text(controller.visibleTransferText(_taskLabel(task)),
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   style: Theme.of(context).textTheme.titleMedium))
@@ -397,7 +412,8 @@ class _TaskDetails extends StatelessWidget {
         Text('Completed: ${formatDateTime(task.completedAt!)}'),
       if (task.strategyLabel != null) Text('Strategy: ${task.strategyLabel}'),
       if (task.currentItemLabel != null)
-        Text('Current item: ${task.currentItemLabel}'),
+        Text(
+            'Current item: ${controller.visibleTransferText(task.currentItemLabel!)}'),
       if (task.kind == BrowserTaskKind.transfer &&
           task.isRunningLike &&
           !task.canCancel &&
@@ -417,7 +433,8 @@ class _TaskDetails extends StatelessWidget {
                 color: Theme.of(context).colorScheme.surfaceContainerHighest,
                 borderRadius: BorderRadius.circular(8)),
             child: SelectableText(
-                _output[task.outputLines] ??= task.outputLines.join('\n'),
+                controller.visibleTransferText(
+                    _output[task.outputLines] ??= task.outputLines.join('\n')),
                 key: PageStorageKey('output-${task.id}'))),
       ],
     ];

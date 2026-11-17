@@ -89,7 +89,11 @@ func benchmarkSafeState(state map[string]interface{}) map[string]interface{} {
 	safe := make(map[string]interface{}, len(state))
 	for key, value := range state {
 		if key != "profile" && !strings.HasPrefix(key, "_benchmark") {
-			safe[key] = value
+			if encryptionSecretField(key) {
+				safe[key] = "[redacted]"
+			} else {
+				safe[key] = redactEncryptionFields(value)
+			}
 		}
 	}
 	return safe

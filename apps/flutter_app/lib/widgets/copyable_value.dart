@@ -28,8 +28,6 @@ class LabeledValue extends StatelessWidget {
     final labelText = Tooltip(
         message: label,
         child: Text(label,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
             style: theme.textTheme.bodyMedium?.copyWith(
                 color: theme.colorScheme.onSurfaceVariant,
                 fontWeight: FontWeight.w600)));

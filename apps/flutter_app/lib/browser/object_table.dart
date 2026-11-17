@@ -13,6 +13,9 @@ class ObjectTable extends StatelessWidget {
   const ObjectTable(
       {super.key,
       required this.objects,
+      this.visibleNameFor,
+      this.visibleKeyFor,
+      this.isClientEncrypted,
       required this.selectedKey,
       required this.selectedKeys,
       required this.compactRows,
@@ -24,6 +27,8 @@ class ObjectTable extends StatelessWidget {
       required this.onSelect,
       required this.onShowContextMenu});
   final List<ObjectEntry> objects;
+  final String Function(ObjectEntry)? visibleNameFor, visibleKeyFor;
+  final bool Function(ObjectEntry)? isClientEncrypted;
   final String? selectedKey;
   final Set<String> selectedKeys;
   final bool compactRows;
@@ -33,6 +38,7 @@ class ObjectTable extends StatelessWidget {
   final void Function(ObjectEntry object, bool range) onToggle;
   final String Function(ObjectEntry) contentTypeFor;
   final ValueChanged<ObjectEntry> onSelect;
+
   /// Opens the object menu. The rectangle is the trigger's global bounds, or
   /// a zero-size rectangle at the pointer for right-clicks.
   final Future<void> Function(ObjectEntry, Rect) onShowContextMenu;
@@ -86,175 +92,213 @@ class ObjectTable extends StatelessWidget {
                     ])),
           const Divider(height: 1),
           Expanded(
-              child: VerticalEdgeFade(child: ListView.builder(
-                  key: const ValueKey('object-panel-list'),
-                  itemExtent: height,
-                  itemCount: objects.length,
-                  itemBuilder: (context, index) {
-                    final object = objects[index];
-                    final inspected = object.key == selectedKey;
-                    final checked = selectedKeys.contains(object.key);
-                    final showActions =
-                        selectedKeys.isEmpty && selectedKey == null;
-                    final theme = Theme.of(context);
-                    void toggle() => onToggle(
-                        object, HardwareKeyboard.instance.isShiftPressed);
-                    return _HoverRow(
-                        builder: (active) => Semantics(
-                            selected: checked || inspected,
-                            label: object.isFolder
-                                ? 'Folder ${object.name}'
-                                : null,
-                            child: Material(
-                                color: checked || inspected
-                                    ? theme.colorScheme.primaryContainer
-                                    : active
-                                        ? theme.colorScheme.surfaceContainerLow
-                                        : Colors.transparent,
-                                child: Builder(builder: (rowContext) {
-                                  // Keyboard and long-press open the menu
-                                  // from the row's action slot, where the
-                                  // actions button sits.
-                                  void actions() {
-                                    final box = rowContext.findRenderObject()
-                                        as RenderBox;
-                                    final slot = Rect.fromLTWH(
-                                        box.size.width - 8 - actionSlot,
-                                        0,
-                                        actionSlot,
-                                        box.size.height);
-                                    onShowContextMenu(
-                                        object,
-                                        slot.shift(
-                                            box.localToGlobal(Offset.zero)));
-                                  }
+              child: VerticalEdgeFade(
+                  child: ListView.builder(
+                      key: const ValueKey('object-panel-list'),
+                      itemExtent: height,
+                      itemCount: objects.length,
+                      itemBuilder: (context, index) {
+                        final object = objects[index];
+                        final inspected = object.key == selectedKey;
+                        final visibleName =
+                            visibleNameFor?.call(object) ?? object.name;
+                        final encrypted =
+                            isClientEncrypted?.call(object) ?? false;
+                        final checked = selectedKeys.contains(object.key);
+                        final showActions =
+                            selectedKeys.isEmpty && selectedKey == null;
+                        final theme = Theme.of(context);
+                        void toggle() => onToggle(
+                            object, HardwareKeyboard.instance.isShiftPressed);
+                        return _HoverRow(
+                            builder: (active) => Semantics(
+                                selected: checked || inspected,
+                                label: object.isFolder
+                                    ? 'Folder $visibleName'
+                                    : encrypted
+                                        ? '$visibleName, Client-side encrypted'
+                                        : null,
+                                child: Material(
+                                    color: checked || inspected
+                                        ? theme.colorScheme.primaryContainer
+                                        : active
+                                            ? theme
+                                                .colorScheme.surfaceContainerLow
+                                            : Colors.transparent,
+                                    child: Builder(builder: (rowContext) {
+                                      // Keyboard and long-press open the menu
+                                      // from the row's action slot, where the
+                                      // actions button sits.
+                                      void actions() {
+                                        final box = rowContext
+                                            .findRenderObject() as RenderBox;
+                                        final slot = Rect.fromLTWH(
+                                            box.size.width - 8 - actionSlot,
+                                            0,
+                                            actionSlot,
+                                            box.size.height);
+                                        onShowContextMenu(
+                                            object,
+                                            slot.shift(box
+                                                .localToGlobal(Offset.zero)));
+                                      }
 
-                                  return CallbackShortcuts(
-                                      bindings: {
-                                        const SingleActivator(
-                                            LogicalKeyboardKey.space): toggle,
-                                        const SingleActivator(
-                                                LogicalKeyboardKey.enter):
-                                            () => onSelect(object),
-                                        const SingleActivator(
-                                            LogicalKeyboardKey.f10,
-                                            shift: true): actions,
-                                      },
-                                      child: InkWell(
-                                          onTap: () {
-                                            if (HardwareKeyboard
-                                                .instance.isShiftPressed) {
-                                              toggle();
-                                            } else {
-                                              onSelect(object);
-                                            }
+                                      return CallbackShortcuts(
+                                          bindings: {
+                                            const SingleActivator(
+                                                    LogicalKeyboardKey.space):
+                                                toggle,
+                                            const SingleActivator(
+                                                    LogicalKeyboardKey.enter):
+                                                () => onSelect(object),
+                                            const SingleActivator(
+                                                LogicalKeyboardKey.f10,
+                                                shift: true): actions,
                                           },
-                                          onLongPress: actions,
-                                          onSecondaryTapDown: (details) =>
-                                              onShowContextMenu(
-                                                  object,
-                                                  details.globalPosition &
-                                                      Size.zero),
-                                          child: Padding(
-                                              padding:
-                                                  const EdgeInsets.symmetric(
-                                                      horizontal: 8),
-                                              child: Row(children: [
-                                                // Fixed checkbox and icon slots keep
-                                                // folder and file names aligned.
-                                                SizedBox(
-                                                    width: checkSlot,
-                                                    child: object.isFolder
-                                                        ? null
-                                                        : Checkbox(
-                                                            value: checked,
-                                                            semanticLabel:
-                                                                'Select ${object.name}',
-                                                            onChanged: (_) =>
-                                                                toggle())),
-                                                SizedBox(
-                                                    width: _iconSlot,
-                                                    child: Align(
-                                                        alignment: Alignment
-                                                            .centerLeft,
-                                                        child: Icon(
-                                                            object.isFolder
-                                                                ? Icons
-                                                                    .folder_outlined
-                                                                : objectTypeIcon(
-                                                                    object.key,
-                                                                    contentTypeFor(
-                                                                        object)),
+                                          child: InkWell(
+                                              onTap: () {
+                                                if (HardwareKeyboard
+                                                    .instance.isShiftPressed) {
+                                                  toggle();
+                                                } else {
+                                                  onSelect(object);
+                                                }
+                                              },
+                                              onLongPress: actions,
+                                              onSecondaryTapDown: (details) =>
+                                                  onShowContextMenu(
+                                                      object,
+                                                      details.globalPosition &
+                                                          Size.zero),
+                                              child: Padding(
+                                                  padding: const EdgeInsets
+                                                      .symmetric(horizontal: 8),
+                                                  child: Row(children: [
+                                                    // Fixed checkbox and icon slots keep
+                                                    // folder and file names aligned.
+                                                    SizedBox(
+                                                        width: checkSlot,
+                                                        child: object.isFolder
+                                                            ? null
+                                                            : Checkbox(
+                                                                value: checked,
+                                                                semanticLabel:
+                                                                    'Select $visibleName',
+                                                                onChanged: (_) =>
+                                                                    toggle())),
+                                                    SizedBox(
+                                                      width: _iconSlot,
+                                                      child: Align(
+                                                          alignment: Alignment
+                                                              .centerLeft,
+                                                          child: Icon(
+                                                              object.isFolder
+                                                                  ? Icons
+                                                                      .folder_outlined
+                                                                  : objectTypeIcon(
+                                                                      visibleKeyFor?.call(
+                                                                              object) ??
+                                                                          object
+                                                                              .key,
+                                                                      contentTypeFor(
+                                                                          object)),
+                                                              size: 18,
+                                                              color: theme
+                                                                  .colorScheme
+                                                                  .onSurfaceVariant)),
+                                                    ),
+                                                    if (encrypted)
+                                                      Padding(
+                                                        padding:
+                                                            const EdgeInsets
+                                                                .only(right: 6),
+                                                        child: Tooltip(
+                                                          message:
+                                                              'Client-side encrypted',
+                                                          child: Icon(
+                                                            Icons.lock_outline,
                                                             size: 18,
                                                             color: theme
                                                                 .colorScheme
-                                                                .onSurfaceVariant))),
-                                                Expanded(
-                                                    child: Tooltip(
-                                                        message: object.key,
-                                                        child: Text(object.name,
-                                                            maxLines: 1,
-                                                            overflow:
-                                                                TextOverflow
-                                                                    .ellipsis))),
-                                                if (!narrow)
-                                                  SizedBox(
-                                                      width: _modifiedWidth,
-                                                      child: Tooltip(
-                                                          message:
-                                                              '${object.modifiedAt.toIso8601String()} · ${formatRelative(object.modifiedAt)}',
-                                                          child: Text(
-                                                              formatDateTime(object
-                                                                  .modifiedAt),
-                                                              style: theme
-                                                                  .textTheme
-                                                                  .bodySmall))),
-                                                SizedBox(
-                                                    width: narrow
-                                                        ? 72
-                                                        : _sizeWidth,
-                                                    child: Text(
-                                                        object.isFolder
-                                                            ? '—'
-                                                            : formatBytes(
-                                                                object.size),
-                                                        textAlign:
-                                                            TextAlign.right,
-                                                        style: theme
-                                                            .textTheme.bodySmall
-                                                            ?.copyWith(
-                                                                fontFeatures: const [
-                                                              FontFeature
-                                                                  .tabularFigures()
-                                                            ]))),
-                                                SizedBox(
-                                                    width: actionSlot,
-                                                    child: Visibility(
-                                                        visible: (AppPlatform
-                                                                    .isMobile ||
-                                                                narrow ||
-                                                                active) &&
-                                                            showActions,
-                                                        maintainState: true,
-                                                        maintainAnimation: true,
-                                                        maintainSize: true,
-                                                        // The menu opens from
-                                                        // this button's bounds.
-                                                        child: Builder(
-                                                            builder: (buttonContext) => IconButton(
-                                                                tooltip:
-                                                                    'Object actions for ${object.name}',
-                                                                icon: const Icon(
-                                                                    Icons
-                                                                        .more_horiz),
-                                                                onPressed: () =>
-                                                                    onShowContextMenu(
+                                                                .onSurfaceVariant,
+                                                            semanticLabel:
+                                                                'Client-side encrypted',
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    Expanded(
+                                                        child: Tooltip(
+                                                            message: visibleKeyFor
+                                                                    ?.call(
+                                                                        object) ??
+                                                                object.key,
+                                                            child: Text(
+                                                                visibleName,
+                                                                maxLines: 1,
+                                                                overflow:
+                                                                    TextOverflow
+                                                                        .ellipsis))),
+                                                    if (!narrow)
+                                                      SizedBox(
+                                                          width: _modifiedWidth,
+                                                          child: Tooltip(
+                                                              message:
+                                                                  '${object.modifiedAt.toIso8601String()} · ${formatRelative(object.modifiedAt)}',
+                                                              child: Text(
+                                                                  formatDateTime(
+                                                                      object
+                                                                          .modifiedAt),
+                                                                  style: theme
+                                                                      .textTheme
+                                                                      .bodySmall))),
+                                                    SizedBox(
+                                                        width: narrow
+                                                            ? 72
+                                                            : _sizeWidth,
+                                                        child: Text(
+                                                            object.isFolder
+                                                                ? '—'
+                                                                : formatBytes(
+                                                                    object
+                                                                        .size),
+                                                            textAlign:
+                                                                TextAlign.right,
+                                                            style: theme
+                                                                .textTheme
+                                                                .bodySmall
+                                                                ?.copyWith(
+                                                                    fontFeatures: const [
+                                                                  FontFeature
+                                                                      .tabularFigures()
+                                                                ]))),
+                                                    SizedBox(
+                                                        width: actionSlot,
+                                                        child: Visibility(
+                                                            visible: (AppPlatform
+                                                                        .isMobile ||
+                                                                    narrow ||
+                                                                    active) &&
+                                                                showActions,
+                                                            maintainState: true,
+                                                            maintainAnimation:
+                                                                true,
+                                                            maintainSize: true,
+                                                            // The menu opens from
+                                                            // this button's bounds.
+                                                            child: Builder(
+                                                                builder: (buttonContext) => IconButton(
+                                                                    tooltip:
+                                                                        'Object actions for $visibleName',
+                                                                    icon: const Icon(
+                                                                        Icons
+                                                                            .more_horiz),
+                                                                    onPressed: () => onShowContextMenu(
                                                                         object,
                                                                         globalRectOf(
                                                                             buttonContext)))))),
-                                              ]))));
-                                }))));
-                  }))),
+                                                  ]))));
+                                    }))));
+                      }))),
         ]);
       });
   static const double _checkSlot = 40;

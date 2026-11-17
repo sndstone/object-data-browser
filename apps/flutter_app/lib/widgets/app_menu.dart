@@ -95,8 +95,6 @@ class AppMenuRow extends StatelessWidget {
         Expanded(
           child: Text(
             label,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
             style: theme.textTheme.bodyMedium?.copyWith(
               color: foreground,
               fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
@@ -130,8 +128,9 @@ PopupMenuItem<T> appMenuItem<T>({
     padding: EdgeInsets.zero,
     child: Builder(
       builder: (context) => Container(
-        height: AppMenuStyle.rowHeight(context),
-        padding: AppMenuStyle.itemPadding,
+        constraints: BoxConstraints(minHeight: AppMenuStyle.rowHeight(context)),
+        padding: AppMenuStyle.itemPadding
+            .add(const EdgeInsets.symmetric(vertical: 8)),
         color: selected
             ? AppMenuStyle.selectedBackground(Theme.of(context))
             : null,

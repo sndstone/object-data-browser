@@ -1,3 +1,5 @@
+import 'diagnostic_safety.dart';
+import 'object_encryption.dart';
 import '../controllers/action_scope.dart';
 import 'listing_cancellation.dart';
 import 'dart:async';
@@ -12,6 +14,7 @@ import 'mobile_benchmark_service.dart';
 import 'mock_engine_service.dart';
 
 class AndroidEngineService
+    with EngineEncryptionResolver
     implements
         EngineService,
         EngineLogSinkRegistrant,
@@ -32,11 +35,15 @@ class AndroidEngineService
           {required EndpointProfile profile,
           required String action,
           Map<String, Object?> arguments = const {},
-          EndpointProfile? destinationProfile}) =>
+          EndpointProfile? destinationProfile}) async =>
       _storage.action(
           profile: profile,
           action: action,
-          arguments: arguments,
+          arguments: await encryptionArguments(
+            profile,
+            destinationProfile,
+            arguments,
+          ),
           destinationProfile: destinationProfile);
 
   final MethodChannel _channel;
@@ -98,7 +105,7 @@ class AndroidEngineService
           id: value['id'] as String? ?? 'android',
           label: value['label'] as String? ?? 'Android Engine',
           language: value['language'] as String? ?? 'native',
-          version: value['version'] as String? ?? '2.3.5',
+          version: value['version'] as String? ?? '2.4.0',
           available: value['available'] as bool? ?? true,
           desktopSupported: false,
           mobileSupported: true,
@@ -490,11 +497,14 @@ class AndroidEngineService
     required EndpointProfile profile,
     required String bucketName,
     required String key,
+    ObjectEncryption? encryption,
   }) async {
     final result = await _dispatch(
       engineId: engineId,
       method: 'getObjectDetails',
       params: {
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
         'profile': _profileToJson(profile),
         'bucketName': bucketName,
         'key': key,
@@ -509,11 +519,14 @@ class AndroidEngineService
     required EndpointProfile profile,
     required String bucketName,
     required String key,
+    ObjectEncryption? encryption,
   }) async {
     await _dispatch(
       engineId: engineId,
       method: 'createFolder',
       params: {
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
         'profile': _profileToJson(profile),
         'bucketName': bucketName,
         'key': key,
@@ -529,11 +542,21 @@ class AndroidEngineService
     required String sourceKey,
     required String destinationBucketName,
     required String destinationKey,
+    ObjectEncryption? encryption,
+    ObjectEncryption? sourceEncryption,
   }) async {
     final result = await _dispatch(
       engineId: engineId,
       method: 'copyObject',
       params: {
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
+        if (sourceEncryption != null)
+          'sourceEncryption': await encryptionPayload(
+            profile,
+            sourceEncryption,
+            source: true,
+          ),
         'profile': _profileToJson(profile),
         'sourceBucketName': sourceBucketName,
         'sourceKey': sourceKey,
@@ -552,11 +575,21 @@ class AndroidEngineService
     required String sourceKey,
     required String destinationBucketName,
     required String destinationKey,
+    ObjectEncryption? encryption,
+    ObjectEncryption? sourceEncryption,
   }) async {
     final result = await _dispatch(
       engineId: engineId,
       method: 'moveObject',
       params: {
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
+        if (sourceEncryption != null)
+          'sourceEncryption': await encryptionPayload(
+            profile,
+            sourceEncryption,
+            source: true,
+          ),
         'profile': _profileToJson(profile),
         'sourceBucketName': sourceBucketName,
         'sourceKey': sourceKey,
@@ -620,11 +653,16 @@ class AndroidEngineService
     required Map<String, String> objectKeyByPath,
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
+    Map<String, Object?>? clientEncryption,
+    ObjectEncryption? encryption,
   }) async {
     final result = await _dispatch(
       engineId: engineId,
       method: 'startUpload',
       params: {
+        if (clientEncryption != null) 'clientEncryption': clientEncryption,
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
         'profile': _profileToJson(profile),
         'bucketName': bucketName,
         'prefix': prefix,
@@ -647,11 +685,16 @@ class AndroidEngineService
     String conflictPolicy = 'keepBoth',
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
+    Map<String, Object?>? clientEncryption,
+    ObjectEncryption? encryption,
   }) async {
     final result = await _dispatch(
       engineId: engineId,
       method: 'startDownload',
       params: {
+        if (clientEncryption != null) 'clientEncryption': clientEncryption,
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
         'profile': _profileToJson(profile),
         'bucketName': bucketName,
         'keys': keys,
@@ -710,11 +753,20 @@ class AndroidEngineService
     required String bucketName,
     required String key,
     required Duration expiration,
+    ObjectEncryption? encryption,
   }) async {
+    if (encryption?.mode.isCustomerKey == true) {
+      throw const EngineException(
+        code: ErrorCode.unsupportedFeature,
+        message: 'Customer-key objects cannot use presigned URLs.',
+      );
+    }
     final result = await _dispatch(
       engineId: engineId,
       method: 'generatePresignedUrl',
       params: {
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
         'profile': _profileToJson(profile),
         'bucketName': bucketName,
         'key': key,
@@ -729,11 +781,14 @@ class AndroidEngineService
     required String engineId,
     required EndpointProfile profile,
     required TestDataToolConfig config,
+    ObjectEncryption? encryption,
   }) async {
     final result = await _dispatch(
       engineId: engineId,
       method: 'runPutTestData',
       params: {
+        if (encryption != null)
+          'encryption': await encryptionPayload(profile, encryption),
         'profile': _profileToJson(profile),
         'config': {
           'bucketName': config.bucketName,
@@ -902,6 +957,18 @@ class AndroidEngineService
     required String method,
     required Map<String, Object?> params,
   }) async {
+    if (method == 'startDownload') {
+      validateClientDownloadName(params['clientEncryption']);
+    }
+    if ((params['profile'] as Map?)?['endpointType'] == 'googleCloudStorage' ||
+        (params['destinationProfile'] as Map?)?['endpointType'] ==
+            'googleCloudStorage') {
+      throw const EngineException(
+        code: ErrorCode.unsupportedFeature,
+        message:
+            'Google Cloud Storage profiles are available on desktop in this version',
+      );
+    }
     if (MobileBenchmarkService.methods.contains(method)) {
       final profile = params['profile'] is Map
           ? EndpointProfile.fromJson(
@@ -947,7 +1014,8 @@ class AndroidEngineService
         'engineId': engineId,
         'method': method,
       };
-      final requestBody = _sanitizeForLogging(params);
+      final requestBody = _sanitizeForLogging(
+          DiagnosticSafety.forNameEncryptedRequest(params, params));
       _emitLog(
         level: 'API',
         category: 'HttpSend',
@@ -1012,7 +1080,8 @@ class AndroidEngineService
           await _channel.invokeMethod<void>('invalidateBucketMetadata');
         } catch (_) {}
       }
-      final payload = _stringKeyedMap(result);
+      final payload = _stringKeyedMap(
+          DiagnosticSafety.forNameEncryptedRequest(result, params));
       final latencyMs = DateTime.now().difference(startedAt).inMilliseconds;
 
       if (apiLoggingEnabled) {
@@ -1099,9 +1168,29 @@ class AndroidEngineService
       );
       throw EngineException(
         code: _parseErrorCode(error.code),
-        message: error.message ?? 'Android engine bridge failed.',
-        details: error.details is Map ? _stringKeyedMap(error.details) : null,
+        message: DiagnosticSafety.forNameEncryptedRequest(
+            error.message ?? 'Android engine bridge failed.', params) as String,
+        details: error.details is Map
+            ? _stringKeyedMap(
+                DiagnosticSafety.forNameEncryptedRequest(error.details, params))
+            : null,
       );
+    } on EngineException catch (error) {
+      throw EngineException(
+          code: error.code,
+          message:
+              DiagnosticSafety.forNameEncryptedRequest(error.message, params)
+                  as String,
+          details: error.details == null
+              ? null
+              : _stringKeyedMap(DiagnosticSafety.forNameEncryptedRequest(
+                  error.details, params)));
+    } catch (error) {
+      final text = error.toString();
+      final safe =
+          DiagnosticSafety.forNameEncryptedRequest(text, params) as String;
+      if (safe == text) rethrow;
+      throw EngineException(code: ErrorCode.unknown, message: safe);
     }
   }
 
@@ -1188,7 +1277,9 @@ class AndroidEngineService
       EngineLogRecord(
         level: level,
         category: category,
-        message: message,
+        message: DiagnosticSafety.text(redactClientDownloadName(
+            DiagnosticSafety.forNameEncryptedRequest(message, params),
+            params?['clientEncryption']) as String),
         profileId: _profileIdFromParams(params),
         bucketName: _bucketNameFromParams(params),
         objectKey: _objectKeyFromParams(params),
@@ -1199,8 +1290,12 @@ class AndroidEngineService
         method: method,
         responseStatus: responseStatus,
         latencyMs: latencyMs,
-        traceHead: traceHead,
-        traceBody: traceBody,
+        traceHead: DiagnosticSafety.trace(redactClientDownloadName(
+            DiagnosticSafety.forNameEncryptedRequest(traceHead, params),
+            params?['clientEncryption'])),
+        traceBody: DiagnosticSafety.trace(redactClientDownloadName(
+            DiagnosticSafety.forNameEncryptedRequest(traceBody, params),
+            params?['clientEncryption'])),
       ),
     );
   }
@@ -1223,27 +1318,13 @@ class AndroidEngineService
         (params?['destinationKey'] as String?);
   }
 
-  Object? _sanitizeForLogging(Object? value) {
-    if (value is Map) {
-      return value.map(
-        (key, entry) => MapEntry(
-          key.toString(),
-          switch (key.toString()) {
-            'accessKey' || 'secretKey' || 'sessionToken' => '[redacted]',
-            _ => _sanitizeForLogging(entry),
-          },
-        ),
-      );
-    }
-    if (value is List) {
-      return value.map(_sanitizeForLogging).toList(growable: false);
-    }
-    return value;
-  }
+  Object? _sanitizeForLogging(Object? value) =>
+      DiagnosticSafety.trace(redactClientDownloadName(value));
 
   String _stringifyForLogging(Object? value) {
     const maxLength = 2000;
-    final encoded = jsonEncode(value);
+    final encoded =
+        jsonEncode(DiagnosticSafety.trace(redactClientDownloadName(value)));
     if (encoded.length <= maxLength) {
       return encoded;
     }
@@ -1251,7 +1332,10 @@ class AndroidEngineService
   }
 
   static Map<String, Object?> _profileToJson(EndpointProfile profile) =>
-      profile.toJson();
+      profile.toJson()
+        ..remove('uploadEncryption')
+        ..remove('providerTemplateId')
+        ..remove('useCustomAwsEndpoint');
 
   static BucketSummary _bucketFromJson(Map<String, Object?> json) {
     return BucketSummary(
@@ -1409,6 +1493,7 @@ class AndroidEngineService
   }
 
   static ObjectDetails _objectDetailsFromJson(Map<String, Object?> json) {
+    json = Map<String, Object?>.from(DiagnosticSafety.sanitize(json) as Map);
     final metadata = Map<String, String>.from(
       (json['metadata'] as Map?)?.map(
             (key, value) => MapEntry(key.toString(), value.toString()),
@@ -1443,6 +1528,11 @@ class AndroidEngineService
             .toList();
 
     return ObjectDetails(
+      encryption: json['encryption'] is Map
+          ? ObjectEncryptionInfo.fromJson(
+              Map<String, Object?>.from(json['encryption'] as Map),
+            )
+          : null,
       key: (json['key'] as String?) ?? '',
       metadata: metadata,
       headers: headers,
@@ -1505,6 +1595,7 @@ class AndroidEngineService
   }
 
   static TransferJob _transferJobFromJson(Map<String, Object?> json) {
+    json = Map<String, Object?>.from(DiagnosticSafety.sanitize(json) as Map);
     return TransferJob(
       id: (json['id'] as String?) ?? '',
       label: (json['label'] as String?) ?? '',
@@ -1532,6 +1623,7 @@ class AndroidEngineService
   static ToolExecutionState _toolExecutionStateFromJson(
     Map<String, Object?> json,
   ) {
+    json = Map<String, Object?>.from(DiagnosticSafety.sanitize(json) as Map);
     return ToolExecutionState(
       label: (json['label'] as String?) ?? '',
       running: json['running'] as bool? ?? false,
@@ -1729,6 +1821,7 @@ class AndroidEngineService
       'invalid_config' => ErrorCode.invalidConfig,
       'object_conflict' => ErrorCode.objectConflict,
       'partial_batch_failure' => ErrorCode.partialBatchFailure,
+      'decryption_failed' => ErrorCode.decryptionFailed,
       'engine_unavailable' => ErrorCode.engineUnavailable,
       _ => ErrorCode.unknown,
     };

@@ -1,7 +1,9 @@
 """Transfer safety regressions with disposable files and isolated SDK fakes."""
 import importlib.util
 import io
+import json
 import sys
+import threading
 from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +29,128 @@ def pyengine(monkeypatch):
 def profile():
     return {'endpointType': 's3Compatible', 'endpointUrl': 'https://fixture.invalid',
             'accessKey': 'fixture', 'secretKey': 'fixture', 'maxConcurrentRequests': 1}
+
+
+def test_api_logging_preserves_get_object_stream_without_accessing_content(pyengine, monkeypatch, profile):
+    from botocore.awsrequest import AWSResponse
+    data = b'complete streamed object'
+    raw = io.BytesIO(data)
+    class StreamingResponse(AWSResponse):
+        @property
+        def content(self):
+            pytest.fail('logging must never access streaming response content')
+    response = StreamingResponse('https://fixture.invalid/bucket/key', 200,
+                                 {'Content-Length': str(len(data)), 'x-amz-security-token': 'SECRET'}, raw)
+    client = pyengine._build_client(pyengine._parse_profile({**profile, 'diagnostics': {'enableApiLogging': True}}))
+    monkeypatch.setattr(client._endpoint.http_session, 'send', lambda _: response)
+    logs = []
+    monkeypatch.setattr(pyengine, '_emit_structured_log', lambda *args: logs.append(args))
+    result = client.get_object(Bucket='bucket', Key='key')
+    assert raw.tell() == 0
+    assert result['Body'].read() == data
+    result['Body'].close()
+    received = next(args[2] for args in logs if args[1] == 'HttpReceive')
+    assert 'RECV GetObject STATUS=200' in received and 'BODY=[streaming body]' in received
+    assert 'SECRET' not in received and '[redacted]' in received
+
+
+def test_api_logging_keeps_bounded_buffered_previews(pyengine, monkeypatch):
+    logs = []
+    monkeypatch.setattr(pyengine, '_emit_structured_log', lambda *args: logs.append(args[2]))
+    for content in (b'<ListBuckets/>', b'x' * (256 * 1024 + 1)):
+        pyengine._log_http_receive(SimpleNamespace(enable_api_logging=True),
+            SimpleNamespace(headers={'Content-Type': 'application/xml'}, content=content, status_code=200),
+            {}, SimpleNamespace(name='ListBuckets', has_streaming_output=False))
+    assert 'BODY=<ListBuckets/>' in logs[0]
+    assert 'BODY=[omitted large body]' in logs[1]
+
+
+def test_bounded_parallel_releases_completed_futures_before_refill(pyengine):
+    import gc
+    import weakref
+    refs = []
+    class Pool(ImmediatePool):
+        def submit(self, function, item):
+            if item == 2:
+                gc.collect()
+                assert all(ref() is None for ref in refs)
+            future = super().submit(function, item)
+            if item < 2: refs.append(weakref.ref(future))
+            return future
+    results = []
+    futures = pyengine._bounded_parallel(Pool(), lambda item: item, range(3), 2)
+    for future in futures:
+        results.append(future.result())
+        del future
+    assert sorted(results) == [0, 1, 2]
+
+
+@pytest.mark.parametrize('suffix', [b'\n', b''])
+def test_input_frames_bound_bytes_and_resynchronize(pyengine, monkeypatch, suffix):
+    assert pyengine._MAX_INPUT_FRAME_BYTES == 64 * 1024**2
+    monkeypatch.setattr(pyengine, '_MAX_INPUT_FRAME_BYTES', 8)
+    class BoundedInput(io.BytesIO):
+        def readline(self, size=-1):
+            assert 0 < size <= 64 * 1024
+            return super().readline(size)
+    stream = BoundedInput(b'12345678\n' + '雪雪雪'.encode() + b'\n' + b'x' * 200000 + b'\nhealth' + suffix)
+    assert list(pyengine._input_frames(stream)) == [b'12345678\n', None, None, b'health' + suffix]
+    assert list(pyengine._input_frames(BoundedInput(b'12345678'))) == [b'12345678']
+    assert list(pyengine._input_frames(BoundedInput(b'123456789'))) == [None]
+
+
+def test_main_rejects_oversized_frame_and_processes_next_request(pyengine, monkeypatch):
+    monkeypatch.setattr(pyengine, '_MAX_INPUT_FRAME_BYTES', 128)
+    monkeypatch.setattr(pyengine, '_scrub_legacy_benchmark_artifacts', lambda: None)
+    request = json.dumps({'requestId': 'after-oversized', 'method': 'health'}).encode()
+    monkeypatch.setattr(pyengine.sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(b'x' * 1000 + b'\n' + request + b'\n')))
+    responses = []
+    monkeypatch.setattr(pyengine, '_write_stdout_line', lambda line: responses.append(json.loads(line)))
+    assert pyengine.main() == 0
+    assert responses[0]['requestId'] is None
+    assert responses[0]['ok'] is False and responses[0]['error']['code'] == 'invalid_request'
+    assert responses[1]['requestId'] == 'after-oversized' and responses[1]['ok'] is True
+
+
+def test_main_bounds_queued_requests_but_controls_bypass_saturated_workers(pyengine, monkeypatch):
+    assert pyengine._MAX_QUEUED_REQUESTS == 256
+    monkeypatch.setattr(pyengine, '_MAX_QUEUED_REQUESTS', 3)
+    monkeypatch.setattr(pyengine, '_scrub_legacy_benchmark_artifacts', lambda: None)
+    started = [threading.Event() for _ in range(8)]
+    release = threading.Event()
+    processed = []
+    responses = []
+    controls = ['pauseTransfer', 'resumeTransfer', 'cancelTransfer', 'cancelToolExecution',
+                'pauseBenchmark', 'resumeBenchmark', 'stopBenchmark', 'getBenchmarkStatus']
+    def process(line):
+        payload = json.loads(line)
+        if payload['method'] == 'blocked':
+            if int(payload['requestId']) < 8: started[int(payload['requestId'])].set()
+            assert release.wait(timeout=5)
+        else:
+            assert threading.current_thread() is threading.main_thread()
+            assert not release.is_set()
+        processed.append(payload['requestId'])
+    def frames(_):
+        try:
+            for index in range(8):
+                yield json.dumps({'requestId': str(index), 'method': 'blocked'}).encode()
+                # Ensure each initial request has started before sending more.
+                assert started[index].wait(timeout=5)
+            for index in range(8, 13):
+                yield json.dumps({'requestId': str(index), 'method': 'blocked'}).encode()
+            for method in controls:
+                yield json.dumps({'requestId': method, 'method': method}).encode()
+        finally:
+            release.set()
+    monkeypatch.setattr(pyengine, '_process_line', process)
+    monkeypatch.setattr(pyengine, '_input_frames', frames)
+    monkeypatch.setattr(pyengine.sys, 'stdin', SimpleNamespace(buffer=None))
+    monkeypatch.setattr(pyengine, '_write_stdout_line', lambda line: responses.append(json.loads(line)))
+    assert pyengine.main() == 0
+    assert [r['requestId'] for r in responses] == ['11', '12']
+    assert all(not r['ok'] and r['error']['code'] == 'overloaded' for r in responses)
+    assert set(processed) == {str(i) for i in range(11)} | set(controls)
 
 
 def upload_params(profile, paths, chunk=5):

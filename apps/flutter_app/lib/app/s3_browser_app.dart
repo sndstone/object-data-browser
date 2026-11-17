@@ -1,3 +1,5 @@
+import '../settings/encryption_settings.dart';
+import '../widgets/controller_content_frame.dart';
 import '../widgets/navigation_item.dart';
 import '../widgets/banner_activity/banner_activity_indicator.dart';
 import '../widgets/banner_activity/banner_activity_spec.dart';
@@ -54,7 +56,8 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
 
   List<WorkspaceTab> _visibleNavTabs() {
     final hideBenchmark = defaultTargetPlatform == TargetPlatform.android ||
-        defaultTargetPlatform == TargetPlatform.iOS;
+        defaultTargetPlatform == TargetPlatform.iOS ||
+        !widget.controller.profileCapability('benchmark');
     if (!hideBenchmark) {
       return _allNavTabs;
     }
@@ -182,7 +185,7 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
       controller.settings.darkMode,
       controller.settings.uiScalePercent,
       controller.settings.compactRows,
-      desktopCompact
+      desktopCompact,
     );
     if (_themeKey != themeKey) {
       _themeKey = themeKey;
@@ -264,7 +267,7 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
                       controller.benchmarkRun,
                       controller.benchmarkHistory,
                       controller.selectedBenchmarkRun,
-                      controller.busyVersion
+                      controller.busyVersion,
                     ),
                     builder: () => BenchmarkWorkspace(controller: controller),
                   ),
@@ -281,7 +284,7 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
                       controller.busyVersion,
                       controller.persistenceState.warning,
                       Object.hashAll(controller.profiles.map(
-                          (p) => controller.profilePersistenceStatusFor(p.id)))
+                          (p) => controller.profilePersistenceStatusFor(p.id))),
                     ),
                     builder: () => SettingsWorkspace(controller: controller),
                   ),
@@ -297,7 +300,7 @@ class _S3BrowserAppState extends State<S3BrowserApp> {
                       controller.settings,
                       controller.profiles,
                       controller.pendingEventLogFilter,
-                      controller.busyVersion
+                      controller.busyVersion,
                     ),
                     builder: () => EventLogWorkspace(controller: controller),
                   ),
@@ -972,17 +975,26 @@ class _HeaderControlStrip extends StatelessWidget {
                     visualDensity: VisualDensity.compact,
                   ),
                   icon: const Icon(Icons.cloud_outlined, size: 18),
-                  label: Text(
-                      '${controller.selectedProfile?.name ?? 'Choose connection'} · ${_shortEngineLabel(controller)}',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis),
+                  label: Tooltip(
+                      message:
+                          '${controller.selectedProfile?.name ?? 'Choose connection'} · ${_shortEngineLabel(controller)}',
+                      child: Text(
+                          '${controller.selectedProfile?.name ?? 'Choose connection'} · ${_shortEngineLabel(controller)}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis)),
                   onPressed: () => showModalBottomSheet<void>(
                       context: context,
                       isScrollControlled: true,
                       builder: (context) => SafeArea(
-                          child: AnimatedBuilder(
-                              animation: controller,
-                              builder: (context, _) => Padding(
+                          child: ControllerContentFrame(
+                              controller: controller,
+                              signature: () => (
+                                    controller.profiles,
+                                    controller.engines,
+                                    controller.selectedProfile,
+                                    controller.activeEngineId,
+                                  ),
+                              builder: (context) => Padding(
                                   padding: EdgeInsets.fromLTRB(
                                       20,
                                       20,
@@ -1075,7 +1087,13 @@ class _HeaderControlStrip extends StatelessWidget {
           child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // One line: while the header is still being measured this slot can
+          // be a few pixels wide, and a wrapping caption would grow the
+          // header to hundreds of pixels for that frame.
           Text(label,
+              maxLines: 1,
+              softWrap: false,
+              overflow: TextOverflow.ellipsis,
               style: theme.textTheme.labelSmall
                   ?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
           child,
@@ -1136,17 +1154,15 @@ class _HeaderControlStrip extends StatelessWidget {
     return AppSelectField<String>(
       value: validProfileValue,
       isExpanded: true,
+      wrapSelectedText: false,
       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
             color: onSurface,
           ),
       decoration: inline
-          ? _inlineDecoration(
-              hintText:
-                  profiles.isEmpty ? 'Create a profile in Settings' : null)
+          ? _inlineDecoration(hintText: profiles.isEmpty ? 'No profile' : null)
           : InputDecoration(
               labelText: phone ? null : 'Endpoint profile',
-              hintText:
-                  profiles.isEmpty ? 'Create a profile in Settings' : null,
+              hintText: profiles.isEmpty ? 'No profile' : null,
               isDense: phone,
               constraints: phone ? const BoxConstraints(minHeight: 48) : null,
               contentPadding:
@@ -1195,7 +1211,19 @@ class _HeaderControlStrip extends StatelessWidget {
           .map(
             (engine) => AppSelectItem(
               value: engine.id,
-              label: engine.label,
+              label: controller.selectedProfile != null &&
+                      !controller.supportsProfile(
+                        controller.selectedProfile!,
+                        engineId: engine.id,
+                      )
+                  ? '${engine.label} — ${controller.profileSupportReason(controller.selectedProfile!)}'
+                  : engine.label,
+              enabled: engine.available &&
+                  (controller.selectedProfile == null ||
+                      controller.supportsProfile(
+                        controller.selectedProfile!,
+                        engineId: engine.id,
+                      )),
             ),
           )
           .toList(),
@@ -1240,9 +1268,10 @@ class _BannerOverlayState extends State<_BannerOverlay> {
     final c = widget.controller;
     final state = (
       c.bannerMessage,
+      c.clientKeyUnlockRequired,
       c.bannerSeverity,
       c.hasBusyActions,
-      c.bannerTask?.status
+      c.bannerTask?.status,
     );
     if (state == _lastState) return;
     _lastState = state;
@@ -1305,7 +1334,7 @@ class _BannerOverlayState extends State<_BannerOverlay> {
           child: child,
         ),
       ),
-      child: c.bannerMessage == null
+      child: c.bannerMessage == null && !c.clientKeyUnlockRequired
           ? const SizedBox.shrink(key: ValueKey('banner-empty'))
           : Align(
               key: ValueKey(transfer != null
@@ -1358,9 +1387,27 @@ class _BannerOverlayState extends State<_BannerOverlay> {
                                       onTap: c.bannerTaskId != null
                                           ? c.openBannerTask
                                           : null,
-                                      child: Text(c.bannerMessage!,
+                                      child: Text(
+                                          c.visibleTransferText(c
+                                                  .bannerMessage ??
+                                              'Unlock your encryption key file to read encrypted names.'),
                                           style:
                                               TextStyle(color: foreground)))),
+                              if (c.clientKeyUnlockRequired)
+                                TextButton(
+                                  onPressed: () async {
+                                    await showEncryptionKeyFileDialog(
+                                        context, c);
+                                    if (c.encryptionKeyStore?.isUnlocked ==
+                                        true) {
+                                      c.clearBanner();
+                                    }
+                                  },
+                                  style: TextButton.styleFrom(
+                                    foregroundColor: foreground,
+                                  ),
+                                  child: const Text('Unlock'),
+                                ),
                               if (c.bannerSeverity == BannerSeverity.error)
                                 TextButton(
                                     onPressed: c.openErrorDetails,

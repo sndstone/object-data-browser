@@ -1,5 +1,46 @@
 # Changelog
 
+## 2.4.0 — review fixes, provider templates, encryption and Google Cloud Storage
+
+### Fixes
+- A share link is attached only to the object it was generated for. Changing the selection before the link returns no longer shows it on another object.
+- An upload keeps the bucket and folder that were open when it was started, even if you navigate while files are still being prepared.
+- With API logging on, the Python engine no longer reads streamed download bodies into its log, which had buffered whole downloads and could break them.
+- Go and Java no longer stop a slow but progressing transfer at a fixed total time. A stalled connection still fails within the read timeout.
+- Go retries an interrupted download range instead of discarding the whole download. Java waits for transfer workers to stop before reporting the result.
+- Changing an unrelated setting no longer resets the benchmark draft. Cancelling a profile export no longer writes a file. Breadcrumbs keep prefixes that contain empty segments. Inspector "current object" actions act on the inspected object only.
+- A denied HEAD with no error body no longer crashes Java's error mapping.
+
+### Interface
+- Settings captions, helper text and responsive layouts stay readable at larger UI scales and on narrow screens.
+- Desktop Upload opens a menu beneath its button; compact layouts retain the upload sheet.
+- Jobs filters (Running, Failed, All) push as one panel with the same timing as the workspaces, including to and from an empty filter.
+- Dialogs keep their text fields alive until the closing animation ends.
+
+### Performance and memory
+- Retained API trace bodies are bounded. The inspector's Events tab builds only visible rows. Open dialogs no longer rebuild on unrelated progress updates. A loading surface appears before credentials are read at startup.
+- Python recoverable downloads stream to disk instead of holding whole ranges. Finished Python benchmarks release their payload cache. Python, Java and Rust bound queued requests and input frame size. Rust's request dispatch no longer reserves a megabyte of stack per request.
+
+### Providers
+- The profile editor offers provider templates for 21 services that prefill the endpoint, region and addressing style.
+- Google Cloud Storage can be used natively with a service-account key on desktop (Python and Go engines).
+
+### Encryption (optional, off by default)
+- Vault rules can encrypt names deterministically per folder, or use a strict policy with a fresh random name for each upload; unlocked names appear in the browser and decrypted downloads.
+- A generated vault or customer key is shown before it is saved, with Copy and "Generate another"; import fields can be revealed, and the key-file dialog can generate a random passphrase.
+- Mobile: a vault upload into a folder now lands in that folder instead of the bucket root.
+- Copies and moves into a vault location accept only vault-encrypted (`.age`) objects, with or without name encryption, so plaintext cannot enter it through bucket copy, rename or a directory move. Version-history copies into a vault location are refused.
+- A name with spaces, control characters, a backslash or a leading slash that an engine could rewrite into a vault location is refused instead of being uploaded, copied or created unencrypted there.
+- The benchmark and the test-data tool refuse to write their unencrypted generated data into a vault location.
+- With the key file locked, a folder name typed into the prefix filter of a name-encrypting location is no longer sent to the provider; the filter asks you to unlock instead.
+- The bucket encryption form saves only after it has read the current server configuration; a failed read no longer lets it overwrite a change made elsewhere.
+- "Bucket encryption" is now a form: choose SSE-S3, SSE-KMS or DSSE-KMS as the bucket default, and turn on vault encryption for the bucket in one step. "Edit as JSON" remains for everything the form does not cover.
+- Settings → Encryption lists each connection's upload encryption and vault rules with an Edit button, and ends with a setup guide for SSE-S3, SSE-KMS, DSSE-KMS, SSE-C, Azure and vault encryption.
+- Provider-side encryption on upload, copy and folder creation: SSE-S3, SSE-KMS, DSSE-KMS and customer keys (SSE-C) for S3; encryption scopes and customer-provided keys for Azure. All four desktop engines support the S3 modes; Python, Go and mobile support the Azure modes. The inspector shows an object's encryption.
+- Client-side encryption for chosen buckets or prefixes, using the standard age format, in all four desktop engines and on Android and iOS. Encrypted objects stay readable outside the app with the `age` tool and the vault key.
+- Encryption keys are kept in a passphrase-protected key file that can be backed up and imported on another machine.
+- The key file can sync through one bucket you assign. Changes made on two devices merge per key instead of overwriting each other, and with bucket versioning on, earlier key files can be listed and keys brought back from them.
+
 ## 2.3.5 — performance, S3 safety and adaptive dialogs
 
 ### Transfers and resource use

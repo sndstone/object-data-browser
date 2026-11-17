@@ -93,18 +93,7 @@ class PreviewImageLoader {
       if (_bytes > aggregateBytes) {
         throw const FormatException('Preview resource budget exceeded');
       }
-      final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
-      late final PreviewImageData data;
-      try {
-        final descriptor = await ui.ImageDescriptor.encoded(buffer);
-        try {
-          data = PreviewImageData(bytes, descriptor.width, descriptor.height);
-        } finally {
-          descriptor.dispose();
-        }
-      } finally {
-        buffer.dispose();
-      }
+      final data = await _decodeBytes(bytes);
       if (cache && bytes.length <= 24 * 1024 * 1024) {
         while (_cache.isNotEmpty &&
             _cachedBytes + bytes.length > 24 * 1024 * 1024) {
@@ -126,6 +115,33 @@ class PreviewImageLoader {
       } else {
         _active--;
       }
+    }
+  }
+
+  /// Decrypted bytes stay local to this surface and never enter the URL cache.
+  Future<PreviewImageData> loadBytes(Uint8List bytes) async {
+    if (_closed) throw StateError('Preview closed');
+    if (++_resources > maximumResources ||
+        bytes.length > maximumBytes ||
+        _bytes + bytes.length > aggregateBytes) {
+      throw const FormatException('Image exceeds preview limit');
+    }
+    _bytes += bytes.length;
+    return _decodeBytes(bytes);
+  }
+
+  Future<PreviewImageData> _decodeBytes(Uint8List bytes) async {
+    final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
+    try {
+      final descriptor = await ui.ImageDescriptor.encoded(buffer);
+      try {
+        if (_closed) throw StateError('Preview closed');
+        return PreviewImageData(bytes, descriptor.width, descriptor.height);
+      } finally {
+        descriptor.dispose();
+      }
+    } finally {
+      buffer.dispose();
     }
   }
 

@@ -1,0 +1,88 @@
+{
+  "description": "age v1 STREAM payload vectors for engine chunk ciphers. Plaintext byte i is (i*31 + (i>>8)*7 + 3) & 0xff. object = header || payloadNonce || sealed chunks. Every object was decrypted with the reference age 1.3.2 tool using testIdentity.",
+  "testIdentity": "AGE-SECRET-KEY-1D7R7D0KTEN803E39JMGZRAH6VRZF0JJ0AY4KKDCZLD57RLW5NRHQY3Z2CC",
+  "testRecipient": "age17h5c6ug79e9rap6yjqaewgm07jltkhjtxj5fheupdfcgwz7hl5yqdx2du8",
+  "chunkSize": 65536,
+  "cases": [
+    {
+      "plaintextLength": 0,
+      "header": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBXYWJmd09La0E3RFExVGc2aERFdnpKUFhVMWREL0lYTWNCYW1hVytydG1NCkFpUFB2Z0ZZaEdLYlAzWmcxQzh2N09GeHp1bFZnb1gvNEZwRFN2QzN1RTAKLS0tIGRHUEZ4dThod2U5YmdBNndQRXJFT0UyZmd6R3RiVXpUOUFBNXIyOU00VDQK",
+      "headerLength": 168,
+      "fileKey": "1VhQv1Wmb7PsDDk3j2hNDw==",
+      "payloadNonce": "BRIfLDlGU2BteoeUoa67yA==",
+      "objectLength": 200,
+      "objectSha256": "8a919c8c6d300d09313fd5dc7f4de93fc5e9644360f2b906b134875b37536c6f",
+      "plaintextSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "plaintextLength": 1,
+      "header": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSB0SnhvdUNVYU4yS0d2VmVKaE5yVTNJb0YxSzRVZ1A0QjlWK25yN1BQQUhrCnVvSE4yaGpucG1DTy96ZFoxUkRCNzFsTitFUEN4cFRtVFhQTk12MTRMNGcKLS0tIGRaaDE4cTFFbW5Kb2VJMVowcXk2SGFQQTJkQnVpa2NUMHlXQWdWc3lzNUEK",
+      "headerLength": 168,
+      "fileKey": "5yfYdo4mY/P6rXPBYPK2UQ==",
+      "payloadNonce": "DBkmM0BNWmd0gY6bqLXCzw==",
+      "objectLength": 201,
+      "objectSha256": "b8c0cacca7d73e3834ca9b1070384e40350994ec275999c850c704f820017c41",
+      "plaintextSha256": "084fed08b978af4d7d196a7446a86b58009e636b611db16211b65a9aadff29c5"
+    },
+    {
+      "plaintextLength": 65535,
+      "header": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBuMG9TcWJYVnBoUVFXZzZIY2tPRWgvbDBGaEx4Vm1TTk5neEpIdEJhR1I4CkQrZGpaM3VrUWRWcWh0cVVydHh2WXc5dVVlZEoxd1YzRWRvb1hUWS94T1kKLS0tIGNIOS80SHNwUE1wUG9hUEhRZXM3Ym10S2NkNk1HUWNSSnk0bWVjbzFYeHcK",
+      "headerLength": 168,
+      "fileKey": "48n1jcZUUncf0baM50XF3A==",
+      "payloadNonce": "/gsYJTI/TFlmc4CNmqe0wQ==",
+      "objectLength": 65735,
+      "objectSha256": "4d46a6592a7ba6fa015c015a8bc6ec3156b2c17061eec55b2fb32342dcbedfef",
+      "plaintextSha256": "240ded293add4fdf94c52b2d6a9fe983ff472054b0c35fb4d301c7e89993a197"
+    },
+    {
+      "plaintextLength": 65536,
+      "header": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBmclg2Nzl2M0Q4M0h0QlZhMUZQZ0gwUTZwZHlrK3c4UGhjQnI5WUp6RTJJCjh0RE0zTUJHUmJZWklDU2E1cXVCQUJCOXd3K2tEQ2s1anVYVG5Id3pXeTAKLS0tIEs5emFiaWZjY2lVWmhsYmlGdU5TSENvVEpVd2RkNWpDTStyZEdvNUZiRU0K",
+      "headerLength": 168,
+      "fileKey": "NqBpiwGmyoHrX189CSF/XA==",
+      "payloadNonce": "BRIfLDlGU2BteoeUoa67yA==",
+      "objectLength": 65736,
+      "objectSha256": "8cd7c2df93e6c23158d8afb3dc39b07b15b001ff7ad306c31bab3d8c973affff",
+      "plaintextSha256": "e5de8ef3b747321c49aed5c2eea58315d7ceb5ff7cc045ce6b6438e6ed059668"
+    },
+    {
+      "plaintextLength": 65537,
+      "header": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBuZHlIdDJYTjZCd0x0Y3VjWVlPUS83WnVhOVVTSG4zYlRQOWJvOXJnYmpjCm9DaU0wbmczcCtFTzZMSHB3eG1VM3RqUHQ3OTA3ZGNsalljT0NNdFZHaTQKLS0tIHk5eTI2MzVMeEtSck5ScFJQSlBuYXozSUJWRUJlQU4rTkFVM1EwVmsvcEEK",
+      "headerLength": 168,
+      "fileKey": "hoUiemCVubNgJYM1BUvC9g==",
+      "payloadNonce": "DBkmM0BNWmd0gY6bqLXCzw==",
+      "objectLength": 65753,
+      "objectSha256": "992c0fc45a50833d881f490a5fc3905f1dcf29698098fa1ba3da8468a6f65a6f",
+      "plaintextSha256": "67f5ccf2459cd521d0c35b555cf6094ee42be79124edf00a9a8d75a58c0a2005"
+    },
+    {
+      "plaintextLength": 131072,
+      "header": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBhM3k2M0ZQNWNCYUkrL1pNRWROamRMSlpHWlJyZnlYTndzRkdKalk4dGxFCm5DMldOeWhWSUlzZjZ1UmIxNWZUd0NvTHdMdFJCSTBITlEvMngrQzNPR00KLS0tIGRsZmV3Um1FbEhFcW5uV3d5NEsyOFJDZ2FYZWtGNjBxMUJ3YndCRVJiSm8K",
+      "headerLength": 168,
+      "fileKey": "uXMrrtuW7J5G3GvSaCpnCQ==",
+      "payloadNonce": "BRIfLDlGU2BteoeUoa67yA==",
+      "objectLength": 131288,
+      "objectSha256": "6662dd6ea1c2a244c51516651c1d307469ce11226685cd61eee9506d70750460",
+      "plaintextSha256": "bd3224081412265123d14bbbd616646cba7047676fc73d2253d59fc317a2725d"
+    },
+    {
+      "plaintextLength": 200000,
+      "header": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSB1RzE5b0IzTWl6L3N5Q2hPV0xUVDB2dnEveUhQazdwd0pFL3g4dnBzMEIwCkFPWkdCRGFOR05icFFqRVNkMlUyNzZrTjVMSGxkMFpQQzZXOUEwK2t3aWsKLS0tIEtmUldOb1NFS2pvYzlHYWNVRWc3ODBneGhlZENtZk5US0VDdnNGZlMxeUEK",
+      "headerLength": 168,
+      "fileKey": "bGCBdqi4Um1JDFaLhD2Ctw==",
+      "payloadNonce": "xdLf7PkGEyAtOkdUYW57iA==",
+      "objectLength": 200248,
+      "objectSha256": "6a8316194c5a23f4d99393ecaa92833f5cee51420fdb54b6e448a86a14dd5a5b",
+      "plaintextSha256": "b4b39a39185a4d1ff1e5826dd2fba47eaa3f998ae48b7bee414421b57064a22f"
+    },
+    {
+      "plaintextLength": 11534353,
+      "header": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBqV1hEMDB3Zzh5SG16MWVmTjhFcjVuclY0Y0NDZGdENXBJWmZXVUIySWxvCnNwQk0zOHREckJTMUpCVGpsSXdZenY4WDJGa0lwaldUaUlaSHNNYnJOSGsKLS0tIDdWZ0o5Q0svR1BCQXd0UnFXbkVQWlNBQURVd3FHcW9ZTnRhNHFiazJ4eW8K",
+      "headerLength": 168,
+      "fileKey": "r/W78wlFtubhD6CA6ga1UA==",
+      "payloadNonce": "fImWo7C9ytfk8f4LGCUyPw==",
+      "objectLength": 11537369,
+      "objectSha256": "3ddd738b0ec7831888d8c1f718f74c4d1dd939fae5493bb590712ce474b9e67c",
+      "plaintextSha256": "a9e3a927139f5b4cccea4db38418435c77a5d21142951b04991d558abba6337a"
+    }
+  ]
+}

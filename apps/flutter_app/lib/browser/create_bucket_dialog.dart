@@ -74,13 +74,15 @@ class _CreateBucketDialogState extends State<CreateBucketDialog> {
                             ? null
                             : (value) => setState(() => _versioning = value),
                         title: const Text('Enable versioning')),
-                    AppSwitchTile(
-                        value: _lock,
-                        onChanged: (value) => setState(() => _lock = value),
-                        title: const Text('Enable object lock')),
+                    if (widget.provider.isS3)
+                      AppSwitchTile(
+                          value: _lock,
+                          onChanged: (value) => setState(() => _lock = value),
+                          title: const Text('Enable object lock')),
                     const SizedBox(height: 8),
-                    const Text(
-                        'Object Lock enables versioning. Availability depends on the storage provider.'),
+                    if (widget.provider.isS3)
+                      const Text(
+                          'Object Lock enables versioning. Availability depends on the storage provider.'),
                   ],
                 ])),
       );

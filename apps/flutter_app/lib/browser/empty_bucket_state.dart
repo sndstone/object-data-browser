@@ -12,7 +12,7 @@ class EmptyBucketState extends StatelessWidget {
 
   final String destination;
   final bool isRoot;
-  final VoidCallback? onUpload;
+  final ValueChanged<BuildContext>? onUpload;
 
   @override
   Widget build(BuildContext context) {
@@ -57,10 +57,14 @@ class EmptyBucketState extends StatelessWidget {
                     style: theme.textTheme.bodySmall,
                     textAlign: TextAlign.center),
                 const SizedBox(height: 18),
-                FilledButton.icon(
-                    onPressed: onUpload,
-                    icon: const Icon(Icons.add),
-                    label: const Text('Choose files')),
+                Builder(
+                    builder: (buttonContext) => FilledButton.icon(
+                        key: const ValueKey('empty-bucket-upload-button'),
+                        onPressed: onUpload == null
+                            ? null
+                            : () => onUpload!(buttonContext),
+                        icon: const Icon(Icons.add),
+                        label: const Text('Choose files'))),
                 const SizedBox(height: 12),
                 Text(
                     isRoot

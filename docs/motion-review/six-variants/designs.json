@@ -1,0 +1,65 @@
+[
+  {
+    "id": "sol-edge-reveal",
+    "title": "Edge reveal",
+    "durationMs": 260,
+    "description": "The next view uncovers the current one; both stay sharp and stationary.",
+    "mechanism": {
+      "type": "edgeReveal",
+      "easing": "cubic-bezier(0.65,0,0.35,1)",
+      "timeline": "Let p run from 0 to 1 over 260 ms. Forward navigation: incoming opaque image is clipped to x=(1-p)*W through W; outgoing opaque image is clipped to x=0 through (1-p)*W. Reverse navigation mirrors both clips. Opacity remains 1 and translation remains zero throughout. The two rectangles meet exactly, so no text overlaps and no background gap opens.",
+      "direction": "Forward uncovers from the right edge toward the left; back uncovers from the left edge toward the right.",
+      "notes": "Keep the viewport and tabs fixed. At rest, remove the outgoing layer. For rapid reversal, preserve the current seam coordinate and animate it back rather than restarting at an edge."
+    },
+    "author": "GPT‑6.1 Sol"
+  },
+  {
+    "id": "sol-clipped-push",
+    "title": "Clipped push",
+    "durationMs": 300,
+    "description": "The next view pushes the previous one aside as one continuous surface.",
+    "mechanism": {
+      "type": "clippedPush",
+      "easing": "cubic-bezier(0.65,0,0.35,1)",
+      "timeline": "Let p run from 0 to 1 over 300 ms. Inside one overflow-hidden viewport, outgoing image translates from x=0 to x=-W*p while incoming image translates from x=W to x=W*(1-p). Images remain opaque and equal-size, touching at the shared boundary. Reverse navigation mirrors both transforms. Do not scale or fade either layer.",
+      "direction": "Forward pushes left; back pushes right.",
+      "notes": "This is intentionally more spatial than Edge reveal, so the user can judge whether visible travel helps. No overshoot or trailing shadow. Preserve the current translation on interrupted reversal."
+    },
+    "author": "GPT‑6.1 Sol"
+  },
+  {
+    "id": "sol-quiet-replace",
+    "title": "Quiet replace",
+    "durationMs": 160,
+    "description": "A brief, stationary replacement with no lateral travel or overlapping text.",
+    "mechanism": {
+      "type": "quietReplace",
+      "easing": "ease-in-out sine for each phase",
+      "timeline": "0-60 ms: outgoing image opacity goes from 1 to 0, incoming remains at 0. At 60 ms: outgoing is removed and incoming begins immediately, with no blank hold. 60-160 ms: incoming opacity goes from 0 to 1. Both images stay at x=0, y=0; the stable viewport background remains visible beneath them. Do not crossfade the text layers.",
+      "direction": "No directional movement; same behavior in both directions.",
+      "notes": "The deliberately short 160 ms duration distinguishes this from the rejected slow fade-through. Keep it a one-shot replacement and avoid an initial empty frame."
+    },
+    "author": "GPT‑6.1 Sol"
+  },
+  {
+    "id": "opus-row-cascade",
+    "title": "Row cascade",
+    "durationMs": 256,
+    "author": "Opus 5.5",
+    "description": "Rows change in a quick top-to-bottom sequence."
+  },
+  {
+    "id": "opus-center-split",
+    "title": "Center split reveal",
+    "durationMs": 240,
+    "author": "Opus 5.5",
+    "description": "The new view opens from the center toward both edges."
+  },
+  {
+    "id": "opus-diagonal-sweep",
+    "title": "Feathered diagonal sweep",
+    "durationMs": 280,
+    "author": "Opus 5.5",
+    "description": "A narrow, soft diagonal edge uncovers the next view."
+  }
+]

@@ -29,6 +29,62 @@ class _MemorySecrets extends ProfileSecretStore {
 
 void main() {
   test(
+    'provider template metadata survives state and export/import without secrets',
+    () async {
+      final directory = await Directory.systemTemp.createTemp(
+        'provider-template-',
+      );
+      addTearDown(() => directory.delete(recursive: true));
+      final store = _MemorySecrets();
+      final repository = LocalAppStateRepository(
+        secretStore: store,
+        applicationSupportDirectoryProvider: () async => directory,
+      );
+      final profile = EndpointProfile.fromJson({
+        'id': 'r2-profile',
+        'name': 'R2',
+        'providerTemplateId': 'cloudflare-r2',
+        'endpointUrl': 'https://example.r2.cloudflarestorage.com',
+        'region': 'auto',
+        'accessKey': 'PROVIDER-ACCESS-SENTINEL',
+        'secretKey': 'PROVIDER-SECRET-SENTINEL',
+      });
+      await repository.saveState(
+        settings: AppSettings.fromJson({}),
+        profiles: [profile],
+        selectedProfileId: profile.id,
+      );
+      expect((await repository.loadState())!.profiles.single, profile);
+      final exported = await repository.exportProfiles(
+        profiles: [profile],
+        path: '${directory.path}/export.json',
+      );
+      final imported = (await repository.importProfiles(exported.path)).single;
+      expect(imported.providerTemplateId, 'cloudflare-r2');
+      expect(imported.accessKey, isEmpty);
+      expect(imported.secretKey, isEmpty);
+      for (final file in directory.listSync().whereType<File>()) {
+        final text = await file.readAsString();
+        expect(text, contains('cloudflare-r2'));
+        expect(text, isNot(contains('PROVIDER-ACCESS-SENTINEL')));
+        expect(text, isNot(contains('PROVIDER-SECRET-SENTINEL')));
+      }
+      final json = jsonDecode(await exported.readAsString()) as Map;
+      (json['profiles'] as List).single['providerTemplateId'] =
+          'future-provider';
+      await exported.writeAsString(jsonEncode(json));
+      expect(
+        (await repository.importProfiles(
+          exported.path,
+        ))
+            .single
+            .providerTemplateId,
+        isNull,
+      );
+    },
+  );
+
+  test(
       'AWS provider options survive metadata persistence without resolved keys',
       () async {
     final directory =
@@ -41,6 +97,8 @@ void main() {
     final profile = EndpointProfile.fromJson({
       'id': 'role-profile',
       'name': 'Role',
+      'providerTemplateId': 'amazon-s3',
+      'useCustomAwsEndpoint': true,
       'endpointType': 'awsS3',
       'endpointUrl': 'https://s3.eu-west-1.amazonaws.com',
       'region': 'eu-west-1',
@@ -61,6 +119,14 @@ void main() {
         selectedProfileId: profile.id);
     final loaded = await repository.loadState();
     expect(loaded!.profiles.single.connection, profile.connection);
+    expect(loaded.profiles.single.useCustomAwsEndpoint, isTrue);
+    final exported = await repository.exportProfiles(
+        profiles: [profile], path: '${directory.path}/export.json');
+    expect(
+        (await repository.importProfiles(exported.path))
+            .single
+            .useCustomAwsEndpoint,
+        isTrue);
     expect(loaded.profiles.single.accessKey, isEmpty);
     expect(loaded.profiles.single.secretKey, isEmpty);
     expect(loaded.profiles.single.connection.storageClasses,
@@ -155,7 +221,7 @@ void main() {
     expect(find.text('Microsoft Entra ID'), findsOneWidget);
     await tester.tap(find.text('Bucket access and endpoint capabilities'));
     await tester.pumpAndSettle();
-    expect(find.text('Known container (optional)'), findsOneWidget);
+    expect(find.text('Known container'), findsOneWidget);
     expect(find.text('Requester Pays'), findsNothing);
     expect(find.byKey(const ValueKey('roleArn')), findsNothing);
   });

@@ -23,7 +23,7 @@ def pyengine(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(module, '_emit_transfer_event', lambda _: None)
     yield module
-    for run in module._BENCHMARKS.values():
+    for run in list(module._BENCHMARKS.values()):
         with run.lock:
             run.state['status'] = 'stopped'
             run.wake.set()
@@ -48,11 +48,11 @@ def test_benchmark_runs_without_polling_and_never_persists_credentials(pyengine,
     state = pyengine._start_benchmark({'profile': profile, 'config': {'bucketName': 'fixture',
         'testMode': 'operation-count', 'operationCount': 20, 'concurrentThreads': 3, 'workloadType': 'write-only',
         'objectSizes': [8], 'outputDirectory': str(tmp_path)}})
-    run = pyengine._BENCHMARKS[state['id']]
-    deadline = time.monotonic() + 5
-    while run.state['status'] == 'running' and time.monotonic() < deadline:
-        time.sleep(0.01)
     snapshot = pyengine._get_benchmark_status({'runId': state['id']})
+    deadline = time.monotonic() + 5
+    while snapshot['status'] == 'running' and time.monotonic() < deadline:
+        time.sleep(0.01)
+        snapshot = pyengine._get_benchmark_status({'runId': state['id']})
     assert snapshot['status'] == 'completed', snapshot
     assert snapshot['processedCount'] == 20
     calls = client.put_object.call_count
@@ -486,7 +486,7 @@ def test_object_details_report_actual_identity_restore_and_encryption(pyengine, 
     details = pyengine._get_object_details({'profile': profile, 'bucketName': 'bucket', 'key': 'key'})
     assert details['etag'] == 'etag'
     assert details['versionId'] == 'actual-version'
-    assert details['encryption']['SSEKMSKeyId'] == 'fixture-key'
+    assert details['encryption'] == {'mode': 'sse-kms', 'kmsKeyId': 'fixture-key'}
     assert details['restore'] == 'ongoing-request="true"'
     assert details['headers']['Content-Disposition'] == 'attachment'
 
@@ -555,11 +555,11 @@ def test_benchmark_pure_write_runs_beyond_first_default_mix_window(pyengine, pro
                 'concurrentThreads': 4, 'objectCount': 120, 'workloadType': 'write-only',
                 'objectSizes': [16], 'randomData': False,
             }})
-            run = pyengine._BENCHMARKS[state['id']]
-            deadline = time.monotonic() + 10
-            while run.state['status'] == 'running' and time.monotonic() < deadline:
-                time.sleep(0.01)
             snapshot = pyengine._get_benchmark_status({'runId': state['id']})
+            deadline = time.monotonic() + 10
+            while snapshot['status'] == 'running' and time.monotonic() < deadline:
+                time.sleep(0.01)
+                snapshot = pyengine._get_benchmark_status({'runId': state['id']})
             assert snapshot['status'] == 'completed', snapshot
             assert snapshot['processedCount'] == 120
             assert snapshot['resultSummary']['operationsByType'] == {'PUT': 120}

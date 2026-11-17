@@ -380,7 +380,7 @@ class _StorageAdminDialogState extends State<StorageAdminDialog> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                   SelectableText(
-                      '${profile.name} / $bucket${object ? '/${widget.objectKey}' : ''}${widget.versionId == null ? '' : '\nVersion: ${widget.versionId}'}'),
+                      '${profile.name} / $bucket${object ? '/${widget.controller.visibleStoredKey(widget.objectKey!)}' : ''}${widget.versionId == null ? '' : '\nVersion: ${widget.versionId}'}'),
                   const SizedBox(height: 12),
                   if (busy) const LinearProgressIndicator(),
                   if (error != null)

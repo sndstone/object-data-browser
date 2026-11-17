@@ -19,9 +19,12 @@ class AppBootstrap {
   static Future<AppController> initialize({
     AppStateRepository? appStateRepository,
     EngineService? engineService,
+    Future<String> Function()? downloadPathProvider,
+    Future<Directory> Function()? temporaryDirectoryProvider,
   }) async {
-    final downloadPath = await resolveDownloadPath();
-    final tempDir = await getTemporaryDirectory();
+    final downloadPath = await (downloadPathProvider ?? resolveDownloadPath)();
+    final tempDir =
+        await (temporaryDirectoryProvider ?? getTemporaryDirectory)();
     final repository = appStateRepository ?? LocalAppStateRepository();
 
     final defaultSettings = AppSettings(

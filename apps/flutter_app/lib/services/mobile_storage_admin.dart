@@ -9,8 +9,13 @@ import 'package:xml/xml.dart';
 import '../controllers/action_scope.dart';
 import '../models/domain_models.dart';
 import 'storage_http_client.dart';
+import 'object_encryption.dart';
+import 'diagnostic_safety.dart';
 import 'listing_cancellation.dart';
 import 'multipart_sizing.dart';
+import 'crypto/age.dart';
+import 'crypto/age_primitives.dart' show ageWipe;
+import 'mobile_client_encryption.dart';
 
 part 'mobile_azure_storage.dart';
 part 'mobile_storage_transfers.dart';
@@ -33,7 +38,18 @@ class MobileStorageAdmin {
     var total = 0, completed = 0;
     if (direction == 'upload') {
       for (final path in arguments['filePaths'] as List? ?? []) {
-        total += await File('$path').length();
+        final size = await File('$path').length();
+        final config = MobileClientEncryption.parse(
+            arguments['clientEncryption'],
+            upload: true);
+        try {
+          total += config == null
+              ? size
+              : ageCiphertextLength(
+                  headerLength: config.headerLength, plaintextLength: size);
+        } finally {
+          config?.dispose();
+        }
       }
     } else {
       final keys = List<String>.from(arguments['keys'] as List? ?? []);
@@ -41,10 +57,24 @@ class MobileStorageAdmin {
           keys.length, profile.maxConcurrentRequests.clamp(1, 8),
           (index) async {
         final key = keys[index];
-        final head = await client(profile)
-            .request('HEAD', '${arguments['bucketName']}', key: key);
+        final head = await client(profile).request(
+          'HEAD',
+          '${arguments['bucketName']}',
+          key: key,
+          headers: objectEncryptionHeaders(
+            profile,
+            arguments['encryption'],
+            read: true,
+          ),
+        );
         heads[key] = head;
-        total += int.parse(head.headers['content-length']!);
+        if (arguments['clientEncryption'] != null) {
+          final size = int.tryParse(head.headers['content-length'] ?? '');
+          if (size == null || size < 0) mobileDecryptionFailed(0);
+          total += size;
+        } else {
+          total += int.parse(head.headers['content-length']!);
+        }
         return true;
       });
     }
@@ -379,7 +409,13 @@ class MobileStorageAdmin {
               rows.where((r) => r['deleteMarker'] == true).length
         };
       case 'objectDetails':
-        return _s3Details(http, bucket, _key(key), versionQuery);
+        return _s3Details(
+          http,
+          bucket,
+          _key(key),
+          versionQuery,
+          arguments['encryption'],
+        );
       case 'objectTags':
         if (arguments['tags'] is Map) {
           await _putXml(
@@ -422,6 +458,7 @@ class MobileStorageAdmin {
           'deleted': true
         };
       case 'presignVersion':
+        rejectCustomerKeyPresign(profile, arguments['encryption']);
         return {
           'url': http.presign(bucket, _key(key),
               versionId: version,
@@ -696,9 +733,37 @@ class MobileStorageAdmin {
     };
   }
 
-  Future<Map<String, Object?>> _s3Details(StorageHttpClient http, String bucket,
-      String key, Map<String, String> query) async {
-    final response = await http.request('HEAD', bucket, key: key, query: query);
+  Future<Map<String, Object?>> _s3Details(
+    StorageHttpClient http,
+    String bucket,
+    String key,
+    Map<String, String> query, [
+    Object? encryption,
+  ]) async {
+    final headers = objectEncryptionHeaders(
+      http.profile,
+      encryption,
+      read: true,
+    );
+    late final StorageHttpResponse response;
+    try {
+      response = await http.request(
+        'HEAD',
+        bucket,
+        key: key,
+        query: query,
+        headers: headers,
+      );
+    } on StorageHttpException catch (error) {
+      if (error.response.status == 400 && headers.isEmpty) {
+        throw EngineException(
+          code: error.code,
+          message: error.message,
+          details: {'encryptionHint': 'sse_c_key_required'},
+        );
+      }
+      rethrow;
+    }
     return {
       'key': key,
       'size': int.tryParse(response.headers['content-length'] ?? '') ?? 0,
@@ -708,7 +773,8 @@ class MobileStorageAdmin {
       'modifiedAt': _date(response.headers['last-modified']),
       'versionId': response.headers['x-amz-version-id'],
       'storageClass': response.headers['x-amz-storage-class'] ?? 'STANDARD',
-      'encryption': response.headers['x-amz-server-side-encryption'],
+      if (objectEncryptionInfo(response.headers) case final encryption?)
+        'encryption': encryption,
       'metadata': {
         for (final e in response.headers.entries)
           if (e.key.startsWith('x-amz-meta-')) e.key.substring(11): e.value
@@ -718,7 +784,7 @@ class MobileStorageAdmin {
           if (response.headers[e.value] != null)
             e.key: response.headers[e.value]
       },
-      'rawHeaders': response.headers
+      'rawHeaders': DiagnosticSafety.sanitize(response.headers)
     };
   }
 

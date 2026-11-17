@@ -171,6 +171,23 @@ class LocalAppStateRepository implements AppStateRepository {
         .toList();
   }
 
+  /// Uses the same sandbox migration selection as metadata loading. No file is created.
+  Future<File> encryptionKeyFile() async {
+    final state = await _stateFileForLoad();
+    final candidate = File(
+      '${state.parent.path}${Platform.pathSeparator}encryption-keys.age',
+    );
+    if (await candidate.exists()) return candidate;
+    final alternate = _alternateMacStateFile(await _stateFile());
+    if (alternate != null) {
+      final existing = File(
+        '${alternate.parent.path}${Platform.pathSeparator}encryption-keys.age',
+      );
+      if (await existing.exists()) return existing;
+    }
+    return candidate;
+  }
+
   Future<File> _stateFile() async {
     final supportDir = await _applicationSupportDirectoryProvider();
     return File(
@@ -488,8 +505,16 @@ class LocalAppStateRepository implements AppStateRepository {
               .toString()
               .split('?')
               .first,
+      if (profile.clientEncryptionRules.isNotEmpty)
+        'clientEncryptionRules':
+            profile.clientEncryptionRules.map((r) => r.toJson()).toList(),
+      if (profile.uploadEncryption != null)
+        'uploadEncryption': profile.uploadEncryption!.toJson(),
       'region': profile.region,
       'endpointType': profile.endpointType.name,
+      if (profile.providerTemplateId != null)
+        'providerTemplateId': profile.providerTemplateId,
+      if (profile.useCustomAwsEndpoint) 'useCustomAwsEndpoint': true,
       'pathStyle': profile.pathStyle,
       'verifyTls': profile.verifyTls,
       'signerOverride': profile.signerOverride,

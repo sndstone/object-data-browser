@@ -4,6 +4,18 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:s3_browser_crossplat/services/preview_image_loader.dart';
 
 void main() {
+  test('decrypted image bytes use the same bounded dimension reader', () async {
+    final bytes = base64Decode(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=');
+    final loader = PreviewImageLoader();
+    addTearDown(loader.close);
+    final data = await loader.loadBytes(bytes);
+    expect(data.bytes, bytes);
+    expect((data.width, data.height), (1, 1));
+    final bounded = PreviewImageLoader(maximumBytes: bytes.length - 1);
+    addTearDown(bounded.close);
+    await expectLater(bounded.loadBytes(bytes), throwsFormatException);
+  });
   test('image loader bounds chunked bytes before decoding', () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     addTearDown(() => server.close(force: true));

@@ -20,6 +20,11 @@ final class ServerCopy {
     }
 
     static Map<String, Object> run(S3Client c, JsonNode p, int workers) {
+        return run(c, p, workers, ObjectEncryption.parse(p, "encryption"), ObjectEncryption.parse(p, "sourceEncryption"));
+    }
+
+    static Map<String, Object> run(S3Client c, JsonNode p, int workers,
+                                  ObjectEncryption encryption, ObjectEncryption sourceEncryption) {
         String sb = required(p, "sourceBucketName"),
                 sk = required(p, "sourceKey"),
                 b = required(p, "destinationBucketName"),
@@ -30,7 +35,7 @@ final class ServerCopy {
                     "Source and destination must differ unless restoring a selected version.");
         var head =
                 c.headObject(
-                        HeadObjectRequest.builder().bucket(sb).key(sk).versionId(selected).build());
+                        sourceEncryption.read(HeadObjectRequest.builder().bucket(sb).key(sk).versionId(selected)).build());
         long size = head.contentLength();
         String version = selected != null ? selected : head.versionId();
         String source =
@@ -39,11 +44,11 @@ final class ServerCopy {
         if (size <= 5L * 1024 * 1024 * 1024) {
             var out =
                     c.copyObject(
-                            CopyObjectRequest.builder()
+                            sourceEncryption.source(encryption.write(CopyObjectRequest.builder()
                                     .bucket(b)
                                     .key(k)
                                     .copySource(source)
-                                    .copySourceIfMatch(head.eTag())
+                                    .copySourceIfMatch(head.eTag())))
                                     .build());
             destinationVersion = out.versionId();
             etag = out.copyObjectResult() == null ? null : out.copyObjectResult().eTag();
@@ -61,9 +66,7 @@ final class ServerCopy {
                             tags.tagSet().stream()
                                     .map(t -> encode(t.key()) + "=" + encode(t.value()))
                                     .toList());
-            var created =
-                    c.createMultipartUpload(
-                            CreateMultipartUploadRequest.builder()
+            var create = CreateMultipartUploadRequest.builder()
                                     .bucket(b)
                                     .key(k)
                                     .contentType(head.contentType())
@@ -77,15 +80,20 @@ final class ServerCopy {
                                     .serverSideEncryption(head.serverSideEncryption())
                                     .ssekmsKeyId(head.ssekmsKeyId())
                                     .bucketKeyEnabled(head.bucketKeyEnabled())
-                                    .tagging(tagging.isEmpty() ? null : tagging)
-                                    .build());
+                                    .tagging(tagging.isEmpty() ? null : tagging);
+            if (p.hasNonNull("encryption")) {
+                // Explicit destination options must replace the legacy inherited KMS settings.
+                create.serverSideEncryption((String) null).ssekmsKeyId(null).bucketKeyEnabled(null);
+                encryption.write(create);
+            }
+            var created = c.createMultipartUpload(create.build());
             String upload = created.uploadId();
             if (upload == null)
                 throw new IllegalStateException("Multipart copy returned no upload ID.");
             ExecutorService executor =
                     Executors.newFixedThreadPool(Math.min(Math.max(workers, 1), 8));
             List<CompletedPart> parts = new ArrayList<>();
-            try (MultipartUploadSession session = new MultipartUploadSession(c, b, k, upload);
+            try (MultipartUploadSession session = new MultipartUploadSession(c, b, k, upload, encryption);
                  BoundedTasks<CompletedPart> tasks = new BoundedTasks<>(executor,
                      Math.min(Math.max(workers, 1), 8), parts::add)) {
                 long partSize = Math.max(128L * 1024 * 1024, (size + 9999) / 10000);
@@ -95,7 +103,7 @@ final class ServerCopy {
                     tasks.submit(() -> {
                                         var out =
                                                 c.uploadPartCopy(
-                                                        UploadPartCopyRequest.builder()
+                                                        sourceEncryption.source(encryption.read(UploadPartCopyRequest.builder()
                                                                 .bucket(b)
                                                                 .key(k)
                                                                 .uploadId(upload)
@@ -104,7 +112,7 @@ final class ServerCopy {
                                                                 .copySourceRange(
                                                                         "bytes=" + start + "-"
                                                                                 + end)
-                                                                .copySourceIfMatch(head.eTag())
+                                                                .copySourceIfMatch(head.eTag())))
                                                                 .build());
                                         if (out.copyPartResult() == null
                                                 || out.copyPartResult().eTag() == null)
@@ -122,19 +130,13 @@ final class ServerCopy {
                 destinationVersion = out.versionId();
                 etag = out.eTag();
             } catch (Exception error) {
-                executor.shutdownNow();
-                try {
-                    executor.awaitTermination(30, TimeUnit.SECONDS);
-                } catch (InterruptedException x) {
-                    Thread.currentThread().interrupt();
-                }
                 Throwable cause = error instanceof ExecutionException ? error.getCause() : error;
                 if (cause instanceof RuntimeException runtime) throw runtime;
                 if (error instanceof InterruptedException) Thread.currentThread().interrupt();
                 throw new IllegalStateException(
                         "Multipart copy failed: " + cause.getMessage(), cause);
             } finally {
-                executor.shutdownNow();
+                BoundedTasks.shutdownAndAwait(executor);
             }
         }
         if (etag == null)

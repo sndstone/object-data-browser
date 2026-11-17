@@ -3,6 +3,18 @@ import '../models/domain_models.dart';
 typedef EngineLogCallback = void Function(EngineLogRecord entry);
 typedef TransferJobCallback = void Function(TransferJob job);
 
+/// Routes the browser's basic copy workflow through a native provider's core
+/// methods on the chosen engine, rather than the Python advanced S3 adapter.
+abstract interface class NativeProviderActions {
+  Future<Map<String, Object?>> nativeProviderAction({
+    required String engineId,
+    required EndpointProfile profile,
+    required String action,
+    required Map<String, Object?> arguments,
+    EndpointProfile? destinationProfile,
+  });
+}
+
 class DiagnosticsOptions {
   const DiagnosticsOptions({
     required this.enableApiLogging,
@@ -203,12 +215,14 @@ abstract class EngineService {
     required EndpointProfile profile,
     required String bucketName,
     required String key,
+    ObjectEncryption? encryption,
   });
   Future<void> createFolder({
     required String engineId,
     required EndpointProfile profile,
     required String bucketName,
     required String key,
+    ObjectEncryption? encryption,
   });
   Future<BatchOperationResult> copyObject({
     required String engineId,
@@ -217,6 +231,8 @@ abstract class EngineService {
     required String sourceKey,
     required String destinationBucketName,
     required String destinationKey,
+    ObjectEncryption? encryption,
+    ObjectEncryption? sourceEncryption,
   });
   Future<BatchOperationResult> moveObject({
     required String engineId,
@@ -225,6 +241,8 @@ abstract class EngineService {
     required String sourceKey,
     required String destinationBucketName,
     required String destinationKey,
+    ObjectEncryption? encryption,
+    ObjectEncryption? sourceEncryption,
   });
   Future<BatchOperationResult> deleteObjects({
     required String engineId,
@@ -247,6 +265,8 @@ abstract class EngineService {
     required Map<String, String> objectKeyByPath,
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
+    Map<String, Object?>? clientEncryption,
+    ObjectEncryption? encryption,
   });
   Future<TransferJob> startDownload({
     required String engineId,
@@ -257,6 +277,8 @@ abstract class EngineService {
     String conflictPolicy = 'keepBoth',
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
+    Map<String, Object?>? clientEncryption,
+    ObjectEncryption? encryption,
   });
   Future<TransferJob> pauseTransfer({
     required String engineId,
@@ -276,11 +298,13 @@ abstract class EngineService {
     required String bucketName,
     required String key,
     required Duration expiration,
+    ObjectEncryption? encryption,
   });
   Future<ToolExecutionState> runPutTestData({
     required String engineId,
     required EndpointProfile profile,
     required TestDataToolConfig config,
+    ObjectEncryption? encryption,
   });
   Future<ToolExecutionState> runDeleteAll({
     required String engineId,

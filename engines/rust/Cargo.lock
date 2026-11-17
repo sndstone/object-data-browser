@@ -1563,7 +1563,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "s3-browser-rust-engine"
-version = "2.3.5"
+version = "2.4.0"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -1575,6 +1575,7 @@ dependencies = [
  "http-body 1.0.1",
  "libc",
  "md-5",
+ "ring",
  "serde",
  "serde_json",
  "sha1",

@@ -71,7 +71,7 @@ class Workflows:
         try:
             with tmp.open('x', encoding='utf-8') as output:
                 os.chmod(tmp, 0o600)
-                json.dump(value, output, default=self.e._serialize_dt)
+                json.dump(self.e._safe_diagnostics(value), output, default=self.e._serialize_dt)
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(tmp, path)
@@ -117,7 +117,7 @@ class Workflows:
         record = {'sequence': journal['sequence'] + 1, 'mappingStart': start,
                   'mappings': state['mappings'][start:],
                   'state': {k: v for k, v in state.items() if k not in {'entries', 'mappings', '_historyJournal'}}}
-        data = json.dumps(record, default=self.e._serialize_dt, separators=(',', ':'))
+        data = json.dumps(self.e._safe_diagnostics(record), default=self.e._serialize_dt, separators=(',', ':'))
         envelope = json.dumps({'sha256': hashlib.sha256(data.encode()).hexdigest(), 'record': data}, separators=(',', ':')).encode() + b'\n'
         with path.with_name(journal['events']).open('ab') as output:
             output.write(envelope)
@@ -934,8 +934,15 @@ class Workflows:
                 valid = []
                 for item in state['ranges']:
                     output.seek(item['start'])
-                    data = output.read(item['length'])
-                    if len(data) == item['length'] and hashlib.sha256(data).hexdigest() == item['sha256']:
+                    digest = hashlib.sha256()
+                    remaining = item['length']
+                    while remaining:
+                        self.e._transfer_gate(control)
+                        data = output.read(min(1024**2, remaining))
+                        if not data: break
+                        digest.update(data)
+                        remaining -= len(data)
+                    if remaining == 0 and digest.hexdigest() == item['sha256']:
                         valid.append(item)
                 state['ranges'] = valid
                 state['completedBytes'] = sum(item['length'] for item in valid)
@@ -945,39 +952,54 @@ class Workflows:
                 done = {item['start'] for item in valid}
                 starts = (start for start in range(0, size, chunk) if start not in done)
                 limit = min(128, max(1, int(p.get('maxRanges') or 32)))
+                write_lock = threading.Lock()
                 def receive(start):
-                    self.e._transfer_gate(control)
                     end = min(size, start + chunk) - 1
                     version = state['versionId']
-                    if azure:
-                        response = client.open('GET', client.blob_path(state['bucketName'], state['key']),
-                                               query={'versionid': version} if version is not None else {},
-                                               headers={'Range': f'bytes={start}-{end}', 'If-Match': state['remoteIdentity']['etag']})
-                        header = response.headers.get('Content-Range', '')
-                        try: data = response.read(chunk + 1)
-                        finally: response.close()
-                    else:
+                    digest = None
+                    def open_range():
+                        nonlocal digest
+                        # Retries rewrite the same offsets and hash only the
+                        # successful attempt, never the preceding partial body.
+                        digest = hashlib.sha256()
+                        if azure:
+                            response = client.open('GET', client.blob_path(state['bucketName'], state['key']),
+                                                   query={'versionid': version} if version is not None else {},
+                                                   headers={'Range': f'bytes={start}-{end}', 'If-Match': state['remoteIdentity']['etag']})
+                            return response, response.headers.get('Content-Range', '')
                         response = client.get_object(Bucket=state['bucketName'], Key=state['key'],
                                                      **({'VersionId': version} if version is not None else {}),
                                                      Range=f'bytes={start}-{end}', IfMatch=state['remoteIdentity']['etag'])
-                        header = response.get('ContentRange', '')
-                        try: data = response['Body'].read(chunk + 1)
-                        finally: response['Body'].close()
-                    self.e._validate_download_range(header, start, end, size, len(data))
-                    return start, data
+                        return response['Body'], response.get('ContentRange', '')
+                    def write(offset, data):
+                        if offset + len(data) > end + 1:
+                            self.fail('object_conflict', 'Download body exceeds the requested range.')
+                        with write_lock:
+                            output.seek(offset)
+                            output.write(data)
+                        digest.update(data)
+                    length = self.e._read_range_with_retry(open_range, write, start, end, size, profile.max_attempts, control)
+                    return {'start': start, 'length': length, 'sha256': digest.hexdigest()}
                 import itertools
                 with self.e.ThreadPoolExecutor(max_workers=min(8, profile.max_pool_connections)) as pool:
-                    for future in self.e._bounded_parallel(pool, receive, itertools.islice(starts, limit), min(8, profile.max_pool_connections)):
-                        start, data = future.result()
-                        self.e._transfer_gate(control)
-                        output.seek(start)
-                        output.write(data)
-                        output.flush()
-                        os.fsync(output.fileno())
-                        state['ranges'].append({'start': start, 'length': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
-                        state['completedBytes'] += len(data)
-                        self.write(state)
-                        self.transfer_event(state, control, len(state['ranges']), total, size)
+                    futures = self.e._bounded_parallel(pool, receive, itertools.islice(starts, limit), min(8, profile.max_pool_connections))
+                    try:
+                        for future in futures:
+                            item = future.result()
+                            del future
+                            self.e._transfer_gate(control)
+                            # Serialize buffered file operations with workers;
+                            # range bytes must be durable before their manifest.
+                            with write_lock:
+                                output.flush()
+                                os.fsync(output.fileno())
+                            state['ranges'].append(item)
+                            state['completedBytes'] += item['length']
+                            self.write(state)
+                            self.transfer_event(state, control, len(state['ranges']), total, size)
+                    except BaseException:
+                        futures.close()
+                        raise
                 if state['completedBytes'] != size:
                     state['status'] = 'paused'
                     self.write(state)

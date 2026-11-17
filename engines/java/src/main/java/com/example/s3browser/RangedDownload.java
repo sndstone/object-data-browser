@@ -22,6 +22,28 @@ final class RangedDownload {
 
     static long transfer(FileChannel target, long start, long end, long total, String etag,
                          int maxAttempts, boolean ranged, Open open, Runnable checkpoint) throws IOException {
+        return transfer(start, end, total, etag, maxAttempts, ranged, open, checkpoint, (bytes, position) -> {
+            while (bytes.hasRemaining()) {
+                checkpoint.run();
+                position += target.write(bytes, position);
+            }
+        });
+    }
+
+    /** A single bounded nonce/chunk range, fully validated before the caller authenticates it. */
+    static byte[] read(long start, long end, long total, String etag, int maxAttempts,
+                       Open open, Runnable checkpoint) throws IOException {
+        if (end < start || end - start >= ClientEncryption.SEALED) throw new IllegalArgumentException("Unbounded cipher range.");
+        byte[] result = new byte[(int) (end - start + 1)];
+        transfer(start, end, total, etag, maxAttempts, true, open, checkpoint,
+            (bytes, position) -> bytes.get(result, (int) (position - start), bytes.remaining()));
+        return result;
+    }
+
+    private interface Sink { void write(ByteBuffer bytes, long position) throws IOException; }
+
+    private static long transfer(long start, long end, long total, String etag, int maxAttempts,
+                                 boolean ranged, Open open, Runnable checkpoint, Sink sink) throws IOException {
         long expected = end - start + 1;
         byte[] buffer = new byte[(int) Math.min(1024 * 1024, expected)];
         for (int attempt = 1; ; attempt++) {
@@ -40,12 +62,7 @@ final class RangedDownload {
                     catch (IOException error) { throw new InterruptedBody(error); }
                     if (read == -1) break;
                     if (count + read > expected) throw new IOException("Oversized range body.");
-                    ByteBuffer bytes = ByteBuffer.wrap(buffer, 0, read);
-                    long position = start + count;
-                    while (bytes.hasRemaining()) {
-                        checkpoint.run();
-                        position += target.write(bytes, position);
-                    }
+                    sink.write(ByteBuffer.wrap(buffer, 0, read), start + count);
                     count += read;
                 }
                 if (count != expected) throw new InterruptedBody(new EOFException("Incomplete range body."));

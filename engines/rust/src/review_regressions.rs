@@ -1,6 +1,101 @@
 use super::*;
 use std::io::Read;
 
+#[tokio::test]
+async fn benchmark_snapshot_and_pending_controls_do_not_need_execution_lock() {
+    let id = format!("control-test-{}", Uuid::new_v4());
+    let live = Arc::new(BenchmarkOwner::new(json!({
+        "id":id,"status":"running","processedCount":7,
+        "profile":{"secretKey":"must-not-be-published"}
+    })));
+    LIVE_BENCHMARKS.get_or_init(Default::default).lock().unwrap().insert(id.clone(), live.clone());
+    let _execution = live.state.lock().await;
+    let params = json!({"runId":id});
+    tokio::time::timeout(Duration::from_millis(500), async {
+        let status = get_benchmark_status(params.clone()).await.unwrap();
+        assert_eq!(status["processedCount"], 7);
+        assert!(status.get("profile").is_none());
+        assert_eq!(pause_benchmark(params.clone()).await.unwrap()["controlPending"], "paused");
+        assert_eq!(get_benchmark_status(params.clone()).await.unwrap()["controlPending"], "paused");
+        assert!(resume_benchmark(params.clone()).await.unwrap().get("controlPending").is_none());
+        assert_eq!(stop_benchmark(params.clone()).await.unwrap()["controlPending"], "stopped");
+        assert_eq!(resume_benchmark(params.clone()).await.unwrap()["controlPending"], "stopped");
+        assert_eq!(pause_benchmark(params.clone()).await.unwrap()["controlPending"], "stopped");
+        assert_eq!(_execution["status"], "running");
+        assert_eq!(_execution["processedCount"], 7);
+    }).await.unwrap();
+    LIVE_BENCHMARKS.get().unwrap().lock().unwrap().remove(&id);
+}
+
+#[tokio::test]
+async fn benchmark_controls_acknowledge_blocked_network_and_settle_dispatched_work() {
+    for action in ["paused", "stopped"] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(request(&mut stream).starts_with("PUT"));
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"test\"\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let output_dir = std::env::temp_dir().join(format!("rust-benchmark-control-{}", Uuid::new_v4()));
+        let started = start_benchmark(json!({
+            "profile":{"id":"fixture","endpointType":"awsS3","endpointUrl":endpoint,"region":"us-east-1","accessKey":"fixture","secretKey":"fixture","pathStyle":true,"maxAttempts":1},
+            "config":{"bucketName":"bucket","workloadType":"write-only","objectCount":10,"objectSizes":[32],
+                "testMode":"operation-count","operationCount":100,"concurrentThreads":1,"maxPoolConnections":1,"maxAttempts":1,
+                "csvOutputPath":output_dir.join("results.csv"),"jsonOutputPath":output_dir.join("results.json"),"logFilePath":output_dir.join("benchmark.log")}
+        })).await.unwrap();
+        let params = json!({"runId":started["id"]});
+        let live = live_benchmark(&params).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), entered_rx).await.unwrap().unwrap();
+
+        let status = tokio::time::timeout(Duration::from_millis(500), get_benchmark_status(params.clone())).await.unwrap().unwrap();
+        assert_eq!(status["status"], "running");
+        assert!(status.get("profile").is_none());
+        let paused = tokio::time::timeout(Duration::from_millis(500), pause_benchmark(params.clone())).await.unwrap().unwrap();
+        assert_eq!(paused["controlPending"], "paused");
+        if action == "stopped" {
+            let resumed = tokio::time::timeout(Duration::from_millis(500), resume_benchmark(params.clone())).await.unwrap().unwrap();
+            assert!(resumed.get("controlPending").is_none());
+            let stopped = tokio::time::timeout(Duration::from_millis(500), stop_benchmark(params.clone())).await.unwrap().unwrap();
+            assert_eq!(stopped["controlPending"], "stopped");
+            assert_eq!(resume_benchmark(params.clone()).await.unwrap()["controlPending"], "stopped");
+            assert_eq!(pause_benchmark(params.clone()).await.unwrap()["controlPending"], "stopped");
+        }
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = get_benchmark_status(params.clone()).await.unwrap();
+                if snapshot["status"] == action {
+                    assert_eq!(snapshot["processedCount"], 1);
+                    assert!(snapshot.get("controlPending").is_none());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        server.join().unwrap();
+        if action == "paused" {
+            assert!(Arc::ptr_eq(&live, &live_benchmark(&params).await.unwrap()));
+            stop_benchmark(params.clone()).await.unwrap();
+        }
+        // Wait for the worker's final cleanup before removing its artifacts.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !LIVE_BENCHMARKS.get().unwrap().lock().unwrap().contains_key(params["runId"].as_str().unwrap()) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        fs::remove_file(benchmark_state_path(params["runId"].as_str().unwrap()).unwrap()).unwrap();
+        fs::remove_dir_all(output_dir).unwrap();
+    }
+}
+
 fn request(stream: &mut std::net::TcpStream) -> String {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -22,7 +117,8 @@ fn request(stream: &mut std::net::TcpStream) -> String {
         .unwrap_or(0);
     let mut body = vec![0; length];
     stream.read_exact(&mut body).unwrap();
-    format!("{header}{}", String::from_utf8(body).unwrap())
+    // Benchmark payloads are binary; only the head is inspected.
+    format!("{header}{}", String::from_utf8_lossy(&body))
 }
 
 #[tokio::test]

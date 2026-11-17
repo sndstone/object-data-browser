@@ -100,7 +100,7 @@ func buildAzureClient(p profile) (*azureClient, context.Context, error) {
 	if err != nil {
 		return nil, ctx, err
 	}
-	client := &azureClient{account: p.AccessKey, key: key, base: base, sas: strings.TrimPrefix(p.AzureSASToken, "?"), attempts: p.MaxAttempts, httpClient: &http.Client{Timeout: time.Duration(p.ConnectTimeoutSeconds+p.ReadTimeoutSeconds) * time.Second, Transport: loggingRoundTripper{base: transport, diagnostics: p.Diagnostics}}}
+	client := &azureClient{account: p.AccessKey, key: key, base: base, sas: strings.TrimPrefix(p.AzureSASToken, "?"), attempts: p.MaxAttempts, httpClient: profileHTTPClient(p, transport)}
 	if p.AuthMode == "azureDefault" {
 		client.sas = ""
 		client.credential, err = azidentity.NewDefaultAzureCredential(&azidentity.DefaultAzureCredentialOptions{ClientOptions: azcore.ClientOptions{Transport: &http.Client{Transport: transport}}})
@@ -123,7 +123,10 @@ func (c *azureClient) urlFor(container, key string) *url.URL {
 	u := *c.base
 	path := strings.TrimSuffix(c.base.Path, "/")
 	if container != "" {
-		path += "/" + container
+		// A container name is one path segment. Escaping it leaves every
+		// valid name unchanged and keeps one with a slash from addressing a
+		// blob path in another container.
+		path += "/" + url.PathEscape(container)
 		if key != "" {
 			path += "/" + key
 		}
@@ -256,6 +259,12 @@ func (c *azureClient) doReader(ctx context.Context, method, container, key strin
 		for name, value := range headers {
 			req.Header.Set(name, value)
 		}
+		if encryption, ok := ctx.Value(azureEncryptionContextKey{}).(objectEncryption); ok && key != "" {
+			if method == http.MethodPut || ((method == http.MethodHead || method == http.MethodGet) && encryption.customer()) {
+				setEncryptionHeaders(req.Header, encryption.headers)
+			}
+		}
+
 		if err = c.sign(req, merged); err != nil {
 			return nil, err
 		}
@@ -275,13 +284,13 @@ func (c *azureClient) doReader(ctx context.Context, method, container, key strin
 		}
 		if err != nil {
 			if wrapped, ok := err.(*url.Error); ok {
-				return nil, wrapped.Err
+				return nil, encryptionProviderError(wrapped.Err, req.Header, method, 0)
 			}
 			return nil, err
 		}
 		if resp.StatusCode >= 300 {
 			defer resp.Body.Close()
-			return nil, azureResponseError(resp)
+			return nil, encryptionProviderError(azureResponseError(resp), req.Header, method, resp.StatusCode)
 		}
 		return resp, nil
 	}
@@ -476,8 +485,15 @@ func handleAzureRequest(method string, params map[string]interface{}) (bool, map
 		for _, key := range []string{"bucket.lifecycle", "bucket.policy", "bucket.cors", "bucket.encryption", "bucket.tagging", "bucket.versioning", "object.resumable", "storage.admin", "tools.bulk-delete"} {
 			items = append(items, map[string]interface{}{"key": key, "label": key, "state": "unsupported", "reason": "Use the Python advanced storage adapter for supported Azure administration."})
 		}
-		return true, map[string]interface{}{"items": items}, nil
-	case "runDeleteAll", "runPutTestData":
+		return true, map[string]interface{}{"items": encryptionCapabilities(items)}, nil
+	case "runPutTestData":
+		raw, isObject := params["encryption"].(map[string]interface{})
+		if params["sourceEncryption"] == nil && (params["encryption"] == nil || (isObject && len(raw) == 1 && raw["mode"] == "bucketDefault")) {
+			return true, nil, azureUnsupported(method)
+		}
+		result, err := runPutTestData(params)
+		return true, result, err
+	case "runDeleteAll":
 		return true, nil, azureUnsupported(method)
 	case "testProfile":
 		result, err := azureTestProfile(asMap(params["profile"]))
@@ -521,8 +537,16 @@ func handleAzureRequest(method string, params map[string]interface{}) (bool, map
 	case "setBucketVersioning", "putBucketLifecycle", "deleteBucketLifecycle",
 		"putBucketPolicy", "deleteBucketPolicy", "putBucketCors", "deleteBucketCors",
 		"putBucketEncryption", "deleteBucketEncryption", "putBucketTagging",
-		"deleteBucketTagging", "listObjectVersions", "deleteObjectVersions",
-		"generatePresignedUrl":
+		"deleteBucketTagging", "listObjectVersions", "deleteObjectVersions":
+		return true, nil, azureUnsupported(method)
+	case "generatePresignedUrl":
+		p, err := parseProfile(asMap(params["profile"]))
+		if err == nil {
+			_, err = parseRequestEncryption(params, p, false)
+		}
+		if err != nil {
+			return true, nil, err
+		}
 		return true, nil, azureUnsupported(method)
 	default:
 		return false, nil, nil
@@ -761,10 +785,15 @@ func azureGetBucketAdminState(params map[string]interface{}) (map[string]interfa
 }
 
 func azureGetObjectDetails(params map[string]interface{}) (map[string]interface{}, error) {
-	_, bucketName, client, ctx, err := azureBucketClient(params)
+	p, bucketName, client, ctx, err := azureBucketClient(params)
 	if err != nil {
 		return nil, err
 	}
+	ctx, err = encryptedAzureContext(params, p, ctx, false)
+	if err != nil {
+		return nil, err
+	}
+
 	key := asString(params["key"])
 	if key == "" {
 		return nil, &sidecarError{Code: "invalid_config", Message: "Bucket name and object key are required for object inspection."}
@@ -823,7 +852,7 @@ func azureGetObjectDetails(params map[string]interface{}) (map[string]interface{
 		"level":     "INFO",
 		"message":   fmt.Sprintf("Loaded metadata and %d tag(s) for %s.", 0, key),
 	})
-	return map[string]interface{}{
+	result := map[string]interface{}{
 		"key":         key,
 		"metadata":    metadata,
 		"headers":     headers,
@@ -838,14 +867,23 @@ func azureGetObjectDetails(params map[string]interface{}) (map[string]interface{
 			"bucketName":  bucketName,
 			"engineState": "healthy",
 		},
-	}, nil
+	}
+	if encryption := azureObjectEncryption(resp.Header); encryption != nil {
+		result["encryption"] = encryption
+	}
+	return result, nil
 }
 
 func azureCreateFolder(params map[string]interface{}) (map[string]interface{}, error) {
-	_, bucketName, client, ctx, err := azureBucketClient(params)
+	p, bucketName, client, ctx, err := azureBucketClient(params)
 	if err != nil {
 		return nil, err
 	}
+	ctx, err = encryptedAzureContext(params, p, ctx, false)
+	if err != nil {
+		return nil, err
+	}
+
 	key := asString(params["key"])
 	if key == "" {
 		return nil, &sidecarError{Code: "invalid_config", Message: "Bucket name and key are required to create a folder."}
@@ -878,7 +916,13 @@ func azureCopyObject(params map[string]interface{}) (map[string]interface{}, err
 	if err != nil {
 		return nil, err
 	}
-	sourceHead, headErr := client.do(ctx, http.MethodHead, sourceBucket, sourceKey, nil, nil, nil)
+	plainContext := ctx
+	ctx, err = encryptedAzureContext(params, p, ctx, true)
+	if err != nil {
+		return nil, err
+	}
+
+	sourceHead, headErr := client.do(plainContext, http.MethodHead, sourceBucket, sourceKey, nil, nil, nil)
 	if headErr != nil {
 		return nil, headErr
 	}
@@ -1020,11 +1064,27 @@ func azureDeleteObjects(params map[string]interface{}) (map[string]interface{}, 
 	}, nil
 }
 
-func azureStartUpload(params map[string]interface{}) (map[string]interface{}, error) {
+func azureStartUpload(params map[string]interface{}) (result map[string]interface{}, err error) {
+	defer protectClientEncryptionResult(params, &result, &err)
+	emitProgress := func(job map[string]interface{}) {
+		if secrets := clientEncryptionSecrets(params); len(secrets) > 0 {
+			job = redactEncryptionValues(redactEncryptionFields(job), secrets).(map[string]interface{})
+		}
+		emitTransferEvent(job)
+	}
+	ce, err := parseClientEncryption(params, true)
+	if err != nil {
+		return nil, err
+	}
 	p, bucketName, client, ctx, err := azureBucketClient(params)
 	if err != nil {
 		return nil, err
 	}
+	ctx, err = encryptedAzureContext(params, p, ctx, false)
+	if err != nil {
+		return nil, err
+	}
+
 	prefix := asString(params["prefix"])
 	filePaths := asStringSlice(params["filePaths"])
 	objectKeyByPath := asStringMap(params["objectKeyByPath"])
@@ -1033,6 +1093,9 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 	}
 	thresholdBytes := azureSingleShotMaxBytes
 	chunkBytes := azureBlockSizeBytes
+	if ce != nil {
+		thresholdBytes = int64(maxInt(asInt(params["multipartThresholdMiB"]), 1, 32)) * 1024 * 1024
+	}
 	totalBytes := int64(0)
 	partsTotal := 0
 	usesMultipart := false
@@ -1042,15 +1105,22 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 		if statErr != nil {
 			return nil, statErr
 		}
+		storedSize := info.Size()
+		if ce != nil {
+			storedSize, err = ageObjectLength(ce.headerLength, info.Size())
+			if err != nil {
+				return nil, err
+			}
+		}
 		sources[filePath] = info
-		totalBytes += info.Size()
-		if info.Size() >= thresholdBytes {
+		totalBytes += storedSize
+		if storedSize >= thresholdBytes {
 			usesMultipart = true
-			chosen, sizingErr := azureBlockSizing(info.Size(), int64(asInt(params["multipartChunkMiB"]))*1024*1024)
+			chosen, sizingErr := azureBlockSizing(storedSize, int64(asInt(params["multipartChunkMiB"]))*1024*1024)
 			if sizingErr != nil {
 				return nil, sizingErr
 			}
-			partsTotal += int((info.Size() + chosen - 1) / chosen)
+			partsTotal += int((storedSize + chosen - 1) / chosen)
 		}
 	}
 	jobID := fmt.Sprintf("upload-%d", time.Now().UnixNano())
@@ -1067,7 +1137,7 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 		partCount = partsTotal
 		partDone = 0
 	}
-	emitTransferEvent(buildTransferJob(jobID, label, "upload", 0, "queued", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), filepath.Base(filePaths[0]), len(filePaths), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+	emitProgress(buildTransferJob(jobID, label, "upload", 0, "queued", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), filepath.Base(filePaths[0]), len(filePaths), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
 	for _, filePath := range filePaths {
 		handle, openErr := os.Open(filePath)
 		if openErr != nil {
@@ -1082,6 +1152,17 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 			handle.Close()
 			return nil, err
 		}
+		fileSize := info.Size()
+		var source io.ReaderAt = handle
+		if ce != nil {
+			reader, cipherErr := newAgeUploadReader(handle, func() error { return verifyUploadSource(handle, filePath, sources[filePath]) }, ce, info.Size())
+			if cipherErr != nil {
+				handle.Close()
+				return nil, cipherErr
+			}
+			source = reader
+			fileSize = reader.length
+		}
 		targetKey := filepath.Base(filePath)
 		if mappedKey, ok := objectKeyByPath[filePath]; ok && strings.TrimSpace(mappedKey) != "" {
 			targetKey = mappedKey
@@ -1089,15 +1170,15 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 		if prefix != "" {
 			targetKey = prefix + targetKey
 		}
-		outputLines = append(outputLines, fmt.Sprintf("Uploading %s (%d bytes) to %s.", info.Name(), info.Size(), targetKey))
-		if info.Size() >= thresholdBytes {
-			chunkBytes, err = azureBlockSizing(info.Size(), int64(asInt(params["multipartChunkMiB"]))*1024*1024)
+		outputLines = append(outputLines, fmt.Sprintf("Uploading %s (%d bytes) to %s.", info.Name(), fileSize, targetKey))
+		if fileSize >= thresholdBytes {
+			chunkBytes, err = azureBlockSizing(fileSize, int64(asInt(params["multipartChunkMiB"]))*1024*1024)
 			if err != nil {
 				handle.Close()
 				return nil, err
 			}
 			partSize = chunkBytes
-			count := int((info.Size() + chunkBytes - 1) / chunkBytes)
+			count := int((fileSize + chunkBytes - 1) / chunkBytes)
 			blockIDs := make([]string, count)
 			nonce := make([]byte, 16)
 			if _, err = rand.Read(nonce); err != nil {
@@ -1110,8 +1191,8 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 			var stateMu sync.Mutex
 			err = parallelParts(ctx, count, transferConcurrency(p), func(workerCtx context.Context, index int) error {
 				offset := int64(index) * chunkBytes
-				length := minInt64(chunkBytes, info.Size()-offset)
-				resp, partErr := client.doReader(workerCtx, http.MethodPut, bucketName, targetKey, url.Values{"comp": {"block"}, "blockid": {blockIDs[index]}}, nil, length, func() io.Reader { return io.NewSectionReader(handle, offset, length) })
+				length := minInt64(chunkBytes, fileSize-offset)
+				resp, partErr := client.doReader(workerCtx, http.MethodPut, bucketName, targetKey, url.Values{"comp": {"block"}, "blockid": {blockIDs[index]}}, nil, length, func() io.Reader { return io.NewSectionReader(source, offset, length) })
 				if partErr != nil {
 					return partErr
 				}
@@ -1124,7 +1205,7 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 				if partsCompleted <= maxPartOutputLines {
 					outputLines = append(outputLines, fmt.Sprintf("Uploaded part %d for %s.", index+1, info.Name()))
 				}
-				emitTransferEvent(buildTransferJob(jobID, label, "upload", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), info.Name(), len(filePaths), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+				emitProgress(buildTransferJob(jobID, label, "upload", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), info.Name(), len(filePaths), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
 				return nil
 			})
 			if err != nil {
@@ -1150,7 +1231,7 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 			}
 			drainAndClose(resp.Body)
 		} else {
-			response, uploadErr := client.doReader(ctx, http.MethodPut, bucketName, targetKey, nil, map[string]string{"x-ms-blob-type": "BlockBlob"}, info.Size(), func() io.Reader { return io.NewSectionReader(handle, 0, info.Size()) })
+			response, uploadErr := client.doReader(ctx, http.MethodPut, bucketName, targetKey, nil, map[string]string{"x-ms-blob-type": "BlockBlob"}, fileSize, func() io.Reader { return io.NewSectionReader(source, 0, fileSize) })
 			if response != nil {
 				drainAndClose(response.Body)
 			}
@@ -1158,7 +1239,7 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 				handle.Close()
 				return nil, err
 			}
-			bytesTransferred += info.Size()
+			bytesTransferred += fileSize
 		}
 		if err = verifyUploadSource(handle, filePath, sources[filePath]); err != nil {
 			handle.Close()
@@ -1167,17 +1248,33 @@ func azureStartUpload(params map[string]interface{}) (map[string]interface{}, er
 		handle.Close()
 		itemsCompleted++
 		outputLines = append(outputLines, fmt.Sprintf("Finished uploading %s.", info.Name()))
-		emitTransferEvent(buildTransferJob(jobID, label, "upload", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), info.Name(), len(filePaths), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+		emitProgress(buildTransferJob(jobID, label, "upload", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), info.Name(), len(filePaths), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
 	}
 	outputLines = append(outputLines, fmt.Sprintf("Uploaded %d file(s) into %s.", len(filePaths), bucketName))
 	return buildTransferJob(jobID, label, "upload", 1, "completed", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), filepath.Base(filePaths[len(filePaths)-1]), len(filePaths), itemsCompleted, partSize, partDone, partCount, false, false, false, outputLines), nil
 }
 
-func azureStartDownload(params map[string]interface{}) (map[string]interface{}, error) {
+func azureStartDownload(params map[string]interface{}) (result map[string]interface{}, err error) {
+	defer protectClientEncryptionResult(params, &result, &err)
+	emitProgress := func(job map[string]interface{}) {
+		if secrets := clientEncryptionSecrets(params); len(secrets) > 0 {
+			job = redactEncryptionValues(redactEncryptionFields(job), secrets).(map[string]interface{})
+		}
+		emitTransferEvent(job)
+	}
+	ce, err := parseClientEncryption(params, false)
+	if err != nil {
+		return nil, err
+	}
 	p, bucketName, client, ctx, err := azureBucketClient(params)
 	if err != nil {
 		return nil, err
 	}
+	ctx, err = encryptedAzureContext(params, p, ctx, false)
+	if err != nil {
+		return nil, err
+	}
+
 	keys := asStringSlice(params["keys"])
 	destinationPath := strings.TrimSpace(asString(params["destinationPath"]))
 	if len(keys) == 0 || destinationPath == "" {
@@ -1200,12 +1297,22 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 		}
 		size, _ := strconv.ParseInt(head.Header.Get("Content-Length"), 10, 64)
 		drainAndClose(head.Body)
+		if ce != nil {
+			if _, err = agePlaintextLength(ce.headerLength, size); err != nil {
+				return nil, err
+			}
+		}
 		objectSizes[key] = size
 		validators[key] = head.Header.Get("ETag")
 		totalBytes += size
 		if size >= thresholdBytes {
 			usesMultipart = true
-			partsTotal += int((size + chunkBytes - 1) / chunkBytes)
+			if ce != nil {
+				plain, _ := agePlaintextLength(ce.headerLength, size)
+				partsTotal += int(ageChunks(plain))
+			} else {
+				partsTotal += int((size + chunkBytes - 1) / chunkBytes)
+			}
 		}
 	}
 	jobID := fmt.Sprintf("download-%d", time.Now().UnixNano())
@@ -1219,6 +1326,9 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 	partDone := interface{}(nil)
 	if partsTotal > 0 {
 		partSize = chunkBytes
+		if ce != nil {
+			partSize = ageSealedChunkSize
+		}
 		partCount = partsTotal
 		partDone = 0
 	}
@@ -1226,7 +1336,8 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 	if err != nil {
 		return nil, err
 	}
-	emitTransferEvent(buildTransferJob(jobID, label, "download", 0, "queued", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), keys[0], len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+	progressGate := newTransferProgressGate(params)
+	emitProgress(buildTransferJob(jobID, label, "download", 0, "queued", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), keys[0], len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
 	for _, key := range keys {
 		size := objectSizes[key]
 		beforeObject := bytesTransferred
@@ -1238,29 +1349,66 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 		defer os.Remove(target)
 		defer handle.Close()
 		outputLines = append(outputLines, fmt.Sprintf("Downloading %s (%d bytes) to %s.", key, size, target))
-		if size >= thresholdBytes {
+		if ce != nil {
+			var progressMu sync.Mutex
+			workers := 1
+			if size >= thresholdBytes {
+				workers = transferConcurrency(p)
+			}
+			err = downloadAgePayload(ctx, handle, ce, size, workers, p.MaxAttempts, func(workerCtx context.Context, start, length int64) (io.ReadCloser, error) {
+				resp, getErr := client.do(workerCtx, http.MethodGet, bucketName, key, nil, map[string]string{
+					"Range": fmt.Sprintf("bytes=%d-%d", start, start+length-1), "If-Match": validators[key],
+				}, nil)
+				if getErr != nil {
+					return nil, getErr
+				}
+				if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, size) {
+					resp.Body.Close()
+					return nil, fmt.Errorf("download range mismatch; partial file discarded")
+				}
+				if received := resp.Header.Get("ETag"); received != "" && validators[key] != "" && received != validators[key] {
+					resp.Body.Close()
+					return nil, fmt.Errorf("download source changed during range request; partial file discarded")
+				}
+				return resp.Body, nil
+			}, func(copied int64, chunk bool) {
+				progressMu.Lock()
+				defer progressMu.Unlock()
+				bytesTransferred += copied
+				if size >= thresholdBytes && chunk {
+					partsCompleted++
+					partDone = partsCompleted
+				}
+				if progressGate.ready(false) {
+					emitProgress(buildTransferJob(jobID, label, "download", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), key, len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+				}
+			})
+			if err != nil {
+				return nil, err
+			}
+		} else if size >= thresholdBytes {
 			count := int((size + chunkBytes - 1) / chunkBytes)
 			var stateMu sync.Mutex
 			err = parallelParts(ctx, count, transferConcurrency(p), func(workerCtx context.Context, index int) error {
 				start := int64(index) * chunkBytes
 				end := minInt64(start+chunkBytes, size) - 1
-				resp, getErr := client.do(workerCtx, http.MethodGet, bucketName, key, nil, map[string]string{"Range": fmt.Sprintf("bytes=%d-%d", start, end), "If-Match": validators[key]}, nil)
-				if getErr != nil {
-					return getErr
-				}
-				defer resp.Body.Close()
-				if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", start, end, size) {
-					return fmt.Errorf("download range mismatch; partial file discarded")
-				}
-				if received := resp.Header.Get("ETag"); received != "" && validators[key] != "" && received != validators[key] {
-					return fmt.Errorf("download source changed during range request; partial file discarded")
-				}
-				copied, copyErr := copyTransferRange(&offsetFileWriter{file: handle, offset: start}, io.LimitReader(resp.Body, end-start+2))
+				copied, copyErr := downloadRangeWithRetry(workerCtx, handle, start, end-start+1, p.MaxAttempts, func() (io.ReadCloser, error) {
+					resp, getErr := client.do(workerCtx, http.MethodGet, bucketName, key, nil, map[string]string{"Range": fmt.Sprintf("bytes=%d-%d", start, end), "If-Match": validators[key]}, nil)
+					if getErr != nil {
+						return nil, getErr
+					}
+					if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", start, end, size) {
+						resp.Body.Close()
+						return nil, fmt.Errorf("download range mismatch; partial file discarded")
+					}
+					if received := resp.Header.Get("ETag"); received != "" && validators[key] != "" && received != validators[key] {
+						resp.Body.Close()
+						return nil, fmt.Errorf("download source changed during range request; partial file discarded")
+					}
+					return resp.Body, nil
+				})
 				if copyErr != nil {
 					return copyErr
-				}
-				if copied != end-start+1 {
-					return fmt.Errorf("download range length mismatch; partial file discarded")
 				}
 				stateMu.Lock()
 				defer stateMu.Unlock()
@@ -1270,7 +1418,9 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 				if partsCompleted <= maxPartOutputLines {
 					outputLines = append(outputLines, fmt.Sprintf("Downloaded byte range %d-%d for %s.", start, end, key))
 				}
-				emitTransferEvent(buildTransferJob(jobID, label, "download", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), key, len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+				if progressGate.ready(false) {
+					emitProgress(buildTransferJob(jobID, label, "download", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), key, len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+				}
 				return nil
 			})
 			if err != nil {
@@ -1294,7 +1444,9 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 						return nil, writeErr
 					}
 					bytesTransferred += int64(readBytes)
-					emitTransferEvent(buildTransferJob(jobID, label, "download", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), key, len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+					if progressGate.ready(false) {
+						emitProgress(buildTransferJob(jobID, label, "download", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), key, len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+					}
 				}
 				if errors.Is(readErr, io.EOF) {
 					break
@@ -1316,14 +1468,18 @@ func azureStartDownload(params map[string]interface{}) (map[string]interface{}, 
 		if err = handle.Close(); err != nil {
 			return nil, err
 		}
-		finalPath, publishErr := destination.publish(target, key, asString(params["conflictPolicy"]))
+		finalPath, publishErr := destination.publish(target, ce.downloadName(key), asString(params["conflictPolicy"]))
 		if publishErr != nil {
 			return nil, publishErr
 		}
 		os.Remove(target)
-		outputLines = append(outputLines, fmt.Sprintf("Saved %s to %s.", key, finalPath))
+		publishedName := key
+		if ce != nil {
+			publishedName = filepath.Base(finalPath)
+		}
+		outputLines = append(outputLines, fmt.Sprintf("Saved %s to %s.", publishedName, finalPath))
 		itemsCompleted++
-		outputLines = append(outputLines, fmt.Sprintf("Finished downloading %s.", key))
+		outputLines = append(outputLines, fmt.Sprintf("Finished downloading %s.", publishedName))
 	}
 	outputLines = append(outputLines, fmt.Sprintf("Downloaded %d object(s) into %s.", len(keys), destinationPath))
 	return buildTransferJob(jobID, label, "download", 1, "completed", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), keys[len(keys)-1], len(keys), itemsCompleted, partSize, partDone, partCount, false, false, false, outputLines), nil

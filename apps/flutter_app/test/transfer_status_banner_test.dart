@@ -25,6 +25,8 @@ class _GatedEngine extends MockEngineService {
     required Map<String, String> objectKeyByPath,
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
+    Map<String, Object?>? clientEncryption,
+    ObjectEncryption? encryption,
   }) async {
     await gate.future;
     return super.startUpload(

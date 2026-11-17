@@ -1,3 +1,4 @@
+import 'object_encryption.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
@@ -5,7 +6,9 @@ import 'dart:math' as math;
 import '../models/domain_models.dart';
 import 'engine_service.dart';
 
-class MockEngineService implements EngineService, TransferJobSinkRegistrant {
+class MockEngineService
+    with EngineEncryptionResolver
+    implements EngineService, TransferJobSinkRegistrant {
   MockEngineService();
 
   @override
@@ -26,6 +29,12 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
 
   static final List<EngineDescriptor> _engines = [
     const EngineDescriptor(
+      endpointTypes: [
+        's3Compatible',
+        'awsS3',
+        'azureBlob',
+        'googleCloudStorage'
+      ],
       id: 'python',
       label: 'Python Engine',
       language: 'Python',
@@ -35,6 +44,12 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
       mobileSupported: false,
     ),
     const EngineDescriptor(
+      endpointTypes: [
+        's3Compatible',
+        'awsS3',
+        'azureBlob',
+        'googleCloudStorage'
+      ],
       id: 'go',
       label: 'Go Engine',
       language: 'Go',
@@ -44,6 +59,7 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
       mobileSupported: true,
     ),
     const EngineDescriptor(
+      endpointTypes: ['s3Compatible', 'awsS3'],
       id: 'rust',
       label: 'Rust Engine',
       language: 'Rust',
@@ -53,6 +69,7 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
       mobileSupported: true,
     ),
     const EngineDescriptor(
+      endpointTypes: ['s3Compatible', 'awsS3'],
       id: 'java',
       label: 'Java Engine',
       language: 'Java',
@@ -83,7 +100,8 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     required EndpointProfile profile,
   }) async {
     await Future<void>.delayed(const Duration(milliseconds: 250));
-    if (profile.endpointUrl.trim().isEmpty) {
+    if (profile.endpointUrl.trim().isEmpty &&
+        !profile.endpointType.isGoogleCloudStorage) {
       throw const EngineException(
         code: ErrorCode.invalidConfig,
         message: 'Endpoint URL is required.',
@@ -105,7 +123,47 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     required String engineId,
     required EndpointProfile profile,
   }) async {
+    if (profile.endpointType.isGoogleCloudStorage) {
+      return [
+        for (final key in [
+          'bucket.lifecycle',
+          'bucket.policy',
+          'bucket.cors',
+          'bucket.encryption',
+          'bucket.tagging',
+          'storage.admin',
+          'object.tags',
+          'tools',
+          'benchmark',
+          for (final mode in ObjectEncryptionMode.values)
+            'object.encryption.${mode.wireName}'
+        ])
+          CapabilityDescriptor(
+              key: key,
+              label: key,
+              state: CapabilityState.unsupported,
+              reason:
+                  'Unavailable for native Google Cloud Storage in this version.'),
+        for (final key in [
+          'bucket.versioning',
+          'bucket.admin_mutation',
+          'object.versions',
+          'object.presign',
+          'object.copy_move'
+        ])
+          CapabilityDescriptor(
+              key: key, label: key, state: CapabilityState.supported),
+      ];
+    }
     return [
+      for (final mode in ObjectEncryptionMode.values)
+        if (mode != ObjectEncryptionMode.bucketDefault)
+          CapabilityDescriptor(
+              key: 'object.encryption.${mode.wireName}',
+              label: mode.label,
+              state: mode.isAzure == profile.endpointType.isAzure
+                  ? CapabilityState.supported
+                  : CapabilityState.unsupported),
       const CapabilityDescriptor(
         key: 'bucket.lifecycle',
         label: 'Lifecycle policy CRUD',
@@ -510,7 +568,9 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     required EndpointProfile profile,
     required String bucketName,
     required String key,
+    ObjectEncryption? encryption,
   }) async {
+    if (encryption != null) await encryptionPayload(profile, encryption);
     final now = DateTime.now();
     return ObjectDetails(
       key: key,
@@ -573,7 +633,10 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     required EndpointProfile profile,
     required String bucketName,
     required String key,
-  }) async {}
+    ObjectEncryption? encryption,
+  }) async {
+    if (encryption != null) await encryptionPayload(profile, encryption);
+  }
 
   @override
   Future<BatchOperationResult> copyObject({
@@ -583,7 +646,13 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     required String sourceKey,
     required String destinationBucketName,
     required String destinationKey,
+    ObjectEncryption? encryption,
+    ObjectEncryption? sourceEncryption,
   }) async {
+    if (encryption != null) await encryptionPayload(profile, encryption);
+    if (sourceEncryption != null) {
+      await encryptionPayload(profile, sourceEncryption, source: true);
+    }
     return const BatchOperationResult(
       successCount: 1,
       failureCount: 0,
@@ -599,7 +668,13 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     required String sourceKey,
     required String destinationBucketName,
     required String destinationKey,
+    ObjectEncryption? encryption,
+    ObjectEncryption? sourceEncryption,
   }) async {
+    if (encryption != null) await encryptionPayload(profile, encryption);
+    if (sourceEncryption != null) {
+      await encryptionPayload(profile, sourceEncryption, source: true);
+    }
     return const BatchOperationResult(
       successCount: 1,
       failureCount: 0,
@@ -645,7 +720,15 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     required Map<String, String> objectKeyByPath,
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
+    Map<String, Object?>? clientEncryption,
+    ObjectEncryption? encryption,
   }) async {
+    if (clientEncryption != null) {
+      throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message: clientEncryptionUnavailable);
+    }
+    if (encryption != null) await encryptionPayload(profile, encryption);
     var totalBytes = 0;
     for (final filePath in filePaths) {
       totalBytes += await _fileLengthOrFallback(filePath);
@@ -745,7 +828,15 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     String conflictPolicy = 'keepBoth',
     required int multipartThresholdMiB,
     required int multipartChunkMiB,
+    Map<String, Object?>? clientEncryption,
+    ObjectEncryption? encryption,
   }) async {
+    if (clientEncryption != null) {
+      throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message: clientEncryptionUnavailable);
+    }
+    if (encryption != null) await encryptionPayload(profile, encryption);
     final totalBytes = _estimatedDownloadBytes(
       itemCount: keys.length,
       multipartThresholdMiB: multipartThresholdMiB,
@@ -950,7 +1041,14 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     required String bucketName,
     required String key,
     required Duration expiration,
+    ObjectEncryption? encryption,
   }) async {
+    if (encryption?.mode.isCustomerKey == true) {
+      throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message: 'Customer-key objects cannot use presigned URLs.');
+    }
+    if (encryption != null) await encryptionPayload(profile, encryption);
     return '${profile.endpointUrl}/$bucketName/$key?X-Amz-Expires=${expiration.inSeconds}&engine=$engineId';
   }
 
@@ -959,7 +1057,9 @@ class MockEngineService implements EngineService, TransferJobSinkRegistrant {
     required String engineId,
     required EndpointProfile profile,
     required TestDataToolConfig config,
+    ObjectEncryption? encryption,
   }) async {
+    if (encryption != null) await encryptionPayload(profile, encryption);
     await Future<void>.delayed(const Duration(milliseconds: 300));
     return ToolExecutionState(
       label: 'put-testdata',

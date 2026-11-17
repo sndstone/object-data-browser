@@ -35,7 +35,7 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
-const engineVersion = "2.3.5"
+const engineVersion = "2.4.0"
 
 var supportedMethods = []string{
 	"health", "getCapabilities", "testProfile", "listBuckets",
@@ -198,11 +198,17 @@ func dispatchRequest(req request) (result map[string]interface{}, err error) {
 }
 
 func writeJSON(value interface{}) {
-	out, _ := json.Marshal(value)
+	out, _ := json.Marshal(redactEncryptionFields(value))
 	fmt.Println(string(out))
 }
 
 func handleRequest(req request) (map[string]interface{}, error) {
+	if err := validateEndpointType(asString(asMap(req.Params["profile"])["endpointType"])); err != nil {
+		return nil, err
+	}
+	if isGCSProfilePayload(asMap(req.Params["profile"])) && req.Method != "health" {
+		return handleGCSRequest(req.Method, req.Params)
+	}
 	if isAzureProfilePayload(asMap(req.Params["profile"])) {
 		if handled, result, err := handleAzureRequest(req.Method, req.Params); handled {
 			return result, err
@@ -216,7 +222,7 @@ func handleRequest(req request) (map[string]interface{}, error) {
 			"available":     true,
 			"methods":       supportedMethods,
 			"nativeSdk":     "aws-sdk-go-v2",
-			"endpointTypes": []string{"s3Compatible", "awsS3", "azureBlob"},
+			"endpointTypes": []string{"s3Compatible", "awsS3", "azureBlob", "googleCloudStorage"},
 		}, nil
 	case "getCapabilities":
 		state := "supported"
@@ -231,7 +237,7 @@ func handleRequest(req request) (map[string]interface{}, error) {
 		}
 		items = append(items, map[string]interface{}{"key": "benchmark", "label": "Benchmark", "state": "supported", "implementationState": "supported", "reason": "Engine benchmark runner is available; storage access is checked when the run starts."})
 		items = append(items, map[string]interface{}{"key": "object.resumable", "label": "Resumable transfer jobs", "state": "unsupported", "reason": "Durable transfer checkpoints are not implemented."}, map[string]interface{}{"key": "storage.admin", "label": "Advanced administration adapter", "state": "unsupported", "reason": "Use the Python advanced storage adapter."}, map[string]interface{}{"key": "auth.awsProfiles", "label": "AWS credential providers", "state": "supported"})
-		return map[string]interface{}{"items": items}, nil
+		return map[string]interface{}{"items": encryptionCapabilities(items)}, nil
 	case "testProfile":
 		return testProfile(asMap(req.Params["profile"]))
 	case "listBuckets":
@@ -289,7 +295,7 @@ func handleRequest(req request) (map[string]interface{}, error) {
 	case "generatePresignedUrl":
 		return generatePresignedURL(req.Params)
 	case "runPutTestData":
-		return runPutTestData(req.Params), nil
+		return runPutTestData(req.Params)
 	case "runDeleteAll":
 		return runDeleteAll(req.Params), nil
 	case "cancelToolExecution":
@@ -317,13 +323,16 @@ func handleRequest(req request) (map[string]interface{}, error) {
 func parseProfile(payload map[string]interface{}) (profile, error) {
 	endpointURL := strings.TrimSpace(asString(payload["endpointUrl"]))
 	endpointType := strings.TrimSpace(asString(payload["endpointType"]))
+	if err := validateEndpointType(endpointType); err != nil {
+		return profile{}, err
+	}
 	accessKey := strings.TrimSpace(asString(payload["accessKey"]))
 	secretKey := strings.TrimSpace(asString(payload["secretKey"]))
 	region := strings.TrimSpace(asString(payload["region"]))
-	if region == "" {
+	if region == "" && !isGCSProfilePayload(payload) {
 		region = "us-east-1"
 	}
-	if endpointURL == "" && !isAzureProfilePayload(payload) {
+	if endpointURL == "" && !isAzureProfilePayload(payload) && !isGCSProfilePayload(payload) {
 		return profile{}, &sidecarError{Code: "invalid_config", Message: "Endpoint URL is required."}
 	}
 	authMode := nonEmpty(asString(payload["authMode"]), "static")
@@ -337,7 +346,7 @@ func parseProfile(payload map[string]interface{}) (profile, error) {
 		return profile{}, &sidecarError{Code: "invalid_config", Message: "Both source access key and secret key are required for role assumption, or leave both empty to use AWS default credentials."}
 	}
 
-	if authMode == "static" && (accessKey == "" || secretKey == "") {
+	if authMode == "static" && (accessKey == "" || secretKey == "") && !isGCSProfilePayload(payload) {
 		return profile{}, &sidecarError{Code: "invalid_config", Message: "Access key and secret key are required."}
 	}
 	return profile{
@@ -376,7 +385,7 @@ func buildClient(p profile) (*s3.Client, context.Context, error) {
 	if err != nil {
 		return nil, ctx, err
 	}
-	httpClient := &http.Client{Timeout: time.Duration(p.ConnectTimeoutSeconds+p.ReadTimeoutSeconds) * time.Second, Transport: loggingRoundTripper{base: baseTransport, diagnostics: p.Diagnostics}}
+	httpClient := profileHTTPClient(p, baseTransport)
 	options := []func(*config.LoadOptions) error{config.WithRegion(p.Region), config.WithHTTPClient(httpClient), config.WithRetryMaxAttempts(p.MaxAttempts)}
 	switch p.AuthMode {
 	case "", "static":
@@ -463,7 +472,7 @@ func profileTransport(p profile) (*http.Transport, error) {
 		}
 		tlsConfig.RootCAs = roots
 	}
-	return &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: time.Duration(p.ConnectTimeoutSeconds) * time.Second}).DialContext, MaxIdleConns: p.MaxPoolConnections, MaxIdleConnsPerHost: p.MaxPoolConnections, IdleConnTimeout: 90 * time.Second, TLSClientConfig: tlsConfig}, nil
+	return &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: time.Duration(p.ConnectTimeoutSeconds) * time.Second}).DialContext, TLSHandshakeTimeout: time.Duration(p.ConnectTimeoutSeconds) * time.Second, ResponseHeaderTimeout: time.Duration(p.ReadTimeoutSeconds) * time.Second, MaxIdleConns: p.MaxPoolConnections, MaxIdleConnsPerHost: p.MaxPoolConnections, IdleConnTimeout: 90 * time.Second, TLSClientConfig: tlsConfig}, nil
 }
 
 type loggingRoundTripper struct {
@@ -478,7 +487,12 @@ func (rt loggingRoundTripper) CloseIdleConnections() {
 }
 
 func (rt loggingRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	if _, ok := request.Context().Value(gcsRequestContextKey{}).(gcsRequestPrivacy); ok {
+		return rt.roundTripGCS(request)
+	}
 	recordBenchmarkAttempt(request.Context())
+	secrets, _ := request.Context().Value(encryptionContextKey{}).([]string)
+	secrets = append(append([]string(nil), secrets...), encryptionSecrets(request.Header)...)
 	if rt.diagnostics.EnableAPILogging {
 		requestBody := summarizeHTTPBody(
 			request.Header.Get("Content-Type"),
@@ -491,9 +505,9 @@ func (rt loggingRoundTripper) RoundTrip(request *http.Request) (*http.Response, 
 			fmt.Sprintf(
 				"SEND %s %s HEADERS=%s BODY=%s",
 				request.Method,
-				redactedURL(request.URL),
-				mustJSONString(sanitizeHeaders(request.Header)),
-				requestBody,
+				redactEncryptionText(redactedURL(request.URL), secrets),
+				redactEncryptionText(mustJSONString(sanitizeHeaders(request.Header)), secrets),
+				redactEncryptionText(requestBody, secrets),
 			),
 			"api",
 		)
@@ -501,7 +515,7 @@ func (rt loggingRoundTripper) RoundTrip(request *http.Request) (*http.Response, 
 	response, err := rt.base.RoundTrip(request)
 	if err != nil {
 		if rt.diagnostics.EnableDebugLogging {
-			emitStructuredLog("DEBUG", "HttpError", err.Error(), "debug")
+			emitStructuredLog("DEBUG", "HttpError", redactEncryptionText(err.Error(), secrets), "debug")
 		}
 		return nil, err
 	}
@@ -517,10 +531,10 @@ func (rt loggingRoundTripper) RoundTrip(request *http.Request) (*http.Response, 
 			fmt.Sprintf(
 				"RECV %s %s STATUS=%d HEADERS=%s BODY=%s",
 				request.Method,
-				redactedURL(request.URL),
+				redactEncryptionText(redactedURL(request.URL), secrets),
 				response.StatusCode,
-				mustJSONString(sanitizeHeaders(response.Header)),
-				responseBody,
+				redactEncryptionText(mustJSONString(sanitizeHeaders(response.Header)), secrets),
+				redactEncryptionText(responseBody, secrets),
 			),
 			"api",
 		)
@@ -560,7 +574,7 @@ func sanitizeHeaders(headers http.Header) map[string]string {
 			strings.Contains(lower, "security-token") ||
 			strings.Contains(lower, "access-key") ||
 			strings.Contains(lower, "secret") ||
-			strings.Contains(lower, "token") || strings.Contains(lower, "copy-source") {
+			strings.Contains(lower, "token") || strings.Contains(lower, "copy-source") || encryptionSecretField(lower) {
 			sanitized[key] = "[redacted]"
 			continue
 		}
@@ -583,6 +597,10 @@ func summarizeHTTPBody(contentType string, contentLength int64, body []byte) str
 	}
 	if !utf8.Valid(body) {
 		return "[omitted binary body]"
+	}
+	var structured interface{}
+	if json.Unmarshal(body, &structured) == nil {
+		body, _ = json.Marshal(redactEncryptionFields(structured))
 	}
 	text := strings.TrimSpace(string(body))
 	if text == "" {
@@ -1322,6 +1340,11 @@ func getObjectDetails(params map[string]interface{}) (map[string]interface{}, er
 	if err != nil {
 		return nil, err
 	}
+	client, err = encryptedS3Client(params, p, client, false)
+	if err != nil {
+		return nil, err
+	}
+
 	key := asString(params["key"])
 	if key == "" {
 		return nil, &sidecarError{Code: "invalid_config", Message: "Bucket name and object key are required for object inspection."}
@@ -1377,7 +1400,7 @@ func getObjectDetails(params map[string]interface{}) (map[string]interface{}, er
 		"level":     "INFO",
 		"message":   fmt.Sprintf("Loaded metadata and %d tag(s) for %s.", len(tags), key),
 	})
-	return map[string]interface{}{
+	result := map[string]interface{}{
 		"key":         key,
 		"metadata":    metadata,
 		"headers":     headers,
@@ -1392,14 +1415,23 @@ func getObjectDetails(params map[string]interface{}) (map[string]interface{}, er
 			"bucketName":  bucketName,
 			"engineState": "healthy",
 		},
-	}, nil
+	}
+	if encryption := s3ObjectEncryption(head); encryption != nil {
+		result["encryption"] = encryption
+	}
+	return result, nil
 }
 
 func createFolder(params map[string]interface{}) (map[string]interface{}, error) {
-	_, bucketName, client, ctx, err := bucketClient(params)
+	p, bucketName, client, ctx, err := bucketClient(params)
 	if err != nil {
 		return nil, err
 	}
+	client, err = encryptedS3Client(params, p, client, false)
+	if err != nil {
+		return nil, err
+	}
+
 	key := asString(params["key"])
 	if key == "" {
 		return nil, &sidecarError{Code: "invalid_config", Message: "Bucket name and key are required to create a folder."}
@@ -1527,11 +1559,27 @@ func transferConcurrency(p profile) int {
 	return limit
 }
 
-func startUpload(params map[string]interface{}) (map[string]interface{}, error) {
+func startUpload(params map[string]interface{}) (result map[string]interface{}, err error) {
+	defer protectClientEncryptionResult(params, &result, &err)
+	emitProgress := func(job map[string]interface{}) {
+		if secrets := clientEncryptionSecrets(params); len(secrets) > 0 {
+			job = redactEncryptionValues(redactEncryptionFields(job), secrets).(map[string]interface{})
+		}
+		emitTransferEvent(job)
+	}
+	ce, err := parseClientEncryption(params, true)
+	if err != nil {
+		return nil, err
+	}
 	p, bucketName, client, ctx, err := bucketClient(params)
 	if err != nil {
 		return nil, err
 	}
+	client, err = encryptedS3Client(params, p, client, false)
+	if err != nil {
+		return nil, err
+	}
+
 	prefix := asString(params["prefix"])
 	filePaths := asStringSlice(params["filePaths"])
 	objectKeyByPath := asStringMap(params["objectKeyByPath"])
@@ -1555,14 +1603,21 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 		if statErr != nil {
 			return nil, statErr
 		}
-		if info.Size() > 50000*1024*1024*1024 || (info.Size() >= thresholdBytes && (info.Size()+chunkBytes-1)/chunkBytes > 10000) {
+		storedSize := info.Size()
+		if ce != nil {
+			storedSize, err = ageObjectLength(ce.headerLength, info.Size())
+			if err != nil {
+				return nil, err
+			}
+		}
+		if storedSize > 50000*1024*1024*1024 || (storedSize >= thresholdBytes && (storedSize+chunkBytes-1)/chunkBytes > 10000) {
 			return nil, &sidecarError{Code: "invalid_config", Message: "Upload exceeds S3 object or 10,000-part limits; select a larger part size."}
 		}
 		sources[filePath] = info
-		totalBytes += info.Size()
-		if info.Size() >= thresholdBytes {
+		totalBytes += storedSize
+		if storedSize >= thresholdBytes {
 			usesMultipart = true
-			partsTotal += int((info.Size() + chunkBytes - 1) / chunkBytes)
+			partsTotal += int((storedSize + chunkBytes - 1) / chunkBytes)
 		}
 	}
 	jobID := fmt.Sprintf("upload-%d", time.Now().UnixNano())
@@ -1579,7 +1634,7 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 		partCount = partsTotal
 		partDone = 0
 	}
-	emitTransferEvent(buildTransferJob(jobID, label, "upload", 0, "queued", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), filepath.Base(filePaths[0]), len(filePaths), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+	emitProgress(buildTransferJob(jobID, label, "upload", 0, "queued", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), filepath.Base(filePaths[0]), len(filePaths), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
 	for _, filePath := range filePaths {
 		handle, openErr := os.Open(filePath)
 		if openErr != nil {
@@ -1594,6 +1649,17 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 			handle.Close()
 			return nil, err
 		}
+		fileSize := info.Size()
+		var source io.ReaderAt = handle
+		if ce != nil {
+			reader, cipherErr := newAgeUploadReader(handle, func() error { return verifyUploadSource(handle, filePath, sources[filePath]) }, ce, info.Size())
+			if cipherErr != nil {
+				handle.Close()
+				return nil, cipherErr
+			}
+			source = reader
+			fileSize = reader.length
+		}
 		targetKey := filepath.Base(filePath)
 		if mappedKey, ok := objectKeyByPath[filePath]; ok && strings.TrimSpace(mappedKey) != "" {
 			targetKey = mappedKey
@@ -1601,8 +1667,8 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 		if prefix != "" {
 			targetKey = prefix + targetKey
 		}
-		outputLines = append(outputLines, fmt.Sprintf("Uploading %s (%d bytes) to %s.", info.Name(), info.Size(), targetKey))
-		if info.Size() >= thresholdBytes {
+		outputLines = append(outputLines, fmt.Sprintf("Uploading %s (%d bytes) to %s.", info.Name(), fileSize, targetKey))
+		if fileSize >= thresholdBytes {
 			createOutput, createErr := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 				Bucket: aws.String(bucketName),
 				Key:    aws.String(targetKey),
@@ -1611,10 +1677,9 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 				handle.Close()
 				return nil, createErr
 			}
-			filePartCount := int((info.Size() + chunkBytes - 1) / chunkBytes)
+			filePartCount := int((fileSize + chunkBytes - 1) / chunkBytes)
 			completed := make([]types.CompletedPart, 0, filePartCount)
 			fileName := info.Name()
-			fileSize := info.Size()
 			var (
 				stateMu   sync.Mutex
 				wg        sync.WaitGroup
@@ -1648,7 +1713,7 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 						Key:           aws.String(targetKey),
 						UploadId:      createOutput.UploadId,
 						PartNumber:    aws.Int32(partNumber),
-						Body:          io.NewSectionReader(handle, offset, length),
+						Body:          io.NewSectionReader(source, offset, length),
 						ContentLength: aws.Int64(length),
 					})
 					if partErr != nil {
@@ -1678,7 +1743,7 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 					partDoneSnapshot := partDone
 					linesSnapshot := append([]string{}, outputLines...)
 					stateMu.Unlock()
-					emitTransferEvent(buildTransferJob(jobID, label, "upload", progressFraction(transferredSnapshot, totalBytes), "running", transferredSnapshot, totalBytes, transferStrategyLabel("upload", usesMultipart), fileName, len(filePaths), itemsSnapshot, partSize, partDoneSnapshot, partCount, true, false, true, linesSnapshot))
+					emitProgress(buildTransferJob(jobID, label, "upload", progressFraction(transferredSnapshot, totalBytes), "running", transferredSnapshot, totalBytes, transferStrategyLabel("upload", usesMultipart), fileName, len(filePaths), itemsSnapshot, partSize, partDoneSnapshot, partCount, true, false, true, linesSnapshot))
 				}(partIndex)
 			}
 			wg.Wait()
@@ -1710,12 +1775,19 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 				_, _ = client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: aws.String(bucketName), Key: aws.String(targetKey), UploadId: createOutput.UploadId})
 			}
 		} else {
+			var body io.Reader = handle
+			var contentLength *int64
+			if ce != nil {
+				body = io.NewSectionReader(source, 0, fileSize)
+				contentLength = aws.Int64(fileSize)
+			}
 			_, err = client.PutObject(ctx, &s3.PutObjectInput{
-				Bucket: aws.String(bucketName),
-				Key:    aws.String(targetKey),
-				Body:   handle,
+				Bucket:        aws.String(bucketName),
+				Key:           aws.String(targetKey),
+				Body:          body,
+				ContentLength: contentLength,
 			})
-			bytesTransferred += info.Size()
+			bytesTransferred += fileSize
 		}
 		if err == nil {
 			err = verifyUploadSource(handle, filePath, sources[filePath])
@@ -1726,17 +1798,33 @@ func startUpload(params map[string]interface{}) (map[string]interface{}, error) 
 		}
 		itemsCompleted++
 		outputLines = append(outputLines, fmt.Sprintf("Finished uploading %s.", info.Name()))
-		emitTransferEvent(buildTransferJob(jobID, label, "upload", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), info.Name(), len(filePaths), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+		emitProgress(buildTransferJob(jobID, label, "upload", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), info.Name(), len(filePaths), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
 	}
 	outputLines = append(outputLines, fmt.Sprintf("Uploaded %d file(s) into %s.", len(filePaths), bucketName))
 	return buildTransferJob(jobID, label, "upload", 1, "completed", bytesTransferred, totalBytes, transferStrategyLabel("upload", usesMultipart), filepath.Base(filePaths[len(filePaths)-1]), len(filePaths), itemsCompleted, partSize, partDone, partCount, false, false, false, outputLines), nil
 }
 
-func startDownload(params map[string]interface{}) (map[string]interface{}, error) {
+func startDownload(params map[string]interface{}) (result map[string]interface{}, err error) {
+	defer protectClientEncryptionResult(params, &result, &err)
+	emitProgress := func(job map[string]interface{}) {
+		if secrets := clientEncryptionSecrets(params); len(secrets) > 0 {
+			job = redactEncryptionValues(redactEncryptionFields(job), secrets).(map[string]interface{})
+		}
+		emitTransferEvent(job)
+	}
+	ce, err := parseClientEncryption(params, false)
+	if err != nil {
+		return nil, err
+	}
 	p, bucketName, client, ctx, err := bucketClient(params)
 	if err != nil {
 		return nil, err
 	}
+	client, err = encryptedS3Client(params, p, client, false)
+	if err != nil {
+		return nil, err
+	}
+
 	keys := asStringSlice(params["keys"])
 	destinationPath := strings.TrimSpace(asString(params["destinationPath"]))
 	if len(keys) == 0 || destinationPath == "" {
@@ -1793,12 +1881,22 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 	for index, key := range keys {
 		headOutput := heads[index]
 		size := aws.ToInt64(headOutput.ContentLength)
+		if ce != nil {
+			if _, err = agePlaintextLength(ce.headerLength, size); err != nil {
+				return nil, err
+			}
+		}
 		objectSizes[key] = size
 		validators[key] = aws.ToString(headOutput.ETag)
 		totalBytes += size
 		if size >= thresholdBytes {
 			usesMultipart = true
-			partsTotal += int((size + chunkBytes - 1) / chunkBytes)
+			if ce != nil {
+				plain, _ := agePlaintextLength(ce.headerLength, size)
+				partsTotal += int(ageChunks(plain))
+			} else {
+				partsTotal += int((size + chunkBytes - 1) / chunkBytes)
+			}
 		}
 	}
 	jobID := fmt.Sprintf("download-%d", time.Now().UnixNano())
@@ -1812,6 +1910,9 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 	partDone := interface{}(nil)
 	if partsTotal > 0 {
 		partSize = chunkBytes
+		if ce != nil {
+			partSize = ageSealedChunkSize
+		}
 		partCount = partsTotal
 		partDone = 0
 	}
@@ -1820,7 +1921,7 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 		return nil, err
 	}
 	progressGate := newTransferProgressGate(params)
-	emitTransferEvent(buildTransferJob(jobID, label, "download", 0, "queued", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), keys[0], len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+	emitProgress(buildTransferJob(jobID, label, "download", 0, "queued", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), keys[0], len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
 	for _, key := range keys {
 		size := objectSizes[key]
 		beforeObject := bytesTransferred
@@ -1832,7 +1933,46 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 		defer os.Remove(target)
 		defer handle.Close()
 		outputLines = append(outputLines, fmt.Sprintf("Downloading %s (%d bytes) to %s.", key, size, target))
-		if size >= thresholdBytes {
+		if ce != nil {
+			var progressMu sync.Mutex
+			workers := 1
+			if size >= thresholdBytes {
+				workers = transferConcurrency(p)
+			}
+			err = downloadAgePayload(ctx, handle, ce, size, workers, p.MaxAttempts, func(workerCtx context.Context, start, length int64) (io.ReadCloser, error) {
+				output, getErr := client.GetObject(workerCtx, &s3.GetObjectInput{
+					Bucket: aws.String(bucketName), Key: aws.String(key),
+					VersionId: stringPtr(asString(params["versionId"])), IfMatch: optionalString(validators[key]),
+					Range: aws.String(fmt.Sprintf("bytes=%d-%d", start, start+length-1)),
+				})
+				if getErr != nil {
+					return nil, getErr
+				}
+				if aws.ToString(output.ContentRange) != fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, size) {
+					output.Body.Close()
+					return nil, fmt.Errorf("download range mismatch")
+				}
+				if received := aws.ToString(output.ETag); received != "" && validators[key] != "" && received != validators[key] {
+					output.Body.Close()
+					return nil, fmt.Errorf("download source changed during range request")
+				}
+				return output.Body, nil
+			}, func(copied int64, chunk bool) {
+				progressMu.Lock()
+				defer progressMu.Unlock()
+				bytesTransferred += copied
+				if size >= thresholdBytes && chunk {
+					partsCompleted++
+					partDone = partsCompleted
+				}
+				if progressGate.ready(false) {
+					emitProgress(buildTransferJob(jobID, label, "download", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), key, len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+				}
+			})
+			if err != nil {
+				return nil, err
+			}
+		} else if size >= thresholdBytes {
 			if err = handle.Truncate(size); err != nil {
 				handle.Close()
 				return nil, err
@@ -1875,36 +2015,29 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 						cancelWorkers()
 					}
 					rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
-					output, getErr := client.GetObject(workerCtx, &s3.GetObjectInput{
-						Bucket:    aws.String(bucketName),
-						Key:       aws.String(objectKey),
-						VersionId: stringPtr(asString(params["versionId"])),
-						IfMatch:   optionalString(validators[objectKey]),
-						Range:     aws.String(rangeHeader),
+					copied, readErr := downloadRangeWithRetry(workerCtx, handle, start, end-start+1, p.MaxAttempts, func() (io.ReadCloser, error) {
+						output, getErr := client.GetObject(workerCtx, &s3.GetObjectInput{
+							Bucket:    aws.String(bucketName),
+							Key:       aws.String(objectKey),
+							VersionId: stringPtr(asString(params["versionId"])),
+							IfMatch:   optionalString(validators[objectKey]),
+							Range:     aws.String(rangeHeader),
+						})
+						if getErr != nil {
+							return nil, getErr
+						}
+						if aws.ToString(output.ContentRange) != fmt.Sprintf("bytes %d-%d/%d", start, end, size) {
+							output.Body.Close()
+							return nil, fmt.Errorf("download range mismatch")
+						}
+						if received := aws.ToString(output.ETag); received != "" && validators[objectKey] != "" && received != validators[objectKey] {
+							output.Body.Close()
+							return nil, fmt.Errorf("download source changed during range request")
+						}
+						return output.Body, nil
 					})
-					if getErr != nil {
-						recordFailure(getErr)
-						return
-					}
-					expectedLength := end - start + 1
-					if aws.ToString(output.ContentRange) != fmt.Sprintf("bytes %d-%d/%d", start, end, size) {
-						output.Body.Close()
-						recordFailure(fmt.Errorf("download range mismatch"))
-						return
-					}
-					if received := aws.ToString(output.ETag); received != "" && validators[objectKey] != "" && received != validators[objectKey] {
-						output.Body.Close()
-						recordFailure(fmt.Errorf("download source changed during range request"))
-						return
-					}
-					copied, readErr := copyTransferRange(&offsetFileWriter{file: handle, offset: start}, io.LimitReader(output.Body, expectedLength+1))
-					output.Body.Close()
 					if readErr != nil {
 						recordFailure(readErr)
-						return
-					}
-					if copied != expectedLength {
-						recordFailure(fmt.Errorf("download range length mismatch"))
 						return
 					}
 					stateMu.Lock()
@@ -1921,7 +2054,7 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 					partDoneSnapshot := partDone
 					linesSnapshot := append([]string{}, outputLines...)
 					stateMu.Unlock()
-					emitTransferEvent(buildTransferJob(jobID, label, "download", progressFraction(transferredSnapshot, totalBytes), "running", transferredSnapshot, totalBytes, transferStrategyLabel("download", usesMultipart), objectKey, len(keys), itemsSnapshot, partSize, partDoneSnapshot, partCount, true, false, true, linesSnapshot))
+					emitProgress(buildTransferJob(jobID, label, "download", progressFraction(transferredSnapshot, totalBytes), "running", transferredSnapshot, totalBytes, transferStrategyLabel("download", usesMultipart), objectKey, len(keys), itemsSnapshot, partSize, partDoneSnapshot, partCount, true, false, true, linesSnapshot))
 				}(partIndex)
 			}
 			wg.Wait()
@@ -1952,7 +2085,7 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 					}
 					bytesTransferred += int64(readBytes)
 					if progressGate.ready(false) {
-						emitTransferEvent(buildTransferJob(jobID, label, "download", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), key, len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
+						emitProgress(buildTransferJob(jobID, label, "download", progressFraction(bytesTransferred, totalBytes), "running", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), key, len(keys), itemsCompleted, partSize, partDone, partCount, true, false, true, append([]string{}, outputLines...)))
 					}
 				}
 				if errors.Is(readErr, io.EOF) {
@@ -1975,14 +2108,18 @@ func startDownload(params map[string]interface{}) (map[string]interface{}, error
 		if err = handle.Close(); err != nil {
 			return nil, err
 		}
-		finalPath, publishErr := destination.publish(target, key, asString(params["conflictPolicy"]))
+		finalPath, publishErr := destination.publish(target, ce.downloadName(key), asString(params["conflictPolicy"]))
 		if publishErr != nil {
 			return nil, publishErr
 		}
 		os.Remove(target)
-		outputLines = append(outputLines, fmt.Sprintf("Saved %s to %s.", key, finalPath))
+		publishedName := key
+		if ce != nil {
+			publishedName = filepath.Base(finalPath)
+		}
+		outputLines = append(outputLines, fmt.Sprintf("Saved %s to %s.", publishedName, finalPath))
 		itemsCompleted++
-		outputLines = append(outputLines, fmt.Sprintf("Finished downloading %s.", key))
+		outputLines = append(outputLines, fmt.Sprintf("Finished downloading %s.", publishedName))
 	}
 	outputLines = append(outputLines, fmt.Sprintf("Downloaded %d object(s) into %s.", len(keys), destinationPath))
 	return buildTransferJob(jobID, label, "download", 1, "completed", bytesTransferred, totalBytes, transferStrategyLabel("download", usesMultipart), keys[len(keys)-1], len(keys), itemsCompleted, partSize, partDone, partCount, false, false, false, outputLines), nil
@@ -1993,6 +2130,14 @@ func generatePresignedURL(params map[string]interface{}) (map[string]interface{}
 	if err != nil {
 		return nil, err
 	}
+	encryption, err := parseRequestEncryption(params, p, false)
+	if err != nil {
+		return nil, err
+	}
+	if encryption.destination.customer() {
+		return nil, &sidecarError{Code: "unsupported_feature", Message: "Customer-key encrypted objects require secret request headers and cannot be shared by URL."}
+	}
+
 	key := asString(params["key"])
 	expiration := maxInt(asInt(params["expirationSeconds"]), 1, 3600)
 	if key == "" {
@@ -2051,7 +2196,7 @@ func transferControl(params map[string]interface{}, action string) map[string]in
 func emitTransferEvent(job map[string]interface{}) {
 	payload, err := json.Marshal(map[string]interface{}{
 		"event": "transferProgress",
-		"job":   job,
+		"job":   redactEncryptionFields(job),
 	})
 	if err != nil {
 		return
@@ -2100,12 +2245,12 @@ func toolFailure(label string, err error) map[string]interface{} {
 	return toolState(label, message, []string{"Error: " + message}, 1)
 }
 
-func runPutTestData(params map[string]interface{}) map[string]interface{} {
+func runPutTestData(params map[string]interface{}) (map[string]interface{}, error) {
 	const label = "put-testdata"
 	config := asMap(params["config"])
 	bucketName := strings.TrimSpace(asString(config["bucketName"]))
 	if bucketName == "" {
-		return toolFailure(label, &sidecarError{Code: "invalid_config", Message: "Bucket name is required."})
+		return toolFailure(label, &sidecarError{Code: "invalid_config", Message: "Bucket name is required."}), nil
 	}
 	prefix := asString(config["prefix"])
 	objectCount := max(asInt(config["objectCount"]), 0)
@@ -2117,12 +2262,41 @@ func runPutTestData(params map[string]interface{}) map[string]interface{} {
 	sizeBytes := max(asInt(config["objectSizeBytes"]), 0)
 	p, err := parseProfile(asMap(params["profile"]))
 	if err != nil {
-		return toolFailure(label, err)
+		return toolFailure(label, err), nil
 	}
-	client, ctx, err := buildClient(p)
+
+	encryption, err := parseRequestEncryption(params, p, false)
 	if err != nil {
-		return toolFailure(label, err)
+		return nil, err
 	}
+	// Azure's test-data tool was unsupported before object encryption. Keep the
+	// default path unchanged; explicit Azure encryption opts into Put Blob writes.
+	if isAzureProfile(p) && encryption.destination.mode == "" {
+		return nil, azureUnsupported("runPutTestData")
+	}
+
+	var put func(string, []byte) error
+	if isAzureProfile(p) {
+		client, ctx, buildErr := buildAzureClient(p)
+		if buildErr != nil {
+			return toolFailure(label, buildErr), nil
+		}
+		ctx = context.WithValue(ctx, azureEncryptionContextKey{}, encryption.destination)
+		put = func(key string, payload []byte) error {
+			return client.putBlob(ctx, bucketName, key, payload, map[string]string{"Content-Type": "application/octet-stream"})
+		}
+	} else {
+		client, ctx, buildErr := buildClient(p)
+		if buildErr != nil {
+			return toolFailure(label, buildErr), nil
+		}
+		client = s3ClientWithEncryption(client, encryption, false)
+		put = func(key string, payload []byte) error {
+			_, putErr := client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucketName), Key: aws.String(key), Body: bytes.NewReader(payload), ContentType: aws.String("application/octet-stream")})
+			return putErr
+		}
+	}
+
 	payload := bytes.Repeat([]byte{'A'}, sizeBytes)
 	started := time.Now()
 	var (
@@ -2141,12 +2315,7 @@ func runPutTestData(params map[string]interface{}) map[string]interface{} {
 			defer func() { <-sem }()
 			key := fmt.Sprintf("%stestdata-%06d.bin", prefix, objectIndex)
 			for versionIndex := 0; versionIndex < versions; versionIndex++ {
-				_, putErr := client.PutObject(ctx, &s3.PutObjectInput{
-					Bucket:      aws.String(bucketName),
-					Key:         aws.String(key),
-					Body:        bytes.NewReader(payload),
-					ContentType: aws.String("application/octet-stream"),
-				})
+				putErr := put(key, payload)
 				countMu.Lock()
 				if putErr != nil {
 					failureCount++
@@ -2173,9 +2342,9 @@ func runPutTestData(params map[string]interface{}) map[string]interface{} {
 	}
 	if firstFailure != nil {
 		outputLines = append(outputLines, fmt.Sprintf("First error: %s", firstFailure.Error()))
-		return toolState(label, fmt.Sprintf("Completed with %d failure(s) writing test data to %s.", failureCount, bucketName), outputLines, 1)
+		return toolState(label, fmt.Sprintf("Completed with %d failure(s) writing test data to %s.", failureCount, bucketName), outputLines, 1), nil
 	}
-	return toolState(label, fmt.Sprintf("Created %d object(s) with %d version(s) each in %s.", objectCount, versions, bucketName), outputLines, 0)
+	return toolState(label, fmt.Sprintf("Created %d object(s) with %d version(s) each in %s.", objectCount, versions, bucketName), outputLines, 0), nil
 }
 
 func runDeleteAll(params map[string]interface{}) map[string]interface{} {
@@ -3446,6 +3615,20 @@ func lifecycleRuleToMap(rule types.LifecycleRule) map[string]interface{} {
 }
 
 func mapError(err error) map[string]interface{} {
+	var encrypted *encryptionFailure
+	if errors.As(err, &encrypted) {
+		result := redactEncryptionValues(redactEncryptionFields(mapError(encrypted.cause)), encrypted.secrets).(map[string]interface{})
+		if encrypted.hint != "" {
+			details := asMap(result["details"])
+			details["encryptionHint"] = encrypted.hint
+			result["details"] = details
+		}
+		return result
+	}
+	return mapErrorBase(err)
+}
+
+func mapErrorBase(err error) map[string]interface{} {
 	var sideErr *sidecarError
 	if errors.As(err, &sideErr) {
 		return map[string]interface{}{

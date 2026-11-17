@@ -1,5 +1,7 @@
 use super::*;
 pub(super) async fn run(params: Value) -> SidecarResult {
+    let encryption = Encryption::parse(&params["encryption"], &params["profile"], false)?;
+    let source_encryption = Encryption::parse(&params["sourceEncryption"], &params["profile"], true)?;
     let profile = parse_profile(&params["profile"])?;
     let source_bucket = required_text(&params, "sourceBucketName", "Source bucket is required.")?;
     let source_key = required_text(&params, "sourceKey", "Source key is required.")?;
@@ -20,14 +22,15 @@ pub(super) async fn run(params: Value) -> SidecarResult {
         ));
     }
     let client = build_client(&profile).await?;
-    let head = client
+    let inherit_encryption = encryption.mode == object_encryption::Mode::BucketDefault;
+    let head = encryption_customer!(client
         .head_object()
         .bucket(&source_bucket)
         .key(&source_key)
-        .set_version_id(selected.clone())
+        .set_version_id(selected.clone()), &source_encryption)
         .send()
         .await
-        .map_err(map_sdk_error)?;
+        .map_err(|error| object_encryption::read_error(error, source_encryption.customer()))?;
     let size = head.content_length().unwrap_or(0).max(0) as u64;
     let version = selected.or_else(|| head.version_id().map(str::to_owned));
     let mut source = urlencoding::encode(&format!("{source_bucket}/{source_key}")).to_string();
@@ -35,12 +38,12 @@ pub(super) async fn run(params: Value) -> SidecarResult {
         source.push_str(&format!("?versionId={}", urlencoding::encode(v)));
     }
     let (dest_version, etag) = if size <= 5 * 1024 * 1024 * 1024 {
-        let out = client
+        let out = encryption_source!(encryption_write!(client
             .copy_object()
             .bucket(&bucket)
             .key(&key)
             .copy_source(&source)
-            .set_copy_source_if_match(head.e_tag().map(str::to_owned))
+            .set_copy_source_if_match(head.e_tag().map(str::to_owned)), &encryption), &source_encryption)
             .send()
             .await
             .map_err(map_sdk_error)?;
@@ -71,7 +74,7 @@ pub(super) async fn run(params: Value) -> SidecarResult {
             })
             .collect::<Vec<_>>()
             .join("&");
-        let created = client
+        let created = encryption_write!(client
             .create_multipart_upload()
             .bucket(&bucket)
             .key(&key)
@@ -83,14 +86,14 @@ pub(super) async fn run(params: Value) -> SidecarResult {
             .set_expires(head.expires().cloned())
             .set_metadata(head.metadata().cloned())
             .set_storage_class(head.storage_class().cloned())
-            .set_server_side_encryption(head.server_side_encryption().cloned())
-            .set_ssekms_key_id(head.ssekms_key_id().map(str::to_owned))
-            .set_bucket_key_enabled(head.bucket_key_enabled())
+            .set_server_side_encryption(if inherit_encryption { head.server_side_encryption().cloned() } else { None })
+            .set_ssekms_key_id(if inherit_encryption { head.ssekms_key_id().map(str::to_owned) } else { None })
+            .set_bucket_key_enabled(if inherit_encryption { head.bucket_key_enabled() } else { None })
             .set_tagging(if tagging.is_empty() {
                 None
             } else {
                 Some(tagging)
-            })
+            }), &encryption)
             .send()
             .await
             .map_err(map_sdk_error)?;
@@ -111,6 +114,8 @@ pub(super) async fn run(params: Value) -> SidecarResult {
                 transfer_concurrency(&profile),
                 |index| {
                     let c = client.clone();
+                    let encryption = encryption.clone();
+                    let source_encryption = source_encryption.clone();
                     let b = bucket.clone();
                     let k = key.clone();
                     let u = upload.clone();
@@ -119,7 +124,7 @@ pub(super) async fn run(params: Value) -> SidecarResult {
                     async move {
                         let start = index * part_size;
                         let end = (start + part_size - 1).min(size - 1);
-                        let out = c
+                        let out = encryption_source!(encryption_customer!(c
                             .upload_part_copy()
                             .bucket(b)
                             .key(k)
@@ -127,7 +132,7 @@ pub(super) async fn run(params: Value) -> SidecarResult {
                             .part_number(index as i32 + 1)
                             .copy_source(s)
                             .copy_source_range(format!("bytes={start}-{end}"))
-                            .set_copy_source_if_match(etag)
+                            .set_copy_source_if_match(etag), &encryption), &source_encryption)
                             .send()
                             .await
                             .map_err(map_sdk_error)?;
@@ -152,7 +157,7 @@ pub(super) async fn run(params: Value) -> SidecarResult {
             )
             .await?;
             parts.sort_by_key(|p| p.part_number());
-            let out = client
+            let out = encryption_customer!(client
                 .complete_multipart_upload()
                 .bucket(&bucket)
                 .key(&key)
@@ -161,7 +166,7 @@ pub(super) async fn run(params: Value) -> SidecarResult {
                     CompletedMultipartUpload::builder()
                         .set_parts(Some(parts))
                         .build(),
-                )
+                ), &encryption)
                 .send()
                 .await
                 .map_err(map_sdk_error)?;

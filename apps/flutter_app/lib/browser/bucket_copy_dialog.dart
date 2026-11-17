@@ -27,8 +27,8 @@ class _BucketCopyDialogState extends State<BucketCopyDialog> {
   final sections = <String>{};
   bool get advanced =>
       !AppPlatform.isMobile &&
-      source.endpointType != EndpointProfileType.azureBlob &&
-      destination.endpointType != EndpointProfileType.azureBlob;
+      source.endpointType.isS3 &&
+      destination.endpointType.isS3;
 
   Future<bool> review(Map<String, Object?> plan) async {
     if (!mounted) return false;
@@ -139,9 +139,16 @@ class _BucketCopyDialogState extends State<BucketCopyDialog> {
                     children: [
                   DropdownButtonFormField<String>(
                       initialValue: destination.id,
-                      decoration: const InputDecoration(
-                          labelText: 'Destination endpoint'),
+                      decoration: InputDecoration(
+                        labelText: 'Destination endpoint',
+                        helperText: source.endpointType.isGoogleCloudStorage
+                            ? 'Native Cloud Storage copies use the same endpoint profile.'
+                            : null,
+                      ),
                       items: widget.controller.profiles
+                          .where((p) => source.endpointType.isGoogleCloudStorage
+                              ? p.id == source.id
+                              : !p.endpointType.isGoogleCloudStorage)
                           .map((p) => DropdownMenuItem(
                               value: p.id, child: Text(p.name)))
                           .toList(),

@@ -77,7 +77,8 @@ class DeferredPageEngine extends MockEngineService {
           {required String engineId,
           required EndpointProfile profile,
           required String bucketName,
-          required String key}) async =>
+          required String key,
+          ObjectEncryption? encryption}) async =>
       ObjectDetails(
           key: key,
           metadata: const {},
