@@ -150,11 +150,50 @@ extension MobileStorageTransfers on MobileStorageAdmin {
         }
       }
     }
+    var expectedGrants = <String, String>{};
     if ((selfCopy || args['move'] == true) &&
         args['options'] is Map &&
         !from.azure) {
-      headers.addAll(await _propertyProtectionHeaders(
-          from, sourceBucket, sourceKey, query));
+      final protection =
+          await _propertyProtectionHeaders(from, sourceBucket, sourceKey, query);
+      expectedGrants = Map.fromEntries(protection.entries
+          .where((entry) => entry.key.startsWith('x-amz-grant-')));
+      headers.addAll(protection);
+    }
+    if (expectedGrants.isNotEmpty && to.azure) {
+      throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message: 'S3 object ACLs cannot be preserved in Azure Blob.');
+    }
+    final localProtectedWrite = expectedGrants.isNotEmpty &&
+        {'127.0.0.1', 'localhost', '::1'}.contains(to.uri('').host);
+    if (localProtectedWrite &&
+        (size > 8 * 1024 * 1024 ||
+            (selfCopy && version != null) ||
+            (args['move'] == true && (source != destination || conflict == 'replace')) ||
+            requireEmptySource)) {
+      throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message:
+              'This loopback endpoint requires a single conditional PUT to preserve object ACLs.');
+    }
+    Future<void> verifySourceGrants() async {
+      if (expectedGrants.isEmpty) return;
+      if (version == null && copiedVersion != null) {
+        final current = await from.request('HEAD', sourceBucket,
+            key: sourceKey, headers: sourceHeaders);
+        if (current.headers['x-amz-version-id'] != copiedVersion) {
+          MobileStorageAdmin._conflict(
+              'The current source version changed during the copy. Refresh before retrying.');
+        }
+      }
+      final acl = (await from.request('GET', sourceBucket,
+              key: sourceKey, query: {...deleteQuery, 'acl': ''}))
+          .xml;
+      if (!_matchingAclGrants(acl, expectedGrants)) {
+        MobileStorageAdmin._conflict(
+            'The source ACL changed during the copy. Refresh before retrying.');
+      }
     }
     // Read the tag set before any destination mutation. A denied read must not
     // silently publish a copy with tags missing.
@@ -188,6 +227,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
 
     try {
       final serverCopyEligible = !requireEmptySource &&
+          !localProtectedWrite &&
           sameEndpoint &&
           !from.azure &&
           !to.azure &&
@@ -203,6 +243,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
         final sourceLocation =
             '/${storageUriEncode(sourceBucket)}/${sourceKey.split('/').map(storageUriEncode).join('/')}'
             '${copiedVersion == null ? '' : '?versionId=${storageUriEncode(copiedVersion)}'}';
+        await verifySourceGrants();
         final copied = await to.request('PUT', bucket, key: key, headers: {
           ...headers,
           ...destinationHeaders,
@@ -226,36 +267,89 @@ extension MobileStorageTransfers on MobileStorageAdmin {
             headers: headers,
             encryption: args['encryption'],
             conflict: conflict,
+            verifySource: expectedGrants.isEmpty ? null : verifySourceGrants,
             expectedDestinationETag: selfCopy && version == null ? etag : null);
       }
       final destinationVersion =
           response.headers[to.azure ? 'x-ms-version-id' : 'x-amz-version-id'];
-      if (response.headers['etag'] == null && destinationVersion == null) {
-        throw const EngineException(
-            code: ErrorCode.unknown,
-            message:
-                'The copy response omitted its destination identity. Inspect the destination before retrying.');
+      final destinationQuery = {
+        if (destinationVersion != null)
+          to.azure ? 'versionid' : 'versionId': destinationVersion
+      };
+      Map<String, Object?> incompleteCopy(String code, String message,
+              {bool sourceRetained = true}) =>
+          {
+            'successCount': 0,
+            'failureCount': 1,
+            'requiresVerification': true,
+            'destinationVersionId': destinationVersion,
+            if (args['move'] == true) ...{
+              'copiedCount': 1,
+              if (sourceRetained) 'sourceRetained': true,
+            },
+            'failures': [
+              {'target': key, 'code': code, 'message': message}
+            ],
+          };
+      final StorageHttpResponse verified;
+      try {
+        if (response.headers['etag'] == null && destinationVersion == null) {
+          throw const EngineException(
+              code: ErrorCode.unknown,
+              message:
+                  'The copy response omitted its destination identity. Inspect the destination before retrying.');
+        }
+        verified = await to.request('HEAD', bucket,
+            key: key,
+            headers: objectEncryptionHeaders(
+              destination,
+              args['encryption'],
+              read: true,
+            ),
+            query: destinationQuery);
+        if (int.tryParse(verified.headers['content-length'] ?? '') != size ||
+            (response.headers['etag'] != null &&
+                response.headers['etag'] != verified.headers['etag'])) {
+          MobileStorageAdmin._conflict(
+              'The destination changed before the copy could be verified.');
+        }
+      } catch (_) {
+        if (expectedGrants.isEmpty) rethrow;
+        return incompleteCopy('destination_unverified',
+            'The copy was written, but its destination could not be verified. Inspect it before retrying.');
       }
-      final verified = await to.request('HEAD', bucket,
-          key: key,
-          headers: objectEncryptionHeaders(
-            destination,
-            args['encryption'],
-            read: true,
-          ),
-          query: {
-            if (destinationVersion != null)
-              to.azure ? 'versionid' : 'versionId': destinationVersion
-          });
-      if (int.tryParse(verified.headers['content-length'] ?? '') != size ||
-          (response.headers['etag'] != null &&
-              response.headers['etag'] != verified.headers['etag'])) {
-        MobileStorageAdmin._conflict(
-            'The destination changed before the copy could be verified.');
+      if (expectedGrants.isNotEmpty) {
+        try {
+          final acl = (await to.request('GET', bucket,
+                  key: key, query: {...destinationQuery, 'acl': ''}))
+              .xml;
+          if (!_matchingAclGrants(acl, expectedGrants)) {
+            throw StateError('Destination grants differ from the source.');
+          }
+        } catch (_) {
+          return incompleteCopy('acl_unverified',
+              'The copy was written, but its ACL could not be verified. Review the destination grants before retrying.');
+        }
       }
       if (args['move'] == true) {
-        await from.request('DELETE', sourceBucket,
-            key: sourceKey, query: deleteQuery, headers: {'if-match': etag});
+        try {
+          await verifySourceGrants();
+        } catch (_) {
+          return incompleteCopy('source_acl_unverified',
+              'The copy was written and the source was kept because its ACL changed or could not be verified.');
+        }
+        try {
+          await from.request('DELETE', sourceBucket,
+              key: sourceKey, query: deleteQuery, headers: {'if-match': etag});
+        } on StorageHttpException catch (error) {
+          return incompleteCopy('source_delete_failed',
+              'The copy was written, but source deletion was not confirmed.',
+              sourceRetained: error.response.status == 412);
+        } catch (_) {
+          return incompleteCopy('source_delete_failed',
+              'The copy was written, but source deletion was not confirmed.',
+              sourceRetained: false);
+        }
       }
       return {
         'successCount': 1,
@@ -305,40 +399,11 @@ extension MobileStorageTransfers on MobileStorageAdmin {
         false;
     if (!enforced) {
       final acl = await optional('acl', object: true);
-      final grants = <String, List<String>>{};
-      const names = {
-        'FULL_CONTROL': 'x-amz-grant-full-control',
-        'READ': 'x-amz-grant-read',
-        'READ_ACP': 'x-amz-grant-read-acp',
-        'WRITE_ACP': 'x-amz-grant-write-acp'
-      };
-      for (final grant in acl?.descendants
-              .whereType<XmlElement>()
-              .where((e) => e.name.local == 'Grant') ??
-          <XmlElement>[]) {
-        final field = names[xmlText(grant, 'Permission')];
-        final grantee = grant.childElements
-            .where((e) => e.name.local == 'Grantee')
-            .firstOrNull;
-        final id = grantee == null ? '' : xmlText(grantee, 'ID');
-        final uri = grantee == null ? '' : xmlText(grantee, 'URI');
-        final value = id.isNotEmpty ? id : uri;
-        if (field == null ||
-            value.isEmpty ||
-            value.contains(RegExp(r'[\r\n"]'))) {
-          throw StateError(
-              'This object ACL cannot be preserved by a property edit.');
-        }
-        grants
-            .putIfAbsent(field, () => [])
-            .add('${id.isNotEmpty ? 'id' : 'uri'}="$value"');
-      }
-      if (grants.isEmpty) {
+      if (acl == null) {
         throw StateError(
             'The object ACL could not be read. No property changes were applied.');
       }
-      result.addAll(
-          grants.map((name, values) => MapEntry(name, values.join(', '))));
+      result.addAll(_aclGrantHeaders(acl));
     }
     final lock = await optional('object-lock');
     if (lock != null && xmlText(lock, 'ObjectLockEnabled') == 'Enabled') {
@@ -354,6 +419,46 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       }
     }
     return result;
+  }
+
+  Map<String, String> _aclGrantHeaders(XmlElement acl) {
+    const names = {
+      'FULL_CONTROL': 'x-amz-grant-full-control',
+      'READ': 'x-amz-grant-read',
+      'READ_ACP': 'x-amz-grant-read-acp',
+      'WRITE_ACP': 'x-amz-grant-write-acp'
+    };
+    final grants = <String, Set<String>>{};
+    for (final grant in acl.descendants
+        .whereType<XmlElement>()
+        .where((e) => e.name.local == 'Grant')) {
+      final field = names[xmlText(grant, 'Permission')];
+      final grantee =
+          grant.childElements.where((e) => e.name.local == 'Grantee').firstOrNull;
+      final id = grantee == null ? '' : xmlText(grantee, 'ID');
+      final uri = grantee == null ? '' : xmlText(grantee, 'URI');
+      final value = id.isNotEmpty ? id : uri;
+      if (field == null ||
+          value.isEmpty ||
+          value.contains(RegExp(r'[\r\n"]'))) {
+        throw StateError(
+            'This object ACL cannot be preserved by a property edit.');
+      }
+      grants
+          .putIfAbsent(field, () => {})
+          .add('${id.isNotEmpty ? 'id' : 'uri'}="$value"');
+    }
+    if (grants.isEmpty) {
+      throw StateError('The object ACL did not contain any grants.');
+    }
+    return grants.map(
+        (name, values) => MapEntry(name, (values.toList()..sort()).join(', ')));
+  }
+
+  bool _matchingAclGrants(XmlElement acl, Map<String, String> expected) {
+    final actual = _aclGrantHeaders(acl);
+    return actual.length == expected.length &&
+        expected.entries.every((entry) => actual[entry.key] == entry.value);
   }
 
   Future<StorageHttpResponse> _writeObject(

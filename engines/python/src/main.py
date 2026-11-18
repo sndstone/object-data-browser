@@ -6144,6 +6144,23 @@ def _copy_options(head, options):
     return result
 
 
+def _acl_grant_headers(acl):
+    grants = {}
+    names = {'FULL_CONTROL': 'GrantFullControl', 'READ': 'GrantRead',
+             'READ_ACP': 'GrantReadACP', 'WRITE_ACP': 'GrantWriteACP'}
+    for grant in acl.get('Grants', []):
+        grantee = grant.get('Grantee', {})
+        field = names.get(grant.get('Permission'))
+        kind = {'CanonicalUser': 'id', 'Group': 'uri'}.get(grantee.get('Type'))
+        value = grantee.get('ID' if kind == 'id' else 'URI')
+        if not field or not kind or not value or any(c in value for c in '\r\n"'):
+            raise SidecarError('unsupported_feature', 'This object ACL cannot be preserved by a property edit.')
+        grants.setdefault(field, set()).add(f'{kind}="{value}"')
+    if not grants:
+        raise SidecarError('invalid_response', 'The object ACL did not contain any grants.')
+    return {field: ', '.join(sorted(values)) for field, values in grants.items()}
+
+
 def _property_copy_protection(client, source):
     """Resolve access and lock settings before publishing a replacement version.
 
@@ -6157,20 +6174,7 @@ def _property_copy_protection(client, source):
         enforced = any(rule.get('ObjectOwnership') == 'BucketOwnerEnforced'
                        for rule in ownership.get('OwnershipControls', {}).get('Rules', []))
         if not enforced:
-            acl = client.get_object_acl(**source)
-            grants = {}
-            names = {'FULL_CONTROL': 'GrantFullControl', 'READ': 'GrantRead', 'READ_ACP': 'GrantReadACP', 'WRITE_ACP': 'GrantWriteACP'}
-            for grant in acl.get('Grants', []):
-                grantee = grant.get('Grantee', {})
-                field = names.get(grant.get('Permission'))
-                kind = 'id' if grantee.get('Type') == 'CanonicalUser' else 'uri' if grantee.get('Type') == 'Group' else None
-                value = grantee.get('ID' if kind == 'id' else 'URI')
-                if not field or not kind or not value or any(c in value for c in '\r\n"'):
-                    raise SidecarError('unsupported_feature', 'This object ACL cannot be preserved by a property edit.')
-                grants.setdefault(field, []).append(f'{kind}="{value}"')
-            if not grants:
-                raise SidecarError('invalid_response', 'The object ACL did not contain any grants.')
-            result.update({field: ', '.join(values) for field, values in grants.items()})
+            result.update(_acl_grant_headers(client.get_object_acl(**source)))
         lock = _configuration_or_missing(lambda: client.get_object_lock_configuration(**bucket), {'ObjectLockConfigurationNotFoundError', 'NoSuchObjectLockConfiguration', 'NotImplemented'})
         if lock.get('ObjectLockConfiguration', {}).get('ObjectLockEnabled') == 'Enabled':
             retention = _configuration_or_missing(lambda: client.get_object_retention(**source), {'NoSuchObjectLockConfiguration', 'NoSuchRetentionConfiguration'}).get('Retention', {})
@@ -6284,11 +6288,27 @@ def _storage_copy_impl(params):
             if _lookup_transfer(job_id) is not control: return
             publish_copy()
     threading.Thread(target=heartbeat, daemon=True).start()
-    if source_profile == dest_profile and source['Bucket'] == dest['Bucket'] and source['Key'] == dest['Key'] and 'encryption' not in options:
+    if same_object and 'encryption' not in options:
         options = {**options, 'encryption': {field: head[field] for field in ('ServerSideEncryption', 'SSEKMSKeyId', 'BucketKeyEnabled') if field in head}}
     put_options = _copy_options(head, options)
     if options.get('preserveObjectProtection') and not src_azure:
         put_options.update(_property_copy_protection(src, source))
+    expected_grants = {field: value for field, value in put_options.items() if field.startswith('Grant')}
+    if expected_grants and dst_azure:
+        raise SidecarError('unsupported_feature', 'S3 object ACLs cannot be preserved in Azure Blob.')
+
+    def verify_source_grants():
+        if not expected_grants:
+            return
+        reference = source if selected_version is not None else {'Bucket': source['Bucket'], 'Key': source['Key']}
+        if selected_version is None and source.get('VersionId'):
+            if src.head_object(**reference).get('VersionId') != source['VersionId']:
+                raise SidecarError('conflict', 'The current source version changed during the copy. Refresh before retrying.')
+        # An ETag cannot detect ACL-only changes. Check grants close to the
+        # mutation; S3 cannot include the ACL revision in its write condition.
+        if _acl_grant_headers(src.get_object_acl(**reference)) != expected_grants:
+            raise SidecarError('conflict', 'The source ACL changed during the copy. Refresh before retrying.')
+
     source_tags = {}
     if options.get('preserveTags', True):
         if src_azure:
@@ -6306,17 +6326,31 @@ def _storage_copy_impl(params):
     result = {}
     conditional_server_copy = (same_authority and source_profile.endpoint_type == 'awsS3'
                                and policy in {'skip', 'fail'} and size > 0)
-    if not require_empty_source and not src_azure and not dst_azure and same_authority and (policy not in {'skip', 'fail'} or conditional_server_copy):
-        if conditional_server_copy:
-            # A lost conditional completion response must never be replayed as
-            # another mutation; reconciliation belongs to the caller.
-            dst = _encrypted_client(_build_client(replace(dest_profile, max_attempts=1)), dest_profile,
-                                    encryption, copy_source=source_encryption)
+    # Loopback emulators can discard grants on CopyObject and multipart
+    # completion. Use one conditional PUT for locally bounded protected writes.
+    loopback = urlparse(dest_profile.endpoint_url).hostname in {'127.0.0.1', 'localhost', '::1'}
+    local_protected_write = loopback and expected_grants and (property_edit or params.get('move'))
+    conditional_property_put = bool(local_protected_write and property_edit)
+    if local_protected_write:
+        permitted = ((same_object and selected_version is None and policy in {'replace', 'overwrite'})
+                     if property_edit else (same_authority and policy in {'skip', 'fail'}
+                                            and (selected_version is not None or source_profile.endpoint_type == 'awsS3')))
+        if not permitted or size > 8 * 1024**2 or require_empty_source or not head.get('ETag'):
+            raise SidecarError('unsupported_feature',
+                               'This loopback endpoint requires a single conditional PUT to preserve object ACLs.')
+    publish_client = dst
+    if expected_grants or conditional_server_copy:
+        # A protected write can commit even when the response is lost. Replaying
+        # the mutation can create another version with grants from an old read.
+        publish_client = _encrypted_client(_build_client(replace(dest_profile, max_attempts=1)), dest_profile,
+                                           encryption, copy_source=source_encryption)
+    if not local_protected_write and not require_empty_source and not src_azure and not dst_azure and same_authority and (policy not in {'skip', 'fail'} or conditional_server_copy):
         strategy = 'server-side-copy'
         copy_source = dict(source)
         match = {'CopySourceIfMatch': head['ETag']} if head.get('ETag') else {}
         if size <= 5 * 1024**3 and not conditional_server_copy:
-            result = dst.copy_object(**dest, CopySource=copy_source, MetadataDirective='REPLACE', TaggingDirective='REPLACE', **put_options, **match)
+            verify_source_grants()
+            result = publish_client.copy_object(**dest, CopySource=copy_source, MetadataDirective='REPLACE', TaggingDirective='REPLACE', **put_options, **match)
             _check_mutation_result(result, 'CopyObjectResult')
         else:
             upload = dst.create_multipart_upload(**dest, **put_options)['UploadId']
@@ -6337,7 +6371,8 @@ def _storage_copy_impl(params):
                         publish_copy(min(size, len(parts) * chunk))
                 parts.sort(key=lambda part: part['PartNumber'])
                 _transfer_gate(control)
-                result = dst.complete_multipart_upload(**dest, UploadId=upload, MultipartUpload={'Parts': parts},
+                verify_source_grants()
+                result = publish_client.complete_multipart_upload(**dest, UploadId=upload, MultipartUpload={'Parts': parts},
                     **({'IfNoneMatch': '*'} if conditional_server_copy else {}))
                 _check_mutation_result(result)
             except BaseException:
@@ -6385,7 +6420,11 @@ def _storage_copy_impl(params):
             elif size <= chunk:
                 data = body.read(chunk + 1)
                 if len(data) != size: raise SidecarError('conflict', 'Source size changed while copying.')
-                result = dst.put_object(**dest, Body=data, **put_options, **({'IfNoneMatch': '*'} if policy in {'skip', 'fail'} else {}))
+                conditions = {'IfNoneMatch': '*'} if policy in {'skip', 'fail'} else {}
+                if conditional_property_put:
+                    conditions['IfMatch'] = head['ETag']
+                verify_source_grants()
+                result = publish_client.put_object(**dest, Body=data, **put_options, **conditions)
             else:
                 upload = dst.create_multipart_upload(**dest, **put_options)['UploadId']
                 try:
@@ -6398,7 +6437,8 @@ def _storage_copy_impl(params):
                         copied += len(block)
                         publish_copy(copied)
                     if copied != size: raise SidecarError('conflict', 'Source size changed while copying.')
-                    result = dst.complete_multipart_upload(**dest, UploadId=upload, MultipartUpload={'Parts': parts},
+                    verify_source_grants()
+                    result = publish_client.complete_multipart_upload(**dest, UploadId=upload, MultipartUpload={'Parts': parts},
                                                            **({'IfNoneMatch': '*'} if policy in {'skip', 'fail'} else {}))
                     _check_mutation_result(result)
                 except BaseException:
@@ -6410,17 +6450,48 @@ def _storage_copy_impl(params):
     _check_mutation_result(result)
     verify = {'Bucket': dest['Bucket'], 'Key': dest['Key']}
     if result.get('VersionId'): verify['VersionId'] = result['VersionId']
-    if dst_azure:
-        _, destination_head, _ = dst.request('HEAD', dst.blob_path(dest['Bucket'], dest['Key']), query={'versionid': result['VersionId']} if result.get('VersionId') else {})
-        dest_size = int(destination_head.get('Content-Length') or 0)
-    else:
-        dest_size = int(dst.head_object(**verify).get('ContentLength') or 0)
-    if dest_size != size: raise SidecarError('conflict', 'Destination size verification failed after copying.')
-    publish_copy(size, completed=True)
     outcome = {'successCount': 1, 'failureCount': 0, 'failures': [], 'skipped': False, 'bytesCopied': size,
                'versionId': result.get('VersionId'), 'strategy': strategy,
                'sourceVersionId': source.get('VersionId'), 'sourceETag': head.get('ETag')}
+
+    def incomplete_copy(code, message):
+        outcome.update(successCount=0, failureCount=1, requiresVerification=True,
+                       failures=[{'target': dest['Key'], 'code': code, 'message': message}])
+        if params.get('move'):
+            outcome.update(copiedCount=1, sourceRetained=True)
+        return outcome
+
+    try:
+        if dst_azure:
+            _, destination_head, _ = dst.request('HEAD', dst.blob_path(dest['Bucket'], dest['Key']), query={'versionid': result['VersionId']} if result.get('VersionId') else {})
+            dest_size = int(destination_head.get('Content-Length') or 0)
+        else:
+            destination_head = dst.head_object(**verify)
+            dest_size = int(destination_head.get('ContentLength') or 0)
+        if dest_size != size:
+            raise SidecarError('conflict', 'Destination size verification failed after copying.')
+    except Exception:
+        if not expected_grants:
+            raise
+        return incomplete_copy('destination_unverified',
+                               'The copy was written, but its destination could not be verified. Inspect it before retrying.')
+    if expected_grants:
+        copied_etag = result.get('ETag') or (result.get('CopyObjectResult') or {}).get('ETag')
+        try:
+            verified = (bool(verify.get('VersionId') or copied_etag)
+                        and (not copied_etag or copied_etag == destination_head.get('ETag'))
+                        and _acl_grant_headers(dst.get_object_acl(**verify)) == expected_grants)
+        except Exception:
+            verified = False
+        if not verified:
+            return incomplete_copy('acl_unverified',
+                                   'The copy was written, but its ACL could not be verified. Review the destination grants before retrying.')
     if params.get('move'):
+        try:
+            verify_source_grants()
+        except Exception:
+            return incomplete_copy('source_acl_unverified',
+                                   'The copy was written and the source was kept because its ACL changed or could not be verified.')
         try:
             if not head.get('ETag'):
                 raise SidecarError('unsupported_feature', 'Source has no ETag for a conditional delete.')
@@ -6437,6 +6508,8 @@ def _storage_copy_impl(params):
                            failures=[{'target': source['Key'], 'versionId': selected_version,
                                       'code': 'source_delete_failed',
                                       'message': f'Copy completed; source deletion was not confirmed: {error}'}])
+    if outcome['failureCount'] == 0:
+        publish_copy(size, completed=True)
     return outcome
 
 

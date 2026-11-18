@@ -10,9 +10,27 @@ void main() {
   late EndpointProfile profile;
   final writes = <Map<String, String>>[];
   var genericMissing = false;
+  var aclEnabled = false;
+  var dropGrants = false;
+  var revokeOnAclRead = 0;
+  var aclReads = 0;
+  var deletes = 0;
+  var sourceHeads = 0;
+  var versionChanges = false;
+  var denyDestinationHead = false;
+  var rejectDelete = false;
   setUp(() async {
     writes.clear();
     genericMissing = false;
+    aclEnabled = false;
+    dropGrants = false;
+    revokeOnAclRead = 0;
+    aclReads = 0;
+    deletes = 0;
+    sourceHeads = 0;
+    versionChanges = false;
+    denyDestinationHead = false;
+    rejectDelete = false;
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     profile = EndpointProfile.fromJson({
       'id': 'fixture',
@@ -27,7 +45,22 @@ void main() {
       await request.drain<void>();
       final response = request.response;
       response.headers.set('etag', '"source"');
-      if (request.uri.path == '/bucket/key' && request.method == 'HEAD') {
+      if (denyDestinationHead &&
+          request.uri.path == '/bucket/moved' &&
+          request.method == 'HEAD' &&
+          writes.isNotEmpty) {
+        response.statusCode = 403;
+      } else if (request.uri.path == '/bucket/moved' &&
+          request.method == 'HEAD' &&
+          writes.isEmpty) {
+        response.statusCode = 404;
+      } else if (request.method == 'HEAD' &&
+          {'/bucket/key', '/bucket/moved'}.contains(request.uri.path)) {
+        if (request.uri.path == '/bucket/key' && versionChanges) {
+          sourceHeads++;
+          response.headers
+              .set('x-amz-version-id', sourceHeads == 1 ? 'old' : 'new');
+        }
         response.headers.set('content-length', '3');
         response.headers.set('content-encoding', 'gzip');
         response.headers.set('content-language', 'en');
@@ -36,8 +69,20 @@ void main() {
         response.headers
             .set('x-amz-server-side-encryption-aws-kms-key-id', 'old-key');
       } else if (request.uri.queryParameters.containsKey('ownershipControls')) {
+        final ownership = aclEnabled ? 'ObjectWriter' : 'BucketOwnerEnforced';
         response.write(
-            '<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>');
+            '<OwnershipControls><Rule><ObjectOwnership>$ownership</ObjectOwnership></Rule></OwnershipControls>');
+      } else if (request.uri.queryParameters.containsKey('acl')) {
+        const owner =
+            '<Grant><Grantee><ID>owner</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant>';
+        const reader =
+            '<Grant><Grantee><ID>reader</ID></Grantee><Permission>READ</Permission></Grant>';
+        aclReads++;
+        final lost = (dropGrants && writes.isNotEmpty) ||
+            revokeOnAclRead == aclReads;
+        final grants = lost ? owner : owner + reader;
+        response.write(
+            '<AccessControlPolicy><AccessControlList>$grants</AccessControlList></AccessControlPolicy>');
       } else if (request.uri.queryParameters['list-type'] == '2') {
         response.write(
             '<ListBucketResult><EncodingType>url</EncodingType><Contents><Key>a+%2B+b</Key><Size>1</Size></Contents></ListBucketResult>');
@@ -58,6 +103,7 @@ void main() {
             'x-amz-server-side-encryption',
             'x-amz-server-side-encryption-aws-kms-key-id',
             'if-match',
+            'x-amz-grant-read',
             'content-encoding',
             'content-language',
             'cache-control',
@@ -66,6 +112,12 @@ void main() {
             if (request.headers.value(name) != null)
               name: request.headers.value(name)!
         });
+      } else if (request.method == 'DELETE') {
+        deletes++;
+        if (rejectDelete) {
+          response.statusCode = 412;
+          response.write('<Error><Code>PreconditionFailed</Code></Error>');
+        }
       } else if (request.uri.queryParameters.containsKey('lifecycle')) {
         if (genericMissing) {
           response.statusCode = 404;
@@ -108,6 +160,95 @@ void main() {
   test('encoded listings distinguish spaces from literal plus signs', () async {
     final result = await admin.listObjects(profile, {'bucketName': 'bucket'});
     expect((result['items'] as List).single['key'], 'a + b');
+  });
+  for (final losesGrant in [false, true]) {
+    test('property edit verifies object ACL (lost grant: $losesGrant)', () async {
+      aclEnabled = true;
+      dropGrants = losesGrant;
+      final result = await admin.action(
+          profile: profile, action: 'objectProperties', arguments: {
+        'bucketName': 'bucket',
+        'key': 'key',
+        'metadata': {'updated': 'true'},
+      });
+      if (losesGrant) {
+        expect(result['requiresVerification'], isTrue);
+        expect((result['failures'] as List).single['code'], 'acl_unverified');
+      } else {
+        expect(result['successCount'], 1);
+      }
+      expect(writes.single['x-amz-grant-read'], 'id="reader"');
+    });
+  }
+  test('same ETag with a revoked ACL stops the edit before writing', () async {
+    aclEnabled = true;
+    revokeOnAclRead = 2;
+    await expectLater(
+        admin.action(
+            profile: profile, action: 'objectProperties', arguments: {
+          'bucketName': 'bucket',
+          'key': 'key',
+          'metadata': {'updated': 'true'},
+        }),
+        throwsA(isA<EngineException>().having((error) => error.message,
+            'message', contains('source ACL changed'))));
+    expect(writes, isEmpty);
+  });
+  test('new current version with the same ETag stops the edit', () async {
+    aclEnabled = true;
+    versionChanges = true;
+    await expectLater(
+        admin.action(
+            profile: profile, action: 'objectProperties', arguments: {
+          'bucketName': 'bucket',
+          'key': 'key',
+          'metadata': {'updated': 'true'},
+        }),
+        throwsA(isA<EngineException>().having((error) => error.message,
+            'message', contains('current source version changed'))));
+    expect(writes, isEmpty);
+  });
+  for (final failure in ['acl_unverified', 'source_acl_unverified', 'destination_unverified']) {
+    test('move retains source on verification failure ($failure)', () async {
+      aclEnabled = true;
+      dropGrants = failure == 'acl_unverified';
+      revokeOnAclRead = failure == 'source_acl_unverified' ? 4 : 0;
+      denyDestinationHead = failure == 'destination_unverified';
+      final result = await admin.copyStorageObject(profile, profile, {
+        'sourceBucketName': 'bucket',
+        'sourceKey': 'key',
+        'destinationBucketName': 'bucket',
+        'destinationKey': 'moved',
+        'conflictPolicy': 'fail',
+        'move': true,
+        'options': {'preserveObjectProtection': true},
+      });
+      expect(result['requiresVerification'], isTrue);
+      expect(result['sourceRetained'], isTrue);
+      expect((result['failures'] as List).single['code'], failure);
+      expect(writes, hasLength(1));
+      expect(deletes, 0);
+    });
+  }
+  test('a move with a rejected delete reports the written destination', () async {
+    aclEnabled = true;
+    rejectDelete = true;
+    final result = await admin.copyStorageObject(profile, profile, {
+      'sourceBucketName': 'bucket',
+      'sourceKey': 'key',
+      'destinationBucketName': 'bucket',
+      'destinationKey': 'moved',
+      'conflictPolicy': 'skip',
+      'move': true,
+      'options': {'preserveObjectProtection': true},
+    });
+    expect(result['skipped'], isNot(true));
+    expect(result['failureCount'], 1);
+    expect(result['copiedCount'], 1);
+    expect(result['sourceRetained'], isTrue);
+    expect((result['failures'] as List).single['code'], 'source_delete_failed');
+    expect(writes, hasLength(1));
+    expect(deletes, 1);
   });
   test('encryption uses shared UI field names and clears obsolete KMS headers',
       () async {
