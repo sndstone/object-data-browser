@@ -66,6 +66,11 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       MobileStorageAdmin._conflict('The source changed since it was listed.');
     }
     final size = int.parse(head.headers['content-length']!);
+    final requireEmptySource = args['requireEmptySource'] == true;
+    if (requireEmptySource && size != 0) {
+      MobileStorageAdmin._invalid(
+          'Only empty markers can be copied into this vault.');
+    }
     final conflict = '${args['conflictPolicy'] ?? 'fail'}';
     if (!{'skip', 'fail', 'replace'}.contains(conflict)) {
       MobileStorageAdmin._invalid('Select a copy conflict policy.');
@@ -182,7 +187,8 @@ extension MobileStorageTransfers on MobileStorageAdmin {
     }
 
     try {
-      final serverCopyEligible = sameEndpoint &&
+      final serverCopyEligible = !requireEmptySource &&
+          sameEndpoint &&
           !from.azure &&
           !to.azure &&
           source.accessKey == destination.accessKey &&

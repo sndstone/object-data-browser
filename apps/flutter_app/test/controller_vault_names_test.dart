@@ -494,8 +494,8 @@ void main() {
       await expectLater(
           c.storageAction('copyObject',
               arguments: {'destinationBucketName': 'bucket', ...arguments}),
-          throwsA(isA<EngineException>().having(
-              (e) => e.message, 'message', contains('vault-encrypted'))),
+          throwsA(isA<EngineException>().having((e) => e.message, 'message',
+              contains('Copies from outside this vault'))),
           reason: '$arguments');
     }
     for (final action in ['planHistoryCopy', 'resumeHistoryCopy']) {
@@ -517,14 +517,25 @@ void main() {
         throwsA(isA<EngineException>()));
     expect(engine.moves, isEmpty);
     expect(engine.actions.where((a) => a != 'createDirectory'), isEmpty);
-    // Ciphertext is copied as it is, and what the location already holds may
-    // move inside it or be restored onto its own key.
+    // A suffix alone cannot authorize ingress into a vault.
+    await expectLater(
+        c.storageAction('copyObject', arguments: {
+          'sourceBucketName': 'source',
+          'sourceKey': 'x/a.age',
+          'destinationBucketName': 'bucket',
+          'destinationKey': 'vault/a.age',
+        }),
+        throwsA(isA<EngineException>()));
+    await expectLater(
+        c.storageAction('copyObject', arguments: {
+          'sourceBucketName': 'bucket',
+          'sourceKey': 'vault/../x/a.age',
+          'destinationBucketName': 'bucket',
+          'destinationKey': 'vault/a.age',
+        }),
+        throwsA(isA<EngineException>()));
+    // What the location already holds may move inside it.
     for (final arguments in <Map<String, Object?>>[
-      {
-        'sourceBucketName': 'source',
-        'sourceKey': 'x/a.age',
-        'destinationKey': 'vault/a.age'
-      },
       {
         'sourceBucketName': 'bucket',
         'sourceKey': 'vault/old.txt',
@@ -545,7 +556,8 @@ void main() {
           arguments: {'destinationBucketName': 'bucket', ...arguments});
     }
     expect(engine.moves.map((m) => m['destinationKey']),
-        ['vault/a.age', 'vault/new.txt', 'vault/old.txt', 'vault/x/']);
+        ['vault/new.txt', 'vault/old.txt', 'vault/x/']);
+    expect(engine.moves.last['requireEmptySource'], isTrue);
     await c.storageAction('renameDirectory', arguments: {
       'bucketName': 'bucket',
       'key': 'vault/dir',
@@ -614,7 +626,7 @@ void main() {
     expect(engine.moves.single['destinationKey'], 'vault/renamed.txt');
   });
   test(
-      'bucket copy preserves an already encoded tree in a name-encrypting destination',
+      'bucket copy accepts an empty root marker and rejects unverified ciphertext',
       () async {
     final rule = vault();
     final key = encodeVaultObjectKey(
@@ -627,9 +639,8 @@ void main() {
     await c.copyBucketContents(
         sourceBucketName: 'source', destinationBucketName: 'bucket');
     expect(engine.moves.first['destinationKey'], 'vault/');
-    expect(engine.moves.last['sourceKey'], key);
-    expect(engine.moves.last['destinationKey'], key);
-    expect(c.bannerMessage, isNot(contains('stopped')));
+    expect(engine.moves.single['requireEmptySource'], isTrue);
+    expect(c.bannerMessage, contains('Copies from outside this vault'));
   });
   test('bucket copy refuses a visible source prefix below encrypted names',
       () async {

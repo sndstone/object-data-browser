@@ -1,10 +1,16 @@
 part of 'app_controller.dart';
 
 extension AppControllerClientEncryption on AppController {
+  bool canUnlockBucketVault(String bucket) =>
+      _encryptionKeyStore?.isUnlocked != true &&
+      (selectedProfile?.clientEncryptionRules
+              .any((rule) => rule.bucket == bucket) ??
+          false);
+
   bool get clientKeyUnlockRequired =>
       _encryptionKeyStore?.isUnlocked != true &&
       (bannerMessage?.contains('Unlock your encryption key file') == true ||
-          clientRuleFor(currentPrefix)?.encryptsNames == true ||
+          clientRuleFor(currentPrefix) != null ||
           objects.any((o) =>
               clientRuleFor(o.key) != null &&
               o.key.split('/').any(looksLikeVaultToken)));
@@ -506,7 +512,7 @@ extension AppControllerClientEncryption on AppController {
         if (prefix.isNotEmpty && !prefix.endsWith('/')) '$prefix/testdata-',
       };
 
-  void _guardVaultStorageAction(String action, Map<String, Object?> arguments,
+  bool _guardVaultStorageAction(String action, Map<String, Object?> arguments,
       EndpointProfile destination,
       {bool sameProfile = true}) {
     // Recovery IDs hide the actual target. History workflows likewise dispatch
@@ -547,10 +553,10 @@ extension AppControllerClientEncryption on AppController {
         throw EngineException(
             code: ErrorCode.unsupportedFeature,
             message: history
-                ? 'This destination contains a vault location, so version history cannot be copied into it. Copy without version history: vault-encrypted objects are copied as they are.'
+                ? 'This destination contains a vault location, so version history cannot be copied into it.'
                 : 'Recoverable uploads cannot write into a vault location. Use Upload in the object browser.');
       }
-      return;
+      return false;
     }
     _guardTrimmedVaultKey(
         destination,
@@ -577,11 +583,11 @@ extension AppControllerClientEncryption on AppController {
     final copy = action == 'copyObject';
     final directory =
         action == 'createDirectory' || action == 'renameDirectory';
-    if (!copy && !directory && action != 'startResumableUpload') return;
+    if (!copy && !directory && action != 'startResumableUpload') return false;
     final bucket = arguments[copy ? 'destinationBucketName' : 'bucketName'];
     final key = arguments[
         copy || action == 'renameDirectory' ? 'destinationKey' : 'key'];
-    if (bucket is! String || key is! String) return;
+    if (bucket is! String || key is! String) return false;
     // Directory paths in Azure administration need not have a trailing slash.
     final target = directory && !key.endsWith('/') ? '$key/' : key;
     final rule = matchingClientEncryptionRule(
@@ -598,17 +604,22 @@ extension AppControllerClientEncryption on AppController {
           message:
               'A directory cannot be moved onto a path that contains a vault location: its contents would not be encrypted.');
     }
-    // The rule's own prefix is never encrypted and holds no content.
-    if (rule == null ||
-        (_isVaultRootMarker(rule, target) &&
-            (action == 'createDirectory' || (copy && key.endsWith('/'))))) {
-      return;
+    if (rule == null) return false;
+    final rootMarker = _isVaultRootMarker(rule, target);
+    if (rootMarker && action == 'createDirectory') return false;
+    if (rootMarker && copy) {
+      // The root is a marker only after the engine verifies the source is empty.
+      return true;
     }
     // What is already stored under this rule adds nothing to it by moving
     // or being copied inside it.
     final sourceKey = arguments[copy ? 'sourceKey' : 'key'];
     final inside = sameProfile &&
         sourceKey is String &&
+        _withoutEdgeBlanks(sourceKey) == sourceKey &&
+        !hasDotSegment(sourceKey) &&
+        !sourceKey.contains('\\') &&
+        !sourceKey.startsWith('/') &&
         (!copy || arguments['sourceBucketName'] == bucket) &&
         identical(
             matchingClientEncryptionRule(
@@ -634,6 +645,10 @@ extension AppControllerClientEncryption on AppController {
       final marker = key.endsWith('/');
       if (rule.policy == ClientEncryptionPolicy.unsupported) {
         message = vaultPolicyUnsupported;
+      } else if (!inside) {
+        if (marker && !rule.encryptsNames) return true;
+        message =
+            'Copies from outside this vault are blocked. Use Upload in the object browser to encrypt files for this vault.';
       } else if (rule.encryptsNames &&
           // Restoring a version onto its own key creates no new name.
           !(inside && sourceKey == key) &&
@@ -645,21 +660,13 @@ extension AppControllerClientEncryption on AppController {
                   looksLikeVaultToken(key.split('/').last))) {
         message =
             'This destination encrypts names. Only objects that already have an encrypted name can be copied here.';
-      } else if (!marker &&
-          !inside &&
-          !(key.endsWith('.age') &&
-              sourceKey is String &&
-              sourceKey.endsWith('.age'))) {
-        // A copy transfers the stored bytes as they are. Only ciphertext may
-        // enter a vault location that way, whatever the rule does to names.
-        message =
-            'This destination is a vault location. Only vault-encrypted objects (.age) can be copied or moved into it. Upload other files in the object browser so they are encrypted.';
       }
     }
     if (message != null) {
       throw EngineException(
           code: ErrorCode.unsupportedFeature, message: message);
     }
+    return false;
   }
 
   bool isClientEncrypted(ObjectEntry object) =>

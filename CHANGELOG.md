@@ -27,10 +27,13 @@
 - Google Cloud Storage can be used natively with a service-account key on desktop (Python and Go engines).
 
 ### Encryption (optional, off by default)
+- Build 4 keeps key-file sync changes pending unless the endpoint can safely enforce conditional writes. Currently, automatic writes are enabled for standard AWS S3 endpoints with TLS verification. Compatible stores can still merge the bucket's copy locally or import earlier versions.
+- Passphrase rotation survives interrupted sync and restart. Recovery offers an explicit choice when the bucket uses a different passphrase.
+- Bucket encryption now checks the live configuration on JSON save and after delete confirmation, and displays unreadable configuration as unavailable.
 - Vault rules can encrypt names deterministically per folder, or use a strict policy with a fresh random name for each upload; unlocked names appear in the browser and decrypted downloads.
 - A generated vault or customer key is shown before it is saved, with Copy and "Generate another"; import fields can be revealed, and the key-file dialog can generate a random passphrase.
 - Mobile: a vault upload into a folder now lands in that folder instead of the bucket root.
-- Copies and moves into a vault location accept only vault-encrypted (`.age`) objects, with or without name encryption, so plaintext cannot enter it through bucket copy, rename or a directory move. Version-history copies into a vault location are refused.
+- Copies into a vault location accept only verified empty folder markers. Use the encrypted upload workflow for files coming from outside the vault. Version-history copies into a vault location are refused.
 - A name with spaces, control characters, a backslash or a leading slash that an engine could rewrite into a vault location is refused instead of being uploaded, copied or created unencrypted there.
 - The benchmark and the test-data tool refuse to write their unencrypted generated data into a vault location.
 - With the key file locked, a folder name typed into the prefix filter of a name-encrypting location is no longer sent to the provider; the filter asks you to unlock instead.

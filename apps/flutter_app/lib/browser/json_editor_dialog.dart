@@ -8,8 +8,10 @@ class JsonEditorDialog extends StatefulWidget {
       {super.key,
       required this.title,
       required this.initialValue,
+      this.savingStatus,
       this.onSave});
   final String title, initialValue;
+  final Widget? savingStatus;
   final Future<void> Function(String)? onSave;
   @override
   State<JsonEditorDialog> createState() => _JsonEditorDialogState();
@@ -69,6 +71,7 @@ class _JsonEditorDialogState extends State<JsonEditorDialog> {
         value: () =>
             const JsonEncoder.withIndent('  ').convert(jsonDecode(_text.text)),
         onSave: widget.onSave,
+        savingStatus: widget.savingStatus,
         extraActions: [
           TextButton(
               onPressed: _error != null || _pending

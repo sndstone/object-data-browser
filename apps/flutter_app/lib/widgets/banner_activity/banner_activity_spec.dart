@@ -1,5 +1,13 @@
 import 'package:flutter/widgets.dart';
 
+enum BucketActivityAnimation {
+  levelMatch,
+  clockSet,
+  shieldScan,
+  hangTag,
+  boltThrow
+}
+
 /// What the status banner is reporting, other than file transfers (those
 /// use the transfer status indicators).
 enum BannerActivityKind {

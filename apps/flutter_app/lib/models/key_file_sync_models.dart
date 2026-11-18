@@ -25,12 +25,14 @@ class KeyFileSyncState {
       this.syncedClock = 0,
       this.conditionalWrites,
       this.versioningEnabled,
+      this.confirmedPassphraseRotation,
       this.passphraseChangePending = false});
   final String? etag, versionId;
 
-  /// The passphrase was changed on this device and the copy in the bucket
-  /// has not been re-encrypted with it yet. Not secret.
+  /// Pending intent written by builds before rotations were stamped in the
+  /// encrypted key file. Retained until a successful sync of this location.
   final bool passphraseChangePending;
+  final String? confirmedPassphraseRotation;
   final DateTime? lastSyncedAt;
   final int syncedClock;
   final bool? conditionalWrites, versioningEnabled;
@@ -41,6 +43,8 @@ class KeyFileSyncState {
         'syncedClock': syncedClock,
         'conditionalWrites': conditionalWrites,
         'versioningEnabled': versioningEnabled,
+        if (confirmedPassphraseRotation != null)
+          'confirmedPassphraseRotation': confirmedPassphraseRotation,
         if (passphraseChangePending) 'passphraseChangePending': true,
       };
   factory KeyFileSyncState.fromJson(Map<String, Object?> json) =>
@@ -52,6 +56,8 @@ class KeyFileSyncState {
           syncedClock: json['syncedClock'] as int? ?? 0,
           conditionalWrites: json['conditionalWrites'] as bool?,
           versioningEnabled: json['versioningEnabled'] as bool?,
+          confirmedPassphraseRotation:
+              json['confirmedPassphraseRotation'] as String?,
           passphraseChangePending: json['passphraseChangePending'] == true);
 }
 

@@ -167,6 +167,28 @@ def test_cross_endpoint_copy_relays_with_independent_credentials_and_pinned_sour
     assert destination.head_object.call_args.kwargs['VersionId'] == 'new-version'
 
 
+@pytest.mark.parametrize('source_size', [None, 0, 7])
+def test_vault_marker_copy_requires_empty_source_and_writes_empty_bytes(
+        pyengine, monkeypatch, profile, source_size):
+    client = Mock()
+    client.head_object.return_value = {'ContentLength': source_size, 'ETag': 'etag'}
+    client.get_object_tagging.return_value = {'TagSet': []}
+    client.put_object.return_value = {}
+    monkeypatch.setattr(pyengine, '_build_client', lambda _: client)
+    params = {'profile': profile, 'sourceBucketName': 'source', 'sourceKey': 'folder/',
+              'destinationBucketName': 'destination', 'destinationKey': 'vault/folder/',
+              'requireEmptySource': True}
+    if source_size == 0:
+        pyengine._storage_copy(params)
+        assert client.put_object.call_args.kwargs['Body'] == b''
+    else:
+        with pytest.raises(pyengine.SidecarError, match='Only empty markers'):
+            pyengine._storage_copy(params)
+        client.put_object.assert_not_called()
+    client.copy_object.assert_not_called()
+    client.get_object.assert_not_called()
+
+
 def test_large_server_side_copy_aborts_on_part_failure(pyengine, monkeypatch, profile):
     client = Mock()
     client.head_object.return_value = {'ContentLength': 6 * 1024**3, 'ETag': 'source-etag', 'Metadata': {}}

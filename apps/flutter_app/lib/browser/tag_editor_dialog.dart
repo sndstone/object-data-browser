@@ -7,9 +7,11 @@ class TagEditorDialog extends StatefulWidget {
       {super.key,
       required this.initialTags,
       this.title = 'Edit tags',
+      this.savingStatus,
       this.onSave});
   final Map<String, String> initialTags;
   final String title;
+  final Widget? savingStatus;
   final Future<void> Function(Map<String, String>)? onSave;
   @override
   State<TagEditorDialog> createState() => _TagEditorDialogState();
@@ -60,6 +62,7 @@ class _TagEditorDialogState extends State<TagEditorDialog> {
         valid: _error == null,
         value: () => _value,
         onSave: widget.onSave,
+        savingStatus: widget.savingStatus,
         child: LayoutBuilder(builder: (context, constraints) {
           final stacked = constraints.maxWidth < 450 ||
               MediaQuery.textScalerOf(context).scale(14) > 20;

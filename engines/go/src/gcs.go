@@ -715,6 +715,9 @@ func (c *gcsClient) copyObject(ctx context.Context, params map[string]interface{
 	if source.Generation == "" {
 		return nil, &sidecarError{Code: "invalid_response", Message: "Cloud Storage omitted the source generation."}
 	}
+	if asBool(params["requireEmptySource"]) && source.Size != "0" {
+		return nil, &sidecarError{Code: "invalid_config", Message: "Only empty markers can be copied into this vault."}
+	}
 	u := c.urlFor("storage", "v1", "b", srcBucket, "o", srcKey, "rewriteTo", "b", dstBucket, "o", dstKey)
 	query := url.Values{"sourceGeneration": {source.Generation}, "ifSourceGenerationMatch": {source.Generation}}
 	policy := asString(params["conflictPolicy"])

@@ -364,6 +364,7 @@ class AppController extends ChangeNotifier {
   KeyFileSync? _keyFileSync;
   EncryptionKeyStore? _encryptionKeyStore;
   Future<EncryptionKeyStore>? _encryptionKeyStoreFuture;
+  bool _unlockingEncryptionKeyFile = false;
   bool encryptionKeyFileExists = false;
   final Map<String, VaultNameKeys> _vaultNameKeys = {};
   final Map<String, String> _activeDownloadNames = {};
@@ -3167,6 +3168,35 @@ class AppController extends ChangeNotifier {
   Future<bool> saveProfile(EndpointProfile profile) async {
     profile = normalizeEndpointProfile(profile);
     final previous = profiles.where((p) => p.id == profile.id).firstOrNull;
+    if (listEquals(previous?.clientEncryptionRules ?? const [],
+        profile.clientEncryptionRules)) {
+      return _saveProfile(profile);
+    }
+    return _saveVaultRules(profile);
+  }
+
+  /// Used by the vault editors even when retrying a session-only save.
+  Future<bool> saveVaultRules(EndpointProfile profile) =>
+      _saveVaultRules(normalizeEndpointProfile(profile));
+
+  Future<bool> _saveVaultRules(EndpointProfile profile) async {
+    final actionKey = 'vault-rules-${profile.id}';
+    var persisted = false;
+    await _runBusy(actionKey, 'Saving vault rules…', () async {
+      persisted = await _saveProfile(profile, showBanner: false);
+      if (_bannerActivity?.actionKey != actionKey) return;
+      if (persisted) {
+        bannerMessage = 'Vault rules saved.';
+      } else {
+        _showProfileSaveBanner(profile, persisted);
+      }
+    }, trackTask: false);
+    return persisted;
+  }
+
+  Future<bool> _saveProfile(EndpointProfile profile,
+      {bool showBanner = true}) async {
+    final previous = profiles.where((p) => p.id == profile.id).firstOrNull;
     if (previous != null) _rebaseDraftEncryption(previous, profile);
     updateProfile(profile);
     if (selectedProfile == null) {
@@ -3201,14 +3231,18 @@ class AppController extends ChangeNotifier {
             : 'Profile ${profile.name} is session-only: secure persistence failed.',
         profileId: profile.id,
         source: 'profiles');
+    if (showBanner) _showProfileSaveBanner(profile, persisted);
+    notifyListeners();
+    return persisted;
+  }
+
+  void _showProfileSaveBanner(EndpointProfile profile, bool persisted) {
     bannerMessage = persisted
         ? 'Saved endpoint profile ${profile.name}.'
         : _credentialStoreError ??
             'Profile is available for this session, but its credentials could not be saved securely.';
     bannerSeverity =
         persisted ? BannerSeverity.success : BannerSeverity.warning;
-    notifyListeners();
-    return persisted;
   }
 
   /// Encryption can be saved from the bucket dialog and Settings → Encryption
@@ -3930,32 +3964,6 @@ class AppController extends ChangeNotifier {
     int itemCount,
     bool copy
   })? get bannerTransferStatus {
-    final activity = _bannerActivity;
-    if (activity != null &&
-        activity.actionKey == 'copy-bucket' &&
-        bannerMessage != null &&
-        (!activity.done || activity.message == bannerMessage)) {
-      // A bucket copy pages through objects without a known total, so it
-      // stays in the segments' indeterminate wave until it ends.
-      return (
-        phase: !activity.done
-            ? (bannerSeverity == BannerSeverity.error
-                ? TransferStatusPhase.failed
-                : TransferStatusPhase.preparing)
-            : activity.cancelled
-                ? TransferStatusPhase.cancelled
-                : switch (bannerSeverity) {
-                    BannerSeverity.error ||
-                    BannerSeverity.warning =>
-                      TransferStatusPhase.failed,
-                    _ => TransferStatusPhase.completed,
-                  },
-        direction: TransferStatusDirection.upload,
-        progress: null,
-        itemCount: 2,
-        copy: true,
-      );
-    }
     final task = bannerTask;
     if (task != null && task.kind == BrowserTaskKind.transfer) {
       final job = transferJobs.where((job) => job.id == task.id).firstOrNull;
@@ -4016,6 +4024,17 @@ class AppController extends ChangeNotifier {
         _ => BannerActivityKind.action,
       };
 
+  static BucketActivityAnimation? _bucketAnimation(String actionKey) =>
+      switch (actionKey) {
+        'copy-bucket' => BucketActivityAnimation.levelMatch,
+        'bucket-lifecycle' => BucketActivityAnimation.clockSet,
+        'bucket-policy' => BucketActivityAnimation.shieldScan,
+        'bucket-tags' => BucketActivityAnimation.hangTag,
+        _ when actionKey.startsWith('vault-rules-') =>
+          BucketActivityAnimation.boltThrow,
+        _ => null,
+      };
+
   void _showBenchmarkBanner(String message) {
     bannerMessage = message;
     _benchmarkBannerMessage = message;
@@ -4046,7 +4065,8 @@ class AppController extends ChangeNotifier {
     BannerActivityKind kind,
     BannerActivityPhase phase,
     double? progress,
-    int? count
+    int? count,
+    BucketActivityAnimation? bucketAnimation
   })? get bannerActivity {
     if (bannerMessage == null || bannerTransferStatus != null) return null;
     final task = bannerTask;
@@ -4060,6 +4080,7 @@ class AppController extends ChangeNotifier {
             : _runPhase(task.status),
         progress: task.progress > 0 ? task.progress.clamp(0.0, 1.0) : null,
         count: null,
+        bucketAnimation: null,
       );
     }
     final run = benchmarkRun;
@@ -4070,28 +4091,40 @@ class AppController extends ChangeNotifier {
         phase: _runPhase(run.status),
         progress: progress > 0 ? progress.clamp(0.0, 1.0) : null,
         count: null,
+        bucketAnimation: null,
       );
     }
     final activity = _bannerActivity;
     if (activity != null &&
         (!activity.done || activity.message == bannerMessage)) {
+      final animation = _bucketAnimation(activity.actionKey);
       final phase = !activity.done
           ? (bannerSeverity == BannerSeverity.error
               ? BannerActivityPhase.failed
-              : BannerActivityPhase.working)
+              : animation == BucketActivityAnimation.levelMatch &&
+                      task?.status == 'cancelling'
+                  ? BannerActivityPhase.stopping
+                  : BannerActivityPhase.working)
           : activity.cancelled
               ? BannerActivityPhase.cancelled
               : _severityPhase;
       final count = activity.kind == BannerActivityKind.listing
           ? (_listingLoadedCount > 0 ? _listingLoadedCount : null)
           : activity.count;
-      return (kind: activity.kind, phase: phase, progress: null, count: count);
+      return (
+        kind: activity.kind,
+        phase: phase,
+        progress: null,
+        count: count,
+        bucketAnimation: animation,
+      );
     }
     return (
       kind: BannerActivityKind.message,
       phase: _severityPhase,
       progress: null,
       count: null,
+      bucketAnimation: null,
     );
   }
 
@@ -5171,6 +5204,7 @@ class AppController extends ChangeNotifier {
     await _mutateBucketAdmin(
       actionKey: 'bucket-policy',
       busyMessage: 'Saving bucket policy...',
+      doneMessage: 'Bucket policy saved.',
       operation: (profile, bucket) => _engineService.putBucketPolicy(
         engineId: activeEngineId,
         profile: profile,
@@ -5184,6 +5218,7 @@ class AppController extends ChangeNotifier {
     await _mutateBucketAdmin(
       actionKey: 'bucket-lifecycle',
       busyMessage: 'Saving lifecycle configuration...',
+      doneMessage: 'Lifecycle policy saved.',
       operation: (profile, bucket) => _engineService.putBucketLifecycle(
         engineId: activeEngineId,
         profile: profile,
@@ -5237,6 +5272,7 @@ class AppController extends ChangeNotifier {
     await _mutateBucketAdmin(
       actionKey: 'bucket-tags',
       busyMessage: 'Saving bucket tags...',
+      doneMessage: 'Bucket tags saved.',
       operation: (profile, bucket) => _engineService.putBucketTagging(
         engineId: activeEngineId,
         profile: profile,
@@ -5256,9 +5292,13 @@ class AppController extends ChangeNotifier {
   }) async {
     final source = profile ?? selectedProfile;
     if (source == null) throw StateError('Select an endpoint first.');
-    _guardVaultStorageAction(action, arguments, destinationProfile ?? source,
+    final requiresEmptySource = _guardVaultStorageAction(
+        action, arguments, destinationProfile ?? source,
         sameProfile:
             destinationProfile == null || destinationProfile.id == source.id);
+    if (requiresEmptySource) {
+      arguments = {...arguments, 'requireEmptySource': true};
+    }
     ActionScope.current?.check();
     if (source.endpointType.isGoogleCloudStorage) {
       final service = _engineService;
@@ -5432,6 +5472,23 @@ class AppController extends ChangeNotifier {
 
   final Future<BucketCopyJournal> Function() _bucketCopyJournalProvider;
 
+  void _setBucketCopyCount(int count) {
+    final activity = _bannerActivity;
+    if (activity == null ||
+        activity.actionKey != 'copy-bucket' ||
+        activity.count == count) {
+      return;
+    }
+    _bannerActivity = (
+      kind: activity.kind,
+      actionKey: activity.actionKey,
+      count: count,
+      done: activity.done,
+      cancelled: activity.cancelled,
+      message: activity.message,
+    );
+  }
+
   Future<void> copyBucketContents({
     required String sourceBucketName,
     required String destinationBucketName,
@@ -5563,6 +5620,8 @@ class AppController extends ChangeNotifier {
               ActionScope.current?.check();
               result = await workflow('resumeHistoryCopy',
                   {'recoveryId': recoveryId, 'maxEntries': 25});
+              _setBucketCopyCount(
+                  (result['completedCount'] as num?)?.toInt() ?? 0);
               bannerMessage =
                   'Copied ${result['completedCount'] ?? 0} history entries; recovery $recoveryId';
               notifyListeners();
@@ -5605,6 +5664,7 @@ class AppController extends ChangeNotifier {
         final completed =
             Set<String>.from(checkpoint?['completed'] as List? ?? []);
         var copied = (checkpoint?['copied'] as num?)?.toInt() ?? 0;
+        _setBucketCopyCount(copied);
         var skipped = (checkpoint?['skipped'] as num?)?.toInt() ?? 0;
         var failed = 0, bytes = (checkpoint?['bytes'] as num?)?.toInt() ?? 0;
         Future<void> save({String? inFlight}) => journal.write({
@@ -5705,6 +5765,7 @@ class AppController extends ChangeNotifier {
               }
               bannerMessage =
                   'Copied $copied · skipped $skipped · failed $failed · $bytes bytes';
+              _setBucketCopyCount(copied);
               notifyListeners();
             }
             if (failed > 0) {
@@ -5740,7 +5801,7 @@ class AppController extends ChangeNotifier {
             source: 'bucket-copy');
         if (failed > 0) throw StateError(summary);
       });
-    });
+    }, itemCount: 0);
   }
 
   void _replaceTransfer(TransferJob updated) => _transfers.upsert(updated);
@@ -6017,6 +6078,7 @@ class AppController extends ChangeNotifier {
   Future<void> _mutateBucketAdmin({
     required String actionKey,
     required String busyMessage,
+    String? doneMessage,
     required Future<BucketAdminState> Function(
       EndpointProfile profile,
       BucketSummary bucket,
@@ -6067,7 +6129,7 @@ class AppController extends ChangeNotifier {
         );
         notifyListeners();
       });
-    });
+    }, doneMessage: doneMessage);
   }
 
   bool _isBucketNotEmpty(EngineException error) {

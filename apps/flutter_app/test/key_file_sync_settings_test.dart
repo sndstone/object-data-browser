@@ -16,6 +16,7 @@ import 'package:s3_browser_crossplat/theme/app_motion.dart';
 import 'package:s3_browser_crossplat/utils/format.dart';
 import 'package:s3_browser_crossplat/services/key_file_sync.dart';
 import 'support/raw_dropdowns.dart';
+import 'app_controller_test.dart' show MemoryAppStateRepository;
 
 const profile = EndpointProfile(
     id: 'p',
@@ -112,6 +113,7 @@ void main() {
                 endpointType: EndpointProfileType.azureBlob)
           ],
           encryptionKeyStore: store,
+          appStateRepository: MemoryAppStateRepository(),
           keyFileSyncTransportFactory: (_) =>
               setupTransport?.call(server) ?? server.client());
       if (configured) {
@@ -187,6 +189,27 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
+    if (width == 390) {
+      testWidgets('an earlier local rotation does not block joining a bucket',
+          (tester) async {
+        final state = await mount(tester);
+        await tester.runAsync(() async {
+          await state.store
+              .changePassphrase(fixture.passphrase, fixture.nextPassphrase);
+          state.server.write(await fixture.encrypt(fixture.doc([]),
+              password: fixture.passphrase));
+          await state.controller.configureKeyFileSync(fixture.config);
+          await state.controller.keyFileSync!.syncNow();
+        });
+        await tester.pump();
+        expect(state.controller.keyFileSync!.passphraseChangePending, isFalse);
+        expect(state.server.puts, 0);
+        expect(state.controller.keyFileSync!.status,
+            KeyFileSyncStatus.passphraseMismatch);
+        expect(find.text('Use bucket passphrase…'), findsOneWidget);
+      });
+    }
+
     testWidgets('sync mismatch prompt adopts remote passphrase at width $width',
         (tester) async {
       final state = await mount(tester, configured: true);
@@ -198,7 +221,7 @@ void main() {
       await tester.pump();
       expect(
           find.textContaining('uses a different passphrase'), findsOneWidget);
-      await tap(tester, 'Enter sync passphrase…');
+      await tap(tester, 'Use bucket passphrase…');
       await until(tester,
           () => find.text('Sync bucket passphrase').evaluate().isNotEmpty);
       expectAppForm(tester);

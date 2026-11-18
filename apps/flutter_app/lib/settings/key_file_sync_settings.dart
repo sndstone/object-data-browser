@@ -95,14 +95,16 @@ class _KeyFileSyncSettingsState extends State<KeyFileSyncSettings> {
     );
   }
 
-  Future<void> _mismatch() async {
+  Future<void> _mismatch({bool adopt = false}) async {
     final sync = controller.keyFileSync;
     if (sync == null) return;
     await _textDialog(
         'Sync bucket passphrase', 'Passphrase (at least 16 characters)',
         secret: true,
-        submit: 'Merge and adopt passphrase', onSave: (passphrase) async {
-      await sync.syncNow(remotePassphrase: passphrase);
+        submit: adopt ? 'Merge and adopt passphrase' : 'Re-encrypt bucket copy',
+        onSave: (passphrase) async {
+      await sync.syncNow(
+          remotePassphrase: passphrase, adoptRemotePassphrase: adopt);
       if (sync.status == KeyFileSyncStatus.passphraseMismatch) {
         throw const KeyFileSyncException('The passphrase is incorrect.');
       }
@@ -208,7 +210,7 @@ class _KeyFileSyncSettingsState extends State<KeyFileSyncSettings> {
                         style: theme.textTheme.bodySmall),
                     if (state.conditionalWrites == false)
                       Text(
-                          'This store does not block simultaneous writes. Changes still merge at the next sync.',
+                          'Automatic writes require a store that enforces conditional writes. Local changes stay on this device.',
                           style: theme.textTheme.bodySmall),
                   ],
                   if (_error != null)
@@ -240,7 +242,11 @@ class _KeyFileSyncSettingsState extends State<KeyFileSyncSettings> {
                 button('Earlier versions…', _versions,
                     enabled: unlocked && sync != null),
                 if (sync?.status == KeyFileSyncStatus.passphraseMismatch)
-                  button('Enter sync passphrase…', _mismatch,
+                  button('Keep this device’s passphrase…', _mismatch,
+                      enabled: unlocked),
+                if (sync?.status == KeyFileSyncStatus.passphraseMismatch &&
+                    sync?.passphraseChangePending == false)
+                  button('Use bucket passphrase…', () => _mismatch(adopt: true),
                       enabled: unlocked),
                 TextButton(
                   onPressed: _busy

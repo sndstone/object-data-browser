@@ -22,6 +22,9 @@ class KeyFileSyncResponse {
 
 /// This boundary sees encrypted key files only. Bucket admin bodies are XML.
 abstract interface class KeyFileSyncTransport {
+  /// True only when the endpoint is known to enforce both PUT preconditions.
+  bool get enforcesConditionalWrites;
+
   Future<KeyFileSyncResponse> request(
     String method,
     String bucket, {
@@ -51,8 +54,6 @@ class KeyFileSync {
       this.onStateChanged,
       this.debounce = const Duration(milliseconds: 400)})
       : _state = state {
-    // Read now, not lazily: the first listener call must see a difference.
-    _seenPassphraseChanges = store.passphraseChanges;
     store.addListener(_storeChanged);
   }
   final EncryptionKeyStore store;
@@ -68,11 +69,17 @@ class KeyFileSync {
   int mergedChanges = 0;
   bool _disposed = false, _again = false;
   int _internal = 0;
-  int _seenPassphraseChanges = 0;
+  Future<void> _stateWrites = Future.value();
   Timer? _timer;
   Future<void>? _running;
+  bool get passphraseChangePending =>
+      state.passphraseChangePending ||
+      (store.isUnlocked &&
+          store.localPassphraseRotation != null &&
+          store.localPassphraseRotation != state.confirmedPassphraseRotation);
   bool get localChangesPending =>
-      store.isUnlocked && store.clock > state.syncedClock;
+      passphraseChangePending ||
+      (store.isUnlocked && store.clock > state.syncedClock);
   KeyFileSyncStatus get status {
     if (_disposed) return KeyFileSyncStatus.off;
     if ({
@@ -97,7 +104,7 @@ class KeyFileSync {
         KeyFileSyncStatus.syncing => 'Syncing…',
         KeyFileSyncStatus.merged =>
           'Merged $mergedChanges change(s) from another device',
-        KeyFileSyncStatus.passphraseMismatch => state.passphraseChangePending
+        KeyFileSyncStatus.passphraseMismatch => passphraseChangePending
             ? 'You changed the passphrase on this device before the sync bucket was updated. Enter the previous passphrase to finish.'
             : 'The key file in the sync bucket uses a different passphrase — it was probably changed on another device.',
         KeyFileSyncStatus.error => error ?? 'Sync failed. Try again.',
@@ -105,24 +112,9 @@ class KeyFileSync {
 
   void _storeChanged() {
     if (_internal > 0 || _disposed) return;
-    if (store.passphraseChanges != _seenPassphraseChanges) {
-      _seenPassphraseChanges = store.passphraseChanges;
-      // Persist the intent: if this device restarts before the bucket copy is
-      // re-encrypted, the mismatch must not revert the new passphrase.
-      unawaited(_save(_withPassphrasePending(true)));
-    }
     onChanged?.call();
     requestSync();
   }
-
-  KeyFileSyncState _withPassphrasePending(bool pending) => KeyFileSyncState(
-      etag: state.etag,
-      versionId: state.versionId,
-      lastSyncedAt: state.lastSyncedAt,
-      syncedClock: state.syncedClock,
-      conditionalWrites: state.conditionalWrites,
-      versioningEnabled: state.versioningEnabled,
-      passphraseChangePending: pending);
 
   void requestSync() {
     if (_disposed || !store.isUnlocked) return;
@@ -136,12 +128,22 @@ class KeyFileSync {
     });
   }
 
-  Future<void> syncNow({String? remotePassphrase}) {
+  Future<void> syncNow({
+    String? remotePassphrase,
+    bool adoptRemotePassphrase = false,
+  }) async {
     if (_disposed || !store.isUnlocked) return Future.value();
     _timer?.cancel();
     if (_running != null) {
       _again = true;
-      return _running!;
+      await _running;
+      if (remotePassphrase != null &&
+          status == KeyFileSyncStatus.passphraseMismatch) {
+        await syncNow(
+            remotePassphrase: remotePassphrase,
+            adoptRemotePassphrase: adoptRemotePassphrase);
+      }
+      return;
     }
     final done = Completer<void>();
     _running = done.future;
@@ -149,7 +151,7 @@ class KeyFileSync {
       try {
         do {
           _again = false;
-          await _sync(remotePassphrase);
+          await _sync(remotePassphrase, adoptRemotePassphrase);
           remotePassphrase = null;
         } while (_again &&
             !_disposed &&
@@ -202,14 +204,22 @@ class KeyFileSync {
     }
   }
 
-  Future<void> _save(KeyFileSyncState value) async {
+  Future<void> _save(KeyFileSyncState Function() nextState) async {
     if (_disposed) return;
-    _state = value;
-    await onStateChanged?.call(value);
+    final write = _stateWrites.then((_) async {
+      if (_disposed) return;
+      final value = nextState();
+      await onStateChanged?.call(value);
+      if (!_disposed) _state = value;
+    });
+    _stateWrites =
+        write.then<void>((_) {}, onError: (Object _, StackTrace __) {});
+    await write;
     if (!_disposed) onChanged?.call();
   }
 
-  Future<void> _sync(String? remotePassphrase) async {
+  Future<void> _sync(
+      String? remotePassphrase, bool adoptRemotePassphrase) async {
     _status = KeyFileSyncStatus.syncing;
     error = null;
     mergedChanges = 0;
@@ -221,82 +231,78 @@ class KeyFileSync {
         throw const KeyFileSyncException(
             'The remote passphrase must have at least 16 characters.');
       }
-      var conditional = state.conditionalWrites;
+      final recoveryRotation = store.localPassphraseRotation;
       for (var round = 0; round < 5; round++) {
+        _check();
+        final rotation = store.localPassphraseRotation;
         final remote = await _request('GET', key: config.objectKey);
         final absent = remote.status == 404;
         var push = absent;
+        var syncedClock = 0;
         if (!absent) {
           _ok(remote);
-          final result = await _storeOperation(
-              () => store.mergeEncrypted(remote.body, remotePassphrase));
+          _check();
+          final result = await _storeOperation(() => store.mergeEncrypted(
+                remote.body,
+                otherPassphrase: remotePassphrase,
+                allowPreviousPassphrase: () => passphraseChangePending,
+                allowPassphraseAdoption: () =>
+                    adoptRemotePassphrase &&
+                    !_disposed &&
+                    store.localPassphraseRotation == recoveryRotation &&
+                    !passphraseChangePending,
+              ));
           mergedChanges += result.changes;
           push = result.remoteDiffers || result.remoteUsesDifferentPassphrase;
-          if (remotePassphrase != null) {
-            if (state.passphraseChangePending) {
-              // The passphrase was changed here: keep it and re-encrypt the
-              // bucket copy, instead of adopting the old one back.
-              push = true;
-            } else {
-              await _storeOperation(
-                  () => store.adoptPassphrase(remotePassphrase!));
-            }
-            remotePassphrase = null;
-          }
+          syncedClock = result.clock;
+          if (!result.remoteUsesDifferentPassphrase) remotePassphrase = null;
         }
-        // Snapshot revision BEFORE the queued ciphertext read. A later mutation
-        // may be included in the bytes, but cannot be falsely marked synced.
         _check();
-        final syncedClock = store.clock;
-        String? expectedEtag = remote.headers['etag'];
+        if (rotation != store.localPassphraseRotation) continue;
+        var confirmed = remote;
         if (push) {
-          final bytes = await store.encryptedBytes();
           final etag = remote.headers['etag'];
-          if (!absent && etag == null) conditional = false;
+          if (!transport.enforcesConditionalWrites ||
+              (!absent && (etag == null || etag.isEmpty))) {
+            throw const KeyFileSyncException(
+                'Safe writes are unavailable for this sync bucket. Local changes are kept on this device.');
+          }
+          syncedClock = store.clock;
+          final bytes = await store.encryptedBytes();
+          _check();
+          if (rotation != store.localPassphraseRotation) continue;
           final headers = <String, String>{
             'content-type': 'application/octet-stream',
-            if (conditional != false)
-              if (absent) 'if-none-match': '*' else 'if-match': etag!,
+            if (absent) 'if-none-match': '*' else 'if-match': etag!,
           };
-          var put = await _request('PUT',
+          final put = await _request('PUT',
               key: config.objectKey, headers: headers, body: bytes);
-          if ({409, 412}.contains(put.status)) {
-            conditional = true;
-            continue;
-          }
-          final unsupported = put.status == 501 ||
-              (put.status == 400 &&
-                  RegExp(r'if-match|if-none-match', caseSensitive: false)
-                      .hasMatch(utf8.decode(put.body, allowMalformed: true)));
-          if (unsupported && conditional != false) {
-            conditional = false;
-            put = await _request('PUT',
-                key: config.objectKey,
-                headers: {'content-type': 'application/octet-stream'},
-                body: bytes);
-          }
+          if ({404, 409, 412}.contains(put.status)) continue;
           _ok(put);
-          // Verify even successful conditional requests: some S3-compatible
-          // endpoints silently ignore those headers. This also detects a writer
-          // that changed the object immediately after our PUT.
-          final confirmed = _ok(await _request('GET', key: config.objectKey));
-          expectedEtag = confirmed.headers['etag'];
-          if (!_equal(bytes, confirmed.body)) {
-            conditional = false;
-            continue;
-          }
-          // A successful PUT does not prove enforcement. Leave this unknown
-          // until a stale precondition is demonstrably rejected.
+          confirmed = _ok(await _request('GET', key: config.objectKey));
+          if (!_equal(bytes, confirmed.body)) continue;
+        }
+        if (confirmed.headers['etag'] == null &&
+            confirmed.headers['x-amz-version-id'] == null) {
+          throw const KeyFileSyncException(
+              'The sync bucket did not return a version or ETag to confirm its key file.');
         }
         final head = _ok(await _request('HEAD', key: config.objectKey));
         // If HEAD observes a later writer, merge that generation next round.
-        if (head.headers['etag'] != expectedEtag) continue;
-        await _save(KeyFileSyncState(
+        if (head.headers['etag'] != confirmed.headers['etag'] ||
+            head.headers['x-amz-version-id'] !=
+                confirmed.headers['x-amz-version-id']) {
+          continue;
+        }
+        _check();
+        if (rotation != store.localPassphraseRotation) continue;
+        await _save(() => KeyFileSyncState(
             etag: head.headers['etag'],
             versionId: head.headers['x-amz-version-id'],
             lastSyncedAt: DateTime.now().toUtc(),
             syncedClock: syncedClock,
-            conditionalWrites: conditional,
+            conditionalWrites: transport.enforcesConditionalWrites,
+            confirmedPassphraseRotation: rotation,
             versioningEnabled: state.versioningEnabled));
         _status = mergedChanges > 0
             ? KeyFileSyncStatus.merged
@@ -342,14 +348,15 @@ class KeyFileSync {
     } catch (_) {
       enabled = null;
     }
-    await _save(KeyFileSyncState(
+    await _save(() => KeyFileSyncState(
         etag: state.etag,
         versionId: state.versionId,
         lastSyncedAt: state.lastSyncedAt,
         syncedClock: state.syncedClock,
-        conditionalWrites: state.conditionalWrites,
+        conditionalWrites: transport.enforcesConditionalWrites,
         versioningEnabled: enabled,
-        passphraseChangePending: state.passphraseChangePending));
+        passphraseChangePending: state.passphraseChangePending,
+        confirmedPassphraseRotation: state.confirmedPassphraseRotation));
   }
 
   Future<List<KeyFileSyncVersion>> earlierVersions() async {

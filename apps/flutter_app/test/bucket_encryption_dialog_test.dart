@@ -282,6 +282,70 @@ void main() {
     expect(find.textContaining('configuration changed'), findsWidgets);
   });
 
+  for (final sectionState in ['available', 'absent']) {
+    testWidgets('fresh encryption reads in state $sectionState allow edits',
+        (tester) async {
+      controller.adminState = controller.adminState!.copyWith(sections: {
+        'GetBucketEncryption': {'state': sectionState}
+      });
+      await open(tester, 1280);
+      tester
+          .widget<AppSelectField<String>>(
+              find.byKey(const ValueKey('bucket-encryption-mode')))
+          .onChanged!('AES256');
+      await tester.pump();
+      await _tap(tester, 'Save');
+      expect(engine.writes, hasLength(1));
+    });
+  }
+
+  testWidgets('a denied encryption read keeps server editing unavailable',
+      (tester) async {
+    controller.adminState = controller.adminState!.copyWith(sections: {
+      'GetBucketEncryption': {'state': 'denied', 'message': 'Access denied'}
+    });
+    await open(tester, 1280);
+    expect(find.byKey(const ValueKey('bucket-encryption-mode')), findsNothing);
+    expect(find.text('Edit as JSON…'), findsNothing);
+    expect(find.text('Load configuration'), findsOneWidget);
+    expect(engine.writes, isEmpty);
+  });
+
+  testWidgets('JSON save refuses a change made with the editor open',
+      (tester) async {
+    await open(tester, 1280);
+    await _tap(tester, 'Edit as JSON…');
+    await tester.enterText(
+        find.descendant(
+            of: find.byType(JsonEditorDialog),
+            matching: find.byType(TextField)),
+        '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}');
+    engine.remoteJson =
+        '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]}';
+    await _tap(tester, 'Save');
+    expect(engine.writes, isEmpty);
+    expect(find.textContaining('configuration changed'), findsWidgets);
+  });
+
+  testWidgets('removal checks for changes after confirmation', (tester) async {
+    controller.adminState = controller.adminState!.copyWith(
+        encryptionEnabled: true,
+        encryptionJson:
+            '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}');
+    await open(tester, 1280);
+    tester
+        .widget<AppSelectField<String>>(
+            find.byKey(const ValueKey('bucket-encryption-mode')))
+        .onChanged!('');
+    await tester.pump();
+    await _tap(tester, 'Save');
+    engine.remoteJson =
+        '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]}';
+    await _tap(tester, 'Remove rule');
+    expect(engine.deletes, 0);
+    expect(find.textContaining('configuration changed'), findsWidgets);
+  });
+
   testWidgets('a failed freshness read blocks the save', (tester) async {
     await open(tester, 1280);
     // Another client changed the document, and the read that would show it

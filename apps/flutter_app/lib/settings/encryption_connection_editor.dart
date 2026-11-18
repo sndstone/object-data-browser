@@ -4,6 +4,8 @@ import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
 import '../services/object_encryption.dart';
 import '../widgets/app_form_dialog.dart';
+import '../widgets/banner_activity/banner_activity_spec.dart';
+import '../widgets/banner_activity/bucket_activity_status.dart';
 import 'client_encryption_editor.dart';
 import 'upload_encryption_editor.dart';
 
@@ -19,6 +21,13 @@ Future<void> showConnectionEncryptionDialog(BuildContext context,
             builder: (context, update) => AppFormDialog<void>(
               title: 'Encryption by connection',
               width: 680,
+              savingStatus: !listEquals(rules, profile.clientEncryptionRules)
+                  ? BucketActivityStatus(
+                      controller: controller,
+                      animation: BucketActivityAnimation.boltThrow,
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                    )
+                  : null,
               dirty: upload != profile.uploadEncryption ||
                   !listEquals(rules, profile.clientEncryptionRules),
               value: () {},
@@ -54,8 +63,13 @@ Future<void> showConnectionEncryptionDialog(BuildContext context,
                         false) {
                   return;
                 }
-                if (!await controller.saveProfile(current.copyWith(
-                    uploadEncryption: upload, clientEncryptionRules: rules))) {
+                final next = current.copyWith(
+                    uploadEncryption: upload, clientEncryptionRules: rules);
+                final persisted =
+                    listEquals(rules, profile.clientEncryptionRules)
+                        ? await controller.saveProfile(next)
+                        : await controller.saveVaultRules(next);
+                if (!persisted) {
                   throw StateError(
                       'Changes are available for this session only: secure profile persistence failed. Save the profile again to recover.');
                 }

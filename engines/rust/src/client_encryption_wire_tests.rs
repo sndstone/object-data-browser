@@ -34,7 +34,13 @@ impl BinaryFixture {
                             stream
                                 .set_write_timeout(Some(Duration::from_secs(10)))
                                 .unwrap();
-                            let request = read_request(&mut BufReader::new(&mut stream)).unwrap();
+                            let mut reader = BufReader::new(&mut stream);
+                            // A range worker can cancel a connection before sending
+                            // its HTTP request when another range fails authentication.
+                            if reader.fill_buf().unwrap().is_empty() {
+                                return;
+                            }
+                            let request = read_request(&mut reader).unwrap();
                             stream.write_all(&respond(&request)).unwrap();
                         }));
                     }

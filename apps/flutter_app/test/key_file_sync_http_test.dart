@@ -5,7 +5,52 @@ import 'package:s3_browser_crossplat/models/domain_models.dart';
 import 'package:s3_browser_crossplat/services/key_file_sync_transport.dart';
 import 'support/key_file_sync_scenarios.dart' as checks;
 
+class _VerifiedFixtureTransport extends S3KeyFileSyncTransport {
+  _VerifiedFixtureTransport(super.profile, this.fixture);
+
+  final checks.MemoryS3 fixture;
+
+  @override
+  bool get enforcesConditionalWrites => fixture.verified;
+}
+
 void main() {
+  test('automatic sync writes require a standard TLS-verified AWS endpoint',
+      () {
+    const aws = EndpointProfile(
+        id: 'p',
+        name: 'AWS',
+        endpointType: EndpointProfileType.awsS3,
+        endpointUrl: 'https://s3.us-east-1.amazonaws.com',
+        region: 'us-east-1',
+        accessKey: 'fixture-access',
+        secretKey: 'fixture-secret',
+        pathStyle: false,
+        verifyTls: true);
+    for (final (profile, permitted) in [
+      (aws, true),
+      (aws.copyWith(verifyTls: false), false),
+      (aws.copyWith(endpointUrl: 'http://s3.us-east-1.amazonaws.com'), false),
+      (
+        aws.copyWith(
+            endpointUrl: 'https://s3.us-east-1.amazonaws.com.example.test'),
+        false
+      ),
+      (
+        aws.copyWith(endpointUrl: 'https://s3.us-east-1.amazonaws.com/proxy'),
+        false
+      ),
+      (aws.copyWith(endpointType: EndpointProfileType.s3Compatible), false),
+    ]) {
+      final transport = S3KeyFileSyncTransport(profile);
+      try {
+        expect(transport.enforcesConditionalWrites, permitted);
+      } finally {
+        transport.close();
+      }
+    }
+  });
+
   // These are plain tests. Flutter's widget binding HTTP override must not
   // intercept the signed pure-Dart client talking to the in-process server.
   setUpAll(() {
@@ -44,7 +89,7 @@ void main() {
           verifyTls: true,
           maxAttempts: 1);
       return (
-        create: () => S3KeyFileSyncTransport(profile),
+        create: () => _VerifiedFixtureTransport(profile, fixture),
         close: () async {
           await server.close(force: true);
           await serving;

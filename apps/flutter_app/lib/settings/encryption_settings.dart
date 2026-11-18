@@ -29,12 +29,12 @@ Future<void> showEncryptionKeyFileDialog(
   final creating = action == 'Create key file';
   final changing = action == 'Change passphrase';
   var revealPassphrase = false;
-  await showDialog<void>(
+  final saved = await showDialog<bool>(
     context: context,
     builder: (_) => _SecretDialogControllers(
       controllers: [current, passphrase, confirmation],
       child: StatefulBuilder(
-        builder: (context, update) => AppFormDialog<void>(
+        builder: (context, update) => AppFormDialog<bool>(
           title: action,
           dirty: current.text.isNotEmpty ||
               passphrase.text.isNotEmpty ||
@@ -44,7 +44,7 @@ Future<void> showEncryptionKeyFileDialog(
               : changing
                   ? 'Change passphrase'
                   : 'Unlock',
-          value: () {},
+          value: () => true,
           onSave: (_) async {
             if ((creating || changing) &&
                 passphrase.text != confirmation.text) {
@@ -52,13 +52,15 @@ Future<void> showEncryptionKeyFileDialog(
                 'The passphrases do not match.',
               );
             }
+            if (!creating && !changing) {
+              await controller.unlockEncryptionKeyFile(passphrase.text);
+              return;
+            }
             await controller.updateEncryptionKeys((store) async {
               if (creating) {
                 await store.create(passphrase.text);
-              } else if (changing) {
-                await store.changePassphrase(current.text, passphrase.text);
               } else {
-                await store.unlock(passphrase.text);
+                await store.changePassphrase(current.text, passphrase.text);
               }
             });
           },
@@ -127,6 +129,9 @@ Future<void> showEncryptionKeyFileDialog(
       ),
     ),
   );
+  if (saved == true && !creating && !changing) {
+    controller.showEncryptionUnlockResult();
+  }
 }
 
 Future<void> showEncryptionKeyDialog(

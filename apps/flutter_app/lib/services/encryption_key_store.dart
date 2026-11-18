@@ -36,13 +36,14 @@ const keyFileSyncMinPassphraseLength = 16;
 
 final class KeyFileMergeResult {
   const KeyFileMergeResult(
-      {required this.added,
+      {required this.clock,
+      required this.added,
       required this.updated,
       required this.removed,
       required this.localChanged,
       required this.remoteDiffers,
       this.remoteUsesDifferentPassphrase = false});
-  final int added, updated, removed;
+  final int clock, added, updated, removed;
   final bool localChanged, remoteDiffers, remoteUsesDifferentPassphrase;
   int get changes => added + updated + removed;
 }
@@ -357,6 +358,7 @@ final class EncryptionKeyStore {
 
   static const int _maxFileLength = 8 * 1024 * 1024;
   static const int _maxLabelLength = 256;
+  static const _passphraseRotationField = 'localPassphraseRotation';
 
   /// The encrypted key file.
   final File file;
@@ -373,11 +375,14 @@ final class EncryptionKeyStore {
   }
 
   String? _previousPassphrase;
-  int _passphraseChanges = 0;
 
-  /// How many times [changePassphrase] succeeded on this instance. Sync uses
-  /// it to tell a passphrase changed here from one changed on another device.
-  int get passphraseChanges => _passphraseChanges;
+  /// Rotation metadata is committed with the new ciphertext. A different
+  /// installation can read the file without inheriting that rotation intent.
+  String? get localPassphraseRotation {
+    final value = _requireUnlocked().document[_passphraseRotationField];
+    return value is String && value.startsWith('$deviceId:') ? value : null;
+  }
+
   int get clock => _requireUnlocked().document['clock'] as int? ?? 0;
   bool get passphraseMeetsSyncPolicy =>
       _requireUnlocked().passphrase.runes.length >=
@@ -605,16 +610,12 @@ final class EncryptionKeyStore {
           throw const EncryptionKeyStoreWrongPassphraseException();
         }
         _checkNewPassphrase(next);
-        // Counted before the commit, whose success notifies listeners; a
-        // failed commit notifies nobody and takes the count back.
-        _passphraseChanges++;
-        try {
-          await _commit(state, List<_Entry>.of(state.entries),
-              passphrase: next);
-        } catch (_) {
-          _passphraseChanges--;
-          rethrow;
-        }
+        await _commit(state, List<_Entry>.of(state.entries),
+            passphrase: next,
+            document: {
+              ...state.document,
+              _passphraseRotationField: '$deviceId:${newDeviceId()}',
+            });
         if (isUnlocked) _previousPassphrase = current;
       });
 
@@ -756,31 +757,27 @@ final class EncryptionKeyStore {
         }
       });
 
-  Future<void> adoptPassphrase(String passphrase) => _serialized(() async {
-        final state = _requireUnlocked();
-        if (passphrase.runes.length < keyFileSyncMinPassphraseLength) {
-          throw const EncryptionKeyStoreWeakPassphraseException(
-              keyFileSyncMinPassphraseLength);
-        }
-        await _commit(state, List<_Entry>.of(state.entries),
-            passphrase: passphrase);
-        _previousPassphrase = null;
-      });
-
-  /// Omitting the remote passphrase uses the unlocked passphrase. A locally
-  /// changed passphrase may read the immediately previous generation in memory;
-  /// the caller must then push a copy protected by the new passphrase.
+  /// Omitting the remote passphrase uses the unlocked passphrase. A sync
+  /// location with a pending local rotation may try the previous passphrase.
   Future<KeyFileMergeResult> mergeEncrypted(Uint8List otherFile,
-          [String? otherPassphrase]) =>
+          {String? otherPassphrase,
+          bool Function()? allowPreviousPassphrase,
+          bool Function()? allowPassphraseAdoption}) =>
       _serialized(() async {
         final state = _requireUnlocked();
         _Unlocked incoming;
-        var differentPassphrase = false;
+        var differentPassphrase =
+            otherPassphrase != null && otherPassphrase != state.passphrase;
         try {
           incoming =
               await _loadBytes(otherFile, otherPassphrase ?? state.passphrase);
         } on EncryptionKeyStoreWrongPassphraseException {
-          if (otherPassphrase != null || _previousPassphrase == null) rethrow;
+          if (!identical(_state, state) ||
+              otherPassphrase != null ||
+              _previousPassphrase == null ||
+              allowPreviousPassphrase?.call() != true) {
+            rethrow;
+          }
           incoming = await _loadBytes(otherFile, _previousPassphrase!);
           differentPassphrase = true;
         }
@@ -792,7 +789,7 @@ final class EncryptionKeyStore {
               'format': formatName,
               'version': formatVersion,
               'keys': [for (final entry in value.entries) entry.raw],
-            };
+            }..remove(_passphraseRotationField);
         final local = documentOf(state), remote = documentOf(incoming);
         final merged = mergeKeyFileDocuments(local, remote);
         final localChanged =
@@ -811,22 +808,45 @@ final class EncryptionKeyStore {
                 old.containsKey(id) &&
                 canonicalKeyFileJson(old[id]) != canonicalKeyFileJson(next[id]))
             .length;
+        var nextEntries = List<_Entry>.of(state.entries);
+        var nextDocument = state.document;
         if (localChanged) {
           final plaintext = Uint8List.fromList(utf8.encode(jsonEncode(merged)));
           try {
             final decoded = await _decode(plaintext, state.passphrase);
-            await _commit(state, decoded.entries, document: decoded.document);
+            nextEntries = decoded.entries;
+            nextDocument = decoded.document;
+            if (state.document.containsKey(_passphraseRotationField)) {
+              nextDocument[_passphraseRotationField] =
+                  state.document[_passphraseRotationField];
+            }
           } finally {
             ageWipe(plaintext);
           }
         }
+        final adopt = differentPassphrase &&
+            otherPassphrase != null &&
+            identical(_state, state) &&
+            allowPassphraseAdoption?.call() == true;
+        if (adopt &&
+            otherPassphrase.runes.length < keyFileSyncMinPassphraseLength) {
+          throw const EncryptionKeyStoreWeakPassphraseException(
+              keyFileSyncMinPassphraseLength);
+        }
+        if (localChanged || adopt) {
+          await _commit(state, nextEntries,
+              document: nextDocument,
+              passphrase: adopt ? otherPassphrase : null);
+          if (adopt) _previousPassphrase = null;
+        }
         return KeyFileMergeResult(
+            clock: merged['clock'] as int,
             added: added,
             updated: updated,
             removed: removed,
             localChanged: localChanged,
             remoteDiffers: remoteDiffers,
-            remoteUsesDifferentPassphrase: differentPassphrase);
+            remoteUsesDifferentPassphrase: differentPassphrase && !adopt);
       });
 
   // -------------------------------------------------------------------------

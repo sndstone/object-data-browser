@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import '../services/app_platform.dart';
 import '../controllers/app_controller.dart';
 import '../models/domain_models.dart';
+import '../widgets/banner_activity/banner_activity_spec.dart';
+import '../widgets/banner_activity/bucket_activity_status.dart';
 
 class BucketCopyDialog extends StatefulWidget {
   const BucketCopyDialog(
@@ -129,7 +131,19 @@ class _BucketCopyDialogState extends State<BucketCopyDialog> {
 
   @override
   Widget build(BuildContext context) => AlertDialog(
-        title: Text('Copy ${widget.sourceBucket.name}'),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('Copy ${widget.sourceBucket.name}'),
+            if (copying)
+              BucketActivityStatus(
+                controller: widget.controller,
+                animation: BucketActivityAnimation.levelMatch,
+                padding: const EdgeInsets.only(top: 12),
+              ),
+          ],
+        ),
         content: SizedBox(
             width: 560,
             child: SingleChildScrollView(

@@ -1,14 +1,20 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:s3_browser_crossplat/controllers/app_controller.dart';
 import 'package:s3_browser_crossplat/models/domain_models.dart';
+import 'package:s3_browser_crossplat/services/app_state_repository.dart';
+import 'package:s3_browser_crossplat/services/bucket_copy_journal.dart';
 import 'package:s3_browser_crossplat/services/mock_engine_service.dart';
 import 'package:s3_browser_crossplat/widgets/banner_activity/banner_activity_indicator.dart';
 import 'package:s3_browser_crossplat/widgets/banner_activity/banner_activity_spec.dart';
+import 'package:s3_browser_crossplat/widgets/banner_activity/bucket_activity_indicator.dart';
 import 'package:s3_browser_crossplat/widgets/banner_activity/living_glyph_indicator.dart';
 import 'package:s3_browser_crossplat/widgets/banner_activity/trace_tile_indicator.dart';
+
+import 'app_controller_test.dart' show MemoryAppStateRepository;
 
 /// Bucket creation waits for [gate], like a slow endpoint.
 class _GatedEngine extends MockEngineService {
@@ -28,6 +34,43 @@ class _GatedEngine extends MockEngineService {
         bucketName: bucketName,
         enableVersioning: enableVersioning,
         enableObjectLock: enableObjectLock);
+  }
+}
+
+class _BucketCopyEngine extends MockEngineService {
+  final copyingSecondObject = Completer<void>();
+  final finish = Completer<void>();
+
+  @override
+  Future<Map<String, Object?>> storageAction({
+    required EndpointProfile profile,
+    required String action,
+    Map<String, Object?> arguments = const {},
+    EndpointProfile? destinationProfile,
+  }) async {
+    switch (action) {
+      case 'listObjects':
+        return {
+          'items': [
+            {'key': 'first', 'size': 1},
+            {'key': 'second', 'size': 1},
+          ],
+          'nextCursor': {'hasMore': false},
+        };
+      case 'copyObject':
+        if (arguments['sourceKey'] == 'second') {
+          copyingSecondObject.complete();
+          await finish.future;
+        }
+        return {'status': 'completed', 'successCount': 1, 'bytesCopied': 1};
+      default:
+        return super.storageAction(
+          profile: profile,
+          action: action,
+          arguments: arguments,
+          destinationProfile: destinationProfile,
+        );
+    }
   }
 }
 
@@ -76,11 +119,17 @@ const _profile = EndpointProfile(
   verifyTls: false,
 );
 
-Future<AppController> _controller(MockEngineService engine) async {
+Future<AppController> _controller(
+  MockEngineService engine, {
+  AppStateRepository? repository,
+  Future<BucketCopyJournal> Function()? journal,
+}) async {
   final c = AppController(
       engineService: engine,
       initialSettings: _settings,
-      initialProfiles: const [_profile]);
+      initialProfiles: const [_profile],
+      appStateRepository: repository,
+      bucketCopyJournalProvider: journal);
   await c.initialize();
   return c;
 }
@@ -135,6 +184,93 @@ void main() {
     expect(c.bannerActivity, isNull);
   });
 
+  test('approved bucket settings keep their animation through confirmation',
+      () async {
+    final c = await _controller(MockEngineService());
+    addTearDown(c.dispose);
+    for (final (save, animation, message) in [
+      (
+        () => c.saveBucketLifecycle('{"Rules":[]}'),
+        BucketActivityAnimation.clockSet,
+        'Lifecycle policy saved.',
+      ),
+      (
+        () => c.saveBucketPolicy('{}'),
+        BucketActivityAnimation.shieldScan,
+        'Bucket policy saved.',
+      ),
+      (
+        () => c.saveBucketTags({'team': 'storage'}),
+        BucketActivityAnimation.hangTag,
+        'Bucket tags saved.',
+      ),
+    ]) {
+      final pending = save();
+      expect(c.bannerActivity?.bucketAnimation, animation);
+      expect(c.bannerActivity?.phase, BannerActivityPhase.working);
+      await pending;
+      expect(c.bannerActivity?.bucketAnimation, animation);
+      expect(c.bannerActivity?.phase, BannerActivityPhase.succeeded);
+      expect(c.bannerMessage, message);
+    }
+    await c.setBucketVersioning(true);
+    expect(c.bannerActivity?.bucketAnimation, isNull);
+  });
+
+  test('Level Match follows actual copied objects and the final outcome',
+      () async {
+    final engine = _BucketCopyEngine();
+    final directory = await Directory.systemTemp.createTemp('bucket-status-');
+    addTearDown(() => directory.delete(recursive: true));
+    final c = await _controller(engine,
+        journal: () async =>
+            BucketCopyJournal(File('${directory.path}/copy.json')));
+    addTearDown(c.dispose);
+    final copy = c.copyBucketContents(
+        sourceBucketName: 'source', destinationBucketName: 'destination');
+    expect(
+        c.bannerActivity?.bucketAnimation, BucketActivityAnimation.levelMatch);
+    expect(c.bannerActivity?.count, 0);
+    await engine.copyingSecondObject.future;
+    expect(c.bannerActivity?.phase, BannerActivityPhase.working);
+    expect(c.bannerActivity?.count, 1);
+    expect(c.bannerActivity?.progress, isNull);
+    expect(c.bannerTransferStatus, isNull);
+    engine.finish.complete();
+    await copy;
+    expect(
+        c.bannerActivity?.bucketAnimation, BucketActivityAnimation.levelMatch);
+    expect(c.bannerActivity?.phase, BannerActivityPhase.succeeded);
+    expect(c.bannerActivity?.count, 2);
+  });
+
+  test('Bolt Throw confirms only a durably saved vault rule', () async {
+    const rule = ClientEncryptionRule(
+      bucket: 'bucket',
+      keyId: 'key-id',
+      recipient: 'age1example',
+      label: 'Example vault',
+    );
+    for (final durable in [true, false]) {
+      final c = await _controller(MockEngineService(),
+          repository: durable ? MemoryAppStateRepository() : null);
+      addTearDown(c.dispose);
+      final save = c.saveVaultRules(
+          _profile.copyWith(clientEncryptionRules: const [rule]));
+      expect(
+          c.bannerActivity?.bucketAnimation, BucketActivityAnimation.boltThrow);
+      expect(c.bannerActivity?.phase, BannerActivityPhase.working);
+      expect(await save, durable);
+      expect(
+          c.bannerActivity?.bucketAnimation, BucketActivityAnimation.boltThrow);
+      expect(
+          c.bannerActivity?.phase,
+          durable
+              ? BannerActivityPhase.succeeded
+              : BannerActivityPhase.warning);
+    }
+  });
+
   Widget host(BannerActivitySpec spec) => MaterialApp(
       home: Scaffold(body: Center(child: BannerActivityIndicator(spec: spec))));
 
@@ -180,6 +316,49 @@ void main() {
         await tester.pumpWidget(host(spec(kind, phase)));
         await tester.pumpAndSettle();
       }
+      await tester.pumpWidget(const SizedBox.shrink());
+    }
+  });
+
+  testWidgets(
+      'approved glyphs complete their handoff and respect reduced motion',
+      (tester) async {
+    Widget host(BucketActivityAnimation animation, BannerActivityPhase phase,
+            {bool animate = true}) =>
+        MaterialApp(
+          home: Scaffold(
+            body: Center(
+              child: BannerActivityIndicator(
+                bucketAnimation: animation,
+                spec: spec(BannerActivityKind.action, phase, animate: animate),
+              ),
+            ),
+          ),
+        );
+    BucketActivityPainter painter() => tester
+        .widget<CustomPaint>(find.descendant(
+          of: find.byType(BucketActivityIndicator),
+          matching: find.byType(CustomPaint),
+        ))
+        .painter! as BucketActivityPainter;
+
+    for (final animation in BucketActivityAnimation.values) {
+      await tester.pumpWidget(host(animation, BannerActivityPhase.working));
+      await tester.pump(const Duration(milliseconds: 130));
+      expect(painter().waiting, isTrue);
+      expect(painter().clock.isAnimating, isTrue);
+      await tester.pumpWidget(host(animation, BannerActivityPhase.succeeded));
+      await tester.pumpAndSettle();
+      expect(painter().phase, BannerActivityPhase.succeeded);
+      expect(painter().clock.value, 1);
+      await tester.pumpWidget(
+          host(animation, BannerActivityPhase.working, animate: false));
+      await tester.pumpAndSettle();
+      expect(painter().clock.isAnimating, isFalse);
+      await tester.pumpWidget(
+          host(animation, BannerActivityPhase.failed, animate: false));
+      expect(painter().phase, BannerActivityPhase.failed);
+      expect(painter().clock.value, 1);
       await tester.pumpWidget(const SizedBox.shrink());
     }
   });

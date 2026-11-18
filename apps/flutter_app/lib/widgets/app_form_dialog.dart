@@ -26,6 +26,7 @@ class AppFormDialog<T> extends StatefulWidget {
     this.width = 560,
     this.submitLabel = 'Save',
     this.extraActions = const [],
+    this.savingStatus,
   });
 
   final String title, submitLabel;
@@ -35,6 +36,7 @@ class AppFormDialog<T> extends StatefulWidget {
   final bool valid, dirty, editor, destructive;
   final double width;
   final List<Widget> extraActions;
+  final Widget? savingStatus;
 
   @override
   State<AppFormDialog<T>> createState() => _AppFormDialogState<T>();
@@ -144,6 +146,8 @@ class _AppFormDialogState<T> extends State<AppFormDialog<T>> {
                             icon: const Icon(Icons.close)),
                       ]),
                     ),
+                    if (_busy && height >= 240 && widget.savingStatus != null)
+                      widget.savingStatus!,
                     const Divider(height: 1),
                     Flexible(
                       child: SingleChildScrollView(

@@ -31,7 +31,8 @@ Future<void> fails<T>(Future<void> Function() run) async {
 Future<Map<String, Object?>> document(EncryptionKeyStore store,
         {String password = passphrase}) async =>
     jsonDecode(utf8.decode(await ageDecrypt(await store.encryptedBytes(),
-        passphrase: password))) as Map<String, Object?>;
+        passphrase: password))) as Map<String, Object?>
+      ..remove('localPassphraseRotation');
 Future<Uint8List> encrypt(Map<String, Object?> document,
         {String password = passphrase}) =>
     ageEncrypt(Uint8List.fromList(utf8.encode(jsonEncode(document))),
@@ -67,6 +68,7 @@ class MemoryS3 {
   Uint8List? bytes;
   int version = 0, requests = 0, puts = 0, active = 0, maxActive = 0;
   bool versioning = true, unsupported = false, ignored = false;
+  bool verified = true, omitEtag = false;
   int? failStatus;
   Future<void> Function()? beforePut;
   Future<void> Function(String)? beforeRequest;
@@ -94,7 +96,7 @@ class MemoryS3 {
       KeyFileSyncResponse response(int status, [List<int> value = const []]) =>
           KeyFileSyncResponse(
               status,
-              {'etag': etag, 'x-amz-version-id': '$version'},
+              {if (!omitEtag) 'etag': etag, 'x-amz-version-id': '$version'},
               Uint8List.fromList(value));
       if (failStatus != null) return response(failStatus!);
       if (query.containsKey('versioning')) {
@@ -144,6 +146,9 @@ class MemoryS3 {
 class MemoryTransport implements KeyFileSyncSetupTransport {
   MemoryTransport(this.server);
   final MemoryS3 server;
+  @override
+  bool get enforcesConditionalWrites => server.verified;
+
   @override
   Future<KeyFileSyncResponse> request(String method, String bucket,
           {String? key,
@@ -196,7 +201,8 @@ class Pair {
     final right = normalizedKeyFileJson(await document(b, password: password));
     final remote = normalizedKeyFileJson(jsonDecode(
             utf8.decode(await ageDecrypt(server.bytes!, passphrase: password)))
-        as Map<String, Object?>);
+        as Map<String, Object?>
+      ..remove('localPassphraseRotation'));
     check(
         left == right && left == remote, 'Devices and bucket did not converge');
   }
@@ -349,7 +355,8 @@ final scenarios = <String, Future<void> Function()>{
             await p.a.importEncrypted(backup, passphrase);
             check(p.a.records.single.id == key.id && p.a.clock == 4,
                 'Additive restoration');
-            await p.a.mergeEncrypted(await encrypt(deleted), passphrase);
+            await p.a.mergeEncrypted(await encrypt(deleted),
+                otherPassphrase: passphrase);
             check(p.a.records.length == 1,
                 'Old tombstone cannot remove restored key');
             await p.a.changePassphrase(passphrase, nextPassphrase);
@@ -358,11 +365,12 @@ final scenarios = <String, Future<void> Function()>{
   'store merge reports counts, no-op keeps bytes, errors leave ciphertext unchanged':
       () => pair((p) async {
             final one = await p.a.generateCustomerKey('one');
-            await p.b.mergeEncrypted(await p.a.encryptedBytes(), passphrase);
+            await p.b.mergeEncrypted(await p.a.encryptedBytes(),
+                otherPassphrase: passphrase);
             await p.b.rename(one.id, 'new');
             await p.b.generateCustomerKey('two');
-            final result = await p.a
-                .mergeEncrypted(await p.b.encryptedBytes(), passphrase);
+            final result = await p.a.mergeEncrypted(await p.b.encryptedBytes(),
+                otherPassphrase: passphrase);
             check(
                 result.added == 1 &&
                     result.updated == 1 &&
@@ -371,8 +379,8 @@ final scenarios = <String, Future<void> Function()>{
                     !result.remoteDiffers,
                 'Merge counts');
             final before = await p.a.encryptedBytes();
-            final noop = await p.a
-                .mergeEncrypted(await p.b.encryptedBytes(), passphrase);
+            final noop = await p.a.mergeEncrypted(await p.b.encryptedBytes(),
+                otherPassphrase: passphrase);
             check(
                 !noop.localChanged &&
                     !noop.remoteDiffers &&
@@ -380,24 +388,26 @@ final scenarios = <String, Future<void> Function()>{
                         base64Encode(before),
                 'No-op rewrite');
             await fails<EncryptionKeyStoreWrongPassphraseException>(() async {
-              await p.a.mergeEncrypted(await p.b.encryptedBytes(), 'wrong');
+              await p.a.mergeEncrypted(await p.b.encryptedBytes(),
+                  otherPassphrase: 'wrong');
             });
             await fails<EncryptionKeyStoreCorruptException>(() async {
-              await p.a
-                  .mergeEncrypted(Uint8List.fromList([1, 2, 3]), passphrase);
+              await p.a.mergeEncrypted(Uint8List.fromList([1, 2, 3]),
+                  otherPassphrase: passphrase);
             });
             await fails<EncryptionKeyStoreUnsupportedVersionException>(
                 () async {
               await p.a.mergeEncrypted(
-                  await encrypt({...doc([]), 'version': 2}), passphrase);
+                  await encrypt({...doc([]), 'version': 2}),
+                  otherPassphrase: passphrase);
             });
             check(
                 base64Encode(await p.a.encryptedBytes()) ==
                     base64Encode(before),
                 'Failed merge changed file');
             await p.b.delete(one.id);
-            final deleted = await p.a
-                .mergeEncrypted(await p.b.encryptedBytes(), passphrase);
+            final deleted = await p.a.mergeEncrypted(await p.b.encryptedBytes(),
+                otherPassphrase: passphrase);
             check(deleted.removed == 1, 'Merge removed count');
           }),
   'store merge keeps the same customer secret under different ids and opaque fields':
@@ -413,8 +423,8 @@ final scenarios = <String, Future<void> Function()>{
               ...doc([copy, live('opaque', 9, 'future')]),
               'futureTop': {'x': true}
             };
-            final result =
-                await p.a.mergeEncrypted(await encrypt(incoming), passphrase);
+            final result = await p.a.mergeEncrypted(await encrypt(incoming),
+                otherPassphrase: passphrase);
             check(
                 result.added == 2 &&
                     p.a.records.length == 2 &&
@@ -513,28 +523,64 @@ final scenarios = <String, Future<void> Function()>{
             await p.converge(a, b, reverse: reverse);
             check(p.server.maxActive == 1, 'Unexpected overlap');
           }),
-  for (final mode in ['strict', 'unsupported', 'ignored'])
-    'sync interleaved writer with $mode conditionals converges': () =>
+  'a conditional conflict merges the concurrent writer': () => pair((p) async {
+        await p.a.generateCustomerKey('a');
+        await p.b.generateCustomerKey('b');
+        final a = p.sync(p.a), b = p.sync(p.b);
+        p.server.beforePut = () async {
+          p.server.write(await p.b.encryptedBytes());
+        };
+        await p.converge(a, b);
+        check(p.a.records.length == 2, 'Race lost a key');
+        check(a.state.conditionalWrites == true, 'Enforcement not recorded');
+      }),
+  for (final existingObject in [false, true])
+    'unverified endpoints make no PUT, existing object=$existingObject': () =>
         pair((p) async {
-          await p.a.generateCustomerKey('a');
-          await p.b.generateCustomerKey('b');
-          final a = p.sync(p.a), b = p.sync(p.b);
-          p.server.unsupported = mode == 'unsupported';
-          p.server.ignored = mode == 'ignored';
-          p.server.beforePut = () async {
-            p.server.write(await p.b.encryptedBytes());
-          };
-          await p.converge(a, b);
-          check(p.a.records.length == 2, 'Race lost a key');
-          if (mode == 'strict') {
-            check(a.state.conditionalWrites == true,
-                'Honoured conditional not recorded');
-          }
-          if (mode == 'unsupported') {
-            check(a.state.conditionalWrites == false,
-                'Unsupported conditional not recorded');
-          }
+          await p.a.generateCustomerKey('offline');
+          if (existingObject) p.server.write(await p.b.encryptedBytes());
+          final before = p.server.bytes;
+          p.server.verified = false;
+          p.server.ignored = true;
+          final a = p.sync(p.a);
+          await a.syncNow();
+          check(p.server.puts == 0 && identical(p.server.bytes, before),
+              'Unverified endpoint was allowed to write');
+          check(a.status == KeyFileSyncStatus.error && a.localChangesPending,
+              'Expected changes to remain pending');
         }),
+  'unsupported condition or missing validator never retries without protection':
+      () => pair((p) async {
+            p.server.write(await p.b.encryptedBytes());
+            final before = p.server.bytes;
+            await p.a.generateCustomerKey('offline');
+            final a = p.sync(p.a);
+            p.server.unsupported = true;
+            await a.syncNow();
+            check(p.server.puts == 1 && identical(p.server.bytes, before),
+                'Rejected precondition fell back to a write');
+            p.server.omitEtag = true;
+            await a.syncNow();
+            check(p.server.puts == 1 && identical(p.server.bytes, before),
+                'Missing validator fell back to a write');
+            check(a.localChangesPending, 'Local changes were marked synced');
+          }),
+  'a newer readback does not downgrade conditional writes': () =>
+      pair((p) async {
+        await p.a.generateCustomerKey('a');
+        await p.b.generateCustomerKey('b');
+        final a = p.sync(p.a);
+        var gets = 0;
+        p.server.beforeRequest = (method) async {
+          if (method == 'GET' && ++gets == 2) {
+            p.server.beforeRequest = null;
+            p.server.write(await p.b.encryptedBytes());
+          }
+        };
+        await a.syncNow();
+        check(p.a.records.length == 2, 'Newer readback was not merged');
+        check(a.state.conditionalWrites == true, 'Enforcement was downgraded');
+      }),
   'sync stops after five racing rounds and keeps local keys': () =>
       pair((p) async {
         await p.a.generateCustomerKey('a');
@@ -582,7 +628,8 @@ final scenarios = <String, Future<void> Function()>{
             await b.syncNow(remotePassphrase: 'wrong password long');
             check(b.status == KeyFileSyncStatus.passphraseMismatch,
                 'Wrong supplied passphrase');
-            await b.syncNow(remotePassphrase: nextPassphrase);
+            await b.syncNow(
+                remotePassphrase: nextPassphrase, adoptRemotePassphrase: true);
             await p.converge(a, b, password: nextPassphrase);
             p.b.lock();
             await p.b.unlock(nextPassphrase);
@@ -620,7 +667,7 @@ final scenarios = <String, Future<void> Function()>{
             // The change is not pushed: the debounce is a day in this harness.
             await p.a.changePassphrase(passphrase, nextPassphrase);
             await Future<void>.delayed(Duration.zero);
-            check(a.state.passphraseChangePending, 'Pending flag not set');
+            check(a.passphraseChangePending, 'Pending flag not set');
             final saved = KeyFileSyncState.fromJson(a.state.toJson());
             a.dispose();
             p.a.lock();
@@ -647,14 +694,15 @@ final scenarios = <String, Future<void> Function()>{
                 again.status == KeyFileSyncStatus.upToDate ||
                     again.status == KeyFileSyncStatus.merged,
                 'Sync after supplying the previous passphrase failed');
-            check(!again.state.passphraseChangePending, 'Flag not cleared');
+            check(!again.passphraseChangePending, 'Flag not cleared');
             await ageDecrypt(p.server.bytes!, passphrase: nextPassphrase);
             restarted.lock();
             await restarted.unlock(nextPassphrase);
             await b.syncNow();
             check(b.status == KeyFileSyncStatus.passphraseMismatch,
                 'Other device should be asked for the new passphrase');
-            await b.syncNow(remotePassphrase: nextPassphrase);
+            await b.syncNow(
+                remotePassphrase: nextPassphrase, adoptRemotePassphrase: true);
             check(
                 normalizedKeyFileJson(
                         await document(restarted, password: nextPassphrase)) ==
@@ -663,6 +711,52 @@ final scenarios = <String, Future<void> Function()>{
                 'Devices did not converge on the new passphrase');
             restarted.lock();
           }),
+  for (final duringMerge in [false, true])
+    'rotation survives a failed sync and restart, during merge=$duringMerge':
+        () => pair((p) async {
+              await p.a.generateCustomerKey('local');
+              final sync = p.sync(p.a);
+              await sync.syncNow();
+              final saved = sync.state;
+              Future<void>? change;
+              p.server.beforeRequest = (method) async {
+                if (change == null &&
+                    method == (duringMerge ? 'GET' : 'HEAD')) {
+                  change = p.a.changePassphrase(passphrase, nextPassphrase);
+                  if (!duringMerge) {
+                    await change;
+                    p.a.lock();
+                  }
+                }
+                if (duringMerge && method == 'PUT') {
+                  p.server.failStatus = 503;
+                }
+              };
+              await sync.syncNow();
+              await change;
+              sync.dispose();
+              p.a.lock();
+              p.server.beforeRequest = null;
+              p.server.failStatus = null;
+              final restarted = EncryptionKeyStore(p.a.file,
+                  scryptWorkFactor: 1, deviceId: p.a.deviceId);
+              await restarted.unlock(nextPassphrase);
+              final recovery = KeyFileSync(
+                  store: restarted,
+                  config: config,
+                  transport: p.transportFactory?.call() ?? p.server.client(),
+                  state: saved,
+                  debounce: const Duration(days: 1));
+              p.syncs.add(recovery);
+              check(recovery.passphraseChangePending,
+                  'A local rotation must survive without a newer settings save');
+              await recovery.syncNow(
+                  remotePassphrase: passphrase, adoptRemotePassphrase: true);
+              check(!recovery.passphraseChangePending,
+                  'Re-encryption did not confirm the pending rotation');
+              await ageDecrypt(p.server.bytes!, passphrase: nextPassphrase);
+              restarted.lock();
+            }),
   'earlier version additive import restores a deleted key and turns versioning on':
       () => pair((p) async {
             final key = await p.a.generateCustomerKey('keep');

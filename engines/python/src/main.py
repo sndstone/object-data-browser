@@ -6238,7 +6238,7 @@ def _storage_copy_impl(params):
     src_query = {'versionid': source['VersionId']} if 'VersionId' in source else {}
     if src_azure:
         _, headers, _ = src.request('HEAD', src.blob_path(source['Bucket'], source['Key']), query=src_query)
-        head = {'ContentLength': int(headers.get('Content-Length') or 0), 'ETag': headers.get('ETag'),
+        head = {'ContentLength': int(headers['Content-Length']) if headers.get('Content-Length') else None, 'ETag': headers.get('ETag'),
                 'Metadata': {k[10:]: v for k, v in headers.items() if k.lower().startswith('x-ms-meta-')}}
         for aws, http in _COPY_HEADERS.items():
             if headers.get(http): head[aws] = headers[http]
@@ -6249,6 +6249,9 @@ def _storage_copy_impl(params):
         if head.get('VersionId') is not None and selected_version is None:
             source['VersionId'] = head['VersionId']
     size = int(head.get('ContentLength') or 0)
+    require_empty_source = params.get('requireEmptySource') is True
+    if require_empty_source and (head.get('ContentLength') != 0 or not head.get('ETag')):
+        raise SidecarError('invalid_config', 'Only empty markers with a source validator can be copied into this vault.')
     options = params.get('options') or {}
     expected = params.get('expectedSourceETag') or options.get('expectedETag') or params.get('expectedETag')
     if expected and str(expected).strip('"') != str(head.get('ETag') or '').strip('"'):
@@ -6303,7 +6306,7 @@ def _storage_copy_impl(params):
     result = {}
     conditional_server_copy = (same_authority and source_profile.endpoint_type == 'awsS3'
                                and policy in {'skip', 'fail'} and size > 0)
-    if not src_azure and not dst_azure and same_authority and (policy not in {'skip', 'fail'} or conditional_server_copy):
+    if not require_empty_source and not src_azure and not dst_azure and same_authority and (policy not in {'skip', 'fail'} or conditional_server_copy):
         if conditional_server_copy:
             # A lost conditional completion response must never be replayed as
             # another mutation; reconciliation belongs to the caller.
@@ -6344,7 +6347,10 @@ def _storage_copy_impl(params):
     else:
         # Relay spills one part at a time above 8 MiB; no credentials go to disk.
         # Source identity is pinned for the entire stream by version/ETag.
-        if src_azure:
+        if require_empty_source:
+            # Publish exactly zero bytes even on stores that ignore copy conditions.
+            body = io.BytesIO()
+        elif src_azure:
             body = src.open('GET', src.blob_path(source['Bucket'], source['Key']), query=src_query,
                             headers={'If-Match': head['ETag']} if head.get('ETag') else {})
         else:

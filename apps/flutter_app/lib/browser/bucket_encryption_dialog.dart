@@ -8,6 +8,8 @@ import '../settings/client_encryption_editor.dart';
 import '../settings/encryption_settings.dart';
 import '../theme/app_motion.dart';
 import '../widgets/app_form_dialog.dart';
+import '../widgets/banner_activity/banner_activity_spec.dart';
+import '../widgets/banner_activity/bucket_activity_status.dart';
 import '../widgets/app_select_field.dart';
 import '../widgets/app_switch.dart';
 import '../widgets/copyable_value.dart';
@@ -87,26 +89,36 @@ class _BucketEncryptionDialogState extends State<BucketEncryptionDialog> {
     }
   }
 
+  bool _encryptionReadSucceeded(BucketAdminState? state) {
+    final section = state?.sections['GetBucketEncryption'];
+    return state?.bucketName == _bucket &&
+        section is Map &&
+        const {'supported', 'missing', 'available', 'absent'}
+            .contains(section['state']);
+  }
+
+  Future<void> _checkCurrentConfiguration(String expectedJson) async {
+    _checkTarget();
+    final before = controller.bucketAdminReads;
+    await controller.runFormAction(controller.refreshBucketAdminState);
+    _checkTarget();
+    final current = controller.adminState;
+    if (controller.bucketAdminReads == before ||
+        !_encryptionReadSucceeded(current)) {
+      throw StateError(
+          'The current server encryption configuration could not be read. Try again.');
+    }
+    // The S3 bucket encryption API has no conditional write. Check as late
+    // as possible to reduce the time available for another writer.
+    if (current!.encryptionJson != expectedJson) {
+      throw StateError(
+          'The server encryption configuration changed. Reopen this dialog before saving.');
+    }
+  }
+
   Future<void> _save() => controller.runFormAction(() async {
         _checkTarget();
         if (_serverChanged) {
-          // Compare against the live document, not the copy this dialog was
-          // opened with: another client may have changed it in the meantime.
-          // The read must have completed: a failed or skipped refresh leaves
-          // the previous state in place, which would compare as unchanged.
-          final before = controller.bucketAdminReads;
-          await controller.runFormAction(controller.refreshBucketAdminState);
-          if (!mounted) return;
-          _checkTarget();
-          if (controller.bucketAdminReads == before ||
-              controller.adminState?.bucketName != _bucket) {
-            throw StateError(
-                'The current server encryption configuration could not be read. Nothing was changed. Try again.');
-          }
-          if (controller.adminState?.encryptionJson != _json) {
-            throw StateError(
-                'The server encryption configuration changed. Reopen this dialog before saving.');
-          }
           if (_mode.isEmpty) {
             final confirmed = await showDialog<bool>(
                 context: context,
@@ -127,13 +139,16 @@ class _BucketEncryptionDialogState extends State<BucketEncryptionDialog> {
             if (confirmed != true) {
               throw StateError('The explicit rule was kept.');
             }
-            _checkTarget();
+            await _checkCurrentConfiguration(_json);
+            if (!mounted) return;
             await controller.runFormAction(controller.deleteBucketEncryption);
           } else {
             final json = _config.encode(
                 mode: _mode,
                 kmsKeyId: widget.kmsController.text.trim(),
                 bucketKeyEnabled: _bucketKey);
+            await _checkCurrentConfiguration(_json);
+            if (!mounted) return;
             await controller
                 .runFormAction(() => controller.saveBucketEncryption(json));
           }
@@ -152,7 +167,7 @@ class _BucketEncryptionDialogState extends State<BucketEncryptionDialog> {
                 'Vault rules changed elsewhere. Reopen this dialog before saving.');
           }
           final persisted = await controller
-              .saveProfile(current.copyWith(clientEncryptionRules: _rules));
+              .saveVaultRules(current.copyWith(clientEncryptionRules: _rules));
           if (!persisted) {
             throw StateError(
                 'Vault rules are available for this session only: secure profile persistence failed. Save the profile again to recover.');
@@ -167,8 +182,9 @@ class _BucketEncryptionDialogState extends State<BucketEncryptionDialog> {
       return;
     }
     await controller.refreshBucketAdminState();
-    if (!mounted || controller.adminState?.bucketName != _bucket) return;
+    if (!mounted) return;
     setState(() {
+      if (!_encryptionReadSucceeded(controller.adminState)) return;
       _json = controller.adminState!.encryptionJson;
       _config = BucketEncryptionConfig.parse(_json);
       _mode = _config.mode;
@@ -178,13 +194,15 @@ class _BucketEncryptionDialogState extends State<BucketEncryptionDialog> {
   }
 
   Future<void> _editJson() async {
+    final original = _json;
     final result = await showDialog<String>(
         context: context,
         builder: (_) => JsonEditorDialog(
               title: 'Encryption JSON',
-              initialValue: _json,
+              initialValue: original,
               onSave: (value) => controller.runFormAction(() async {
-                _checkTarget();
+                await _checkCurrentConfiguration(original);
+                if (!mounted) return;
                 await controller.saveBucketEncryption(value);
               }),
             ));
@@ -301,7 +319,7 @@ class _BucketEncryptionDialogState extends State<BucketEncryptionDialog> {
     final serverSupported = providerAvailable &&
         controller.profileCapability('bucket.encryption') &&
         reportedServerCapability?.state != CapabilityState.unsupported;
-    final serverLoaded = controller.adminState?.bucketName == _bucket;
+    final serverLoaded = _encryptionReadSucceeded(controller.adminState);
     final vaultSupported = controller.capabilities.any((c) =>
         c.key == 'object.clientEncryption' &&
         c.state == CapabilityState.supported);
@@ -312,6 +330,13 @@ class _BucketEncryptionDialogState extends State<BucketEncryptionDialog> {
       width: 680,
       value: () {},
       onSave: (_) => _save(),
+      savingStatus: _vaultChanged
+          ? BucketActivityStatus(
+              controller: controller,
+              animation: BucketActivityAnimation.boltThrow,
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+            )
+          : null,
       dirty: _serverChanged || _vaultChanged,
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         CopyableValue(label: 'Bucket', value: _bucket, controller: controller),

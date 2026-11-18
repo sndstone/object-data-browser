@@ -769,19 +769,25 @@ class ExactStorageUri implements Uri {
   int get hashCode => toString().hashCode;
 }
 
+bool isStandardAwsStorageEndpoint(EndpointProfile profile) {
+  final endpoint = Uri.tryParse(profile.endpointUrl);
+  return profile.endpointType == EndpointProfileType.awsS3 &&
+      endpoint != null &&
+      endpoint.scheme == 'https' &&
+      endpoint.port == 443 &&
+      RegExp(r'^s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com(?:\.cn)?$')
+          .hasMatch(endpoint.host) &&
+      (endpoint.path.isEmpty || endpoint.path == '/');
+}
+
 /// Trust region corrections only from standard AWS endpoints in the same partition.
 String? storageAwsRedirectRegion(
     EndpointProfile profile, String bucket, StorageHttpResponse response) {
   final endpoint = Uri.tryParse(profile.endpointUrl);
   final region = response.headers['x-amz-bucket-region'];
-  if (profile.endpointType != EndpointProfileType.awsS3 ||
+  if (!isStandardAwsStorageEndpoint(profile) ||
       bucket.isEmpty ||
       endpoint == null ||
-      endpoint.scheme != 'https' ||
-      endpoint.port != 443 ||
-      !RegExp(r'^s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com(?:\.cn)?$')
-          .hasMatch(endpoint.host) ||
-      (endpoint.path.isNotEmpty && endpoint.path != '/') ||
       region == null ||
       !RegExp(r'^[a-z]{2}(?:-gov)?-[a-z]+-\d+$').hasMatch(region) ||
       region.startsWith('cn-') != endpoint.host.endsWith('.cn') ||

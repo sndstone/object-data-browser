@@ -29,6 +29,11 @@ class S3KeyFileSyncTransport implements KeyFileSyncSetupTransport {
 
   final StorageHttpClient _client;
   @override
+  bool get enforcesConditionalWrites =>
+      _client.profile.verifyTls &&
+      isStandardAwsStorageEndpoint(_client.profile);
+
+  @override
   Future<KeyFileSyncResponse> request(
     String method,
     String bucket, {

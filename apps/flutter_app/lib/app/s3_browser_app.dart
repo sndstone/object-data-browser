@@ -3,6 +3,7 @@ import '../widgets/controller_content_frame.dart';
 import '../widgets/navigation_item.dart';
 import '../widgets/banner_activity/banner_activity_indicator.dart';
 import '../widgets/banner_activity/banner_activity_spec.dart';
+import '../widgets/banner_activity/vault_wheel_indicator.dart';
 import '../widgets/transfer_status/transfer_status_indicator.dart';
 import '../widgets/transfer_status/transfer_status_spec.dart';
 import 'app_shortcuts.dart';
@@ -1269,6 +1270,7 @@ class _BannerOverlayState extends State<_BannerOverlay> {
     final state = (
       c.bannerMessage,
       c.clientKeyUnlockRequired,
+      c.unlockingEncryptionKeyFile,
       c.bannerSeverity,
       c.hasBusyActions,
       c.bannerTask?.status,
@@ -1277,6 +1279,7 @@ class _BannerOverlayState extends State<_BannerOverlay> {
     _lastState = state;
     _timer?.cancel();
     if (c.bannerMessage == null ||
+        c.unlockingEncryptionKeyFile ||
         c.hasBusyActions ||
         (c.bannerTask?.isRunningLike ?? false)) {
       return;
@@ -1298,7 +1301,20 @@ class _BannerOverlayState extends State<_BannerOverlay> {
   Widget build(BuildContext context) {
     final c = widget.controller;
     final colors = Theme.of(context).colorScheme;
-    final background = switch (c.bannerSeverity) {
+    final vaultPhase = c.unlockingEncryptionKeyFile
+        ? VaultWheelPhase.unlocking
+        : c.showVaultUnlockResult
+            ? VaultWheelPhase.unlocked
+            : c.clientKeyUnlockRequired &&
+                    (c.bannerMessage == null ||
+                        c.bannerMessage!
+                            .contains('Unlock your encryption key file'))
+                ? VaultWheelPhase.locked
+                : null;
+    final severity = vaultPhase == VaultWheelPhase.unlocking
+        ? BannerSeverity.info
+        : c.bannerSeverity;
+    final background = switch (severity) {
       BannerSeverity.error => colors.errorContainer,
       BannerSeverity.warning => colors.tertiaryContainer,
       BannerSeverity.success => colors.primaryContainer,
@@ -1309,7 +1325,7 @@ class _BannerOverlayState extends State<_BannerOverlay> {
     final animate =
         AppMotion.duration(context, enabled: c.settings.enableAnimations) >
             Duration.zero;
-    final foreground = switch (c.bannerSeverity) {
+    final foreground = switch (severity) {
       BannerSeverity.error => colors.onErrorContainer,
       BannerSeverity.warning => colors.onTertiaryContainer,
       BannerSeverity.success => colors.onPrimaryContainer,
@@ -1334,12 +1350,16 @@ class _BannerOverlayState extends State<_BannerOverlay> {
           child: child,
         ),
       ),
-      child: c.bannerMessage == null && !c.clientKeyUnlockRequired
+      child: c.bannerMessage == null &&
+              !c.clientKeyUnlockRequired &&
+              vaultPhase == null
           ? const SizedBox.shrink(key: ValueKey('banner-empty'))
           : Align(
-              key: ValueKey(transfer != null
-                  ? 'banner-transfer'
-                  : 'banner-${c.bannerTaskId ?? 'message'}'),
+              key: ValueKey(vaultPhase != null
+                  ? 'banner-vault'
+                  : transfer != null
+                      ? 'banner-transfer'
+                      : 'banner-${c.bannerTaskId ?? 'message'}'),
               alignment: Alignment.bottomRight,
               child: Semantics(
                   liveRegion: true,
@@ -1360,7 +1380,19 @@ class _BannerOverlayState extends State<_BannerOverlay> {
                             padding: const EdgeInsets.fromLTRB(12, 6, 4, 6),
                             child:
                                 Row(mainAxisSize: MainAxisSize.min, children: [
-                              if (transfer != null)
+                              if (vaultPhase != null)
+                                VaultWheelIndicator(
+                                  phase: vaultPhase,
+                                  animate: animate,
+                                  foreground: foreground,
+                                  accent: vaultPhase == VaultWheelPhase.locked
+                                      ? foreground
+                                      : vaultPhase == VaultWheelPhase.unlocked
+                                          ? colors.primary
+                                          : colors.inversePrimary,
+                                  background: background,
+                                )
+                              else if (transfer != null)
                                 TransferStatusIndicator(
                                     spec: TransferStatusSpec(
                                         phase: transfer.phase,
@@ -1373,6 +1405,7 @@ class _BannerOverlayState extends State<_BannerOverlay> {
                                         background: background))
                               else if (activity != null)
                                 BannerActivityIndicator(
+                                    bucketAnimation: activity.bucketAnimation,
                                     spec: BannerActivitySpec(
                                         kind: activity.kind,
                                         phase: activity.phase,
@@ -1384,46 +1417,48 @@ class _BannerOverlayState extends State<_BannerOverlay> {
                               const SizedBox(width: 12),
                               Flexible(
                                   child: InkWell(
-                                      onTap: c.bannerTaskId != null
+                                      onTap: vaultPhase == null &&
+                                              c.bannerTaskId != null
                                           ? c.openBannerTask
                                           : null,
                                       child: Text(
-                                          c.visibleTransferText(c
-                                                  .bannerMessage ??
-                                              'Unlock your encryption key file to read encrypted names.'),
+                                          vaultPhase ==
+                                                  VaultWheelPhase.unlocking
+                                              ? 'Unlocking your encryption key file…'
+                                              : c.visibleTransferText(c
+                                                      .bannerMessage ??
+                                                  'Unlock your encryption key file to access this vault.'),
                                           style:
                                               TextStyle(color: foreground)))),
-                              if (c.clientKeyUnlockRequired)
+                              if (c.clientKeyUnlockRequired &&
+                                  vaultPhase != VaultWheelPhase.unlocking)
                                 TextButton(
-                                  onPressed: () async {
-                                    await showEncryptionKeyFileDialog(
-                                        context, c);
-                                    if (c.encryptionKeyStore?.isUnlocked ==
-                                        true) {
-                                      c.clearBanner();
-                                    }
-                                  },
+                                  onPressed: () =>
+                                      showEncryptionKeyFileDialog(context, c),
                                   style: TextButton.styleFrom(
                                     foregroundColor: foreground,
                                   ),
                                   child: const Text('Unlock'),
                                 ),
-                              if (c.bannerSeverity == BannerSeverity.error)
+                              if (vaultPhase == null &&
+                                  c.bannerSeverity == BannerSeverity.error)
                                 TextButton(
                                     onPressed: c.openErrorDetails,
                                     style: TextButton.styleFrom(
                                         foregroundColor: foreground),
                                     child: const Text('Details'))
-                              else if (c.bannerTaskId != null)
+                              else if (vaultPhase == null &&
+                                  c.bannerTaskId != null)
                                 TextButton(
                                     onPressed: c.openBannerTask,
                                     style: TextButton.styleFrom(
                                         foregroundColor: foreground),
                                     child: const Text('Details')),
-                              IconButton(
-                                  tooltip: 'Dismiss message',
-                                  onPressed: c.clearBanner,
-                                  icon: Icon(Icons.close, color: foreground)),
+                              if (vaultPhase != VaultWheelPhase.unlocking)
+                                IconButton(
+                                    tooltip: 'Dismiss message',
+                                    onPressed: c.clearBanner,
+                                    icon: Icon(Icons.close, color: foreground)),
                             ])),
                       ))),
             ),

@@ -11,6 +11,8 @@ import 'json_editor_dialog.dart';
 import 'create_bucket_dialog.dart';
 import 'rename_dialog.dart';
 import '../widgets/app_form_dialog.dart';
+import '../widgets/banner_activity/banner_activity_spec.dart';
+import '../widgets/banner_activity/bucket_activity_status.dart';
 import 'dart:convert' show utf8;
 import 'tag_editor_dialog.dart';
 import '../widgets/copyable_value.dart';
@@ -856,6 +858,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       onEditBucketLifecycle: (bucket) => _showJsonEditorDialog(
         context,
         title: 'Lifecycle JSON',
+        animation: BucketActivityAnimation.clockSet,
         initialValue: controller.adminState?.bucketName == bucket.name
             ? controller.adminState!.lifecycleJson
             : '{\n  "Rules": []\n}',
@@ -864,6 +867,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
       onEditBucketPolicy: (bucket) => _showJsonEditorDialog(
         context,
         title: 'Policy JSON',
+        animation: BucketActivityAnimation.shieldScan,
         initialValue: controller.adminState?.bucketName == bucket.name
             ? controller.adminState!.policyJson
             : '{}',
@@ -1253,6 +1257,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             OutlinedButton(
                 onPressed: () => _showJsonEditorDialog(context,
                     title: 'Lifecycle JSON',
+                    animation: BucketActivityAnimation.clockSet,
                     initialValue: admin.lifecycleJson,
                     onSave: controller.saveBucketLifecycle),
                 child: const Text('Edit lifecycle')),
@@ -1260,6 +1265,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
             OutlinedButton(
               onPressed: () => _showJsonEditorDialog(context,
                   title: 'Policy JSON',
+                  animation: BucketActivityAnimation.shieldScan,
                   initialValue: admin.policyJson,
                   onSave: controller.saveBucketPolicy),
               child: const Text('Edit policy'),
@@ -2653,6 +2659,7 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
     required String title,
     required String initialValue,
     required Future<void> Function(String value) onSave,
+    required BucketActivityAnimation animation,
   }) async {
     final profile = controller.selectedProfile?.id,
         bucket = controller.selectedBucket?.name;
@@ -2662,6 +2669,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         builder: (_) => JsonEditorDialog(
               title: title,
               initialValue: initialValue,
+              savingStatus: BucketActivityStatus(
+                controller: controller,
+                animation: animation,
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+              ),
               onSave: (value) => controller.runFormAction(() async {
                 if (controller.selectedProfile?.id != profile ||
                     controller.selectedBucket?.name != bucket ||
@@ -2683,6 +2695,11 @@ class _BrowserWorkspaceState extends State<BrowserWorkspace> {
         context: context,
         builder: (_) => TagEditorDialog(
               initialTags: initialTags,
+              savingStatus: BucketActivityStatus(
+                controller: controller,
+                animation: BucketActivityAnimation.hangTag,
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+              ),
               onSave: (value) => controller.runFormAction(() async {
                 if (controller.selectedProfile?.id != profile ||
                     controller.selectedBucket?.name != bucket ||
@@ -2793,7 +2810,9 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
     Rect anchor,
   ) async {
     // Native Cloud Storage retains versioning; advanced panels follow capabilities.
-    final isAzure = widget.controller.selectedProfile?.endpointType ==
+    final controller = widget.controller;
+    final profileId = controller.selectedProfile?.id;
+    final isAzure = controller.selectedProfile?.endpointType ==
         EndpointProfileType.azureBlob;
     final selected = await showAppMenu<String>(
       context: context,
@@ -2804,6 +2823,12 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
           icon: Icons.folder_open_outlined,
           label: 'Open bucket',
         ),
+        if (controller.canUnlockBucketVault(bucket.name))
+          appMenuItem(
+            value: 'unlock-vault',
+            icon: Icons.lock_open_rounded,
+            label: 'Unlock vault…',
+          ),
         appMenuItem(
           value: 'copy',
           icon: Icons.copy_all_outlined,
@@ -2882,6 +2907,16 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
     }
     if (selected == 'open') {
       await widget.onOpenBucket(bucket);
+      return;
+    }
+    if (selected == 'unlock-vault') {
+      // Unlocking opens the shared local key file. It doesn't need a listing
+      // or a change to the bucket currently open in the browser.
+      if (context.mounted &&
+          controller.selectedProfile?.id == profileId &&
+          controller.canUnlockBucketVault(bucket.name)) {
+        await showEncryptionKeyFileDialog(context, controller);
+      }
       return;
     }
     if (widget.controller.selectedBucket?.name != bucket.name) {

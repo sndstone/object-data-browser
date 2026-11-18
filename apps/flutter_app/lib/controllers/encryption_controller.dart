@@ -1,7 +1,14 @@
 part of 'app_controller.dart';
 
+const _vaultUnlockedMessage = 'Vault unlocked.';
+
 extension AppControllerEncryption on AppController {
   EncryptionKeyStore? get encryptionKeyStore => _encryptionKeyStore;
+  bool get unlockingEncryptionKeyFile => _unlockingEncryptionKeyFile;
+  bool get showVaultUnlockResult =>
+      _encryptionKeyStore?.isUnlocked == true &&
+      bannerMessage == _vaultUnlockedMessage &&
+      bannerSeverity == BannerSeverity.success;
   List<EncryptionKeyRecord> get encryptionKeys =>
       _encryptionKeyStore?.isUnlocked == true
           ? _encryptionKeyStore!.records
@@ -51,6 +58,30 @@ extension AppControllerEncryption on AppController {
     }
   }
 
+  Future<void> unlockEncryptionKeyFile(String passphrase) async {
+    if (_unlockingEncryptionKeyFile) {
+      throw StateError('The encryption key file is already unlocking.');
+    }
+    _unlockingEncryptionKeyFile = true;
+    _notifyEncryptionChanged();
+    try {
+      await updateEncryptionKeys((store) => store.unlock(passphrase));
+    } finally {
+      _unlockingEncryptionKeyFile = false;
+      _notifyEncryptionChanged();
+    }
+  }
+
+  void showEncryptionUnlockResult() {
+    if (!_disposed && _encryptionKeyStore?.isUnlocked == true) {
+      showBannerMessage(
+        _vaultUnlockedMessage,
+        category: 'Encryption',
+        severity: BannerSeverity.success,
+      );
+    }
+  }
+
   KeyFileSync? get keyFileSync => _keyFileSync;
 
   void _ensureKeyFileSync() {
@@ -75,8 +106,15 @@ extension AppControllerEncryption on AppController {
         onChanged: _notifyEncryptionChanged,
         onStateChanged: (state) async {
           if (_disposed || !identical(settings.keyFileSync, config)) return;
+          final previous = settings.keyFileSyncState;
           settings = settings.copyWith(keyFileSyncState: state);
-          await _persistState();
+          if (!await _persistState()) {
+            if (identical(settings.keyFileSyncState, state)) {
+              settings = settings.copyWith(keyFileSyncState: previous);
+            }
+            throw const KeyFileSyncException(
+                'Sync status could not be saved. Local keys remain available.');
+          }
         });
     _keyFileSync = sync;
     if (store.isUnlocked) sync.requestSync();
@@ -117,7 +155,9 @@ extension AppControllerEncryption on AppController {
     _keyFileSync?.dispose();
     _keyFileSync = null;
     settings = settings.copyWith(
-        keyFileSync: config, keyFileSyncState: const KeyFileSyncState());
+        keyFileSync: config,
+        keyFileSyncState: KeyFileSyncState(
+            confirmedPassphraseRotation: store.localPassphraseRotation));
     await _persistState();
     _ensureKeyFileSync();
     await _keyFileSync?.refreshVersioning();
@@ -136,6 +176,7 @@ extension AppControllerEncryption on AppController {
 
   void lockEncryptionKeyFile() {
     _encryptionKeyStore?.lock();
+    if (bannerMessage == _vaultUnlockedMessage) clearBanner();
     _clearClientPreviewBytes();
     _cancelTextPreview();
     if (selectedObject != null && isClientEncrypted(selectedObject!)) {

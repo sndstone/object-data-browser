@@ -414,6 +414,8 @@ def _copy(params, client, move=False):
     generation = str(source.get('generation') or '')
     if not generation:
         raise e.SidecarError('object_conflict', 'Source generation is unavailable; copy stopped.')
+    if params.get('requireEmptySource') is True and str(source.get('size')) != '0':
+        raise e.SidecarError('invalid_config', 'Only empty markers can be copied into this vault.')
     path = client.path(source_bucket, source_key) + '/rewriteTo/b/' + quote(dest_bucket, safe='') + '/o/' + quote(dest_key, safe='')
     query = {'sourceGeneration': generation, 'ifSourceGenerationMatch': generation}
     policy = params.get('conflictPolicy') or 'replace'

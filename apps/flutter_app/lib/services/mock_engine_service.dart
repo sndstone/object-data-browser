@@ -1526,6 +1526,9 @@ class MockEngineService
       corsEnabled: true,
       encryptionEnabled: true,
       encryptionSummary: 'SSE-S3 default encryption with bucket keys enabled',
+      sections: const {
+        'GetBucketEncryption': {'state': 'supported'},
+      },
       objectLockMode: bucketName == 'archive-vault' ? 'GOVERNANCE' : null,
       objectLockRetentionDays: bucketName == 'archive-vault' ? 30 : null,
       tags: const {
