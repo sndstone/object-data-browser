@@ -2,6 +2,16 @@ part of 'mobile_storage_admin.dart';
 
 /// Sealed age chunks fetched per ranged request on encrypted downloads.
 const _ageChunksPerRequest = 64;
+const _s3SinglePutMax = 5 * 1024 * 1024 * 1024;
+
+bool _usesNativeAwsCopy(EndpointProfile profile) {
+  if (profile.endpointType != EndpointProfileType.awsS3) return false;
+  if (profile.endpointUrl.isEmpty) return true;
+  final host = Uri.parse(profile.endpointUrl).host.replaceFirst(RegExp(r'\.$'), '');
+  return RegExp(
+          r'^s3(?:-fips)?(?:\.dualstack)?(?:[.-][a-z]{2}(?:-[a-z0-9]+)+-\d+)?\.(?:amazonaws\.com(?:\.cn)?|api\.aws)$')
+      .hasMatch(host);
+}
 
 extension MobileStorageTransfers on MobileStorageAdmin {
   Future<Map<String, Object?>> copyStorageObject(EndpointProfile source,
@@ -151,48 +161,64 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       }
     }
     var expectedGrants = <String, String>{};
+    var ownerOnlyAcl = false;
     if ((selfCopy || args['move'] == true) &&
         args['options'] is Map &&
         !from.azure) {
       final protection =
           await _propertyProtectionHeaders(from, sourceBucket, sourceKey, query);
-      expectedGrants = Map.fromEntries(protection.entries
+      expectedGrants = Map.fromEntries(protection.headers.entries
           .where((entry) => entry.key.startsWith('x-amz-grant-')));
-      headers.addAll(protection);
+      ownerOnlyAcl = protection.ownerOnly;
+      headers.addAll(protection.headers);
     }
     if (expectedGrants.isNotEmpty && to.azure) {
       throw const EngineException(
           code: ErrorCode.unsupportedFeature,
           message: 'S3 object ACLs cannot be preserved in Azure Blob.');
     }
-    final localProtectedWrite = expectedGrants.isNotEmpty &&
-        {'127.0.0.1', 'localhost', '::1'}.contains(to.uri('').host);
-    if (localProtectedWrite &&
-        (size > 8 * 1024 * 1024 ||
+    if (expectedGrants.isNotEmpty &&
+        args['move'] == true &&
+        version == null &&
+        source.endpointType != EndpointProfileType.awsS3) {
+      throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message:
+              'This endpoint has no verified conditional-delete capability for the source.');
+    }
+    final protectedPut = expectedGrants.isNotEmpty &&
+        !ownerOnlyAcl &&
+        !_usesNativeAwsCopy(destination);
+    if (protectedPut &&
+        (size > _s3SinglePutMax ||
             (selfCopy && version != null) ||
-            (args['move'] == true && (source != destination || conflict == 'replace')) ||
+            (!selfCopy && (source != destination || conflict == 'replace')) ||
             requireEmptySource)) {
       throw const EngineException(
           code: ErrorCode.unsupportedFeature,
           message:
-              'This loopback endpoint requires a single conditional PUT to preserve object ACLs.');
+              'This S3-compatible endpoint requires a single conditional PUT to preserve object ACLs.');
     }
     Future<void> verifySourceGrants() async {
       if (expectedGrants.isEmpty) return;
-      if (version == null && copiedVersion != null) {
-        final current = await from.request('HEAD', sourceBucket,
-            key: sourceKey, headers: sourceHeaders);
-        if (current.headers['x-amz-version-id'] != copiedVersion) {
-          MobileStorageAdmin._conflict(
-              'The current source version changed during the copy. Refresh before retrying.');
-        }
-      }
       final acl = (await from.request('GET', sourceBucket,
               key: sourceKey, query: {...deleteQuery, 'acl': ''}))
           .xml;
       if (!_matchingAclGrants(acl, expectedGrants)) {
         MobileStorageAdmin._conflict(
             'The source ACL changed during the copy. Refresh before retrying.');
+      }
+      if (version == null && (copiedVersion != null || (protectedPut && selfCopy))) {
+        final current = await from.request('HEAD', sourceBucket,
+            key: sourceKey, headers: sourceHeaders);
+        if (current.headers['x-amz-version-id'] != copiedVersion) {
+          MobileStorageAdmin._conflict(
+              'The current source version changed during the copy. Refresh before retrying.');
+        }
+        if (protectedPut && selfCopy && current.headers['etag'] != etag) {
+          MobileStorageAdmin._conflict(
+              'The source ETag changed during the copy. Refresh before retrying.');
+        }
       }
     }
     // Read the tag set before any destination mutation. A denied read must not
@@ -227,7 +253,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
 
     try {
       final serverCopyEligible = !requireEmptySource &&
-          !localProtectedWrite &&
+          !protectedPut &&
           sameEndpoint &&
           !from.azure &&
           !to.azure &&
@@ -268,6 +294,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
             encryption: args['encryption'],
             conflict: conflict,
             verifySource: expectedGrants.isEmpty ? null : verifySourceGrants,
+            multipartThresholdBytes: protectedPut ? _s3SinglePutMax + 1 : null,
             expectedDestinationETag: selfCopy && version == null ? etag : null);
       }
       final destinationVersion =
@@ -307,9 +334,11 @@ extension MobileStorageTransfers on MobileStorageAdmin {
               read: true,
             ),
             query: destinationQuery);
+        final etagQuotes = RegExp(r'^"|"$');
+        final copiedETag = response.headers['etag']?.replaceAll(etagQuotes, '');
+        final destinationETag = verified.headers['etag']?.replaceAll(etagQuotes, '');
         if (int.tryParse(verified.headers['content-length'] ?? '') != size ||
-            (response.headers['etag'] != null &&
-                response.headers['etag'] != verified.headers['etag'])) {
+            (copiedETag != null && copiedETag != destinationETag)) {
           MobileStorageAdmin._conflict(
               'The destination changed before the copy could be verified.');
         }
@@ -367,9 +396,11 @@ extension MobileStorageTransfers on MobileStorageAdmin {
     }
   }
 
-  Future<Map<String, String>> _propertyProtectionHeaders(StorageHttpClient http,
-      String bucket, String key, Map<String, String> query) async {
+  Future<({Map<String, String> headers, bool ownerOnly})>
+      _propertyProtectionHeaders(StorageHttpClient http, String bucket,
+          String key, Map<String, String> query) async {
     final result = <String, String>{};
+    var ownerOnly = false;
     Future<XmlElement?> optional(String name, {bool object = false}) async {
       try {
         return (await http.request('GET', bucket,
@@ -403,7 +434,15 @@ extension MobileStorageTransfers on MobileStorageAdmin {
         throw StateError(
             'The object ACL could not be read. No property changes were applied.');
       }
-      result.addAll(_aclGrantHeaders(acl));
+      final grants = _aclGrantHeaders(acl);
+      final owner = acl.childElements
+          .where((element) => element.name.local == 'Owner')
+          .firstOrNull;
+      final ownerID = owner == null ? '' : xmlText(owner, 'ID');
+      ownerOnly = ownerID.isNotEmpty &&
+          grants.length == 1 &&
+          grants['x-amz-grant-full-control'] == 'id="$ownerID"';
+      result.addAll(grants);
     }
     final lock = await optional('object-lock');
     if (lock != null && xmlText(lock, 'ObjectLockEnabled') == 'Enabled') {
@@ -418,7 +457,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
         result['x-amz-object-lock-legal-hold'] = xmlText(hold, 'Status');
       }
     }
-    return result;
+    return (headers: result, ownerOnly: ownerOnly);
   }
 
   Map<String, String> _aclGrantHeaders(XmlElement acl) {
@@ -524,6 +563,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       }
 
       final hash = await http.hashPayload(stream());
+      if (!retrySafe && !clientEncrypted) await verifySource?.call();
       final response = await http.requestStream('PUT', bucket,
           key: key,
           query: query,

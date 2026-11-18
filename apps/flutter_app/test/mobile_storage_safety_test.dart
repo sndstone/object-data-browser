@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:s3_browser_crossplat/models/domain_models.dart';
 import 'package:s3_browser_crossplat/services/mobile_storage_admin.dart';
@@ -19,6 +20,11 @@ void main() {
   var versionChanges = false;
   var denyDestinationHead = false;
   var rejectDelete = false;
+  var sourceSize = 3;
+  var putBytes = 0;
+  var ownerOnly = false;
+  var etagChanges = false;
+  var multipartStarts = 0;
   setUp(() async {
     writes.clear();
     genericMissing = false;
@@ -31,6 +37,11 @@ void main() {
     versionChanges = false;
     denyDestinationHead = false;
     rejectDelete = false;
+    sourceSize = 3;
+    putBytes = 0;
+    ownerOnly = false;
+    etagChanges = false;
+    multipartStarts = 0;
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     profile = EndpointProfile.fromJson({
       'id': 'fixture',
@@ -42,7 +53,9 @@ void main() {
     });
     admin = MobileStorageAdmin();
     server.listen((request) async {
-      await request.drain<void>();
+      await for (final bytes in request) {
+        if (request.method == 'PUT') putBytes += bytes.length;
+      }
       final response = request.response;
       response.headers.set('etag', '"source"');
       if (denyDestinationHead &&
@@ -56,12 +69,17 @@ void main() {
         response.statusCode = 404;
       } else if (request.method == 'HEAD' &&
           {'/bucket/key', '/bucket/moved'}.contains(request.uri.path)) {
-        if (request.uri.path == '/bucket/key' && versionChanges) {
+        if (request.uri.path == '/bucket/key' && (versionChanges || etagChanges)) {
           sourceHeads++;
-          response.headers
-              .set('x-amz-version-id', sourceHeads == 1 ? 'old' : 'new');
+          if (versionChanges) {
+            response.headers
+                .set('x-amz-version-id', sourceHeads == 1 ? 'old' : 'new');
+          }
+          if (etagChanges && sourceHeads > 1) {
+            response.headers.set('etag', '"other"');
+          }
         }
-        response.headers.set('content-length', '3');
+        response.headers.set('content-length', '$sourceSize');
         response.headers.set('content-encoding', 'gzip');
         response.headers.set('content-language', 'en');
         response.headers.set('cache-control', 'max-age=300');
@@ -80,9 +98,9 @@ void main() {
         aclReads++;
         final lost = (dropGrants && writes.isNotEmpty) ||
             revokeOnAclRead == aclReads;
-        final grants = lost ? owner : owner + reader;
+        final grants = lost || ownerOnly ? owner : owner + reader;
         response.write(
-            '<AccessControlPolicy><AccessControlList>$grants</AccessControlList></AccessControlPolicy>');
+            '<AccessControlPolicy><Owner><ID>owner</ID></Owner><AccessControlList>$grants</AccessControlList></AccessControlPolicy>');
       } else if (request.uri.queryParameters['list-type'] == '2') {
         response.write(
             '<ListBucketResult><EncodingType>url</EncodingType><Contents><Key>a+%2B+b</Key><Size>1</Size></Contents></ListBucketResult>');
@@ -95,8 +113,18 @@ void main() {
         response.write('<Tagging><TagSet/></Tagging>');
       } else if (request.method == 'GET' && request.uri.path.endsWith('/key')) {
         response.statusCode = 206;
-        response.headers.set('content-range', 'bytes 0-2/3');
-        response.write('abc');
+        final range = request.headers.value('range')!.substring(6).split('-');
+        final start = int.parse(range[0]), end = int.parse(range[1]);
+        response.headers.set('content-range', 'bytes $start-$end/$sourceSize');
+        if (sourceSize == 3) {
+          response.write('abc');
+        } else {
+          response.add(Uint8List(end - start + 1));
+        }
+      } else if (request.uri.queryParameters.containsKey('uploads')) {
+        multipartStarts++;
+        response.statusCode = 403;
+        response.write('<Error><Code>AccessDenied</Code></Error>');
       } else if (request.method == 'PUT') {
         writes.add({
           for (final name in [
@@ -208,9 +236,70 @@ void main() {
             'message', contains('current source version changed'))));
     expect(writes, isEmpty);
   });
+  test('an ACL-bearing edit above the multipart threshold uses one PUT',
+      () async {
+    aclEnabled = true;
+    sourceSize = 9 * 1024 * 1024;
+    final result = await admin.action(
+        profile: profile, action: 'objectProperties', arguments: {
+      'bucketName': 'bucket',
+      'key': 'key',
+      'metadata': {'edited': 'yes'},
+    });
+    expect(result['successCount'], 1);
+    expect(aclReads, 3);
+    expect(putBytes, sourceSize);
+    expect(writes.single['x-amz-grant-read'], 'id="reader"');
+    expect(writes.single['if-match'], '"source"');
+  });
+  test('an unversioned ETag change stops a guarded edit before publication',
+      () async {
+    aclEnabled = true;
+    etagChanges = true;
+    await expectLater(
+        admin.action(profile: profile, action: 'objectProperties', arguments: {
+          'bucketName': 'bucket',
+          'key': 'key',
+          'metadata': {'edited': 'yes'},
+        }),
+        throwsA(isA<EngineException>().having((error) => error.message,
+            'message', contains('source ETag changed'))));
+    expect(writes, isEmpty);
+  });
+  test('a large owner-only ACL edit can still start multipart upload', () async {
+    aclEnabled = true;
+    ownerOnly = true;
+    sourceSize = 5 * 1024 * 1024 * 1024 + 1;
+    await expectLater(
+        admin.action(profile: profile, action: 'objectProperties', arguments: {
+          'bucketName': 'bucket',
+          'key': 'key',
+          'metadata': {'edited': 'yes'},
+        }),
+        throwsA(anything));
+    expect(multipartStarts, 1);
+    expect(writes, isEmpty);
+  });
+  test('compatible move with no selected version stops before writing',
+      () async {
+    aclEnabled = true;
+    await expectLater(
+        admin.copyStorageObject(profile, profile, {
+          'sourceBucketName': 'bucket',
+          'sourceKey': 'key',
+          'destinationBucketName': 'bucket',
+          'destinationKey': 'moved',
+          'move': true,
+          'options': {'preserveObjectProtection': true},
+        }),
+        throwsA(isA<EngineException>()));
+    expect(writes, isEmpty);
+    expect(deletes, 0);
+  });
   for (final failure in ['acl_unverified', 'source_acl_unverified', 'destination_unverified']) {
     test('move retains source on verification failure ($failure)', () async {
       aclEnabled = true;
+      profile = profile.copyWith(endpointType: EndpointProfileType.awsS3);
       dropGrants = failure == 'acl_unverified';
       revokeOnAclRead = failure == 'source_acl_unverified' ? 4 : 0;
       denyDestinationHead = failure == 'destination_unverified';
@@ -232,6 +321,7 @@ void main() {
   }
   test('a move with a rejected delete reports the written destination', () async {
     aclEnabled = true;
+    profile = profile.copyWith(endpointType: EndpointProfileType.awsS3);
     rejectDelete = true;
     final result = await admin.copyStorageObject(profile, profile, {
       'sourceBucketName': 'bucket',
