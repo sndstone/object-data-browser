@@ -289,6 +289,35 @@ func TestAzureSASRetryAndRedaction(t *testing.T) {
 		t.Fatal("SAS exposed")
 	}
 }
+func TestCopySendsEncodedSourceAndVersion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		switch r.Method {
+		case "HEAD":
+			w.Header().Set("ETag", "\"source-etag\"")
+			w.Header().Set("Content-Length", "10")
+		case "PUT":
+			if got := r.Header.Get("x-amz-copy-source"); got != "source/reports/a%20%2B%20%C3%BC%252F.txt?versionId=v%2B1%2F%3D" {
+				t.Errorf("wrong copy source header: %q", got)
+				xmlError(w, 404, "NoSuchKey")
+				return
+			}
+			fmt.Fprint(w, "<CopyObjectResult><ETag>copied</ETag></CopyObjectResult>")
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL)
+		}
+	}))
+	defer server.Close()
+	result, err := copyObject(map[string]interface{}{
+		"profile": testProfilePayload(server.URL), "sourceBucketName": "source",
+		"sourceKey": "reports/a + ü%2F.txt", "sourceVersionId": "v+1/=",
+		"destinationBucketName": "destination", "destinationKey": "copied.txt",
+	})
+	if err != nil || asInt(result["successCount"]) != 1 {
+		t.Fatalf("copy failed: %v, %v", result, err)
+	}
+}
+
 func TestMultipartCopyUsesSourceIdentityAndRetainsMetadata(t *testing.T) {
 	var partCount atomic.Int32
 	var completed atomic.Bool
@@ -313,8 +342,8 @@ func TestMultipartCopyUsesSourceIdentityAndRetainsMetadata(t *testing.T) {
 			if r.Header.Get("x-amz-copy-source-if-match") != "\"source-etag\"" {
 				t.Error("source condition lost")
 			}
-			if !strings.Contains(r.Header.Get("x-amz-copy-source"), "%20key%20") {
-				t.Error("source key changed")
+			if got := r.Header.Get("x-amz-copy-source"); got != "source/reports/a%20%2B%20%C3%BC.txt" {
+				t.Errorf("wrong multipart copy source: %q", got)
 			}
 			var start, end int64
 			fmt.Sscanf(r.Header.Get("x-amz-copy-source-range"), "bytes=%d-%d", &start, &end)
@@ -329,7 +358,7 @@ func TestMultipartCopyUsesSourceIdentityAndRetainsMetadata(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	result, err := copyObject(map[string]interface{}{"profile": testProfilePayload(server.URL), "sourceBucketName": "source", "sourceKey": " key ", "destinationBucketName": "destination", "destinationKey": " key "})
+	result, err := copyObject(map[string]interface{}{"profile": testProfilePayload(server.URL), "sourceBucketName": "source", "sourceKey": "reports/a + ü.txt", "destinationBucketName": "destination", "destinationKey": " key "})
 	if err != nil {
 		t.Fatal(err)
 	}

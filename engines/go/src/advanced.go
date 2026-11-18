@@ -390,7 +390,9 @@ func copyObjectAdvanced(params map[string]interface{}) (map[string]interface{}, 
 		return nil, &sidecarError{Code: "unsupported_feature", Message: "Source has no validator; a consistent copy cannot be guaranteed."}
 	}
 	version := nonEmpty(asString(params["sourceVersionId"]), aws.ToString(head.VersionId))
-	source := url.PathEscape(sourceBucket + "/" + sourceKey)
+	// Preserve path separators and escape literal plus signs for x-amz-copy-source.
+	escapedSource := url.QueryEscape(sourceBucket + "/" + sourceKey)
+	source := strings.NewReplacer("+", "%20", "%2F", "/").Replace(escapedSource)
 	if version != "" {
 		source += "?versionId=" + url.QueryEscape(version)
 	}
