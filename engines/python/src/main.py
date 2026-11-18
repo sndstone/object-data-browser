@@ -6144,6 +6144,23 @@ def _copy_options(head, options):
     return result
 
 
+def _acl_grant_headers(acl):
+    grants = {}
+    names = {'FULL_CONTROL': 'GrantFullControl', 'READ': 'GrantRead',
+             'READ_ACP': 'GrantReadACP', 'WRITE_ACP': 'GrantWriteACP'}
+    for grant in acl.get('Grants', []):
+        grantee = grant.get('Grantee', {})
+        field = names.get(grant.get('Permission'))
+        kind = {'CanonicalUser': 'id', 'Group': 'uri'}.get(grantee.get('Type'))
+        value = grantee.get('ID' if kind == 'id' else 'URI')
+        if not field or not kind or not value or any(c in value for c in '\r\n"'):
+            raise SidecarError('unsupported_feature', 'This object ACL cannot be preserved by a property edit.')
+        grants.setdefault(field, set()).add(f'{kind}="{value}"')
+    if not grants:
+        raise SidecarError('invalid_response', 'The object ACL did not contain any grants.')
+    return {field: ', '.join(sorted(values)) for field, values in grants.items()}
+
+
 def _property_copy_protection(client, source):
     """Resolve access and lock settings before publishing a replacement version.
 
@@ -6152,25 +6169,17 @@ def _property_copy_protection(client, source):
     """
     bucket = {'Bucket': source['Bucket']}
     result = {}
+    owner_only = False
     try:
         ownership = _configuration_or_missing(lambda: client.get_bucket_ownership_controls(**bucket), {'OwnershipControlsNotFoundError', 'NoSuchOwnershipControls', 'NotImplemented'})
         enforced = any(rule.get('ObjectOwnership') == 'BucketOwnerEnforced'
                        for rule in ownership.get('OwnershipControls', {}).get('Rules', []))
         if not enforced:
             acl = client.get_object_acl(**source)
-            grants = {}
-            names = {'FULL_CONTROL': 'GrantFullControl', 'READ': 'GrantRead', 'READ_ACP': 'GrantReadACP', 'WRITE_ACP': 'GrantWriteACP'}
-            for grant in acl.get('Grants', []):
-                grantee = grant.get('Grantee', {})
-                field = names.get(grant.get('Permission'))
-                kind = 'id' if grantee.get('Type') == 'CanonicalUser' else 'uri' if grantee.get('Type') == 'Group' else None
-                value = grantee.get('ID' if kind == 'id' else 'URI')
-                if not field or not kind or not value or any(c in value for c in '\r\n"'):
-                    raise SidecarError('unsupported_feature', 'This object ACL cannot be preserved by a property edit.')
-                grants.setdefault(field, []).append(f'{kind}="{value}"')
-            if not grants:
-                raise SidecarError('invalid_response', 'The object ACL did not contain any grants.')
-            result.update({field: ', '.join(values) for field, values in grants.items()})
+            grants = _acl_grant_headers(acl)
+            owner = (acl.get('Owner') or {}).get('ID')
+            owner_only = bool(owner and grants == {'GrantFullControl': f'id="{owner}"'})
+            result.update(grants)
         lock = _configuration_or_missing(lambda: client.get_object_lock_configuration(**bucket), {'ObjectLockConfigurationNotFoundError', 'NoSuchObjectLockConfiguration', 'NotImplemented'})
         if lock.get('ObjectLockConfiguration', {}).get('ObjectLockEnabled') == 'Enabled':
             retention = _configuration_or_missing(lambda: client.get_object_retention(**source), {'NoSuchObjectLockConfiguration', 'NoSuchRetentionConfiguration'}).get('Retention', {})
@@ -6183,7 +6192,7 @@ def _property_copy_protection(client, source):
     except Exception as error:
         if isinstance(error, SidecarError): raise
         raise SidecarError('access_denied', 'Cannot safely preserve ACL and Object Lock settings. No property changes were applied.', {'reason': str(error)}) from error
-    return result
+    return result, owner_only
 
 
 def _check_mutation_result(result, required_field=None):
@@ -6210,7 +6219,44 @@ def _relay_chunks(body, chunk_size):
 
 
 def _storage_copy(params):
-    return _run_transfer(_storage_copy_impl, params)
+    def run(params):
+        try:
+            result = _storage_copy_impl(params)
+        except _TransferCancelled:
+            raise
+        except Exception:
+            _publish_copy_failure()
+            raise
+        if result.get('failureCount'):
+            _publish_copy_failure(result['failures'][0]['message'], result.get('bytesCopied'))
+        return result
+
+    return _run_transfer(run, params)
+
+
+def _publish_copy_failure(message='The copy did not finish.', bytes_copied=None):
+    control = _lookup_transfer(getattr(_CURRENT_TRANSFER, 'job_id', None))
+    if control is None:
+        return
+    with control.lock:
+        _unregister_transfer(control.job_id)
+        transferred = control.bytes_transferred if bytes_copied is None else bytes_copied
+        _emit_transfer_event(_build_transfer_job(
+            job_id=control.job_id, label=control.label, direction='copy', status='failed',
+            progress=transferred / control.total_bytes if control.total_bytes else 0,
+            bytes_transferred=transferred, total_bytes=control.total_bytes,
+            output_lines=[message], item_count=1, items_completed=0,
+        ))
+
+
+def _uses_native_aws_copy(profile):
+    if profile.endpoint_type != 'awsS3':
+        return False
+    if not profile.endpoint_url:
+        return True
+    host = (urlparse(profile.endpoint_url).hostname or '').rstrip('.')
+    return re.fullmatch(r's3(?:-fips)?(?:\.dualstack)?(?:[.-][a-z]{2}(?:-[a-z0-9]+)+-\d+)?'
+                        r'\.(?:amazonaws\.com(?:\.cn)?|api\.aws)', host) is not None
 
 
 def _storage_copy_impl(params):
@@ -6272,11 +6318,17 @@ def _storage_copy_impl(params):
     control = _register_transfer(TransferControl(job_id=job_id, label=f"Copy {source['Key']}", direction="copy", total_bytes=size,
         item_count=1, strategy_label="Object copy", part_size_bytes=None, parts_total=None))
     def publish_copy(transferred=None, completed=False):
-        if transferred is not None:
-            _transfer_checkpoint(control, bytes_transferred=transferred, items_completed=int(completed), parts_completed=0, current_item_label=source['Key'])
-        _emit_transfer_event(_build_transfer_job(job_id=job_id, label=control.label, direction="copy", progress=control.bytes_transferred / size if size else int(completed),
-            status="completed" if completed else "running", bytes_transferred=control.bytes_transferred, total_bytes=size, output_lines=[], current_item_label=source['Key'],
-            item_count=1, items_completed=int(completed), can_pause=not completed, can_cancel=not completed))
+        if transferred is not None and not completed:
+            _transfer_checkpoint(control, bytes_transferred=transferred, items_completed=0, parts_completed=0, current_item_label=source['Key'])
+        with control.lock:
+            if _lookup_transfer(job_id) is not control:
+                return
+            if completed:
+                _unregister_transfer(job_id)
+            sent = size if completed else control.bytes_transferred
+            _emit_transfer_event(_build_transfer_job(job_id=job_id, label=control.label, direction="copy", progress=sent / size if size else int(completed),
+                status="completed" if completed else "running", bytes_transferred=sent, total_bytes=size, output_lines=[], current_item_label=source['Key'],
+                item_count=1, items_completed=int(completed), can_pause=not completed, can_cancel=not completed))
     publish_copy(0)
     def heartbeat():
         while True:
@@ -6284,11 +6336,32 @@ def _storage_copy_impl(params):
             if _lookup_transfer(job_id) is not control: return
             publish_copy()
     threading.Thread(target=heartbeat, daemon=True).start()
-    if source_profile == dest_profile and source['Bucket'] == dest['Bucket'] and source['Key'] == dest['Key'] and 'encryption' not in options:
+    if same_object and 'encryption' not in options:
         options = {**options, 'encryption': {field: head[field] for field in ('ServerSideEncryption', 'SSEKMSKeyId', 'BucketKeyEnabled') if field in head}}
     put_options = _copy_options(head, options)
+    owner_only_acl = False
     if options.get('preserveObjectProtection') and not src_azure:
-        put_options.update(_property_copy_protection(src, source))
+        protection, owner_only_acl = _property_copy_protection(src, source)
+        put_options.update(protection)
+    expected_grants = {field: value for field, value in put_options.items() if field.startswith('Grant')}
+    if expected_grants and dst_azure:
+        raise SidecarError('unsupported_feature', 'S3 object ACLs cannot be preserved in Azure Blob.')
+
+    def verify_source_grants():
+        if not expected_grants:
+            return
+        reference = source if selected_version is not None else {'Bucket': source['Bucket'], 'Key': source['Key']}
+        # An ETag cannot detect ACL-only changes. Check grants close to the
+        # mutation; S3 cannot include the ACL revision in its write condition.
+        if _acl_grant_headers(src.get_object_acl(**reference)) != expected_grants:
+            raise SidecarError('conflict', 'The source ACL changed during the copy. Refresh before retrying.')
+        if selected_version is None and (source.get('VersionId') or conditional_property_put):
+            current = src.head_object(**reference)
+            if current.get('VersionId') != source.get('VersionId'):
+                raise SidecarError('conflict', 'The current source version changed during the copy. Refresh before retrying.')
+            if conditional_property_put and current.get('ETag') != head.get('ETag'):
+                raise SidecarError('conflict', 'The source ETag changed during the copy. Refresh before retrying.')
+
     source_tags = {}
     if options.get('preserveTags', True):
         if src_azure:
@@ -6306,17 +6379,31 @@ def _storage_copy_impl(params):
     result = {}
     conditional_server_copy = (same_authority and source_profile.endpoint_type == 'awsS3'
                                and policy in {'skip', 'fail'} and size > 0)
-    if not require_empty_source and not src_azure and not dst_azure and same_authority and (policy not in {'skip', 'fail'} or conditional_server_copy):
-        if conditional_server_copy:
-            # A lost conditional completion response must never be replayed as
-            # another mutation; reconciliation belongs to the caller.
-            dst = _encrypted_client(_build_client(replace(dest_profile, max_attempts=1)), dest_profile,
-                                    encryption, copy_source=source_encryption)
+    # Compatible services can discard grants on CopyObject and multipart
+    # completion. PutObject sends the payload and ACL together.
+    protected_put = bool(expected_grants and not owner_only_acl and not _uses_native_aws_copy(dest_profile))
+    conditional_property_put = protected_put and property_edit
+    if expected_grants and params.get('move') and selected_version is None and source_profile.endpoint_type != 'awsS3':
+        raise SidecarError('unsupported_feature', 'This endpoint has no verified conditional-delete capability for the source.')
+    if protected_put:
+        permitted = ((same_object and selected_version is None and policy in {'replace', 'overwrite'})
+                     if property_edit else (same_authority and policy in {'skip', 'fail'}))
+        if not permitted or size > 5 * 1024**3 or require_empty_source or not head.get('ETag'):
+            raise SidecarError('unsupported_feature',
+                               'This S3-compatible endpoint requires a single conditional PUT to preserve object ACLs.')
+    publish_client = dst
+    if expected_grants or conditional_server_copy:
+        # A protected write can commit even when the response is lost. Replaying
+        # the mutation can create another version with grants from an old read.
+        publish_client = _encrypted_client(_build_client(replace(dest_profile, max_attempts=1)), dest_profile,
+                                           encryption, copy_source=source_encryption)
+    if not protected_put and not require_empty_source and not src_azure and not dst_azure and same_authority and (policy not in {'skip', 'fail'} or conditional_server_copy):
         strategy = 'server-side-copy'
         copy_source = dict(source)
         match = {'CopySourceIfMatch': head['ETag']} if head.get('ETag') else {}
         if size <= 5 * 1024**3 and not conditional_server_copy:
-            result = dst.copy_object(**dest, CopySource=copy_source, MetadataDirective='REPLACE', TaggingDirective='REPLACE', **put_options, **match)
+            verify_source_grants()
+            result = publish_client.copy_object(**dest, CopySource=copy_source, MetadataDirective='REPLACE', TaggingDirective='REPLACE', **put_options, **match)
             _check_mutation_result(result, 'CopyObjectResult')
         else:
             upload = dst.create_multipart_upload(**dest, **put_options)['UploadId']
@@ -6337,7 +6424,8 @@ def _storage_copy_impl(params):
                         publish_copy(min(size, len(parts) * chunk))
                 parts.sort(key=lambda part: part['PartNumber'])
                 _transfer_gate(control)
-                result = dst.complete_multipart_upload(**dest, UploadId=upload, MultipartUpload={'Parts': parts},
+                verify_source_grants()
+                result = publish_client.complete_multipart_upload(**dest, UploadId=upload, MultipartUpload={'Parts': parts},
                     **({'IfNoneMatch': '*'} if conditional_server_copy else {}))
                 _check_mutation_result(result)
             except BaseException:
@@ -6382,10 +6470,32 @@ def _storage_copy_impl(params):
                 xml = ('<BlockList>' + ''.join(f'<Latest>{v}</Latest>' for v in block_ids) + '</BlockList>').encode()
                 _, final_headers, _ = dst.request('PUT', path, query={'comp': 'blocklist'}, headers=headers, body=xml)
                 result = {'VersionId': final_headers.get('x-ms-version-id')}
-            elif size <= chunk:
-                data = body.read(chunk + 1)
-                if len(data) != size: raise SidecarError('conflict', 'Source size changed while copying.')
-                result = dst.put_object(**dest, Body=data, **put_options, **({'IfNoneMatch': '*'} if policy in {'skip', 'fail'} else {}))
+            elif protected_put or size <= chunk:
+                conditions = {'IfNoneMatch': '*'} if policy in {'skip', 'fail'} else {}
+                if conditional_property_put:
+                    conditions['IfMatch'] = head['ETag']
+                if size <= chunk:
+                    data = body.read(chunk + 1)
+                    if len(data) != size: raise SidecarError('conflict', 'Source size changed while copying.')
+                    verify_source_grants()
+                    result = publish_client.put_object(**dest, Body=data, **put_options, **conditions)
+                else:
+                    with tempfile.TemporaryFile() as staged:
+                        copied = 0
+                        while copied <= size:
+                            _transfer_gate(control)
+                            block = body.read(min(1024**2, size + 1 - copied))
+                            if not block:
+                                break
+                            staged.write(block)
+                            copied += len(block)
+                            _transfer_liveness(control)
+                        if copied != size:
+                            raise SidecarError('conflict', 'Source size changed while copying.')
+                        staged.seek(0)
+                        verify_source_grants()
+                        result = publish_client.put_object(**dest, Body=staged, ContentLength=size,
+                                                           **put_options, **conditions)
             else:
                 upload = dst.create_multipart_upload(**dest, **put_options)['UploadId']
                 try:
@@ -6398,7 +6508,8 @@ def _storage_copy_impl(params):
                         copied += len(block)
                         publish_copy(copied)
                     if copied != size: raise SidecarError('conflict', 'Source size changed while copying.')
-                    result = dst.complete_multipart_upload(**dest, UploadId=upload, MultipartUpload={'Parts': parts},
+                    verify_source_grants()
+                    result = publish_client.complete_multipart_upload(**dest, UploadId=upload, MultipartUpload={'Parts': parts},
                                                            **({'IfNoneMatch': '*'} if policy in {'skip', 'fail'} else {}))
                     _check_mutation_result(result)
                 except BaseException:
@@ -6410,33 +6521,73 @@ def _storage_copy_impl(params):
     _check_mutation_result(result)
     verify = {'Bucket': dest['Bucket'], 'Key': dest['Key']}
     if result.get('VersionId'): verify['VersionId'] = result['VersionId']
-    if dst_azure:
-        _, destination_head, _ = dst.request('HEAD', dst.blob_path(dest['Bucket'], dest['Key']), query={'versionid': result['VersionId']} if result.get('VersionId') else {})
-        dest_size = int(destination_head.get('Content-Length') or 0)
-    else:
-        dest_size = int(dst.head_object(**verify).get('ContentLength') or 0)
-    if dest_size != size: raise SidecarError('conflict', 'Destination size verification failed after copying.')
-    publish_copy(size, completed=True)
     outcome = {'successCount': 1, 'failureCount': 0, 'failures': [], 'skipped': False, 'bytesCopied': size,
                'versionId': result.get('VersionId'), 'strategy': strategy,
                'sourceVersionId': source.get('VersionId'), 'sourceETag': head.get('ETag')}
+
+    def incomplete_copy(code, message):
+        outcome.update(successCount=0, failureCount=1, requiresVerification=True,
+                       failures=[{'target': dest['Key'], 'code': code, 'message': message}])
+        if params.get('move'):
+            outcome.update(copiedCount=1, sourceRetained=True)
+        return outcome
+
+    try:
+        if dst_azure:
+            _, destination_head, _ = dst.request('HEAD', dst.blob_path(dest['Bucket'], dest['Key']), query={'versionid': result['VersionId']} if result.get('VersionId') else {})
+            dest_size = int(destination_head.get('Content-Length') or 0)
+        else:
+            destination_head = dst.head_object(**verify)
+            dest_size = int(destination_head.get('ContentLength') or 0)
+        if dest_size != size:
+            raise SidecarError('conflict', 'Destination size verification failed after copying.')
+    except Exception:
+        if not expected_grants:
+            raise
+        return incomplete_copy('destination_unverified',
+                               'The copy was written, but its destination could not be verified. Inspect it before retrying.')
+    if expected_grants:
+        copied_etag = result.get('ETag') or (result.get('CopyObjectResult') or {}).get('ETag')
+        try:
+            verified = (bool(verify.get('VersionId') or copied_etag)
+                        and (not copied_etag or copied_etag.strip('"') == (destination_head.get('ETag') or '').strip('"'))
+                        and _acl_grant_headers(dst.get_object_acl(**verify)) == expected_grants)
+        except Exception:
+            verified = False
+        if not verified:
+            return incomplete_copy('acl_unverified',
+                                   'The copy was written, but its ACL could not be verified. Review the destination grants before retrying.')
     if params.get('move'):
+        try:
+            verify_source_grants()
+        except Exception:
+            return incomplete_copy('source_acl_unverified',
+                                   'The copy was written and the source was kept because its ACL changed or could not be verified.')
+        delete_attempted = False
         try:
             if not head.get('ETag'):
                 raise SidecarError('unsupported_feature', 'Source has no ETag for a conditional delete.')
             if src_azure:
+                delete_attempted = True
                 src.request('DELETE', src.blob_path(source['Bucket'], source['Key']), query=src_query,
                             headers={'If-Match': head['ETag']})
             else:
                 if selected_version is None and source_profile.endpoint_type != 'awsS3':
                     raise SidecarError('unsupported_feature', 'This endpoint has no verified conditional-delete capability.')
-                src.delete_object(Bucket=source['Bucket'], Key=source['Key'], IfMatch=head['ETag'],
+                delete_client = _build_client(replace(source_profile, max_attempts=1))
+                delete_attempted = True
+                delete_client.delete_object(Bucket=source['Bucket'], Key=source['Key'], IfMatch=head['ETag'],
                                   **({'VersionId': selected_version} if selected_version is not None else {}))
         except Exception as error:
-            outcome.update(successCount=0, failureCount=1, copiedCount=1, sourceRetained=True,
+            outcome.update(successCount=0, failureCount=1, copiedCount=1, requiresVerification=True,
                            failures=[{'target': source['Key'], 'versionId': selected_version,
                                       'code': 'source_delete_failed',
-                                      'message': f'Copy completed; source deletion was not confirmed: {error}'}])
+                                      'message': 'The copy was written, but source deletion was not confirmed.'}])
+            if not delete_attempted or _client_error_code(error) == 'PreconditionFailed' or (
+                    isinstance(error, SidecarError) and error.details.get('httpStatus') == 412):
+                outcome['sourceRetained'] = True
+    if outcome['failureCount'] == 0:
+        publish_copy(size, completed=True)
     return outcome
 
 

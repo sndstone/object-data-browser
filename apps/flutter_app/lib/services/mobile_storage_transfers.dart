@@ -2,6 +2,16 @@ part of 'mobile_storage_admin.dart';
 
 /// Sealed age chunks fetched per ranged request on encrypted downloads.
 const _ageChunksPerRequest = 64;
+const _s3SinglePutMax = 5 * 1024 * 1024 * 1024;
+
+bool _usesNativeAwsCopy(EndpointProfile profile) {
+  if (profile.endpointType != EndpointProfileType.awsS3) return false;
+  if (profile.endpointUrl.isEmpty) return true;
+  final host = Uri.parse(profile.endpointUrl).host.replaceFirst(RegExp(r'\.$'), '');
+  return RegExp(
+          r'^s3(?:-fips)?(?:\.dualstack)?(?:[.-][a-z]{2}(?:-[a-z0-9]+)+-\d+)?\.(?:amazonaws\.com(?:\.cn)?|api\.aws)$')
+      .hasMatch(host);
+}
 
 extension MobileStorageTransfers on MobileStorageAdmin {
   Future<Map<String, Object?>> copyStorageObject(EndpointProfile source,
@@ -150,11 +160,66 @@ extension MobileStorageTransfers on MobileStorageAdmin {
         }
       }
     }
+    var expectedGrants = <String, String>{};
+    var ownerOnlyAcl = false;
     if ((selfCopy || args['move'] == true) &&
         args['options'] is Map &&
         !from.azure) {
-      headers.addAll(await _propertyProtectionHeaders(
-          from, sourceBucket, sourceKey, query));
+      final protection =
+          await _propertyProtectionHeaders(from, sourceBucket, sourceKey, query);
+      expectedGrants = Map.fromEntries(protection.headers.entries
+          .where((entry) => entry.key.startsWith('x-amz-grant-')));
+      ownerOnlyAcl = protection.ownerOnly;
+      headers.addAll(protection.headers);
+    }
+    if (expectedGrants.isNotEmpty && to.azure) {
+      throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message: 'S3 object ACLs cannot be preserved in Azure Blob.');
+    }
+    if (expectedGrants.isNotEmpty &&
+        args['move'] == true &&
+        version == null &&
+        source.endpointType != EndpointProfileType.awsS3) {
+      throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message:
+              'This endpoint has no verified conditional-delete capability for the source.');
+    }
+    final protectedPut = expectedGrants.isNotEmpty &&
+        !ownerOnlyAcl &&
+        !_usesNativeAwsCopy(destination);
+    if (protectedPut &&
+        (size > _s3SinglePutMax ||
+            (selfCopy && version != null) ||
+            (!selfCopy && (source != destination || conflict == 'replace')) ||
+            requireEmptySource)) {
+      throw const EngineException(
+          code: ErrorCode.unsupportedFeature,
+          message:
+              'This S3-compatible endpoint requires a single conditional PUT to preserve object ACLs.');
+    }
+    Future<void> verifySourceGrants() async {
+      if (expectedGrants.isEmpty) return;
+      final acl = (await from.request('GET', sourceBucket,
+              key: sourceKey, query: {...deleteQuery, 'acl': ''}))
+          .xml;
+      if (!_matchingAclGrants(acl, expectedGrants)) {
+        MobileStorageAdmin._conflict(
+            'The source ACL changed during the copy. Refresh before retrying.');
+      }
+      if (version == null && (copiedVersion != null || (protectedPut && selfCopy))) {
+        final current = await from.request('HEAD', sourceBucket,
+            key: sourceKey, headers: sourceHeaders);
+        if (current.headers['x-amz-version-id'] != copiedVersion) {
+          MobileStorageAdmin._conflict(
+              'The current source version changed during the copy. Refresh before retrying.');
+        }
+        if (protectedPut && selfCopy && current.headers['etag'] != etag) {
+          MobileStorageAdmin._conflict(
+              'The source ETag changed during the copy. Refresh before retrying.');
+        }
+      }
     }
     // Read the tag set before any destination mutation. A denied read must not
     // silently publish a copy with tags missing.
@@ -188,6 +253,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
 
     try {
       final serverCopyEligible = !requireEmptySource &&
+          !protectedPut &&
           sameEndpoint &&
           !from.azure &&
           !to.azure &&
@@ -203,6 +269,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
         final sourceLocation =
             '/${storageUriEncode(sourceBucket)}/${sourceKey.split('/').map(storageUriEncode).join('/')}'
             '${copiedVersion == null ? '' : '?versionId=${storageUriEncode(copiedVersion)}'}';
+        await verifySourceGrants();
         final copied = await to.request('PUT', bucket, key: key, headers: {
           ...headers,
           ...destinationHeaders,
@@ -226,36 +293,92 @@ extension MobileStorageTransfers on MobileStorageAdmin {
             headers: headers,
             encryption: args['encryption'],
             conflict: conflict,
+            verifySource: expectedGrants.isEmpty ? null : verifySourceGrants,
+            multipartThresholdBytes: protectedPut ? _s3SinglePutMax + 1 : null,
             expectedDestinationETag: selfCopy && version == null ? etag : null);
       }
       final destinationVersion =
           response.headers[to.azure ? 'x-ms-version-id' : 'x-amz-version-id'];
-      if (response.headers['etag'] == null && destinationVersion == null) {
-        throw const EngineException(
-            code: ErrorCode.unknown,
-            message:
-                'The copy response omitted its destination identity. Inspect the destination before retrying.');
+      final destinationQuery = {
+        if (destinationVersion != null)
+          to.azure ? 'versionid' : 'versionId': destinationVersion
+      };
+      Map<String, Object?> incompleteCopy(String code, String message,
+              {bool sourceRetained = true}) =>
+          {
+            'successCount': 0,
+            'failureCount': 1,
+            'requiresVerification': true,
+            'destinationVersionId': destinationVersion,
+            if (args['move'] == true) ...{
+              'copiedCount': 1,
+              if (sourceRetained) 'sourceRetained': true,
+            },
+            'failures': [
+              {'target': key, 'code': code, 'message': message}
+            ],
+          };
+      final StorageHttpResponse verified;
+      try {
+        if (response.headers['etag'] == null && destinationVersion == null) {
+          throw const EngineException(
+              code: ErrorCode.unknown,
+              message:
+                  'The copy response omitted its destination identity. Inspect the destination before retrying.');
+        }
+        verified = await to.request('HEAD', bucket,
+            key: key,
+            headers: objectEncryptionHeaders(
+              destination,
+              args['encryption'],
+              read: true,
+            ),
+            query: destinationQuery);
+        final etagQuotes = RegExp(r'^"|"$');
+        final copiedETag = response.headers['etag']?.replaceAll(etagQuotes, '');
+        final destinationETag = verified.headers['etag']?.replaceAll(etagQuotes, '');
+        if (int.tryParse(verified.headers['content-length'] ?? '') != size ||
+            (copiedETag != null && copiedETag != destinationETag)) {
+          MobileStorageAdmin._conflict(
+              'The destination changed before the copy could be verified.');
+        }
+      } catch (_) {
+        if (expectedGrants.isEmpty) rethrow;
+        return incompleteCopy('destination_unverified',
+            'The copy was written, but its destination could not be verified. Inspect it before retrying.');
       }
-      final verified = await to.request('HEAD', bucket,
-          key: key,
-          headers: objectEncryptionHeaders(
-            destination,
-            args['encryption'],
-            read: true,
-          ),
-          query: {
-            if (destinationVersion != null)
-              to.azure ? 'versionid' : 'versionId': destinationVersion
-          });
-      if (int.tryParse(verified.headers['content-length'] ?? '') != size ||
-          (response.headers['etag'] != null &&
-              response.headers['etag'] != verified.headers['etag'])) {
-        MobileStorageAdmin._conflict(
-            'The destination changed before the copy could be verified.');
+      if (expectedGrants.isNotEmpty) {
+        try {
+          final acl = (await to.request('GET', bucket,
+                  key: key, query: {...destinationQuery, 'acl': ''}))
+              .xml;
+          if (!_matchingAclGrants(acl, expectedGrants)) {
+            throw StateError('Destination grants differ from the source.');
+          }
+        } catch (_) {
+          return incompleteCopy('acl_unverified',
+              'The copy was written, but its ACL could not be verified. Review the destination grants before retrying.');
+        }
       }
       if (args['move'] == true) {
-        await from.request('DELETE', sourceBucket,
-            key: sourceKey, query: deleteQuery, headers: {'if-match': etag});
+        try {
+          await verifySourceGrants();
+        } catch (_) {
+          return incompleteCopy('source_acl_unverified',
+              'The copy was written and the source was kept because its ACL changed or could not be verified.');
+        }
+        try {
+          await from.request('DELETE', sourceBucket,
+              key: sourceKey, query: deleteQuery, headers: {'if-match': etag});
+        } on StorageHttpException catch (error) {
+          return incompleteCopy('source_delete_failed',
+              'The copy was written, but source deletion was not confirmed.',
+              sourceRetained: error.response.status == 412);
+        } catch (_) {
+          return incompleteCopy('source_delete_failed',
+              'The copy was written, but source deletion was not confirmed.',
+              sourceRetained: false);
+        }
       }
       return {
         'successCount': 1,
@@ -273,9 +396,11 @@ extension MobileStorageTransfers on MobileStorageAdmin {
     }
   }
 
-  Future<Map<String, String>> _propertyProtectionHeaders(StorageHttpClient http,
-      String bucket, String key, Map<String, String> query) async {
+  Future<({Map<String, String> headers, bool ownerOnly})>
+      _propertyProtectionHeaders(StorageHttpClient http, String bucket,
+          String key, Map<String, String> query) async {
     final result = <String, String>{};
+    var ownerOnly = false;
     Future<XmlElement?> optional(String name, {bool object = false}) async {
       try {
         return (await http.request('GET', bucket,
@@ -305,40 +430,19 @@ extension MobileStorageTransfers on MobileStorageAdmin {
         false;
     if (!enforced) {
       final acl = await optional('acl', object: true);
-      final grants = <String, List<String>>{};
-      const names = {
-        'FULL_CONTROL': 'x-amz-grant-full-control',
-        'READ': 'x-amz-grant-read',
-        'READ_ACP': 'x-amz-grant-read-acp',
-        'WRITE_ACP': 'x-amz-grant-write-acp'
-      };
-      for (final grant in acl?.descendants
-              .whereType<XmlElement>()
-              .where((e) => e.name.local == 'Grant') ??
-          <XmlElement>[]) {
-        final field = names[xmlText(grant, 'Permission')];
-        final grantee = grant.childElements
-            .where((e) => e.name.local == 'Grantee')
-            .firstOrNull;
-        final id = grantee == null ? '' : xmlText(grantee, 'ID');
-        final uri = grantee == null ? '' : xmlText(grantee, 'URI');
-        final value = id.isNotEmpty ? id : uri;
-        if (field == null ||
-            value.isEmpty ||
-            value.contains(RegExp(r'[\r\n"]'))) {
-          throw StateError(
-              'This object ACL cannot be preserved by a property edit.');
-        }
-        grants
-            .putIfAbsent(field, () => [])
-            .add('${id.isNotEmpty ? 'id' : 'uri'}="$value"');
-      }
-      if (grants.isEmpty) {
+      if (acl == null) {
         throw StateError(
             'The object ACL could not be read. No property changes were applied.');
       }
-      result.addAll(
-          grants.map((name, values) => MapEntry(name, values.join(', '))));
+      final grants = _aclGrantHeaders(acl);
+      final owner = acl.childElements
+          .where((element) => element.name.local == 'Owner')
+          .firstOrNull;
+      final ownerID = owner == null ? '' : xmlText(owner, 'ID');
+      ownerOnly = ownerID.isNotEmpty &&
+          grants.length == 1 &&
+          grants['x-amz-grant-full-control'] == 'id="$ownerID"';
+      result.addAll(grants);
     }
     final lock = await optional('object-lock');
     if (lock != null && xmlText(lock, 'ObjectLockEnabled') == 'Enabled') {
@@ -353,7 +457,47 @@ extension MobileStorageTransfers on MobileStorageAdmin {
         result['x-amz-object-lock-legal-hold'] = xmlText(hold, 'Status');
       }
     }
-    return result;
+    return (headers: result, ownerOnly: ownerOnly);
+  }
+
+  Map<String, String> _aclGrantHeaders(XmlElement acl) {
+    const names = {
+      'FULL_CONTROL': 'x-amz-grant-full-control',
+      'READ': 'x-amz-grant-read',
+      'READ_ACP': 'x-amz-grant-read-acp',
+      'WRITE_ACP': 'x-amz-grant-write-acp'
+    };
+    final grants = <String, Set<String>>{};
+    for (final grant in acl.descendants
+        .whereType<XmlElement>()
+        .where((e) => e.name.local == 'Grant')) {
+      final field = names[xmlText(grant, 'Permission')];
+      final grantee =
+          grant.childElements.where((e) => e.name.local == 'Grantee').firstOrNull;
+      final id = grantee == null ? '' : xmlText(grantee, 'ID');
+      final uri = grantee == null ? '' : xmlText(grantee, 'URI');
+      final value = id.isNotEmpty ? id : uri;
+      if (field == null ||
+          value.isEmpty ||
+          value.contains(RegExp(r'[\r\n"]'))) {
+        throw StateError(
+            'This object ACL cannot be preserved by a property edit.');
+      }
+      grants
+          .putIfAbsent(field, () => {})
+          .add('${id.isNotEmpty ? 'id' : 'uri'}="$value"');
+    }
+    if (grants.isEmpty) {
+      throw StateError('The object ACL did not contain any grants.');
+    }
+    return grants.map(
+        (name, values) => MapEntry(name, (values.toList()..sort()).join(', ')));
+  }
+
+  bool _matchingAclGrants(XmlElement acl, Map<String, String> expected) {
+    final actual = _aclGrantHeaders(acl);
+    return actual.length == expected.length &&
+        expected.entries.every((entry) => actual[entry.key] == entry.value);
   }
 
   Future<StorageHttpResponse> _writeObject(
@@ -419,6 +563,7 @@ extension MobileStorageTransfers on MobileStorageAdmin {
       }
 
       final hash = await http.hashPayload(stream());
+      if (!retrySafe && !clientEncrypted) await verifySource?.call();
       final response = await http.requestStream('PUT', bucket,
           key: key,
           query: query,

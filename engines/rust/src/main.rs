@@ -5153,5 +5153,8 @@ mod advanced_regressions {
 fn decode_listing_key(value: Option<&str>, encoding: Option<&aws_sdk_s3::types::EncodingType>) -> Result<String, SidecarError> {
     let raw = value.unwrap_or_default();
     if encoding != Some(&aws_sdk_s3::types::EncodingType::Url) { return Ok(raw.to_string()); }
-    urlencoding::decode(raw).map(|v| v.into_owned()).map_err(|_| SidecarError::new("invalid_response", "Invalid URL-encoded object key in listing."))
+    let form_decoded = raw.replace('+', " ");
+    urlencoding::decode(&form_decoded)
+        .map(|value| value.into_owned())
+        .map_err(|_| SidecarError::new("invalid_response", "Invalid URL-encoded object key in listing."))
 }

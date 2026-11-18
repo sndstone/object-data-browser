@@ -1627,6 +1627,10 @@ class AppController extends ChangeNotifier {
                     'move': true,
                     'options': {'preserveObjectProtection': true}
                   });
+              if (result['requiresVerification'] == true) {
+                throw StateError(
+                    'Inspect "$destinationKey" and the source before retrying the rename. ${result['failures']}');
+              }
               if ((result['failureCount'] as num? ?? 0) > 0) {
                 throw StateError(
                     'The copy completed but source removal was not confirmed. Inspect "$destinationKey" before retrying. ${result['failures']}');

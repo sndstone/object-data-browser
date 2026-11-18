@@ -476,7 +476,7 @@ def test_conditional_s3_copy_retains_both_customer_keys(engine, profile, monkeyp
 
 
 def test_object_properties_keeps_existing_encryption_shape(engine, profile, monkeypatch):
-    monkeypatch.setattr(engine, '_property_copy_protection', lambda *_: {})
+    monkeypatch.setattr(engine, '_property_copy_protection', lambda *_: ({}, False))
     profile, fixture = connect(engine, profile, monkeypatch)
     # Preserve the existing S3 SDK-shaped options accepted by this action.
     request(engine, 'storageAction', profile, action='objectProperties', bucketName='bucket', key='key',

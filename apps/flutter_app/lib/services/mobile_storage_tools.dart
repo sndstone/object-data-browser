@@ -364,7 +364,7 @@ class _MobileDeleteAll {
     String keyText(XmlElement element, String field) {
       final raw = xmlText(element, field);
       return xmlText(root, 'EncodingType') == 'url'
-          ? Uri.decodeComponent(raw)
+          ? Uri.decodeQueryComponent(raw)
           : raw;
     }
 

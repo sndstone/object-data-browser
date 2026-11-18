@@ -248,8 +248,8 @@ class Workflows:
                         fields = {n.tag.rsplit('}', 1)[-1]: n.text for n in child}
                         key = fields.get('Key')
                         if encoded and key is not None:
-                            from urllib.parse import unquote
-                            key = unquote(key)
+                            from urllib.parse import unquote_plus
+                            key = unquote_plus(key)
                         raw_order.append((key, fields.get('VersionId')))
                 except (ET.ParseError, AttributeError, TypeError):
                     return
