@@ -1037,6 +1037,6 @@ const _missingConfigurations = {
 String storageKeyText(XmlElement root, XmlElement element, String field) {
   final value = xmlText(element, field);
   return xmlText(root, 'EncodingType') == 'url'
-      ? Uri.decodeComponent(value)
+      ? Uri.decodeQueryComponent(value)
       : value;
 }

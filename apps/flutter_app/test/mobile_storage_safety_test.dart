@@ -38,6 +38,9 @@ void main() {
       } else if (request.uri.queryParameters.containsKey('ownershipControls')) {
         response.write(
             '<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>');
+      } else if (request.uri.queryParameters['list-type'] == '2') {
+        response.write(
+            '<ListBucketResult><EncodingType>url</EncodingType><Contents><Key>a+%2B+b</Key><Size>1</Size></Contents></ListBucketResult>');
       } else if (request.uri.queryParameters.containsKey('object-lock')) {
         response.statusCode = 404;
         response.write(
@@ -101,6 +104,10 @@ void main() {
     expect(writes.single['x-amz-server-side-encryption-aws-kms-key-id'],
         'old-key');
     expect(writes.single['if-match'], '"source"');
+  });
+  test('encoded listings distinguish spaces from literal plus signs', () async {
+    final result = await admin.listObjects(profile, {'bucketName': 'bucket'});
+    expect((result['items'] as List).single['key'], 'a + b');
   });
   test('encryption uses shared UI field names and clears obsolete KMS headers',
       () async {

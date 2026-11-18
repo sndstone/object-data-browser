@@ -3973,7 +3973,7 @@ func decodeListingKey(value string, encoding types.EncodingType) (string, error)
 	if encoding != types.EncodingTypeUrl {
 		return value, nil
 	}
-	result, err := url.PathUnescape(value)
+	result, err := url.QueryUnescape(value)
 	if err != nil {
 		return "", &sidecarError{Code: "invalid_response", Message: "Invalid URL-encoded object key in listing."}
 	}

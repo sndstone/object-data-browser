@@ -169,14 +169,14 @@ async fn moves_delete_only_explicit_versions_and_keep_exact_keys() {
 }
 
 #[test]
-fn listing_keys_decode_once_and_preserve_plus() {
+fn listing_keys_form_decode_once() {
     assert_eq!(
         decode_listing_key(
-            Some("a%252Fb%2B%E9%9B%AA%01"),
+            Some("a%252Fb%2B+%E9%9B%AA%01"),
             Some(&aws_sdk_s3::types::EncodingType::Url)
         )
         .unwrap(),
-        "a%2Fb+雪\x01"
+        "a%2Fb+ 雪\x01"
     );
     assert_eq!(
         decode_listing_key(Some("literal%2F+"), None).unwrap(),

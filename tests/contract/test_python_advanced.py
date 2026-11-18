@@ -737,13 +737,14 @@ def test_bucket_enumeration_is_explicitly_paginated(pyengine):
 def test_history_raw_order_decodes_keys_once(pyengine):
     from types import SimpleNamespace
     from botocore.hooks import HierarchicalEmitter
-    from urllib.parse import quote
+    from urllib.parse import quote_plus
     events = HierarchicalEmitter()
-    key = 'a%2Fb+雪'
+    key = 'a%2Fb+ 雪'
     client = Mock()
     client.meta.events = events
     def page(**kwargs):
-        xml = f'<ListVersionsResult><EncodingType>url</EncodingType><DeleteMarker><Key>{quote(key, safe="")}</Key><VersionId>delete+%2F</VersionId></DeleteMarker><Version><Key>{quote(key, safe="")}</Key><VersionId>content</VersionId></Version></ListVersionsResult>'
+        encoded = quote_plus(key, safe='')
+        xml = f'<ListVersionsResult><EncodingType>url</EncodingType><DeleteMarker><Key>{encoded}</Key><VersionId>delete+%2F</VersionId></DeleteMarker><Version><Key>{encoded}</Key><VersionId>content</VersionId></Version></ListVersionsResult>'
         events.emit('after-call.s3.ListObjectVersions', http_response=SimpleNamespace(content=xml.encode()))
         now = datetime.now(timezone.utc)
         return {'Versions': [{'Key': key, 'VersionId': 'content', 'LastModified': now}],
