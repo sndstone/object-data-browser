@@ -307,3 +307,7 @@ def test_exact_credential_error_code_is_redacted(engine, server):
         out = module._redact_result({'errorCode': code, 'headers': {}, 'output': {}}, numeric)
         assert out['errorCode'] == '[redacted]', code
     assert module._redact_result({'errorCode': '403', 'headers': {}, 'output': {}}, numeric)['errorCode'] == '403'
+    # A status-shaped code with a trailing newline is not a status code: with
+    # the credential "501" it must be scrubbed, not kept verbatim.
+    bare = module._Redactor(types.SimpleNamespace(secret_key='501', session_token=None, access_key=None), engine)
+    assert module._redact_result({'errorCode': '501\n', 'headers': {}, 'output': {}}, bare)['errorCode'] == '[redacted]\n'
