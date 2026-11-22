@@ -686,6 +686,9 @@ class AppController extends ChangeNotifier {
         source: 'app',
       );
       engines = await _engineService.listEngines();
+      if (AppPlatform.isMobile) {
+        engines = engines.where((engine) => engine.mobileSupported).toList();
+      }
       selectedProfile = _selectBootstrapProfile();
       final preferredEngineId = settings.defaultEngineId;
       final preferredEngineAvailable = engines.any(
@@ -3084,6 +3087,12 @@ class AppController extends ChangeNotifier {
       }
       return const {'python', 'go'}.contains(engine);
     }
+    if (AppPlatform.isMobile && engine == 'rust-raw') {
+      return false;
+    }
+    if (engine == 'rust-raw' && profile.connection.authMode != 'static') {
+      return false;
+    }
     if (AppPlatform.isMobile &&
         !const {'static', 'azureSas'}.contains(profile.connection.authMode)) {
       return false;
@@ -3093,6 +3102,13 @@ class AppController extends ChangeNotifier {
   }
 
   String profileSupportReason(EndpointProfile profile) {
+    if (activeEngineId == 'rust-raw' &&
+        !AppPlatform.isMobile &&
+        profile.connection.authMode != 'static' &&
+        (profile.endpointType == EndpointProfileType.s3Compatible ||
+            profile.endpointType == EndpointProfileType.awsS3)) {
+      return 'Rust Raw HTTP Engine requires an access key and secret key.';
+    }
     final engine =
         engines.where((item) => item.id == activeEngineId).firstOrNull;
     return profile.endpointType.isGoogleCloudStorage &&
@@ -5357,7 +5373,22 @@ class AppController extends ChangeNotifier {
         }
       }
     }
-    final result = await _engineService.storageAction(
+    final service = _engineService;
+    if (!AppPlatform.isMobile &&
+        activeEngineId == 'rust-raw' &&
+        destinationProfile == null &&
+        rustRawStorageActions.contains(action) &&
+        service is NativeProviderActions &&
+        (source.endpointType == EndpointProfileType.s3Compatible ||
+            source.endpointType == EndpointProfileType.awsS3)) {
+      return (service as NativeProviderActions).nativeProviderAction(
+        engineId: activeEngineId,
+        profile: source,
+        action: action,
+        arguments: arguments,
+      );
+    }
+    final result = await service.storageAction(
         profile: source,
         action: action,
         arguments: arguments,

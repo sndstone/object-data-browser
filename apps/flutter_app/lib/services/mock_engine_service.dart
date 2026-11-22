@@ -70,6 +70,16 @@ class MockEngineService
     ),
     const EngineDescriptor(
       endpointTypes: ['s3Compatible', 'awsS3'],
+      id: 'rust-raw',
+      label: 'Rust Raw HTTP Engine',
+      language: 'Rust',
+      version: '2.4.0',
+      available: true,
+      desktopSupported: true,
+      mobileSupported: false,
+    ),
+    const EngineDescriptor(
+      endpointTypes: ['s3Compatible', 'awsS3'],
       id: 'java',
       label: 'Java Engine',
       language: 'Java',

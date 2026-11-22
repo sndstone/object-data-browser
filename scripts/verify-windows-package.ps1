@@ -75,7 +75,7 @@ New-Item -ItemType Junction -Path $TestRoot -Target $Installed | Out-Null
 $EngineRoot = Join-Path $TestRoot 'engines'
 $Manifest = Get-Content (Join-Path $EngineRoot 'manifest.json') -Raw | ConvertFrom-Json
 if ($Manifest.version -ne $ExpectedVersion -or $Manifest.architecture -ne 'x64') { throw 'Unexpected installed manifest' }
-if ((($Manifest.engines.id | Sort-Object) -join ',') -ne 'go,java,python,rust') { throw 'Installed engine set is incomplete' }
+if ((($Manifest.engines.id | Sort-Object) -join ',') -ne 'go,java,python,rust,rust-raw') { throw 'Installed engine set is incomplete' }
 foreach ($Engine in $Manifest.engines) {
     foreach ($Required in $Engine.requiredFiles) {
         if (-not (Test-Path -LiteralPath (Join-Path $EngineRoot $Required))) { throw "Missing installed engine file: $Required" }

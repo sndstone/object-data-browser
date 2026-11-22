@@ -2985,235 +2985,242 @@ class _BrowserBucketPanelState extends State<BrowserBucketPanel> {
     final isRefreshing = controller.isBusy('refresh-buckets');
     final isCreatingBucket = controller.isBusy('create-bucket');
 
-    final bucketListContent = ListView(
-      key: _bucketListKey,
-      controller: _bucketScrollController,
-      padding: EdgeInsets.zero,
-      primary: false,
-      physics: const AlwaysScrollableScrollPhysics(),
-      children: [
-        if (buckets.isEmpty)
-          EmptyState(
-              icon: Icons.storage_outlined,
-              title: hasProfile
-                  ? 'No buckets loaded yet for this endpoint.'
-                  : 'No connection configured',
-              message: hasProfile
-                  ? 'Refresh this connection to list its buckets.'
-                  : 'Create a profile to connect to your storage.',
-              action: TextButton(
-                  onPressed: hasProfile
-                      ? controller.refreshBuckets
-                      : controller.openConnectionSettings,
-                  child:
-                      Text(hasProfile ? 'Refresh buckets' : 'Create profile')))
-        else if (visibleBuckets.isEmpty && hasProfile)
-          const Padding(
-            padding: EdgeInsets.only(bottom: 12),
-            child: Text('No buckets match this search.'),
-          )
-        else
-          ...visibleBuckets.map(
-            (bucket) => Builder(
-              builder: (context) {
-                final selected = controller.selectedBucket?.name == bucket.name;
-                return _BucketRowHover(
-                    builder: (hovered) => Padding(
-                          padding: const EdgeInsets.only(bottom: 3),
-                          child: Material(
-                            color: selected
-                                ? Theme.of(context)
-                                    .colorScheme
-                                    .primaryContainer
-                                    .withValues(alpha: 0.72)
-                                : Colors.transparent,
-                            borderRadius: BorderRadius.circular(8),
-                            child: GestureDetector(
-                              behavior: HitTestBehavior.opaque,
-                              onSecondaryTapDown: (details) => _showBucketMenu(
-                                context,
-                                bucket,
-                                details.globalPosition & Size.zero,
-                              ),
-                              child: InkWell(
-                                borderRadius: BorderRadius.circular(8),
-                                child: ListTile(
-                                  dense: desktopCompact,
-                                  contentPadding: const EdgeInsets.symmetric(
-                                      horizontal: 10),
-                                  minLeadingWidth: 20,
-                                  horizontalTitleGap: 10,
-                                  minVerticalPadding: desktopCompact ? 4 : 8,
-                                  leading: Icon(
-                                    Icons.folder_rounded,
-                                    color: selected
-                                        ? Theme.of(context).colorScheme.primary
-                                        : Theme.of(context)
-                                            .colorScheme
-                                            .onSurfaceVariant,
-                                    size: 20,
-                                  ),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(8),
-                                  ),
-                                  selected: selected,
-                                  title: Row(children: [
-                                    Flexible(
-                                      child: Tooltip(
-                                        message: bucket.name,
-                                        waitDuration:
-                                            const Duration(milliseconds: 600),
-                                        child: Text(
-                                          bucket.name,
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: Theme.of(context)
-                                              .textTheme
-                                              .bodyMedium
-                                              ?.copyWith(
-                                                  fontWeight: FontWeight.w600),
-                                        ),
+    final bucketRows = <Widget>[
+      if (buckets.isEmpty)
+        EmptyState(
+            icon: Icons.storage_outlined,
+            title: hasProfile
+                ? 'No buckets loaded yet for this endpoint.'
+                : 'No connection configured',
+            message: hasProfile
+                ? 'Refresh this connection to list its buckets.'
+                : 'Create a profile to connect to your storage.',
+            action: TextButton(
+                onPressed: hasProfile
+                    ? controller.refreshBuckets
+                    : controller.openConnectionSettings,
+                child: Text(hasProfile ? 'Refresh buckets' : 'Create profile')))
+      else if (visibleBuckets.isEmpty && hasProfile)
+        const Padding(
+          padding: EdgeInsets.only(bottom: 12),
+          child: Text('No buckets match this search.'),
+        )
+      else
+        ...visibleBuckets.map(
+          (bucket) => Builder(
+            builder: (context) {
+              final selected = controller.selectedBucket?.name == bucket.name;
+              return _BucketRowHover(
+                  builder: (hovered) => Padding(
+                        padding: const EdgeInsets.only(bottom: 3),
+                        child: Material(
+                          color: selected
+                              ? Theme.of(context)
+                                  .colorScheme
+                                  .primaryContainer
+                                  .withValues(alpha: 0.72)
+                              : Colors.transparent,
+                          borderRadius: BorderRadius.circular(8),
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onSecondaryTapDown: (details) => _showBucketMenu(
+                              context,
+                              bucket,
+                              details.globalPosition & Size.zero,
+                            ),
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(8),
+                              child: ListTile(
+                                dense: desktopCompact,
+                                contentPadding:
+                                    const EdgeInsets.symmetric(horizontal: 10),
+                                minLeadingWidth: 20,
+                                horizontalTitleGap: 10,
+                                minVerticalPadding: desktopCompact ? 4 : 8,
+                                leading: Icon(
+                                  Icons.folder_rounded,
+                                  color: selected
+                                      ? Theme.of(context).colorScheme.primary
+                                      : Theme.of(context)
+                                          .colorScheme
+                                          .onSurfaceVariant,
+                                  size: 20,
+                                ),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                selected: selected,
+                                title: Row(children: [
+                                  Flexible(
+                                    child: Tooltip(
+                                      message: bucket.name,
+                                      waitDuration:
+                                          const Duration(milliseconds: 600),
+                                      child: Text(
+                                        bucket.name,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .bodyMedium
+                                            ?.copyWith(
+                                                fontWeight: FontWeight.w600),
                                       ),
                                     ),
-                                    if (bucket.versioningEnabled) ...[
-                                      const SizedBox(width: 6),
-                                      const _StatusBadge(
-                                        label: 'Versioned',
-                                        tooltip:
-                                            'Versioning is enabled for this bucket',
-                                      ),
-                                    ],
-                                  ]),
-                                  subtitle: Text(
-                                    '${bucket.region} · ${formatCount(bucket.objectCountHint)} objects',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodySmall
-                                        ?.copyWith(
-                                            color: Theme.of(context)
-                                                .colorScheme
-                                                .onSurfaceVariant),
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
                                   ),
-                                  // Actions appear on hover, focus and touch so
-                                  // bucket names keep the row's full width.
-                                  // Right-click opens the same menu.
-                                  trailing: hovered || AppPlatform.isMobile
-                                      ? Builder(
-                                          // The menu opens from this
-                                          // button's bounds.
-                                          builder: (buttonContext) =>
-                                              IconButton(
-                                            tooltip: 'Bucket actions',
-                                            visualDensity:
-                                                VisualDensity.compact,
-                                            onPressed: () => _showBucketMenu(
-                                              context,
-                                              bucket,
-                                              globalRectOf(buttonContext),
-                                            ),
-                                            icon: const Icon(Icons.more_horiz),
-                                          ),
-                                        )
-                                      : null,
-                                  onTap: () => widget.onOpenBucket(bucket),
+                                  if (bucket.versioningEnabled) ...[
+                                    const SizedBox(width: 6),
+                                    const _StatusBadge(
+                                      label: 'Versioned',
+                                      tooltip:
+                                          'Versioning is enabled for this bucket',
+                                    ),
+                                  ],
+                                ]),
+                                subtitle: Text(
+                                  '${bucket.region} · ${formatCount(bucket.objectCountHint)} objects',
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .bodySmall
+                                      ?.copyWith(
+                                          color: Theme.of(context)
+                                              .colorScheme
+                                              .onSurfaceVariant),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                 ),
+                                // Actions appear on hover, focus and touch so
+                                // bucket names keep the row's full width.
+                                // Right-click opens the same menu.
+                                trailing: hovered || AppPlatform.isMobile
+                                    ? Builder(
+                                        // The menu opens from this
+                                        // button's bounds.
+                                        builder: (buttonContext) => IconButton(
+                                          tooltip: 'Bucket actions',
+                                          visualDensity: VisualDensity.compact,
+                                          onPressed: () => _showBucketMenu(
+                                            context,
+                                            bucket,
+                                            globalRectOf(buttonContext),
+                                          ),
+                                          icon: const Icon(Icons.more_horiz),
+                                        ),
+                                      )
+                                    : null,
+                                onTap: () => widget.onOpenBucket(bucket),
                               ),
                             ),
                           ),
-                        ));
-              },
-            ),
+                        ),
+                      ));
+            },
           ),
-      ],
-    );
+        ),
+    ];
 
-    final bucketListViewport = Scrollbar(
-      controller: _bucketScrollController,
-      thumbVisibility: true,
-      interactive: true,
-      child: bucketListContent,
+    Widget bucketList(List<Widget> children) => Scrollbar(
+          controller: _bucketScrollController,
+          thumbVisibility: true,
+          interactive: true,
+          child: ListView(
+            key: _bucketListKey,
+            controller: _bucketScrollController,
+            padding: EdgeInsets.zero,
+            primary: false,
+            physics: const AlwaysScrollableScrollPhysics(),
+            children: children,
+          ),
+        );
+
+    final toolbar = <Widget>[
+      Row(
+        children: [
+          Expanded(
+              child: Text('Buckets',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.titleLarge)),
+          Container(
+            margin: const EdgeInsets.only(left: 6, right: 6),
+            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.primaryContainer,
+              borderRadius: BorderRadius.circular(5),
+            ),
+            child: Text('${buckets.length}',
+                style: Theme.of(context).textTheme.labelSmall),
+          ),
+          if (isRefreshing)
+            IconButton(
+              onPressed: () => controller.cancelAction('refresh-buckets'),
+              icon: const Icon(Icons.stop_circle_outlined, size: 18),
+              tooltip: 'Cancel bucket listing',
+            )
+          else
+            IconButton(
+              tooltip: 'Refresh buckets',
+              onPressed: hasProfile ? controller.refreshBuckets : null,
+              icon: const Icon(Icons.refresh),
+            ),
+          IconButton(
+            key: _bucketActionBarKey,
+            tooltip: isCreatingBucket ? 'Creating bucket…' : 'New bucket',
+            onPressed:
+                hasProfile && !isCreatingBucket ? widget.onCreateBucket : null,
+            icon: isCreatingBucket
+                ? widget.inlineSpinnerBuilder()
+                : const Icon(Icons.add),
+          ),
+        ],
+      ),
+      const SizedBox(height: 12),
+      TextField(
+        enabled: hasProfile,
+        decoration: const InputDecoration(
+          hintText: 'Search buckets...',
+          prefixIcon: Icon(Icons.search),
+          contentPadding: EdgeInsets.fromLTRB(10, 8, 10, 8),
+        ),
+        onChanged: (value) {
+          setState(() {
+            _bucketSearchQuery = value.trim();
+          });
+        },
+      ),
+    ];
+    const profileHint = Padding(
+      padding: EdgeInsets.only(top: 8),
+      child: Text(
+          'No endpoint profile is selected. Create one in Settings, save it, then come back here to list buckets.'),
     );
 
     return Card(
       clipBehavior: Clip.antiAlias,
       child: Padding(
         padding: EdgeInsets.all(desktopCompact ? 10 : 16),
-        child: Column(
-          mainAxisSize: MainAxisSize.max,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Expanded(
-                    child: Text('Buckets',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.titleLarge)),
-                Container(
-                  margin: const EdgeInsets.only(left: 6, right: 6),
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: Theme.of(context).colorScheme.primaryContainer,
-                    borderRadius: BorderRadius.circular(5),
-                  ),
-                  child: Text('${buckets.length}',
-                      style: Theme.of(context).textTheme.labelSmall),
-                ),
-                if (isRefreshing)
-                  IconButton(
-                    onPressed: () => controller.cancelAction('refresh-buckets'),
-                    icon: const Icon(Icons.stop_circle_outlined, size: 18),
-                    tooltip: 'Cancel bucket listing',
-                  )
-                else
-                  IconButton(
-                    tooltip: 'Refresh buckets',
-                    onPressed: hasProfile ? controller.refreshBuckets : null,
-                    icon: const Icon(Icons.refresh),
-                  ),
-                IconButton(
-                  key: _bucketActionBarKey,
-                  tooltip: isCreatingBucket ? 'Creating bucket…' : 'New bucket',
-                  onPressed: hasProfile && !isCreatingBucket
-                      ? widget.onCreateBucket
-                      : null,
-                  icon: isCreatingBucket
-                      ? widget.inlineSpinnerBuilder()
-                      : const Icon(Icons.add),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              enabled: hasProfile,
-              decoration: const InputDecoration(
-                hintText: 'Search buckets...',
-                prefixIcon: Icon(Icons.search),
-                contentPadding: EdgeInsets.fromLTRB(10, 8, 10, 8),
-              ),
-              onChanged: (value) {
-                setState(() {
-                  _bucketSearchQuery = value.trim();
-                });
-              },
-            ),
-            if (!hasProfile)
-              const Flexible(
-                  child: SingleChildScrollView(
-                      child: Padding(
-                padding: EdgeInsets.only(top: 8),
-                child: Text(
-                    'No endpoint profile is selected. Create one in Settings, save it, then come back here to list buckets.'),
-              ))),
-            const SizedBox(height: 12),
-            Expanded(
-              child: bucketListViewport,
-            ),
-          ],
-        ),
+        child: LayoutBuilder(builder: (context, constraints) {
+          if (constraints.maxHeight <
+              MediaQuery.textScalerOf(context).scale(136)) {
+            return bucketList([
+              ...toolbar,
+              if (!hasProfile) profileHint,
+              const SizedBox(height: 12),
+              ...bucketRows,
+            ]);
+          }
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              ...toolbar,
+              if (!hasProfile)
+                const Flexible(
+                    child: SingleChildScrollView(child: profileHint)),
+              const SizedBox(height: 12),
+              Expanded(child: bucketList(bucketRows)),
+            ],
+          );
+        }),
       ),
     );
   }

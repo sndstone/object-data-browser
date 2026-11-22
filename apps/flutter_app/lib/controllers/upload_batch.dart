@@ -289,9 +289,12 @@ class UploadBatch {
                 : 'Upload cancelled.',
             _child);
       } catch (error) {
-        _failed++;
+        _unknown = error is EngineException &&
+            error.details?['outcomeUnknown'] == true;
+        if (!_unknown) _failed++;
         _failureMessage = _safeText(error.toString());
-        onFile(i, paths[i], 'failed', _failureMessage!, _child);
+        onFile(i, paths[i], _unknown ? 'unknown' : 'failed', _failureMessage!,
+            _child);
         // Unknown engine/process outcomes must stop the batch, not schedule
         // another request while an earlier upload might still be executing.
         _cancelled = true;

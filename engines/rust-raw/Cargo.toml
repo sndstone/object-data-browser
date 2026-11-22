@@ -1,0 +1,37 @@
+[package]
+name = "s3-browser-rust-raw-engine"
+version = "2.4.0"
+edition = "2021"
+
+[dependencies]
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", features = ["clock"] }
+crc-fast = "1.9"
+hex = "0.4"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+libc = "0.2"
+md-5 = "0.10"
+percent-encoding = "2"
+quick-xml = { version = "0.41", features = ["serialize"] }
+regex = "1"
+ring = "=0.17.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tower-service = "0.3"
+rustls-pemfile = "2"
+uuid = { version = "1", features = ["v4"] }
+webpki-roots = "1"
+
+[profile.release]
+strip = "symbols"

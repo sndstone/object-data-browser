@@ -333,30 +333,33 @@ function Stage-GoEngine {
 }
 
 function Stage-RustEngine {
+    param([string]$EngineId)
     $CargoExe = Join-Path $ToolsDir "cargo\bin\cargo.exe"
     if (-not (Test-Path $CargoExe)) {
         throw "Rust toolchain was not found at $CargoExe."
     }
 
-    $RustSource = Join-Path $EngineSourceDir "rust"
-    $RustDest = Join-Path $StageRoot "rust"
+    $RustSource = Join-Path $EngineSourceDir $EngineId
+    $RustDest = Join-Path $StageRoot $EngineId
+    $BinaryName = "s3-browser-$EngineId-engine.exe"
     $RustTargetTriple = if ($Arch -eq "arm64") {
         "aarch64-pc-windows-msvc"
     } else {
         "x86_64-pc-windows-msvc"
     }
-    $RustBinary = Join-Path $RustSource "target\$RustTargetTriple\release\s3-browser-rust-engine.exe"
+    $RustBinary = Join-Path $RustSource "target\$RustTargetTriple\release\$BinaryName"
     Remove-DirectoryIfExists $RustDest
     New-Item -ItemType Directory -Force -Path $RustDest | Out-Null
 
     Push-Location $RustSource
     try {
-        Write-Host "Building Rust engine for $RustTargetTriple..."
+        Write-Host "Building $EngineId engine for $RustTargetTriple..."
         $CargoProcess = Start-Process `
             -FilePath $CargoExe `
             -ArgumentList @(
                 "build",
                 "--release",
+                "--locked",
                 "--target",
                 $RustTargetTriple
             ) `
@@ -371,8 +374,8 @@ function Stage-RustEngine {
     }
 
     if (-not (Test-Path $RustBinary)) {
-        $FallbackBinary = Join-Path $RustSource "target\release\s3-browser-rust-engine.exe"
-        $ArtifactSummary = Get-ChildItem -Path (Join-Path $RustSource "target") -Recurse -Filter "s3-browser-rust-engine*" -ErrorAction SilentlyContinue |
+        $FallbackBinary = Join-Path $RustSource "target\release\$BinaryName"
+        $ArtifactSummary = Get-ChildItem -Path (Join-Path $RustSource "target") -Recurse -Filter $BinaryName -ErrorAction SilentlyContinue |
             Select-Object -ExpandProperty FullName
         if (Test-Path $FallbackBinary) {
             $RustBinary = $FallbackBinary
@@ -389,7 +392,7 @@ function Stage-RustEngine {
     New-Item -ItemType Directory -Force -Path $RustDest | Out-Null
     Copy-Item `
         -Path $RustBinary `
-        -Destination (Join-Path $RustDest "s3-browser-rust-engine.exe") `
+        -Destination (Join-Path $RustDest $BinaryName) `
         -Force
 }
 
@@ -462,7 +465,8 @@ New-Item -ItemType Directory -Force -Path $StageRoot | Out-Null
 
 Stage-PythonEngine
 Stage-GoEngine
-Stage-RustEngine
+Stage-RustEngine -EngineId "rust"
+Stage-RustEngine -EngineId "rust-raw"
 Stage-JavaEngine
 
 $EngineVersion = Get-AppVersion
@@ -501,6 +505,17 @@ $Manifest = @{
             workingDirectory = "rust"
             requiredFiles = @(
                 "rust\s3-browser-rust-engine.exe"
+            )
+        },
+        @{
+            id = "rust-raw"
+            version = $EngineVersion
+            executable = "rust-raw\s3-browser-rust-raw-engine.exe"
+            arguments = @()
+            workingDirectory = "rust-raw"
+            endpointTypes = @("s3Compatible", "awsS3")
+            requiredFiles = @(
+                "rust-raw\s3-browser-rust-raw-engine.exe"
             )
         },
         @{

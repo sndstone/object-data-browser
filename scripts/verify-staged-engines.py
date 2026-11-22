@@ -16,6 +16,9 @@ def main():
     root = args.engine_root.resolve()
     repository = Path(__file__).resolve().parent.parent
     manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8-sig'))
+    raw_entries = [engine for engine in manifest['engines'] if engine['id'] == 'rust-raw']
+    if len(raw_entries) != 1 or raw_entries[0].get('endpointTypes') != ['s3Compatible', 'awsS3']:
+        raise RuntimeError('Final desktop package must register the Rust Raw HTTP Engine for S3.')
     python = root / 'python' / ('python.exe' if os.name == 'nt' else 'bin/python3')
     java = root / 'java/runtime/bin' / ('java.exe' if os.name == 'nt' else 'java')
     if not python.is_file() or not java.is_file():
@@ -34,8 +37,16 @@ def main():
         completed = subprocess.run(command, cwd=working, input=request, text=True,
                                    capture_output=True, timeout=30, env=env, check=True)
         messages = [json.loads(line) for line in completed.stdout.splitlines() if line.startswith('{')]
-        if not any(row.get('requestId') == 'payload-health' and row.get('ok') for row in messages):
+        health = next((row.get('result') for row in messages
+                       if row.get('requestId') == 'payload-health' and row.get('ok')), None)
+        if not health:
             raise RuntimeError(f"Packaged {engine['id']} did not pass health: {completed.stderr[-2000:]}")
+        if engine['id'] == 'rust-raw' and (
+            health.get('engine') != 'rust-raw'
+            or health.get('nativeSdk') != 'hyper-rustls-raw'
+            or health.get('endpointTypes') != raw_entries[0]['endpointTypes']
+        ):
+            raise RuntimeError('Staged rust-raw executable has the wrong engine identity or endpoint types.')
         print(f"Packaged {engine['id']} health passed", flush=True)
         if args.contracts:
             contract_env = dict(env, ENGINE_CMD_JSON=json.dumps(command), REQUIRE_ENGINE='1')

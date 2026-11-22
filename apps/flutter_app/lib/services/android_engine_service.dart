@@ -97,7 +97,7 @@ class AndroidEngineService
       final items =
           await _channel.invokeListMethod<Map<dynamic, dynamic>>('listEngines');
       if (items == null || items.isEmpty) {
-        return await _fallback.listEngines();
+        return await _mobileFallbackEngines();
       }
       return items.map((entry) {
         final value = Map<String, Object?>.from(entry.cast<String, Object?>());
@@ -112,11 +112,16 @@ class AndroidEngineService
         );
       }).toList(growable: false);
     } on PlatformException {
-      return _fallback.listEngines();
+      return _mobileFallbackEngines();
     } on MissingPluginException {
-      return _fallback.listEngines();
+      return _mobileFallbackEngines();
     }
   }
+
+  Future<List<EngineDescriptor>> _mobileFallbackEngines() async =>
+      (await _fallback.listEngines())
+          .where((engine) => engine.mobileSupported)
+          .toList(growable: false);
 
   @override
   Future<List<CapabilityDescriptor>> getCapabilities({
