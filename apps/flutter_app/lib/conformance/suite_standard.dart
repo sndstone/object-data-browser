@@ -245,8 +245,13 @@ extension _SetupAndStandard on S3ConformanceSuite {
       c.equals('EncodingType', 'url', o.field('EncodingType'));
       final raw = [for (final item in o.list('Contents')) '${item['Key']}'];
       final direct = sorted.where((k) => !k.startsWith('p1/list/c/')).toList();
-      if (_sdkDecodedListing(c, raw, direct)) return;
-      c.equals('decoded Contents[].Key', direct, [for (final key in raw) _formDecode(key)]);
+      final sdkDecoded = _sdkDecodes(c);
+      final decode = sdkDecoded ? (String v) => v : _formDecode;
+      c.equals('decoded Contents[].Key', direct, [for (final key in raw) decode(key)]);
+      final prefixes = [for (final item in o.list('CommonPrefixes')) '${item['Prefix']}'];
+      c.equals('decoded CommonPrefixes', ['p1/list/c/'], [for (final p in prefixes) decode(p)]);
+      c.equals('decoded Prefix', prefix, decode('${o.field('Prefix') ?? ''}'));
+      if (sdkDecoded) return;
       final unicode = raw.where((k) => _formDecode(k) == 'p1/list/ü.txt').firstOrNull;
       c.isTrue('encoded unicode key', unicode != null && unicode.contains('%C3%BC'),
           expected: 'p1/list/%C3%BC.txt', actual: unicode);
@@ -254,8 +259,6 @@ extension _SetupAndStandard on S3ConformanceSuite {
       c.isTrue('encoded plus key', plus != null && plus.contains('%2B'),
           expected: 'p1/list/h%2Bi.txt', actual: plus,
           explanation: 'A literal + must be encoded as %2B so it is not read as a space.');
-      final prefixes = [for (final item in o.list('CommonPrefixes')) '${item['Prefix']}'];
-      c.equals('decoded CommonPrefixes', ['p1/list/c/'], [for (final p in prefixes) _formDecode(p)]);
     });
     await _check('list.v2.encoding-url-fields',
         category: 'Listing',
@@ -278,14 +281,17 @@ extension _SetupAndStandard on S3ConformanceSuite {
       final rawStart = '${o.field('StartAfter') ?? ''}';
       final rawKeys = [for (final item in o.list('Contents')) '${item['Key']}'];
       final rawCommon = [for (final item in o.list('CommonPrefixes')) '${item['Prefix']}'];
-      if (_sdkDecodedListing(c, rawKeys, const ['p1/enc ü+/c+d.txt'])) return;
-      c.equals('decoded Prefix', prefix, _formDecode(rawPrefix));
-      c.isTrue('Prefix encoded', !rawPrefix.contains(' ') && !rawPrefix.contains('ü'),
-          expected: 'URL-encoded', actual: rawPrefix);
-      c.equals('decoded StartAfter', 'p1/enc ü+/a b.txt', _formDecode(rawStart));
-      c.isTrue('StartAfter encoded', !rawStart.contains(' '), expected: 'URL-encoded', actual: rawStart);
-      c.equals('decoded Contents[].Key', ['p1/enc ü+/c+d.txt'], [for (final k in rawKeys) _formDecode(k)]);
-      c.equals('decoded CommonPrefixes', ['p1/enc ü+/sub dir/'], [for (final p in rawCommon) _formDecode(p)]);
+      final sdkDecoded = _sdkDecodes(c);
+      final decode = sdkDecoded ? (String v) => v : _formDecode;
+      c.equals('decoded Prefix', prefix, decode(rawPrefix));
+      c.equals('decoded StartAfter', 'p1/enc ü+/a b.txt', decode(rawStart));
+      c.equals('decoded Contents[].Key', ['p1/enc ü+/c+d.txt'], [for (final k in rawKeys) decode(k)]);
+      c.equals('decoded CommonPrefixes', ['p1/enc ü+/sub dir/'], [for (final p in rawCommon) decode(p)]);
+      if (!sdkDecoded) {
+        c.isTrue('Prefix encoded', !rawPrefix.contains(' ') && !rawPrefix.contains('ü'),
+            expected: 'URL-encoded', actual: rawPrefix);
+        c.isTrue('StartAfter encoded', !rawStart.contains(' '), expected: 'URL-encoded', actual: rawStart);
+      }
       c.equals('Delimiter', '/', o.field('Delimiter'), informational: true);
     });
     await _check('list.v2.empty',
@@ -347,8 +353,8 @@ extension _SetupAndStandard on S3ConformanceSuite {
       c.status(o, 200);
       c.equals('EncodingType', 'url', o.field('EncodingType'));
       final raw = [for (final item in o.list('Contents')) '${item['Key']}'];
-      if (_sdkDecodedListing(c, raw, sorted)) return;
-      c.equals('decoded Contents[].Key', sorted, [for (final key in raw) _formDecode(key)]);
+      final decode = _sdkDecodes(c) ? (String v) => v : _formDecode;
+      c.equals('decoded Contents[].Key', sorted, [for (final key in raw) decode(key)]);
     });
   }
 
@@ -411,16 +417,14 @@ extension _SetupAndStandard on S3ConformanceSuite {
 }
 
 /// Some SDKs (AWS SDK for Java v2) URL-decode `EncodingType=url` listings
-/// before returning them, so the wire encoding cannot be inspected. The keys
-/// are then compared as returned and the SDK behaviour is reported as a
-/// deviation instead of decoding a second time.
-bool _sdkDecodedListing(_CheckContext c, List<String> raw, List<String> expected) {
-  // Only an engine that declares it may return decoded keys; anywhere else,
-  // unencoded keys mean the endpoint ignored EncodingType=url.
+/// before returning them, and their engines declare it in the capability. The
+/// decoded values are still compared; only the wire encoding is reported as
+/// unobservable (a deviation). Any other engine is decoded by the host, so
+/// unencoded values from the endpoint fail.
+bool _sdkDecodes(_CheckContext c) {
   if (c.suite._capability?.client['urlEncodedListings'] != 'decodedBySdk') return false;
-  c.equals('Contents[].Key (as returned by the SDK)', expected, raw);
   c.isTrue('wire encoding visible', false,
-      expected: 'URL-encoded keys', actual: 'keys already decoded by the SDK',
+      expected: 'URL-encoded values', actual: 'values already decoded by the SDK',
       informational: true,
       explanation: 'The SDK decodes EncodingType=url responses itself; the endpoint encoding cannot be checked through it.');
   return true;

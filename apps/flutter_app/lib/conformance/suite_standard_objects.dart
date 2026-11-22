@@ -540,7 +540,8 @@ extension _StandardObjects on S3ConformanceSuite {
       // Remove the peer now; teardown retries anything left.
       await c.call('DeleteObject', {'Bucket': _peerBucket, 'Key': 'copied.txt'});
       final deleted = await c.call('DeleteBucket', {'Bucket': _peerBucket});
-      if (deleted.isSuccess) _ownedBuckets.remove(_peerBucket);
+      final gone = await c.call('HeadBucket', {'Bucket': _peerBucket});
+      if (deleted.isSuccess && gone.isService && gone.httpStatus == 404) _ownedBuckets.remove(_peerBucket);
     });
     await _check('copy.conditional',
         category: 'CopyObject',
@@ -661,7 +662,6 @@ extension _StandardObjects on S3ConformanceSuite {
       c.fixture(await c.call('PutObject', {'Bucket': _stdBucket, 'Key': 'p1/tags/untagged.txt'}, body: S3OpBody.text('x')));
       final o = await c.call('GetObjectTagging', {'Bucket': _stdBucket, 'Key': 'p1/tags/untagged.txt'});
       c.status(o, 200);
-      c.isTrue('TagSet element', o.isSuccess, expected: 'present (empty)', actual: _CheckContext.describe(o));
       c.equals('TagSet', const [], _tags(o));
     });
     await _check('tagging.object.crud',
@@ -824,12 +824,12 @@ extension _StandardObjects on S3ConformanceSuite {
       // The same request used within its lifetime succeeds, so a 403 below is
       // caused by expiry rather than by signing or permissions.
       c.status(await c.call('PresignedRequest', {
-        'Method': 'GET', 'Bucket': _stdBucket, 'Key': 'p1/presign/expiring.txt', 'ExpiresIn': 60,
-      }), 200, explanation: 'A presigned GET used within its lifetime must succeed.');
+        'Method': 'GET', 'Bucket': _stdBucket, 'Key': 'p1/presign/expiring.txt', 'ExpiresIn': 3,
+      }), 200, explanation: 'A presigned GET with the same lifetime, used at once, must succeed.');
       c.status(await c.call('PresignedRequest', {
-        'Method': 'GET', 'Bucket': _stdBucket, 'Key': 'p1/presign/expiring.txt', 'ExpiresIn': 1,
+        'Method': 'GET', 'Bucket': _stdBucket, 'Key': 'p1/presign/expiring.txt', 'ExpiresIn': 3,
         // Signed with the local clock: wait longer when it runs ahead of the server.
-        'DelayMs': (2500 + max(0, -_serverSkew.inMilliseconds)).clamp(2500, 5000),
+        'DelayMs': (4500 + max(0, -_serverSkew.inMilliseconds)).clamp(4500, 5000),
       }), 403, code: 'AccessDenied');
     });
   }

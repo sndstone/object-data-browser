@@ -42,7 +42,7 @@ extension _Versioning on S3ConformanceSuite {
     // AWS documents a propagation delay after versioning is first enabled
     // (writes may briefly behave as unversioned). Wait until a probe write
     // gets a real version ID that reads back, within a bounded budget.
-    await _check('versioning.ready',
+    final ready = await _check('versioning.ready',
         category: 'Versioning',
         title: 'Versioning takes effect for new writes',
         spec: 'After PutBucketVersioning(Enabled), PutObject returns a non-"null" x-amz-version-id that GetObject accepts. AWS allows a propagation delay; the suite waits up to 60 s.',
@@ -56,7 +56,8 @@ extension _Versioning on S3ConformanceSuite {
         final id = put.header('x-amz-version-id');
         if (put.isSuccess && id != null && id.isNotEmpty && id != 'null') {
           final get = await c.call('GetObject', {'Bucket': _stdBucket, 'Key': 'p2/ready-probe.txt', 'VersionId': id});
-          if (get.isSuccess) {
+          final expected = ConformanceBytes.sha256Hex(utf8.encode('probe $attempts'));
+          if (get.isSuccess && get.header('x-amz-version-id') == id && get.field('Body.sha256') == expected) {
             if (attempts > 1) c.note('Versioning took effect after $attempts probe writes.');
             return;
           }
@@ -70,6 +71,12 @@ extension _Versioning on S3ConformanceSuite {
         await _sleep(const Duration(seconds: 2));
       }
     });
+    if (ready.status != ConformanceStatus.pass) {
+      // Without confirmed propagation, version-dependent results would not
+      // describe the endpoint's steady state.
+      _run.note = 'Versioning did not take effect within 60 s; the remaining phase-2 checks were skipped.';
+      return;
+    }
     const key = 'p2/versioned.txt';
     final v1 = utf8.encode('version one');
     final v2 = utf8.encode('version two, longer');

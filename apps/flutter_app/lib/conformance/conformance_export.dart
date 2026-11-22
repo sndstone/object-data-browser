@@ -67,7 +67,7 @@ abstract final class ConformanceExport {
         ..writeln('- Client: ${_cell(jsonEncode(engine.client))}')
         ..writeln('- Buckets: ${engine.buckets.values.map((b) => '`$b`').join(', ')}')
         ..writeln('- Status: ${engine.status.name}${engine.note == null ? '' : ' — ${_cell(engine.note!)}'}')
-        ..writeln('- Phase 1 gate: ${engine.gatePassed == null ? 'not reached' : engine.gatePassed! ? 'all required checks passed' : 'required checks failed'}');
+        ..writeln('- Phase 1 gate: ${engine.gatePassed == null ? 'not reached' : engine.gatePassed! ? 'all required checks passed' : 'incomplete (a required check did not pass)'}');
       final teardown = engine.teardown;
       if (teardown != null) {
         out.writeln('- Teardown: deleted ${teardown.bucketsDeleted.length} bucket(s), '

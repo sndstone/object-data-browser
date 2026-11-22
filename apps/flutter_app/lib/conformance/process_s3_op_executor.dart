@@ -106,13 +106,21 @@ class ProcessS3OpExecutor implements S3OpExecutor {
     final id = 'conf-${++_sequence}';
     final completer = Completer<Map<String, Object?>>();
     _pending[id] = completer;
-    _process.stdin.writeln(jsonEncode({
-      'requestId': id,
-      'method': method,
-      'engineVersion': '1.0',
-      'params': {...params, 'profile': _profile},
-    }));
-    await _process.stdin.flush();
+    // An exit while writing completes the future with an error before it is
+    // awaited; that error is handled below, not reported as unhandled.
+    completer.future.ignore();
+    try {
+      _process.stdin.writeln(jsonEncode({
+        'requestId': id,
+        'method': method,
+        'engineVersion': '1.0',
+        'params': {...params, 'profile': _profile},
+      }));
+      await _process.stdin.flush();
+    } catch (_) {
+      _pending.remove(id);
+      throw const S3OpRpcException('engine_unavailable', 'The engine process exited.');
+    }
     final response = await completer.future.timeout(_timeout, onTimeout: () {
       _pending.remove(id);
       throw const S3OpRpcException(
@@ -121,8 +129,9 @@ class ProcessS3OpExecutor implements S3OpExecutor {
     if (response['ok'] != true) {
       final error = response['error'];
       final map = error is Map ? error : const {};
-      throw S3OpRpcException('${map['code'] ?? 'unknown'}',
-          '${map['message'] ?? 'Engine error.'}');
+      final message = scrubConformanceResult({'errorMessage': '${map['message'] ?? 'Engine error.'}'},
+          ['${_profile['secretKey'] ?? ''}', '${_profile['sessionToken'] ?? ''}', '${_profile['accessKey'] ?? ''}'])['errorMessage'];
+      throw S3OpRpcException('${map['code'] ?? 'unknown'}', '$message');
     }
     final result = response['result'];
     return result is Map ? Map<String, Object?>.from(result) : const {};

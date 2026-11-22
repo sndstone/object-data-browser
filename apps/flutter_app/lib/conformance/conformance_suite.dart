@@ -203,10 +203,12 @@ class S3ConformanceSuite {
       return _run;
     }
     // Pick names nobody uses yet: an existing bucket (ours or someone else's)
-    // must never become a test bucket.
-    for (var attempt = 0; attempt < 5 && await _anyBucketExists(); attempt++) {
+    // must never become a test bucket. Every name needs an affirmative 404.
+    var unused = await _namesUnused();
+    for (var attempt = 0; attempt < 4 && !unused; attempt++) {
       runId = _newRunId();
       _assignBuckets(runId);
+      unused = await _namesUnused();
     }
     _run = ConformanceEngineRun(
       engineId: _run.engineId,
@@ -224,6 +226,12 @@ class S3ConformanceSuite {
         'copyPeer': _peerBucket,
       },
     );
+    if (!unused) {
+      _run.status = ConformanceRunStatus.failed;
+      _run.note = 'Could not confirm unused bucket names (HeadBucket did not return 404); nothing was created.';
+      _run.finishedAt = _clock();
+      return _run;
+    }
     var status = ConformanceRunStatus.completed;
     try {
       await _setupPhase();
@@ -249,13 +257,13 @@ class S3ConformanceSuite {
         await _teardownPhase();
       } catch (error) {
         _run.teardown = ConformanceTeardownReport(
-          bucketsRetained: List.of(_ownedBuckets),
+          bucketsRetained: [..._ownedBuckets, ..._uncertainBuckets],
           errors: ['Teardown stopped: ${conformanceClip(error, 200)}'],
         );
       }
     } else {
       _run.teardown = ConformanceTeardownReport(
-        bucketsRetained: List.of(_ownedBuckets),
+        bucketsRetained: [..._ownedBuckets, ..._uncertainBuckets],
         errors: const ['Teardown skipped by force stop.'],
       );
     }
@@ -270,12 +278,12 @@ class S3ConformanceSuite {
     _peerBucket = '${config.baseBucketName}-xb-$runId';
   }
 
-  Future<bool> _anyBucketExists() async {
+  Future<bool> _namesUnused() async {
     for (final bucket in [_stdBucket, _lockBucket, _peerBucket]) {
       final head = await _quiet('HeadBucket', {'Bucket': bucket});
-      if (head != null && head.isService && head.httpStatus != 404) return true;
+      if (head == null || !head.isService || head.httpStatus != 404) return false;
     }
-    return false;
+    return true;
   }
 
   /// CreateBucket inside a check, recording ownership only on proof.
@@ -314,6 +322,7 @@ class S3ConformanceSuite {
     final deadline = _clock().add(max);
     while (_serverNow().isBefore(target) && _clock().isBefore(deadline)) {
       _throwIfCancelled();
+      if (_phase == ConformancePhase.teardown && cancellation.skipTeardown) return;
       final remaining = target.difference(_serverNow());
       await _sleep(remaining > const Duration(milliseconds: 500)
           ? const Duration(milliseconds: 500)
@@ -407,6 +416,8 @@ class S3ConformanceSuite {
   /// Runs an untracked call (setup or teardown), outside any check.
   Future<S3OpObservation?> _quiet(String op, Map<String, Object?> input,
       {S3OpBody? body}) async {
+    // "Stop without cleanup" during teardown: no further cleanup request.
+    if (_phase == ConformancePhase.teardown && cancellation.skipTeardown) return null;
     try {
       final observation = await executor.execute(S3OpRequest(op, input, body: body));
       _observeDate(observation);

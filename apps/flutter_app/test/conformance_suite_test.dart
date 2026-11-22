@@ -86,6 +86,38 @@ void main() {
     expect(executor.calls.where((c) => c.input['Bucket'] == collided && c.op.startsWith('Delete')), isEmpty);
   });
 
+  test('names that cannot be confirmed unused are never created', () async {
+    final executor = FakeExecutor()..headForbidden = true;
+    final run = await _suite(executor).run();
+    expect(run.status, ConformanceRunStatus.failed);
+    expect(executor.calls.any((c) => c.op == 'CreateBucket'), isFalse);
+  });
+
+  test('a DeleteBucket that leaves the bucket in place is not reported clean', () async {
+    final executor = FakeExecutor()..noOpDeleteBucket = true;
+    final run = await _suite(executor).run();
+    expect(run.teardown?.bucketsRetained, isNotEmpty);
+    expect(run.teardown?.clean, isFalse);
+  });
+
+  test('the scrub backstop removes credentials and signing values', () {
+    final scrubbed = scrubConformanceResult({
+      'errorMessage': 'bad test key Signature=abc HTTPS://H.example/k?X-Amz-Signature=def ${'y' * 300}',
+      'headers': {'location': 'https://h/k?X-Amz-Credential=AKID', 'etag': '"test"'},
+      'output': {'TagSet': [{'Key': 'env', 'Value': 'test'}], 'Note': 'long-secret-value-0123456789'},
+    }, ['test', 'long-secret-value-0123456789']);
+    final message = scrubbed['errorMessage'] as String;
+    expect(message.length, lessThanOrEqualTo(256));
+    expect(message, isNot(contains(' test ')));
+    expect(message, isNot(contains('abc')));
+    expect(message, isNot(contains('def')));
+    expect((scrubbed['headers'] as Map)['location'], 'https://h/k?[query]');
+    // Short credentials are ordinary words in S3 data.
+    expect((scrubbed['headers'] as Map)['etag'], '"test"');
+    expect(jsonEncode(scrubbed['output']), contains('"Value":"test"'));
+    expect(jsonEncode(scrubbed['output']), isNot(contains('long-secret-value')));
+  });
+
   test('cancellation stops checks but still tears down', () async {
     final cancellation = ConformanceCancellation();
     late FakeExecutor executor;

@@ -276,10 +276,21 @@ class _Redactor:
 
     def __init__(self, profile, g):
         self._g = g
-        # Like the Java engine: short credentials ("test") are ordinary words in
-        # S3 data and are not substring-replaced; customer keys always are.
-        self._secrets = [value for value in (profile.secret_key, profile.session_token, profile.access_key)
-                         if value and len(value) >= 16]
+        credentials = [value for value in (profile.secret_key, profile.session_token, profile.access_key) if value]
+        # S3 data: like the Java engine, short credentials ("test") are ordinary
+        # words and are not substring-replaced; customer keys always are.
+        self._secrets = [value for value in credentials if len(value) >= 16]
+        # Free-form diagnostics: every credential, whatever its length.
+        self._diagnostic_secrets = sorted(credentials, key=len, reverse=True)
+
+    def diagnostic(self, value: Any) -> Any:
+        """Error messages, codes and request IDs: scrub everything, then clip."""
+        if not isinstance(value, str):
+            return value
+        value = _strip_signing(_strip_urls(self._g._redact_customer_text(value)))
+        for secret in self._diagnostic_secrets:
+            value = value.replace(secret, '[redacted]')
+        return value[:_MAX_ERROR_MESSAGE]
 
     def text(self, value: Any) -> Any:
         if not isinstance(value, str):
@@ -333,10 +344,11 @@ def capability(profile_payload: Any, g) -> dict[str, Any]:
 
 
 def _message(g, text: Any) -> str | None:
+    # Clipped only after redaction (in _redact_result), so a credential can
+    # never survive as a cut-off prefix.
     if text is None:
         return None
-    text = g._redact_customer_text(str(text))
-    return text[:_MAX_ERROR_MESSAGE]
+    return g._redact_customer_text(str(text))[:16 * 1024]
 
 
 def _result(op, outcome, status, *, error_code=None, error_message=None, headers=None, output=None,
@@ -364,8 +376,9 @@ def _redact_result(result: dict[str, Any], redactor: _Redactor) -> dict[str, Any
         # S3 pages hold at most 1000 entries; anything larger is not projected.
         result['output'] = {'truncated': True}
     result['headers'] = redactor.headers(result.get('headers') or {})
-    if result.get('errorMessage') is not None:
-        result['errorMessage'] = redactor.text(result['errorMessage'])[:_MAX_ERROR_MESSAGE]
+    for field in ('errorMessage', 'errorCode', 'requestId'):
+        if result.get(field) is not None:
+            result[field] = redactor.diagnostic(result[field])
     result['output'] = redactor.deep(result.get('output') or {})
     return result
 
@@ -484,7 +497,17 @@ def _decode_errors(bce) -> tuple:
 
 def _strip_urls(text: str) -> str:
     """Drop query strings from any URL embedded in transport error text."""
-    return re.sub(r'(https?://[^\s?\'"]*)\?[^\s\'"]*', r'\1?[query]', text)
+    return re.sub(r'(https?://[^\s?\'"]*)\?[^\s\'"]*', r'\1?[query]', text, flags=re.IGNORECASE)
+
+
+_SIGNING = re.compile(
+    r'((?:x-amz-)?(?:signature|credential|security-token|securitytoken)\s*[=:]\s*)[^\s&,;"\'<]+'
+    r'|(authorization\s*[=:]\s*)[^\n"\'<]+', re.IGNORECASE)
+
+
+def _strip_signing(text: str) -> str:
+    """Remove SigV4 signing values that appear outside a URL."""
+    return _SIGNING.sub(lambda m: (m.group(1) or m.group(2)) + '[redacted]', text)
 
 
 def _presigned_request(profile, kwargs: dict[str, Any], body: Any, g) -> dict[str, Any]:

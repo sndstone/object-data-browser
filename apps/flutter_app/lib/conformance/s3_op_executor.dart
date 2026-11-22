@@ -222,25 +222,38 @@ class S3ConformanceCapability {
       };
 }
 
-/// Host-side backstop for engine results: removes credential values and URL
-/// query strings (presigned signatures) before anything is recorded, even if
-/// an engine or endpoint echoed them.
+/// Host-side backstop for engine results: removes credential values, SigV4
+/// signing values and URL query strings (presigned signatures) before anything
+/// is recorded, even if an engine or endpoint echoed them.
+///
+/// Free-form diagnostics (`errorMessage`, `errorCode`, `requestId`) lose every
+/// credential whatever its length and are clipped only afterwards. S3 data
+/// (`output`, `headers`) loses credentials of 16 characters or more: shorter
+/// ones, such as an emulator's `test`, are ordinary words there.
 Map<String, Object?> scrubConformanceResult(
     Map<String, Object?> json, Iterable<String?> secrets) {
-  final values = [
+  final all = [
     for (final secret in secrets)
-      // Short credentials ("test") are ordinary words in S3 data.
-      if (secret != null && secret.length >= 16) secret
-  ];
-  final query = RegExp(r"""(https?://[^\s?"']*)\?[^\s"']*""");
-  Object? visit(Object? value) {
-    if (value is String) {
-      var text = value.replaceAllMapped(query, (m) => '${m[1]}?[query]');
-      for (final secret in values) {
-        text = text.replaceAll(secret, '[redacted]');
-      }
-      return text;
+      if (secret != null && secret.isNotEmpty) secret
+  ]..sort((a, b) => b.length.compareTo(a.length));
+  final long = [for (final secret in all) if (secret.length >= 16) secret];
+  final query = RegExp(r"""(https?://[^\s?"']*)\?[^\s"']*""", caseSensitive: false);
+  final signing = RegExp(
+      r"""((?:x-amz-)?(?:signature|credential|security-token|securitytoken)\s*[=:]\s*)[^\s&,;"'<]+|(authorization\s*[=:]\s*)[^\n"'<]+""",
+      caseSensitive: false);
+  String text(String value, List<String> values, {bool diagnostic = false}) {
+    var out = value.replaceAllMapped(query, (m) => '${m[1]}?[query]');
+    if (diagnostic) {
+      out = out.replaceAllMapped(signing, (m) => '${m[1] ?? m[2]}[redacted]');
     }
+    for (final secret in values) {
+      out = out.replaceAll(secret, '[redacted]');
+    }
+    return out;
+  }
+
+  Object? visit(Object? value) {
+    if (value is String) return text(value, long);
     if (value is List) return [for (final item in value) visit(item)];
     if (value is Map) {
       return {for (final entry in value.entries) '${entry.key}': visit(entry.value)};
@@ -251,14 +264,20 @@ Map<String, Object?> scrubConformanceResult(
   final headers = json['headers'];
   return {
     for (final entry in json.entries)
-      entry.key: entry.key == 'headers' && headers is Map
-          ? {
-              for (final header in headers.entries)
-                '${header.key}': _urlHeader('${header.key}')
-                    ? visit('${header.value}'.replaceFirst(RegExp(r'\?.*$'), '?[query]'))
-                    : visit(header.value)
-            }
-          : visit(entry.value),
+      entry.key: switch (entry.key) {
+        'errorMessage' || 'errorCode' || 'requestId' when entry.value is String =>
+          () {
+            final scrubbed = text(entry.value as String, all, diagnostic: true);
+            return scrubbed.length <= 256 ? scrubbed : scrubbed.substring(0, 256);
+          }(),
+        'headers' when headers is Map => {
+            for (final header in headers.entries)
+              '${header.key}': _urlHeader('${header.key}')
+                  ? visit('${header.value}'.replaceFirst(RegExp(r'\?.*$'), '?[query]'))
+                  : visit(header.value)
+          },
+        _ => visit(entry.value),
+      },
   };
 }
 

@@ -71,6 +71,10 @@ class FakeS3(BaseHTTPRequestHandler):
                               {'x-amz-bucket-region': 'eu-west-1'})
         if key == 'echo':
             return self._send(403, ('<Error><Code>AccessDenied</Code><Message>token ' + SESSION + ' rejected</Message></Error>').encode())
+        if key == 'signing':
+            message = ('Signature=deadbeef X-Amz-Credential=AKIDFIXTURE/20260101 see HTTPS://Host.example/b/k?X-Amz-Signature=cafe '
+                       'secret test ' + 'z' * 300 + SESSION)
+            return self._send(403, ('<Error><Code>AccessDenied</Code><Message>' + message + '</Message></Error>').encode())
         if key == 'location':
             return self._send(200, b'x', {'Location': 'https://elsewhere.example/b/k?X-Amz-Signature=abc&X-Amz-Credential=def'})
         if key == 'deleted':
@@ -259,3 +263,24 @@ def test_echoed_credentials_and_signed_locations_are_redacted(engine, server):
     assert SESSION not in json.dumps(echoed) and '[redacted]' in echoed['errorMessage']
     located = call(engine, server, 'GetObject', {'Bucket': 'b', 'Key': 'location'})
     assert located['headers']['location'] == 'https://elsewhere.example/b/k?[query]'
+
+
+def test_diagnostics_scrub_short_credentials_signing_values_and_clip_after(engine, server):
+    url = server
+    short = {**profile(url), 'accessKey': 'test', 'secretKey': 'test'}
+    result = engine.handle_request({'method': 's3ConformanceOp', 'params': {
+        'profile': short, 'op': 'GetObject', 'input': {'Bucket': 'b', 'Key': 'signing'}}})
+    message = result['errorMessage']
+    assert len(message) <= 256
+    for leaked in ('deadbeef', 'AKIDFIXTURE/2026', 'cafe', ' test '):
+        assert leaked not in message, leaked
+    # A long session token clipped at the boundary must not survive as a prefix.
+    full = call(engine, url, 'GetObject', {'Bucket': 'b', 'Key': 'signing'})
+    assert SESSION[:12] not in json.dumps(full)
+
+
+def test_short_credentials_stay_in_s3_data(engine, server):
+    short = {**profile(server), 'accessKey': 'test', 'secretKey': 'test'}
+    result = engine.handle_request({'method': 's3ConformanceOp', 'params': {
+        'profile': short, 'op': 'ListObjectsV2', 'input': {'Bucket': 'b', 'MaxKeys': 1}}})
+    assert result['output']['Contents'][0]['Key'] == 'a b+c'

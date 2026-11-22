@@ -281,6 +281,10 @@ extension _ObjectLock on S3ConformanceSuite {
       c.status(retention, 200);
       c.equals('Retention.Mode', 'COMPLIANCE', retention.field('Retention.Mode'));
       _sameSecond(c, 'Retention.RetainUntilDate', until, retention.field('Retention.RetainUntilDate'));
+      // The denials below are meaningful only while the lock is still active.
+      if (!_serverNow().isBefore(until.subtract(const Duration(seconds: 2)))) {
+        c.skip('The 5-second COMPLIANCE window closed before the denial requests could be sent (slow endpoint); inconclusive.');
+      }
       final deleteAttempt = await c.call('DeleteObject', {
         'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id, 'BypassGovernanceRetention': true,
       });
@@ -295,8 +299,11 @@ extension _ObjectLock on S3ConformanceSuite {
         'Retention': {'Mode': 'GOVERNANCE', 'RetainUntilDate': _isoSeconds(until)},
       });
       c.status(relax, 403, code: 'AccessDenied', explanation: 'COMPLIANCE cannot be switched to GOVERNANCE.');
-      final still = await c.call('HeadObject', {'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id});
+      final still = await c.call('GetObjectRetention', {'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id});
       c.status(still, 200, explanation: 'The protected version must still exist.');
+      c.equals('Retention.Mode after the denials', 'COMPLIANCE', still.field('Retention.Mode'),
+          explanation: 'A refused change must leave the retention unchanged.');
+      _sameSecond(c, 'Retention.RetainUntilDate after the denials', until, still.field('Retention.RetainUntilDate'));
       await _waitUntilServer(until.add(const Duration(seconds: 2)));
       c.status(await c.call('DeleteObject', {'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id}), 204,
           explanation: 'After the retain-until date the version can be deleted.');

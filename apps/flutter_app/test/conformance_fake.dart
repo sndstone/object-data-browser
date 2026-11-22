@@ -21,6 +21,12 @@ class FakeExecutor implements S3OpExecutor {
   /// Simulates a race: the first CreateBucket finds someone else's bucket
   /// (409) that HeadBucket did not see during preflight.
   bool collideFirstCreate = false;
+
+  /// HeadBucket answers 403 for every name (preflight cannot confirm 404).
+  bool headForbidden = false;
+
+  /// DeleteBucket returns 204 without removing the bucket.
+  bool noOpDeleteBucket = false;
   String? collidedBucket;
 
   @override
@@ -64,9 +70,11 @@ class FakeExecutor implements S3OpExecutor {
         objects[bucket] = {};
         return ok();
       case 'HeadBucket':
+        if (headForbidden) return ok(403);
         return ok(buckets.contains(bucket) ? 200 : 404);
       case 'DeleteBucket':
         if (!buckets.contains(bucket)) return ok(404);
+        if (noOpDeleteBucket) return ok(204);
         if (objects[bucket]!.isNotEmpty) {
           return S3OpObservation(op: request.op, outcome: 'service', httpStatus: 409, errorCode: 'BucketNotEmpty', latencyMs: 1.5);
         }

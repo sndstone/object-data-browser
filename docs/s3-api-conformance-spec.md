@@ -141,8 +141,10 @@ Each engine run creates its own buckets, so engines never share state:
 | Bucket 2 | `<base>-lock-<run>` | Created with `ObjectLockEnabledForBucket: true` for phase 3. |
 
 `<run>` is eight random lower-case characters. Before anything is created the
-suite sends HeadBucket for all three names and picks new names if any of them
-exists, so an existing bucket can never become a test bucket. A bucket counts
+suite sends HeadBucket for all three names and needs an affirmative `404` for
+each; otherwise it picks new names (five attempts) and, failing that, stops
+without creating anything. An existing bucket can therefore never become a
+test bucket. A bucket counts
 as **owned** only when its CreateBucket returned 2xx; only owned buckets are
 purged and deleted. A create without a definite outcome (for example a
 transport failure) is reported for manual inspection and never purged, and a
@@ -159,11 +161,15 @@ transport failure) is reported for manual inspection and never purged, and a
    passed. Coverage must be affirmative: a required check that failed, errored,
    was unsupported or was skipped leaves the gate incomplete. Phase 2 runs
    either way, so versioning remains diagnosable; the gate result is shown in
-   the report.
+   the report. A *deviation* counts as covered: for the AWS SDK for Java v2 the
+   listing checks verify the decoded keys, prefixes and StartAfter, but the
+   wire encoding itself is unobservable through that SDK.
 4. **Phase 2, versioning.** `PutBucketVersioning(Enabled)`, then
    `versioning.ready` (probe writes until a version ID reads back, at most 60 s,
    because AWS documents a propagation delay), then the versioning checks,
-   then `PutBucketVersioning(Suspended)` and the "null" version checks.
+   then `PutBucketVersioning(Suspended)` and the "null" version checks. If
+   versioning does not take effect within the budget, the remaining phase-2
+   checks are skipped rather than reported as failures.
 5. **Phase 3, Object Lock.** First the negative checks on bucket 1 (Object
    Lock calls on a bucket without Object Lock must fail), then bucket 2.
 6. **Teardown.** Always runs, also after Stop (unless *Stop without cleanup*).
@@ -200,10 +206,12 @@ For each owned bucket (lock bucket first):
    bucket), falling back to per-object `DeleteObject` for entries the batch
    could not remove. Plain keys are used only for a bucket whose versioning
    status is confirmed absent, so a delete can never add delete markers.
-5. DeleteBucket.
+5. DeleteBucket, then HeadBucket must return `404`; a `204` that leaves the
+   bucket in place is reported as retained. A listing the engine could not
+   project, or a bucket still listing versions after 200 rounds, is reported.
 
-*Stop without cleanup* pressed during teardown leaves the remaining buckets in
-place and lists them as retained.
+*Stop without cleanup* pressed during teardown stops before the next cleanup
+request (and ends any wait) and lists the remaining buckets as retained.
 
 The result (`teardown.complete` and the teardown summary) lists deleted and
 retained buckets, removed versions, aborted uploads, cleared holds, leftovers
@@ -305,11 +313,13 @@ The suite follows `AGENTS.md`:
   `encryption`/`sourceEncryption` objects (which the engines and the host's
   `DiagnosticSafety` already redact), refused inside `input`, and sent only
   to HTTPS or loopback endpoints.
-- Error messages are clipped to 256 characters by the engines and pass through
-  the engines' redaction. Profile credentials of 16 characters or more are
-  replaced wherever they appear (shorter ones, such as an emulator's `test`,
-  are ordinary words in S3 data and are not substring-replaced; customer keys
-  always are). URL-valued headers (`location`,
+- Free-form diagnostics (error messages, error codes, request IDs) lose every
+  profile credential whatever its length, SigV4 signing values
+  (`Signature=`, `Credential=`, `X-Amz-Security-Token=`, `Authorization`) and
+  URL query strings, and are clipped to 256 characters only after scrubbing.
+  In S3 data (outputs and headers) profile credentials of 16 characters or
+  more are replaced; shorter ones, such as an emulator's `test`, are ordinary
+  words there and are kept. Customer keys are always removed. URL-valued headers (`location`,
   `x-amz-website-redirect-location`) lose their query string. The host
   applies the same scrub again to every engine result before recording it. Presigned error documents are parsed for `Code` and
   `Message` only, because AWS error documents can echo the canonical request.
@@ -323,6 +333,12 @@ The suite follows `AGENTS.md`:
   holds one listing page at a time, the headless runner discards response
   frames over 64 MiB, and the Python engine drops structured output over
   4 MiB (S3 pages hold at most 1000 entries).
+- **Residual risk:** the engines' SDKs read a structured (XML) response
+  completely before parsing it, so a misbehaving endpoint that returns an
+  enormous listing or error document can make one engine process allocate
+  that much memory before any cap applies. This is the same exposure as the
+  engines' ordinary browsing calls; streamed object bodies are bounded
+  (32 MiB is hashed, not stored).
 - Base bucket names covered by a client-encryption (vault) rule are refused.
 
 ## Verification
@@ -427,7 +443,7 @@ and the AWS behaviour it expects.
 | `copy.replace-metadata` | required | CopyObject, HeadObject | CopyObject REPLACE: the destination has only the metadata and Content-Type sent with the copy. |
 | `copy.special-destination` | required | CopyObject, GetObject, ListObjectsV2 | CopyObject: 200; the destination key is exactly the requested UTF-8 key. |
 | `copy.tagging` | required | CopyObject, GetObjectTagging | CopyObject: TaggingDirective COPY (default) keeps the source tag set; REPLACE uses x-amz-tagging. |
-| `copy.cross-bucket` | required | CreateBucket, CopyObject, GetObject, DeleteObject, DeleteBucket | CopyObject between buckets: 200; the destination payload equals the source. |
+| `copy.cross-bucket` | required | CreateBucket, CopyObject, GetObject, DeleteObject, DeleteBucket, HeadBucket | CopyObject between buckets: 200; the destination payload equals the source. |
 | `copy.conditional` | required | CopyObject | CopyObject CopySourceIfMatch with another ETag: 412 PreconditionFailed. |
 | `copy.missing-source` | required | CopyObject | CopyObject: 404 NoSuchKey. |
 | `copy.onto-itself` | informational | CopyObject | CopyObject source = destination with COPY: 400 InvalidRequest; with MetadataDirective REPLACE: 200. |
@@ -559,10 +575,10 @@ Run on 2026-11-22 against the AWS emulator 1.0.504 on the N100 host (HTTPS with 
 
 | Engine | SDK | Pass | Fail | Deviation | Unsupported | Skipped | Error | Calls | Mean ms | p50 ms | p95 ms | Wall time | Phase 1 gate | Teardown |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| python | boto3 1.43.89 (botocore 1.43.89) | 162 | 1 | 5 | 2 | 0 | 0 | 424 | 8.9 | 6.2 | 14.5 | 17 s | incomplete | clean: 2 buckets, 68 versions |
-| go | aws-sdk-go-v2 1.96.4 | 164 | 1 | 4 | 1 | 0 | 0 | 427 | 7.9 | 5.7 | 10.4 | 17 s | passed | clean: 2 buckets, 69 versions |
-| rust | aws-sdk-s3 1.125.0 | 164 | 1 | 4 | 1 | 0 | 0 | 427 | 7.5 | 5.5 | 9.7 | 17 s | passed | clean: 2 buckets, 69 versions |
-| java | aws-sdk-java-v2 2.41.29 | 161 | 1 | 7 | 1 | 0 | 0 | 427 | 10.9 | 7.5 | 16.3 | 19 s | passed | clean: 2 buckets, 69 versions |
+| python | boto3 1.43.89 (botocore 1.43.89) | 162 | 1 | 5 | 2 | 0 | 0 | 425 | 9.0 | 6.4 | 15.0 | 20 s | incomplete | clean: 2 buckets, 68 versions |
+| go | aws-sdk-go-v2 1.96.4 | 164 | 1 | 4 | 1 | 0 | 0 | 428 | 7.5 | 5.7 | 9.2 | 19 s | passed | clean: 2 buckets, 69 versions |
+| rust | aws-sdk-s3 1.125.0 | 164 | 1 | 4 | 1 | 0 | 0 | 428 | 7.7 | 5.4 | 9.4 | 19 s | passed | clean: 2 buckets, 69 versions |
+| java | aws-sdk-java-v2 2.41.29 | 161 | 1 | 7 | 1 | 0 | 0 | 428 | 10.4 | 7.9 | 17.0 | 21 s | passed | clean: 2 buckets, 69 versions |
 
 170 checks ran on every engine. The checks that did not pass on every engine:
 
@@ -584,20 +600,20 @@ Mean latency per operation in ms (call count in parentheses), for the most frequ
 
 | Operation | python | go | rust | java |
 | --- | ---: | ---: | ---: | ---: |
-| PutObject | 12.1 (80) | 7.8 (81) | 7.0 (81) | 13.0 (81) |
-| GetObject | 10.6 (65) | 11.9 (66) | 11.1 (66) | 15.2 (66) |
-| HeadObject | 6.2 (44) | 6.0 (45) | 5.6 (45) | 6.6 (45) |
-| ListObjectsV2 | 5.9 (20) | 5.7 (20) | 5.6 (20) | 7.5 (20) |
-| DeleteObject | 5.5 (16) | 5.9 (16) | 5.6 (16) | 6.2 (16) |
-| CopyObject | 5.9 (13) | 6.3 (13) | 5.5 (13) | 6.8 (13) |
-| GetObjectTagging | 5.6 (10) | 5.7 (10) | 5.6 (10) | 5.7 (10) |
-| UploadPart | 33.5 (10) | 26.7 (10) | 30.1 (10) | 34.5 (10) |
-| ListObjectVersions | 6.8 (10) | 6.4 (10) | 6.1 (10) | 6.6 (10) |
-| CreateMultipartUpload | 5.7 (8) | 5.9 (8) | 6.1 (8) | 8.6 (8) |
-| PutObjectRetention | 7.5 (6) | 5.7 (6) | 6.0 (6) | 11.2 (6) |
-| GetObjectRetention | 4.8 (6) | 6.3 (6) | 5.7 (6) | 5.3 (6) |
-| CreateBucket | 5.5 (5) | 6.0 (5) | 6.6 (5) | 6.2 (5) |
-| ListObjects | 6.5 (5) | 5.1 (5) | 4.8 (5) | 6.5 (5) |
+| PutObject | 13.0 (80) | 7.4 (81) | 6.9 (81) | 12.5 (81) |
+| GetObject | 10.5 (65) | 10.4 (66) | 12.4 (66) | 11.0 (66) |
+| HeadObject | 6.0 (43) | 5.7 (44) | 5.3 (44) | 7.1 (44) |
+| ListObjectsV2 | 5.9 (20) | 6.1 (20) | 5.3 (20) | 7.2 (20) |
+| DeleteObject | 5.8 (16) | 6.2 (16) | 6.4 (16) | 6.5 (16) |
+| CopyObject | 6.3 (13) | 5.3 (13) | 5.5 (13) | 7.7 (13) |
+| GetObjectTagging | 5.7 (10) | 6.4 (10) | 6.1 (10) | 7.4 (10) |
+| UploadPart | 32.2 (10) | 28.1 (10) | 31.3 (10) | 33.6 (10) |
+| ListObjectVersions | 6.0 (10) | 6.1 (10) | 6.7 (10) | 7.3 (10) |
+| CreateMultipartUpload | 8.0 (8) | 5.9 (8) | 5.2 (8) | 8.0 (8) |
+| GetObjectRetention | 6.7 (7) | 5.4 (7) | 6.4 (7) | 6.3 (7) |
+| PutObjectRetention | 7.6 (6) | 6.5 (6) | 5.5 (6) | 11.3 (6) |
+| CreateBucket | 5.8 (5) | 5.0 (5) | 5.8 (5) | 7.9 (5) |
+| ListObjects | 5.6 (5) | 5.1 (5) | 5.3 (5) | 5.8 (5) |
 
 ### Findings
 
@@ -641,9 +657,8 @@ every teardown was clean.
   space, encoded Prefix and StartAfter).
 - The Rust SDK is the only one that validates XML root element names, which
   exposed the two list-configuration deviations above.
-- Latency is comparable across SDKs (p50 5.5–7.5 ms per call). UploadPart
-  calls are dominated by the 5 MiB payload; Java's first CreateBucket includes
-  client warm-up.
+- Latency is comparable across SDKs (see the p50 column above); UploadPart
+  calls are dominated by the 5 MiB payload.
 
 **Suite defects found by the live runs and the council review** (all fixed
 before this run): the Python engine's error mapping referenced a botocore

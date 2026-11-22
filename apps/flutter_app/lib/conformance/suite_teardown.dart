@@ -19,7 +19,7 @@ extension _Teardown on S3ConformanceSuite {
     // cannot prove it created it. It is reported for manual inspection.
     for (final bucket in _uncertainBuckets) {
       final head = await _quiet('HeadBucket', {'Bucket': bucket});
-      if (head != null && head.isService && (head.httpStatus == 404 || head.httpStatus == 400)) continue;
+      if (head != null && head.isService && head.httpStatus == 404) continue;
       retained.add(bucket);
       errors.add('CreateBucket $bucket had no definite outcome; it was not deleted automatically. Check it manually.');
     }
@@ -55,8 +55,13 @@ extension _Teardown on S3ConformanceSuite {
       objects += purge.$1;
       leftovers += purge.$2;
       final delete = await _quiet('DeleteBucket', {'Bucket': bucket});
-      if (delete != null && delete.isSuccess) {
+      final gone = await _quiet('HeadBucket', {'Bucket': bucket});
+      if (delete != null && delete.isSuccess && gone != null && gone.isService && gone.httpStatus == 404) {
         deleted.add(bucket);
+      } else if (delete != null && delete.isSuccess) {
+        retained.add(bucket);
+        errors.add('DeleteBucket $bucket returned ${delete.httpStatus} but HeadBucket still reports '
+            '${gone == null ? 'an engine error' : _CheckContext.describe(gone)}.');
       } else {
         retained.add(bucket);
         errors.add('DeleteBucket $bucket: ${delete == null ? 'engine error' : _CheckContext.describe(delete)}');
@@ -98,7 +103,7 @@ extension _Teardown on S3ConformanceSuite {
         if (keyMarker != null) 'KeyMarker': keyMarker,
         if (uploadMarker != null) 'UploadIdMarker': uploadMarker,
       });
-      if (list == null || !list.isSuccess) {
+      if (list == null || !list.isSuccess || list.output['truncated'] == true) {
         errors.add('ListMultipartUploads $bucket: ${list == null ? 'engine error' : _CheckContext.describe(list)}; uploads may remain.');
         break;
       }
@@ -128,7 +133,7 @@ extension _Teardown on S3ConformanceSuite {
         if (keyMarker != null) 'KeyMarker': keyMarker,
         if (versionMarker != null) 'VersionIdMarker': versionMarker,
       });
-      if (list == null || !list.isSuccess) {
+      if (list == null || !list.isSuccess || list.output['truncated'] == true) {
         errors.add('ListObjectVersions $bucket: ${list == null ? 'engine error' : _CheckContext.describe(list)}; legal holds may remain.');
         return released;
       }
@@ -157,6 +162,10 @@ extension _Teardown on S3ConformanceSuite {
   /// had versioning, where deleting a key cannot create a delete marker.
   Future<(List<_VersionEntry>, bool)?> _remainingPage(String bucket, List<String> errors) async {
     final list = await _quiet('ListObjectVersions', {'Bucket': bucket, 'MaxKeys': 1000});
+    if (list != null && list.isSuccess && list.output['truncated'] == true) {
+      errors.add('ListObjectVersions $bucket: the engine could not project the listing; versions cannot be enumerated.');
+      return null;
+    }
     if (list != null && list.isSuccess) {
       return (
         <_VersionEntry>[
@@ -172,7 +181,7 @@ extension _Teardown on S3ConformanceSuite {
       return null;
     }
     final keys = await _quiet('ListObjectsV2', {'Bucket': bucket, 'MaxKeys': 1000});
-    if (keys == null || !keys.isSuccess) {
+    if (keys == null || !keys.isSuccess || keys.output['truncated'] == true) {
       errors.add('ListObjectsV2 $bucket: ${keys == null ? 'engine error' : _CheckContext.describe(keys)}');
       return null;
     }
@@ -232,6 +241,9 @@ extension _Teardown on S3ConformanceSuite {
       }
     }
     final last = await _remainingPage(bucket, errors);
+    if (last != null && last.$1.isNotEmpty) {
+      errors.add('$bucket still lists ${last.$1.length}${last.$2 ? '+' : ''} versions after 200 cleanup rounds.');
+    }
     return (deleted, last == null ? 1 : last.$1.length);
   }
 }

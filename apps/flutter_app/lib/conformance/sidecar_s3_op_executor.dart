@@ -32,7 +32,9 @@ class SidecarS3OpExecutor implements S3OpExecutor {
       return await transport.conformanceRequest(
           engineId: engineId, profile: profile, method: method, params: params);
     } on EngineException catch (error) {
-      throw S3OpRpcException(_code(error.code), error.message);
+      throw S3OpRpcException(
+          _code(error.code),
+          '${scrubConformanceResult({'errorMessage': error.message}, [profile.secretKey, profile.sessionToken, profile.accessKey])['errorMessage']}');
     }
   }
 

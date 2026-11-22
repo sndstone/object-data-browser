@@ -420,7 +420,7 @@ class _ConformanceViewState extends State<ConformanceView> {
         ],
         const SizedBox(height: 4),
         Text(
-          'Phase 1 gate: ${run.gatePassed == null ? 'not reached' : run.gatePassed! ? 'every required check passed before versioning was enabled' : 'required checks failed before versioning was enabled'}',
+          'Phase 1 gate: ${run.gatePassed == null ? 'not reached' : run.gatePassed! ? 'every required check passed before versioning was enabled' : 'incomplete: not every required check passed before versioning was enabled'}',
           style: theme.textTheme.bodySmall,
         ),
         if (run.teardown != null) ...[
