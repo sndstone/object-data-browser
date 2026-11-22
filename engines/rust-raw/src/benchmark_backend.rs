@@ -25,8 +25,13 @@ pub(super) async fn put(
     payload: &Payload,
     size: usize,
 ) -> Result<(), SidecarError> {
+    let mut headers = HeaderMap::new();
     let payload = match payload {
-        Payload::Memory(bytes) => HttpPayload::Bytes(bytes.clone()),
+        Payload::Memory(bytes) => {
+            // Object Lock requires an upload checksum. The client adds one for files.
+            operations::set_header(&mut headers, "content-md5", &operations::content_md5(bytes))?;
+            HttpPayload::Bytes(bytes.clone())
+        }
         Payload::File(path) => HttpPayload::file(path.clone(), 0, size as u64, None),
     };
     client
@@ -35,7 +40,7 @@ pub(super) async fn put(
             Some(bucket),
             Some(key),
             &[],
-            HeaderMap::new(),
+            headers,
             payload,
             Retry::Rejected,
         )

@@ -106,6 +106,36 @@ fn error(code: &str) -> String {
 }
 
 #[tokio::test]
+async fn in_memory_benchmark_put_sends_content_md5() {
+    let (endpoint, seen) = mock(Arc::new(|request: &Seen| {
+        if request.header("content-md5") == Some("XrY7u+Ae7tCTyyK7j1rNww==") {
+            (200, vec![], String::new())
+        } else {
+            (400, vec![], error("InvalidRequest"))
+        }
+    }))
+    .await;
+    let client = Client::new(&profile(&endpoint, "s3Compatible")).unwrap();
+    let body = Bytes::from_static(b"hello world");
+    let size = body.len();
+    crate::benchmark_backend::put(
+        &client,
+        "bucket",
+        "benchmark/object",
+        &crate::benchmark_runtime::Payload::Memory(body),
+        size,
+    )
+    .await
+    .unwrap();
+
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "PUT");
+    assert_eq!(requests[0].target, "/bucket/benchmark/object");
+    assert_eq!(requests[0].body, b"hello world");
+}
+
+#[tokio::test]
 async fn delete_objects_sends_md5_and_reports_partial_failures() {
     let (endpoint, seen) = mock(Arc::new(|_request: &Seen| {
         (200, vec![], concat!(
