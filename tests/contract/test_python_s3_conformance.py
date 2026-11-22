@@ -291,3 +291,14 @@ def test_presigned_error_text_is_unescaped_before_scrubbing(engine, server):
     result = call(engine, server, 'PresignedRequest', {'Method': 'GET', 'Bucket': 'b', 'Key': 'signing', 'ExpiresIn': 60})
     assert result['httpStatus'] == 403 and result['errorCode'] == 'AccessDenied'
     assert 'quoted0' not in json.dumps(result) and 'deadbeef' not in json.dumps(result)
+
+
+def test_exact_credential_error_code_is_redacted(engine, server):
+    import types
+    module = engine._conformance_module()
+    redactor = module._Redactor(types.SimpleNamespace(secret_key='InvalidEncryptionAlgorithmError',
+                                                      session_token=None, access_key='Denied'), engine)
+    result = module._redact_result({'errorCode': 'InvalidEncryptionAlgorithmError', 'headers': {}, 'output': {}}, redactor)
+    assert result['errorCode'] == '[redacted]'
+    kept = module._redact_result({'errorCode': 'AccessDenied', 'headers': {}, 'output': {}}, redactor)
+    assert kept['errorCode'] == 'AccessDenied'

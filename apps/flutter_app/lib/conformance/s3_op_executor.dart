@@ -268,7 +268,9 @@ Map<String, Object?> scrubConformanceResult(
         // Known S3 error codes (and HTTP-status codes synthesised by SDKs) are
         // kept verbatim so assertions recognise them; any other code is
         // scrubbed like a message.
+        // A credential that happens to equal a known code is still removed.
         'errorCode' when entry.value is String &&
+                !all.contains(entry.value) &&
                 (knownS3ErrorCodes.contains(entry.value) ||
                     RegExp(r'^[1-5][0-9][0-9]$').hasMatch(entry.value as String)) =>
           entry.value,

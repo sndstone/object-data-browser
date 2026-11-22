@@ -128,6 +128,11 @@ void main() {
     final unknown = scrubConformanceResult(
         {'errorCode': 'RejectedLongCredentialValue123'}, ['LongCredentialValue123']);
     expect(unknown['errorCode'], 'Rejected[redacted]');
+    // An exact credential is removed even when it looks like a known code;
+    // a credential that is only a substring of a code leaves the code intact.
+    expect(scrubConformanceResult({'errorCode': 'InvalidEncryptionAlgorithmError'},
+        ['InvalidEncryptionAlgorithmError'])['errorCode'], '[redacted]');
+    expect(scrubConformanceResult({'errorCode': 'AccessDenied'}, ['Denied'])['errorCode'], 'AccessDenied');
     expect(scrubbed['errorMessage'], isNot(contains('abc123')));
     expect(scrubbed['errorMessage'], isNot(contains('AKID/x')));
     expect((scrubbed['headers'] as Map)['x-amz-request-id'], 'req-[redacted]');
@@ -146,6 +151,19 @@ void main() {
     expect(run.teardown?.bucketsRetained, contains(startsWith('odb-test-std-')));
     expect(run.teardown?.clean, isFalse);
     expect(executor.buckets, isNotEmpty);
+  });
+
+  test('an endpoint 501 for CreateBucket keeps the name uncertain', () async {
+    final run = await S3ConformanceSuite(
+      executor: _StatusOnCreate(FakeExecutor(), 501),
+      config: const ConformanceConfig(baseBucketName: 'odb-test', includeObjectLock: false),
+      endpoint: const ConformanceEndpoint(endpointUrl: 'https://s3.example.test', region: 'us-east-1', pathStyle: true),
+      sleep: (_) async {},
+      multipartPartSize: 64 * 1024,
+    ).run();
+    expect(run.check('bucket.create')?.status, ConformanceStatus.unsupported);
+    // The fake never created it, so teardown sees 404 and has nothing to report.
+    expect(run.teardown?.bucketsRetained, isEmpty);
   });
 
   test('cancellation stops checks but still tears down', () async {
@@ -266,5 +284,23 @@ class _DecodeFailingCreate implements S3OpExecutor {
       return const S3OpObservation(op: 'CreateBucket', outcome: 'sdk_decode', httpStatus: 200, errorCode: 'ParseError');
     }
     return o;
+  }
+}
+
+/// Answers CreateBucket with a fixed status without creating anything.
+class _StatusOnCreate implements S3OpExecutor {
+  _StatusOnCreate(this.inner, this.status);
+  final FakeExecutor inner;
+  final int status;
+  @override
+  String get engineId => inner.engineId;
+  @override
+  Future<S3ConformanceCapability?> capability() => inner.capability();
+  @override
+  Future<S3OpObservation> execute(S3OpRequest request) async {
+    if (request.op == 'CreateBucket') {
+      return S3OpObservation(op: 'CreateBucket', outcome: 'service', httpStatus: status, errorCode: 'NotImplemented');
+    }
+    return inner.execute(request);
   }
 }

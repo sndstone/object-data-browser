@@ -284,6 +284,10 @@ class _Redactor:
         # Free-form diagnostics: every credential, whatever its length.
         self._diagnostic_secrets = sorted(credentials, key=len, reverse=True)
 
+    def is_credential(self, value: str) -> bool:
+        """Exactly a configured credential (even one that looks like an S3 code)."""
+        return value in self._diagnostic_secrets
+
     def diagnostic(self, value: Any) -> Any:
         """Error messages, codes and request IDs: scrub everything, then clip."""
         if not isinstance(value, str):
@@ -381,7 +385,8 @@ def _redact_result(result: dict[str, Any], redactor: _Redactor) -> dict[str, Any
         if result.get(field) is not None:
             result[field] = redactor.diagnostic(result[field])
     code = result.get('errorCode')
-    if code is not None and str(code) not in KNOWN_S3_ERROR_CODES and not _HTTP_STATUS_CODE.match(str(code)):
+    known = code is not None and (str(code) in KNOWN_S3_ERROR_CODES or _HTTP_STATUS_CODE.match(str(code)))
+    if code is not None and (not known or redactor.is_credential(str(code))):
         result['errorCode'] = redactor.diagnostic(code)
     if result['headers'].get('x-amz-request-id') is not None:
         result['headers']['x-amz-request-id'] = redactor.diagnostic(result['headers']['x-amz-request-id'])
