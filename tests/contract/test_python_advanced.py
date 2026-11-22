@@ -48,11 +48,14 @@ def test_benchmark_runs_without_polling_and_never_persists_credentials(pyengine,
     state = pyengine._start_benchmark({'profile': profile, 'config': {'bucketName': 'fixture',
         'testMode': 'operation-count', 'operationCount': 20, 'concurrentThreads': 3, 'workloadType': 'write-only',
         'objectSizes': [8], 'outputDirectory': str(tmp_path)}})
+    # Workers can publish final output after status first becomes completed.
+    with pyengine._BENCHMARKS_LOCK:
+        run = pyengine._BENCHMARKS.get(state['id'])
+    if run is not None:
+        for worker in run.threads:
+            worker.join(timeout=5)
+            assert not worker.is_alive()
     snapshot = pyengine._get_benchmark_status({'runId': state['id']})
-    deadline = time.monotonic() + 5
-    while snapshot['status'] == 'running' and time.monotonic() < deadline:
-        time.sleep(0.01)
-        snapshot = pyengine._get_benchmark_status({'runId': state['id']})
     assert snapshot['status'] == 'completed', snapshot
     assert snapshot['processedCount'] == 20
     calls = client.put_object.call_count
