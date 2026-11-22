@@ -302,3 +302,8 @@ def test_exact_credential_error_code_is_redacted(engine, server):
     assert result['errorCode'] == '[redacted]'
     kept = module._redact_result({'errorCode': 'AccessDenied', 'headers': {}, 'output': {}}, redactor)
     assert kept['errorCode'] == 'AccessDenied'
+    numeric = module._Redactor(types.SimpleNamespace(secret_key='501\n', session_token='404', access_key=None), engine)
+    for code in ('501\n', '404'):
+        out = module._redact_result({'errorCode': code, 'headers': {}, 'output': {}}, numeric)
+        assert out['errorCode'] == '[redacted]', code
+    assert module._redact_result({'errorCode': '403', 'headers': {}, 'output': {}}, numeric)['errorCode'] == '403'

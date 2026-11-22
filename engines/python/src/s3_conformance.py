@@ -385,7 +385,7 @@ def _redact_result(result: dict[str, Any], redactor: _Redactor) -> dict[str, Any
         if result.get(field) is not None:
             result[field] = redactor.diagnostic(result[field])
     code = result.get('errorCode')
-    known = code is not None and (str(code) in KNOWN_S3_ERROR_CODES or _HTTP_STATUS_CODE.match(str(code)))
+    known = code is not None and (str(code) in KNOWN_S3_ERROR_CODES or _HTTP_STATUS_CODE.fullmatch(str(code)))
     if code is not None and (not known or redactor.is_credential(str(code))):
         result['errorCode'] = redactor.diagnostic(code)
     if result['headers'].get('x-amz-request-id') is not None:
@@ -584,7 +584,7 @@ KNOWN_S3_ERROR_CODES = frozenset({
     'TemporaryRedirect',
     'XAmzContentChecksumMismatch',
 })
-_HTTP_STATUS_CODE = re.compile(r'^[1-5][0-9][0-9]$')
+_HTTP_STATUS_CODE = re.compile(r'[1-5][0-9][0-9]')  # used with fullmatch: no trailing newline
 
 
 def _strip_signing(text: str) -> str:

@@ -154,15 +154,20 @@ void main() {
   });
 
   test('an endpoint 501 for CreateBucket keeps the name uncertain', () async {
+    final executor = _StatusOnCreate(FakeExecutor(), 501);
     final run = await S3ConformanceSuite(
-      executor: _StatusOnCreate(FakeExecutor(), 501),
+      executor: executor,
       config: const ConformanceConfig(baseBucketName: 'odb-test', includeObjectLock: false),
       endpoint: const ConformanceEndpoint(endpointUrl: 'https://s3.example.test', region: 'us-east-1', pathStyle: true),
       sleep: (_) async {},
       multipartPartSize: 64 * 1024,
     ).run();
     expect(run.check('bucket.create')?.status, ConformanceStatus.unsupported);
-    // The fake never created it, so teardown sees 404 and has nothing to report.
+    // Teardown still checks the uncertain name; the fake never created it, so
+    // HeadBucket answers 404 and there is nothing to report.
+    final calls = executor.inner.calls;
+    expect(calls.where((c) => c.op == 'HeadBucket' && '${c.input['Bucket']}'.startsWith('odb-test-std-')).length,
+        greaterThanOrEqualTo(2), reason: 'preflight and teardown both check the name');
     expect(run.teardown?.bucketsRetained, isEmpty);
   });
 
