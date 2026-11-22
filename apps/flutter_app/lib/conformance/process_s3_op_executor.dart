@@ -15,7 +15,8 @@ class ProcessS3OpExecutor implements S3OpExecutor {
   ProcessS3OpExecutor._(this.engineId, this._process, this._profile,
       {required Duration timeout})
       : _timeout = timeout {
-    _subscription = _process.stdout.listen(_onBytes, onDone: _failPending, onError: (_) => _failPending());
+    _subscription = _process.stdout
+        .listen(_onBytes, onDone: _failPending, onError: (_) => _failPending());
     _process.stderr.drain<void>();
   }
 
@@ -79,11 +80,13 @@ class ProcessS3OpExecutor implements S3OpExecutor {
     _closed = true;
     for (final completer in _pending.values) {
       if (!completer.isCompleted) {
-        completer.completeError(const S3OpRpcException('engine_unavailable', 'The engine process exited.'));
+        completer.completeError(const S3OpRpcException(
+            'engine_unavailable', 'The engine process exited.'));
       }
     }
     _pending.clear();
   }
+
   int _sequence = 0;
 
   void _onLine(String line) {
@@ -101,7 +104,8 @@ class ProcessS3OpExecutor implements S3OpExecutor {
   Future<Map<String, Object?>> _send(
       String method, Map<String, Object?> params) async {
     if (_closed) {
-      throw const S3OpRpcException('engine_unavailable', 'The engine process exited.');
+      throw const S3OpRpcException(
+          'engine_unavailable', 'The engine process exited.');
     }
     final id = 'conf-${++_sequence}';
     final completer = Completer<Map<String, Object?>>();
@@ -119,7 +123,8 @@ class ProcessS3OpExecutor implements S3OpExecutor {
       await _process.stdin.flush();
     } catch (_) {
       _pending.remove(id);
-      throw const S3OpRpcException('engine_unavailable', 'The engine process exited.');
+      throw const S3OpRpcException(
+          'engine_unavailable', 'The engine process exited.');
     }
     final response = await completer.future.timeout(_timeout, onTimeout: () {
       _pending.remove(id);
@@ -129,9 +134,16 @@ class ProcessS3OpExecutor implements S3OpExecutor {
     if (response['ok'] != true) {
       final error = response['error'];
       final map = error is Map ? error : const {};
-      final message = scrubConformanceResult({'errorMessage': '${map['message'] ?? 'Engine error.'}'},
-          ['${_profile['secretKey'] ?? ''}', '${_profile['sessionToken'] ?? ''}', '${_profile['accessKey'] ?? ''}'])['errorMessage'];
-      throw S3OpRpcException('${map['code'] ?? 'unknown'}', '$message');
+      final scrubbed = scrubConformanceResult({
+        'errorMessage': '${map['message'] ?? 'Engine error.'}',
+        'errorCode': '${map['code'] ?? 'unknown'}'
+      }, [
+        '${_profile['secretKey'] ?? ''}',
+        '${_profile['sessionToken'] ?? ''}',
+        '${_profile['accessKey'] ?? ''}'
+      ]);
+      throw S3OpRpcException(
+          '${scrubbed['errorCode']}', '${scrubbed['errorMessage']}');
     }
     final result = response['result'];
     return result is Map ? Map<String, Object?>.from(result) : const {};
@@ -155,7 +167,9 @@ class ProcessS3OpExecutor implements S3OpExecutor {
           await _send('s3ConformanceOp', request.toParams()), [
         '${_profile['secretKey'] ?? ''}',
         '${_profile['sessionToken'] ?? ''}',
-        '${_profile['accessKey'] ?? ''}'
+        '${_profile['accessKey'] ?? ''}',
+        request.customerKey,
+        request.sourceCustomerKey,
       ]));
 
   Future<void> close() async {

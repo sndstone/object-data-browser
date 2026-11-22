@@ -239,7 +239,7 @@ Map<String, Object?> scrubConformanceResult(
   final long = [for (final secret in all) if (secret.length >= 16) secret];
   final query = RegExp(r"""(https?://[^\s?"']*)\?[^\s"']*""", caseSensitive: false);
   final signing = RegExp(
-      r"""((?:x-amz-)?(?:signature|credential|security-token|securitytoken)\s*[=:]\s*)[^\s&,;"'<]+|(authorization\s*[=:]\s*)[^\n"'<]+""",
+      r"""((?:x-amz-)?(?:signature|credential|security-token|securitytoken)["']?\s*[=:]\s*["']?)[^\s&,;"'<]+|(authorization["']?\s*[=:]\s*["']?)[^\n"'<]+""",
       caseSensitive: false);
   String text(String value, List<String> values, {bool diagnostic = false}) {
     var out = value.replaceAllMapped(query, (m) => '${m[1]}?[query]');
@@ -265,6 +265,12 @@ Map<String, Object?> scrubConformanceResult(
   return {
     for (final entry in json.entries)
       entry.key: switch (entry.key) {
+        // An S3 error code is a server identifier, kept unless it could carry
+        // text or equals a credential, so assertions still recognise it.
+        'errorCode' when entry.value is String &&
+                RegExp(r'^[A-Za-z][A-Za-z0-9.]{0,63}$').hasMatch(entry.value as String) &&
+                !all.contains(entry.value) =>
+          entry.value,
         'errorMessage' || 'errorCode' || 'requestId' when entry.value is String =>
           () {
             final scrubbed = text(entry.value as String, all, diagnostic: true);
@@ -274,7 +280,9 @@ Map<String, Object?> scrubConformanceResult(
             for (final header in headers.entries)
               '${header.key}': _urlHeader('${header.key}')
                   ? visit('${header.value}'.replaceFirst(RegExp(r'\?.*$'), '?[query]'))
-                  : visit(header.value)
+                  : '${header.key}'.toLowerCase() == 'x-amz-request-id'
+                      ? text('${header.value}', all, diagnostic: true)
+                      : visit(header.value)
           },
         _ => visit(entry.value),
       },

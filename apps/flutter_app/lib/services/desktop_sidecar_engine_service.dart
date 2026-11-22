@@ -248,6 +248,7 @@ class DesktopSidecarEngineService
         entry,
         method: method,
         params: {...params, 'profile': _profileToJson(profile)},
+        traceBodies: false,
       );
     } on TimeoutException catch (error) {
       throw EngineException(
@@ -1483,6 +1484,7 @@ class DesktopSidecarEngineService
     Map<String, Object?>? params,
     void Function(Map<String, Object?> event)? onEvent,
     ListingCancellation? cancellation,
+    bool traceBodies = true,
   }) async {
     ActionScope.current?.check();
     cancellation ??= ActionScope.current;
@@ -1510,8 +1512,12 @@ class DesktopSidecarEngineService
         'method': method,
         'requestId': requestId,
       };
-      final requestBody = _sanitizeForLogging(
-          DiagnosticSafety.forNameEncryptedRequest(request['params'], params));
+      // Conformance results can echo endpoint text verbatim; their bodies are
+      // never traced (the head, status and latency still are).
+      final requestBody = traceBodies
+          ? _sanitizeForLogging(
+              DiagnosticSafety.forNameEncryptedRequest(request['params'], params))
+          : const {'omitted': 'S3 conformance request'};
       _log(
         level: 'API',
         category: 'EngineRequest',
@@ -1572,8 +1578,10 @@ class DesktopSidecarEngineService
         'ok': response.payload['ok'],
         'requestId': requestId,
       };
-      final responseBody = _sanitizeForLogging(
-          DiagnosticSafety.forNameEncryptedRequest(response.payload, params));
+      final responseBody = traceBodies
+          ? _sanitizeForLogging(
+              DiagnosticSafety.forNameEncryptedRequest(response.payload, params))
+          : const {'omitted': 'S3 conformance result'};
       _log(
         level: 'API',
         category: 'EngineResponse',
@@ -1610,8 +1618,9 @@ class DesktopSidecarEngineService
       _log(
         level: 'ERROR',
         category: 'EngineError',
-        message:
-            '${entry.id}.$method ${(error['message'] as String?) ?? 'Unknown engine error.'}$detailSuffix',
+        message: traceBodies
+            ? '${entry.id}.$method ${(error['message'] as String?) ?? 'Unknown engine error.'}$detailSuffix'
+            : '${entry.id}.$method failed (${_parseErrorCode(error['code'] as String?).name}).',
         source: 'engine-error',
         params: params,
       );

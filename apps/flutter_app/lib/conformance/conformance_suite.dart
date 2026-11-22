@@ -292,8 +292,16 @@ class S3ConformanceSuite {
     _uncertainBuckets.add(bucket);
     try {
       final o = await c.call('CreateBucket', input ?? _createBucketInput(bucket, objectLock: objectLock));
-      _uncertainBuckets.remove(bucket);
-      if (o.isSuccess && !_ownedBuckets.contains(bucket)) _ownedBuckets.add(bucket);
+      if (o.isSuccess) {
+        _uncertainBuckets.remove(bucket);
+        if (!_ownedBuckets.contains(bucket)) _ownedBuckets.add(bucket);
+      } else if (o.outcome == 'sdk_validation' ||
+          (o.isService && o.httpStatus >= 400 && o.httpStatus < 500 && o.httpStatus != 408 && o.httpStatus != 429)) {
+        // A definite rejection: nothing was created by this request.
+        _uncertainBuckets.remove(bucket);
+      }
+      // Anything else (a decode failure, 3xx, 5xx, throttling) stays uncertain:
+      // teardown reports the name for manual inspection and never purges it.
       return o;
     } on _CheckUnsupported {
       _uncertainBuckets.remove(bucket);

@@ -27,14 +27,21 @@ class SidecarS3OpExecutor implements S3OpExecutor {
   final S3ConformanceTransport transport;
   final EndpointProfile profile;
 
-  Future<Map<String, Object?>> _send(String method, Map<String, Object?> params) async {
+  Future<Map<String, Object?>> _send(
+      String method, Map<String, Object?> params) async {
     try {
       return await transport.conformanceRequest(
           engineId: engineId, profile: profile, method: method, params: params);
     } on EngineException catch (error) {
       throw S3OpRpcException(
           _code(error.code),
-          '${scrubConformanceResult({'errorMessage': error.message}, [profile.secretKey, profile.sessionToken, profile.accessKey])['errorMessage']}');
+          '${scrubConformanceResult({
+                'errorMessage': error.message
+              }, [
+                profile.secretKey,
+                profile.sessionToken,
+                profile.accessKey
+              ])['errorMessage']}');
     }
   }
 
@@ -53,7 +60,8 @@ class SidecarS3OpExecutor implements S3OpExecutor {
     final result = await _send('getCapabilities', const {});
     for (final item in (result['items'] as List?) ?? const []) {
       if (item is Map && item['key'] == 'conformance.s3') {
-        return S3ConformanceCapability.fromJson(Map<String, Object?>.from(item));
+        return S3ConformanceCapability.fromJson(
+            Map<String, Object?>.from(item));
       }
     }
     return null;
@@ -62,6 +70,11 @@ class SidecarS3OpExecutor implements S3OpExecutor {
   @override
   Future<S3OpObservation> execute(S3OpRequest request) async =>
       S3OpObservation.fromJson(scrubConformanceResult(
-          await _send('s3ConformanceOp', request.toParams()),
-          [profile.secretKey, profile.sessionToken, profile.accessKey]));
+          await _send('s3ConformanceOp', request.toParams()), [
+        profile.secretKey,
+        profile.sessionToken,
+        profile.accessKey,
+        request.customerKey,
+        request.sourceCustomerKey
+      ]));
 }

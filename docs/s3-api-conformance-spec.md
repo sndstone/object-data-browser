@@ -143,8 +143,12 @@ Each engine run creates its own buckets, so engines never share state:
 `<run>` is eight random lower-case characters. Before anything is created the
 suite sends HeadBucket for all three names and needs an affirmative `404` for
 each; otherwise it picks new names (five attempts) and, failing that, stops
-without creating anything. An existing bucket can therefore never become a
-test bucket. A bucket counts
+without creating anything. A HEAD followed by a CreateBucket still leaves a
+short race on endpoints whose CreateBucket succeeds for a bucket you already
+own (AWS in `us-east-1`); the random run ID makes a collision in that window
+practically impossible. A create whose outcome is not definite (a decode
+failure, `3xx`, `5xx` or throttling) is reported for manual inspection and
+never purged. A bucket counts
 as **owned** only when its CreateBucket returned 2xx; only owned buckets are
 purged and deleted. A create without a definite outcome (for example a
 transport failure) is reported for manual inspection and never purged, and a
@@ -161,7 +165,8 @@ transport failure) is reported for manual inspection and never purged, and a
    passed. Coverage must be affirmative: a required check that failed, errored,
    was unsupported or was skipped leaves the gate incomplete. Phase 2 runs
    either way, so versioning remains diagnosable; the gate result is shown in
-   the report. A *deviation* counts as covered: for the AWS SDK for Java v2 the
+   the report as "required coverage met" or "incomplete". A *deviation*
+   counts as covered: for the AWS SDK for Java v2 the
    listing checks verify the decoded keys, prefixes and StartAfter, but the
    wire encoding itself is unobservable through that SDK.
 4. **Phase 2, versioning.** `PutBucketVersioning(Enabled)`, then
@@ -306,7 +311,9 @@ behaviour:
 The suite follows `AGENTS.md`:
 
 - Credentials, session tokens, `Authorization`, SSE-C keys and presigned URLs
-  never appear in results, logs, traces or exports. The engines report only
+  never appear in results, logs, traces or exports. With API logging on, the
+  desktop app traces conformance calls by method, status and latency only;
+  request and result bodies, and engine error text, are not traced. The engines report only
   allow-listed response headers; `PresignedRequest` reports the query
   parameter **names** only and strips query strings from transport errors.
 - SSE-C keys are generated per run in memory, sent only through the existing
@@ -333,7 +340,11 @@ The suite follows `AGENTS.md`:
   holds one listing page at a time, the headless runner discards response
   frames over 64 MiB, and the Python engine drops structured output over
   4 MiB (S3 pages hold at most 1000 entries).
-- **Residual risk:** the engines' SDKs read a structured (XML) response
+- Error codes are server identifiers and are kept as returned unless they
+  could carry text, so redaction never turns `AccessDenied` into something an
+  assertion cannot recognise; request IDs are scrubbed like messages.
+- **Residual risk:** the response caps above apply after the SDK has read the
+  response. The engines' SDKs read a structured (XML) response
   completely before parsing it, so a misbehaving endpoint that returns an
   enormous listing or error document can make one engine process allocate
   that much memory before any cap applies. This is the same exposure as the
@@ -575,10 +586,10 @@ Run on 2026-11-22 against the AWS emulator 1.0.504 on the N100 host (HTTPS with 
 
 | Engine | SDK | Pass | Fail | Deviation | Unsupported | Skipped | Error | Calls | Mean ms | p50 ms | p95 ms | Wall time | Phase 1 gate | Teardown |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| python | boto3 1.43.89 (botocore 1.43.89) | 162 | 1 | 5 | 2 | 0 | 0 | 425 | 9.0 | 6.4 | 15.0 | 20 s | incomplete | clean: 2 buckets, 68 versions |
-| go | aws-sdk-go-v2 1.96.4 | 164 | 1 | 4 | 1 | 0 | 0 | 428 | 7.5 | 5.7 | 9.2 | 19 s | passed | clean: 2 buckets, 69 versions |
-| rust | aws-sdk-s3 1.125.0 | 164 | 1 | 4 | 1 | 0 | 0 | 428 | 7.7 | 5.4 | 9.4 | 19 s | passed | clean: 2 buckets, 69 versions |
-| java | aws-sdk-java-v2 2.41.29 | 161 | 1 | 7 | 1 | 0 | 0 | 428 | 10.4 | 7.9 | 17.0 | 21 s | passed | clean: 2 buckets, 69 versions |
+| python | boto3 1.43.89 (botocore 1.43.89) | 162 | 1 | 5 | 2 | 0 | 0 | 425 | 9.1 | 6.8 | 14.8 | 19 s | incomplete | clean: 2 buckets, 68 versions |
+| go | aws-sdk-go-v2 1.96.4 | 164 | 1 | 4 | 1 | 0 | 0 | 428 | 7.3 | 5.5 | 9.6 | 18 s | coverage met | clean: 2 buckets, 69 versions |
+| rust | aws-sdk-s3 1.125.0 | 164 | 1 | 4 | 1 | 0 | 0 | 428 | 7.3 | 5.2 | 9.3 | 19 s | coverage met | clean: 2 buckets, 69 versions |
+| java | aws-sdk-java-v2 2.41.29 | 161 | 1 | 7 | 1 | 0 | 0 | 428 | 10.2 | 7.4 | 16.7 | 20 s | coverage met | clean: 2 buckets, 69 versions |
 
 170 checks ran on every engine. The checks that did not pass on every engine:
 
@@ -600,20 +611,20 @@ Mean latency per operation in ms (call count in parentheses), for the most frequ
 
 | Operation | python | go | rust | java |
 | --- | ---: | ---: | ---: | ---: |
-| PutObject | 13.0 (80) | 7.4 (81) | 6.9 (81) | 12.5 (81) |
-| GetObject | 10.5 (65) | 10.4 (66) | 12.4 (66) | 11.0 (66) |
-| HeadObject | 6.0 (43) | 5.7 (44) | 5.3 (44) | 7.1 (44) |
-| ListObjectsV2 | 5.9 (20) | 6.1 (20) | 5.3 (20) | 7.2 (20) |
-| DeleteObject | 5.8 (16) | 6.2 (16) | 6.4 (16) | 6.5 (16) |
-| CopyObject | 6.3 (13) | 5.3 (13) | 5.5 (13) | 7.7 (13) |
-| GetObjectTagging | 5.7 (10) | 6.4 (10) | 6.1 (10) | 7.4 (10) |
-| UploadPart | 32.2 (10) | 28.1 (10) | 31.3 (10) | 33.6 (10) |
-| ListObjectVersions | 6.0 (10) | 6.1 (10) | 6.7 (10) | 7.3 (10) |
-| CreateMultipartUpload | 8.0 (8) | 5.9 (8) | 5.2 (8) | 8.0 (8) |
-| GetObjectRetention | 6.7 (7) | 5.4 (7) | 6.4 (7) | 6.3 (7) |
-| PutObjectRetention | 7.6 (6) | 6.5 (6) | 5.5 (6) | 11.3 (6) |
-| CreateBucket | 5.8 (5) | 5.0 (5) | 5.8 (5) | 7.9 (5) |
-| ListObjects | 5.6 (5) | 5.1 (5) | 5.3 (5) | 5.8 (5) |
+| PutObject | 12.2 (80) | 7.6 (81) | 7.1 (81) | 13.0 (81) |
+| GetObject | 10.8 (65) | 10.0 (66) | 12.0 (66) | 11.9 (66) |
+| HeadObject | 6.1 (43) | 5.5 (44) | 5.2 (44) | 6.4 (44) |
+| ListObjectsV2 | 6.2 (20) | 5.3 (20) | 5.4 (20) | 7.1 (20) |
+| DeleteObject | 5.9 (16) | 6.0 (16) | 5.2 (16) | 6.4 (16) |
+| CopyObject | 6.6 (13) | 5.5 (13) | 5.8 (13) | 7.8 (13) |
+| GetObjectTagging | 6.8 (10) | 5.5 (10) | 5.2 (10) | 6.6 (10) |
+| UploadPart | 33.0 (10) | 26.9 (10) | 26.7 (10) | 31.7 (10) |
+| ListObjectVersions | 5.9 (10) | 5.3 (10) | 5.3 (10) | 6.2 (10) |
+| CreateMultipartUpload | 6.2 (8) | 5.1 (8) | 4.7 (8) | 7.0 (8) |
+| GetObjectRetention | 6.7 (7) | 5.3 (7) | 5.3 (7) | 5.9 (7) |
+| PutObjectRetention | 5.7 (6) | 6.2 (6) | 5.9 (6) | 10.1 (6) |
+| CreateBucket | 6.8 (5) | 5.0 (5) | 5.4 (5) | 6.5 (5) |
+| ListObjects | 6.7 (5) | 5.8 (5) | 7.0 (5) | 7.9 (5) |
 
 ### Findings
 

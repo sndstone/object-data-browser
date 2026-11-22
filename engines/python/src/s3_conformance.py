@@ -283,6 +283,9 @@ class _Redactor:
         # Free-form diagnostics: every credential, whatever its length.
         self._diagnostic_secrets = sorted(credentials, key=len, reverse=True)
 
+    def is_credential(self, value: str) -> bool:
+        return value in self._diagnostic_secrets
+
     def diagnostic(self, value: Any) -> Any:
         """Error messages, codes and request IDs: scrub everything, then clip."""
         if not isinstance(value, str):
@@ -376,9 +379,14 @@ def _redact_result(result: dict[str, Any], redactor: _Redactor) -> dict[str, Any
         # S3 pages hold at most 1000 entries; anything larger is not projected.
         result['output'] = {'truncated': True}
     result['headers'] = redactor.headers(result.get('headers') or {})
-    for field in ('errorMessage', 'errorCode', 'requestId'):
+    for field in ('errorMessage', 'requestId'):
         if result.get(field) is not None:
             result[field] = redactor.diagnostic(result[field])
+    code = result.get('errorCode')
+    if code is not None and (not _ERROR_CODE.match(str(code)) or redactor.is_credential(str(code))):
+        result['errorCode'] = redactor.diagnostic(code)
+    if result['headers'].get('x-amz-request-id') is not None:
+        result['headers']['x-amz-request-id'] = redactor.diagnostic(result['headers']['x-amz-request-id'])
     result['output'] = redactor.deep(result.get('output') or {})
     return result
 
@@ -501,8 +509,12 @@ def _strip_urls(text: str) -> str:
 
 
 _SIGNING = re.compile(
-    r'((?:x-amz-)?(?:signature|credential|security-token|securitytoken)\s*[=:]\s*)[^\s&,;"\'<]+'
-    r'|(authorization\s*[=:]\s*)[^\n"\'<]+', re.IGNORECASE)
+    r'((?:x-amz-)?(?:signature|credential|security-token|securitytoken)["\']?\s*[=:]\s*["\']?)[^\s&,;"\'<]+'
+    r'|(authorization["\']?\s*[=:]\s*["\']?)[^\n"\'<]+', re.IGNORECASE)
+# An S3 error code is a server identifier; it is kept unless it could carry
+# text (or exactly equals a credential), so redaction never rewrites
+# "AccessDenied" into something an assertion cannot recognise.
+_ERROR_CODE = re.compile(r'^[A-Za-z][A-Za-z0-9.]{0,63}$')
 
 
 def _strip_signing(text: str) -> str:

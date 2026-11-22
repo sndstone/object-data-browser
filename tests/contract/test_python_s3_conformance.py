@@ -72,7 +72,7 @@ class FakeS3(BaseHTTPRequestHandler):
         if key == 'echo':
             return self._send(403, ('<Error><Code>AccessDenied</Code><Message>token ' + SESSION + ' rejected</Message></Error>').encode())
         if key == 'signing':
-            message = ('Signature=deadbeef X-Amz-Credential=AKIDFIXTURE/20260101 see HTTPS://Host.example/b/k?X-Amz-Signature=cafe '
+            message = ('Signature=deadbeef Signature=&quot;quoted0&quot; X-Amz-Credential=AKIDFIXTURE/20260101 see HTTPS://Host.example/b/k?X-Amz-Signature=cafe '
                        'secret test ' + 'z' * 300 + SESSION)
             return self._send(403, ('<Error><Code>AccessDenied</Code><Message>' + message + '</Message></Error>').encode())
         if key == 'location':
@@ -272,7 +272,8 @@ def test_diagnostics_scrub_short_credentials_signing_values_and_clip_after(engin
         'profile': short, 'op': 'GetObject', 'input': {'Bucket': 'b', 'Key': 'signing'}}})
     message = result['errorMessage']
     assert len(message) <= 256
-    for leaked in ('deadbeef', 'AKIDFIXTURE/2026', 'cafe', ' test '):
+    assert result['errorCode'] == 'AccessDenied'
+    for leaked in ('deadbeef', 'quoted0', 'AKIDFIXTURE/2026', 'cafe', ' test '):
         assert leaked not in message, leaked
     # A long session token clipped at the boundary must not survive as a prefix.
     full = call(engine, url, 'GetObject', {'Bucket': 'b', 'Key': 'signing'})

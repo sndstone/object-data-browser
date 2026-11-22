@@ -393,7 +393,12 @@ extension _SetupAndStandard on S3ConformanceSuite {
         severity: ConformanceSeverity.informational,
         body: (c) async {
       final invalidName = 'Invalid_Name..${_newRunId()}';
-      // Ownership is recorded only if the endpoint accepts the name.
+      // Like every created name, it must be confirmed unused first; ownership
+      // is recorded only if the endpoint then accepts the name.
+      final probe = await _quiet('HeadBucket', {'Bucket': invalidName});
+      if (probe == null || !probe.isService || (probe.httpStatus != 404 && probe.httpStatus != 400)) {
+        c.skip('The invalid name could not be confirmed unused (HeadBucket ${probe == null ? 'failed' : _CheckContext.describe(probe)}).');
+      }
       final o = await _createBucket(c, invalidName, input: {'Bucket': invalidName});
       if (o.outcome == 'sdk_validation') {
         c.note('The SDK rejected the name before sending (${o.errorCode ?? 'validation'}).');

@@ -118,6 +118,33 @@ void main() {
     expect(jsonEncode(scrubbed['output']), isNot(contains('long-secret-value')));
   });
 
+  test('error codes survive redaction and quoted signing values do not', () {
+    final scrubbed = scrubConformanceResult({
+      'errorCode': 'AccessDenied',
+      'errorMessage': 'Denied: Signature="abc123" "X-Amz-Credential":"AKID/x"',
+      'headers': {'x-amz-request-id': 'req-Denied'},
+    }, ['Denied']);
+    expect(scrubbed['errorCode'], 'AccessDenied');
+    expect(scrubbed['errorMessage'], isNot(contains('abc123')));
+    expect(scrubbed['errorMessage'], isNot(contains('AKID/x')));
+    expect((scrubbed['headers'] as Map)['x-amz-request-id'], 'req-[redacted]');
+  });
+
+  test('a create without a definite outcome is reported, never purged', () async {
+    final executor = FakeExecutor(onCall: (_) {});
+    final wrapped = _DecodeFailingCreate(executor);
+    final run = await S3ConformanceSuite(
+      executor: wrapped,
+      config: const ConformanceConfig(baseBucketName: 'odb-test', includeObjectLock: false),
+      endpoint: const ConformanceEndpoint(endpointUrl: 'https://s3.example.test', region: 'us-east-1', pathStyle: true),
+      sleep: (_) async {},
+      multipartPartSize: 64 * 1024,
+    ).run();
+    expect(run.teardown?.bucketsRetained, contains(startsWith('odb-test-std-')));
+    expect(run.teardown?.clean, isFalse);
+    expect(executor.buckets, isNotEmpty);
+  });
+
   test('cancellation stops checks but still tears down', () async {
     final cancellation = ConformanceCancellation();
     late FakeExecutor executor;
@@ -218,4 +245,23 @@ void main() {
     expect(o.list('Contents').single['Key'], 'a');
     expect(o.isSuccess, isTrue);
   });
+}
+
+
+/// Creates the bucket but reports an undecodable response.
+class _DecodeFailingCreate implements S3OpExecutor {
+  _DecodeFailingCreate(this.inner);
+  final FakeExecutor inner;
+  @override
+  String get engineId => inner.engineId;
+  @override
+  Future<S3ConformanceCapability?> capability() => inner.capability();
+  @override
+  Future<S3OpObservation> execute(S3OpRequest request) async {
+    final o = await inner.execute(request);
+    if (request.op == 'CreateBucket' && o.isSuccess) {
+      return const S3OpObservation(op: 'CreateBucket', outcome: 'sdk_decode', httpStatus: 200, errorCode: 'ParseError');
+    }
+    return o;
+  }
 }

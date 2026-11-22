@@ -65,7 +65,7 @@ extension _Versioning on S3ConformanceSuite {
         if (_clock().isAfter(deadline)) {
           c.isTrue('versioned probe write', false,
               expected: 'version ID that reads back', actual: '${_CheckContext.describe(put)}, version ${id ?? 'absent'}',
-              explanation: 'Versioning did not take effect within 60 s; later phase-2 results may reflect propagation.');
+              explanation: 'Versioning did not take effect within 60 s; the remaining phase-2 checks were skipped.');
           return;
         }
         await _sleep(const Duration(seconds: 2));
@@ -74,7 +74,7 @@ extension _Versioning on S3ConformanceSuite {
     if (ready.status != ConformanceStatus.pass) {
       // Without confirmed propagation, version-dependent results would not
       // describe the endpoint's steady state.
-      _run.note = 'Versioning did not take effect within 60 s; the remaining phase-2 checks were skipped.';
+      _run.note = 'Versioning could not be confirmed (versioning.ready: ${ready.status.label}${ready.note == null ? '' : ', ${ready.note}'}); the remaining phase-2 checks were skipped.';
       return;
     }
     const key = 'p2/versioned.txt';

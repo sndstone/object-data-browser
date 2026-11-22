@@ -820,6 +820,13 @@ extension _StandardObjects on S3ConformanceSuite {
         spec: 'Presigned GET used after X-Amz-Expires: 403 AccessDenied (Request has expired).',
         severity: ConformanceSeverity.informational,
         body: (c) async {
+      // The URL is signed with the local clock: the wait must cover the lifetime,
+      // one second of timestamp granularity and how far the local clock runs
+      // ahead of the server. The engine waits at most 5 s.
+      final neededDelay = 3000 + 1000 + max(0, -_serverSkew.inMilliseconds);
+      if (neededDelay > 5000) {
+        c.skip('The local clock runs ${-_serverSkew.inMilliseconds} ms ahead of the server; expiry cannot be observed within the 5 s wait.');
+      }
       c.fixture(await c.call('PutObject', {'Bucket': _stdBucket, 'Key': 'p1/presign/expiring.txt'}, body: S3OpBody.text('x')));
       // The same request used within its lifetime succeeds, so a 403 below is
       // caused by expiry rather than by signing or permissions.
@@ -829,7 +836,7 @@ extension _StandardObjects on S3ConformanceSuite {
       c.status(await c.call('PresignedRequest', {
         'Method': 'GET', 'Bucket': _stdBucket, 'Key': 'p1/presign/expiring.txt', 'ExpiresIn': 3,
         // Signed with the local clock: wait longer when it runs ahead of the server.
-        'DelayMs': (4500 + max(0, -_serverSkew.inMilliseconds)).clamp(4500, 5000),
+        'DelayMs': max(neededDelay, 4500),
       }), 403, code: 'AccessDenied');
     });
   }

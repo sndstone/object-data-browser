@@ -282,23 +282,42 @@ extension _ObjectLock on S3ConformanceSuite {
       c.equals('Retention.Mode', 'COMPLIANCE', retention.field('Retention.Mode'));
       _sameSecond(c, 'Retention.RetainUntilDate', until, retention.field('Retention.RetainUntilDate'));
       // The denials below are meaningful only while the lock is still active.
-      if (!_serverNow().isBefore(until.subtract(const Duration(seconds: 2)))) {
-        c.skip('The 5-second COMPLIANCE window closed before the denial requests could be sent (slow endpoint); inconclusive.');
+      // Each denial is meaningful only while the lock is still active (and, for
+      // shortening, while the earlier date is still in the future). Results
+      // already observed are kept; denials that could not be sent in time are
+      // reported as inconclusive.
+      final shortened = until.subtract(const Duration(seconds: 2));
+      bool open(DateTime limit) => _serverNow().isBefore(limit.subtract(const Duration(milliseconds: 500)));
+      final inconclusive = <String>[];
+      if (open(until)) {
+        final deleteAttempt = await c.call('DeleteObject', {
+          'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id, 'BypassGovernanceRetention': true,
+        });
+        c.status(deleteAttempt, 403, code: 'AccessDenied');
+      } else {
+        inconclusive.add('delete with bypass');
       }
-      final deleteAttempt = await c.call('DeleteObject', {
-        'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id, 'BypassGovernanceRetention': true,
-      });
-      c.status(deleteAttempt, 403, code: 'AccessDenied');
-      final shorten = await c.call('PutObjectRetention', {
-        'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id, 'BypassGovernanceRetention': true,
-        'Retention': {'Mode': 'COMPLIANCE', 'RetainUntilDate': _isoSeconds(until.subtract(const Duration(seconds: 2)))},
-      });
-      c.status(shorten, 403, code: 'AccessDenied', explanation: 'COMPLIANCE retention cannot be shortened, even with bypass.');
-      final relax = await c.call('PutObjectRetention', {
-        'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id, 'BypassGovernanceRetention': true,
-        'Retention': {'Mode': 'GOVERNANCE', 'RetainUntilDate': _isoSeconds(until)},
-      });
-      c.status(relax, 403, code: 'AccessDenied', explanation: 'COMPLIANCE cannot be switched to GOVERNANCE.');
+      if (open(shortened)) {
+        final shorten = await c.call('PutObjectRetention', {
+          'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id, 'BypassGovernanceRetention': true,
+          'Retention': {'Mode': 'COMPLIANCE', 'RetainUntilDate': _isoSeconds(shortened)},
+        });
+        c.status(shorten, 403, code: 'AccessDenied', explanation: 'COMPLIANCE retention cannot be shortened, even with bypass.');
+      } else {
+        inconclusive.add('shortening');
+      }
+      if (open(until)) {
+        final relax = await c.call('PutObjectRetention', {
+          'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id, 'BypassGovernanceRetention': true,
+          'Retention': {'Mode': 'GOVERNANCE', 'RetainUntilDate': _isoSeconds(until)},
+        });
+        c.status(relax, 403, code: 'AccessDenied', explanation: 'COMPLIANCE cannot be switched to GOVERNANCE.');
+      } else {
+        inconclusive.add('switch to GOVERNANCE');
+      }
+      if (inconclusive.isNotEmpty) {
+        c.note('Inconclusive (the 5-second window closed first on a slow endpoint): ${inconclusive.join(', ')}.');
+      }
       final still = await c.call('GetObjectRetention', {'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id});
       c.status(still, 200, explanation: 'The protected version must still exist.');
       c.equals('Retention.Mode after the denials', 'COMPLIANCE', still.field('Retention.Mode'),
