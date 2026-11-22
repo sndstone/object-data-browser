@@ -120,7 +120,16 @@ jobs:
           cache: true
       - run: flutter pub get
         working-directory: apps/flutter_app
-      - run: flutter build ios --simulator --debug
+      - name: Build iOS simulator
+        run: |
+          flutter build ios --simulator --debug --config-only
+          # The pinned AWS SDK's Smithy generator needs approval on fresh runners.
+          xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner \
+            -configuration Debug -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/odb-ios-simulator" \
+            -clonedSourcePackagesDirPath "$PWD/build/ios/SourcePackages" \
+            -disableAutomaticPackageResolution -skipPackagePluginValidation \
+            ARCHS="$(uname -m)" CODE_SIGNING_ALLOWED=NO build
         working-directory: apps/flutter_app
 
   download-filesystems:
