@@ -1,7 +1,8 @@
 # Rust Raw HTTP Engine
 
-Select **Rust Raw HTTP Engine** in the desktop engine picker. Its engine ID is
-`rust-raw` and the packaged binary is `s3-browser-rust-raw-engine`. It supports
+Select **Rust Raw HTTP Engine** in the desktop engine picker. **Rust AWS SDK
+Engine** is a separate entry. The raw engine ID is `rust-raw` and the packaged
+binary is `s3-browser-rust-raw-engine`. It supports
 S3-compatible and AWS S3 profiles with an access key, secret key and optional
 session token. AWS credential providers such as SSO, shared AWS profiles and
 role assumption are available through SDK engines. The raw binary is staged

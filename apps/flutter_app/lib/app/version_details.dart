@@ -13,7 +13,7 @@ const Map<String, String> kFlutterDependencyVersions = <String, String>{
 };
 
 const Map<String, String> kBundledEngineVersions = <String, String>{
-  'Rust engine': '2.4.0',
+  'Rust AWS SDK Engine': '2.4.0',
   'Rust Raw HTTP Engine': '2.4.0',
   'Go engine': '2.4.0',
   'Python engine': '2.4.0',

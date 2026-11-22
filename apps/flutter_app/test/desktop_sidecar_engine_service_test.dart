@@ -35,6 +35,7 @@ void main() {
     await File('${emptyEngineRoot.path}/manifest.json')
         .writeAsString(jsonEncode({
       'engines': [
+        {'id': 'rust', 'executable': 'sdk-fixture'},
         {'id': 'rust-raw', 'executable': 'fixture'}
       ]
     }));
@@ -42,8 +43,12 @@ void main() {
     service.shutdown();
     service = DesktopSidecarEngineService(
         host: host, engineRoot: emptyEngineRoot.path);
-    final raw =
-        (await service.listEngines()).singleWhere((e) => e.id == 'rust-raw');
+    final engines = await service.listEngines();
+    final sdk = engines.singleWhere((e) => e.id == 'rust');
+    final raw = engines.singleWhere((e) => e.id == 'rust-raw');
+    expect(sdk.label, 'Rust AWS SDK Engine');
+    expect(sdk.available, isTrue);
+    expect(raw.label, 'Rust Raw HTTP Engine');
     expect(raw.available, isTrue);
     expect(raw.desktopSupported, isTrue);
     expect(raw.mobileSupported, isFalse);
