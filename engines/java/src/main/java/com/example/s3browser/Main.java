@@ -126,7 +126,7 @@ public final class Main {
     private static final ConcurrentHashMap<String, JobControl> TRANSFER_REGISTRY = new ConcurrentHashMap<>();
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final DateTimeFormatter ISO = DateTimeFormatter.ISO_OFFSET_DATE_TIME.withZone(ZoneOffset.UTC);
-    private static final TrustManager[] TRUST_ALL_MANAGERS = new TrustManager[] {
+    static final TrustManager[] TRUST_ALL_MANAGERS = new TrustManager[] {
         new X509TrustManager() {
             @Override
             public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType) {
@@ -183,7 +183,8 @@ public final class Main {
         "pauseBenchmark",
         "resumeBenchmark",
         "stopBenchmark",
-        "exportBenchmarkResults"
+        "exportBenchmarkResults",
+        "s3ConformanceOp"
     );
 
     private Main() {
@@ -358,7 +359,7 @@ public final class Main {
         JsonNode params = payload.path("params");
         return switch (method) {
             case "health" -> health();
-            case "getCapabilities" -> getCapabilities();
+            case "getCapabilities" -> getCapabilities(params);
             case "testProfile" -> testProfile(params.path("profile"));
             case "listBuckets" -> listBuckets(params.path("profile"));
             case "createBucket" -> createBucket(params);
@@ -398,6 +399,7 @@ public final class Main {
             case "resumeBenchmark" -> resumeBenchmark(params);
             case "stopBenchmark" -> stopBenchmark(params);
             case "exportBenchmarkResults" -> exportBenchmarkResults(params);
+            case "s3ConformanceOp" -> S3Conformance.run(params);
             default -> throw new SidecarException(
                 "unsupported_feature",
                 "Method " + method + " is not implemented in the Java engine."
@@ -415,7 +417,7 @@ public final class Main {
         );
     }
 
-    private static Map<String, Object> getCapabilities() {
+    private static Map<String, Object> getCapabilities(JsonNode params) {
         List<Map<String, Object>> items =
                 List.of(
                         capability("bucket.lifecycle", "Lifecycle policy CRUD", "supported", null),
@@ -442,7 +444,8 @@ public final class Main {
                                 "Delete-all maintenance tool",
                                 "supported",
                                 null),
-                        capability("benchmark", "Integrated benchmark mode", "supported", null));
+                        capability("benchmark", "Integrated benchmark mode", "supported", null),
+                        S3Conformance.capability(params));
         return orderedMap("items", items);
     }
 
@@ -2072,7 +2075,7 @@ public final class Main {
         );
     }
 
-    private static Profile parseProfile(JsonNode payload) {
+    static Profile parseProfile(JsonNode payload) {
         if ("azureBlob".equals(payload.path("endpointType").asText("").trim())) {
             throw new SidecarException(
                     "unsupported_feature",
@@ -2140,7 +2143,7 @@ public final class Main {
         return clientLease(built);
     }
 
-    private static S3Client clientLease(S3Client client) {
+    static S3Client clientLease(S3Client client) {
         return (S3Client)
                 java.lang.reflect.Proxy.newProxyInstance(
                         S3Client.class.getClassLoader(),
@@ -2155,7 +2158,7 @@ public final class Main {
                         });
     }
 
-    private static TrustManager[] customCa(String path) {
+    static TrustManager[] customCa(String path) {
         try (var input = Files.newInputStream(Path.of(path))) {
             var certificates =
                     java.security.cert.CertificateFactory.getInstance("X.509")
@@ -2219,7 +2222,7 @@ public final class Main {
             .build();
     }
 
-    private static AwsCredentialsProvider credentialsProvider(Profile profile) {
+    static AwsCredentialsProvider credentialsProvider(Profile profile) {
         if ("awsProfile".equals(profile.authMode))
             return software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider.create(
                     blankToDefault(profile.awsProfileName, "default"));
@@ -3722,7 +3725,7 @@ public final class Main {
         void accept(T value) throws Exception;
     }
 
-    private record Profile(
+    record Profile(
             String endpointType,
             String authMode,
             String awsProfileName,

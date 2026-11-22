@@ -19,6 +19,7 @@ public final class TransferRegressionTest {
         TimeoutRegressionTest.run();
         ReviewRegressionTest.run();
         EncryptionRegressionTest.run();
+        S3ConformanceTest.run();
         System.out.println("Transfer regression checks passed (multipart limits, publication, bounded tasks, source snapshots, range retries, cleanup).");
     }
 

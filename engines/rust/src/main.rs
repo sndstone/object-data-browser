@@ -16,6 +16,7 @@ mod delete_all;
 mod download_destination;
 mod lifecycle;
 mod server_copy;
+mod s3_conformance;
 use aws_config::{retry::RetryConfig, BehaviorVersion};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::interceptors::{
@@ -63,6 +64,7 @@ const ENGINE_VERSION: &str = "2.4.0";
 const SUPPORTED_METHODS: &[&str] = &[
     "health",
     "getCapabilities",
+    "s3ConformanceOp",
     "testProfile",
     "listBuckets",
     "createBucket",
@@ -284,9 +286,17 @@ fn write_response(request_id: String, result: SidecarResult) {
 }
 
 async fn handle_request(request: Request) -> SidecarResult {
-    let secrets = secret_hygiene::collect(&request.params);
+    let conformance = request.method == "s3ConformanceOp";
+    let secrets = if conformance {
+        secret_hygiene::collect_conformance(&request.params)
+    } else {
+        secret_hygiene::collect(&request.params)
+    };
     secret_hygiene::SECRETS.scope(secrets, async {
         match dispatch_request(request).await {
+            // Conformance already filters the observation using the signed
+            // request's secrets as well as this scope. Preserve its field names.
+            Ok(value) if conformance => Ok(value),
             Ok(value) => Ok(secret_hygiene::value(value)),
             Err(error) => Err(SidecarError::with_details(error.code, error.message, error.details)),
         }
@@ -307,6 +317,7 @@ async fn dispatch_request(request: Request) -> SidecarResult {
         })),
         "getCapabilities" => Ok(json!({
             "items": [
+                s3_conformance::capability(&request.params["profile"]),
                 {"key": "bucket.lifecycle", "label": "Lifecycle policy CRUD", "state": "supported"},
                 {"key": "bucket.policy", "label": "Bucket policy CRUD", "state": "supported"},
                 {"key": "bucket.cors", "label": "Bucket CORS CRUD", "state": "supported"},
@@ -326,6 +337,7 @@ async fn dispatch_request(request: Request) -> SidecarResult {
                 {"key": "benchmark", "label": "Integrated benchmark mode", "state": "supported"},
             ]
         })),
+        "s3ConformanceOp" => Box::pin(s3_conformance::run(request.params)).await,
         "testProfile" => {
             Box::pin(test_profile(
                 request
@@ -2688,6 +2700,34 @@ async fn build_client(profile: &Profile) -> Result<Client, SidecarError> {
             return Ok(client.clone());
         }
     }
+    let shared_config = load_profile_config(profile).await?;
+    let config = aws_sdk_s3::config::Builder::from(&shared_config)
+        .endpoint_url(profile.endpoint_url.clone())
+        .force_path_style(profile.path_style)
+        .request_checksum_calculation(if profile.endpoint_type == "awsS3" { aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported } else { aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired })
+        .response_checksum_validation(if profile.endpoint_type == "awsS3" { aws_sdk_s3::config::ResponseChecksumValidation::WhenSupported } else { aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired })
+        .timeout_config(profile_timeout_config(profile))
+        .interceptor(ProfileHeaders {
+            requester_pays: profile.requester_pays,
+            expected_bucket_owner: profile.expected_bucket_owner.clone(),
+        })
+        .interceptor(HttpTraceInterceptor {
+            enable_api_logging: profile.enable_api_logging,
+        })
+        .build();
+    let client = Client::from_conf(config);
+    let mut clients = CLIENTS.get_or_init(Default::default).lock().await;
+    if let Some((_, cached)) = clients.iter().find(|(key, _)| key == profile) {
+        return Ok(cached.clone());
+    }
+    if clients.len() >= 16 {
+        clients.remove(0);
+    }
+    clients.push((profile.clone(), client.clone()));
+    Ok(client)
+}
+
+async fn load_profile_config(profile: &Profile) -> Result<aws_config::SdkConfig, SidecarError> {
     let mut loader = aws_config::defaults(BehaviorVersion::latest())
         .region(Region::new(profile.region.clone()))
         .retry_config(RetryConfig::standard().with_max_attempts(profile.max_attempts));
@@ -2731,34 +2771,14 @@ async fn build_client(profile: &Profile) -> Result<Client, SidecarError> {
             )
             .build();
     }
-    let timeout_config = TimeoutConfig::builder()
+    Ok(shared_config)
+}
+
+fn profile_timeout_config(profile: &Profile) -> TimeoutConfig {
+    TimeoutConfig::builder()
         .connect_timeout(Duration::from_secs(profile.connect_timeout_seconds as u64))
         .read_timeout(Duration::from_secs(profile.read_timeout_seconds as u64))
-        .build();
-    let config = aws_sdk_s3::config::Builder::from(&shared_config)
-        .endpoint_url(profile.endpoint_url.clone())
-        .force_path_style(profile.path_style)
-        .request_checksum_calculation(if profile.endpoint_type == "awsS3" { aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported } else { aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired })
-        .response_checksum_validation(if profile.endpoint_type == "awsS3" { aws_sdk_s3::config::ResponseChecksumValidation::WhenSupported } else { aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired })
-        .timeout_config(timeout_config)
-        .interceptor(ProfileHeaders {
-            requester_pays: profile.requester_pays,
-            expected_bucket_owner: profile.expected_bucket_owner.clone(),
-        })
-        .interceptor(HttpTraceInterceptor {
-            enable_api_logging: profile.enable_api_logging,
-        })
-        .build();
-    let client = Client::from_conf(config);
-    let mut clients = CLIENTS.get_or_init(Default::default).lock().await;
-    if let Some((_, cached)) = clients.iter().find(|(key, _)| key == profile) {
-        return Ok(cached.clone());
-    }
-    if clients.len() >= 16 {
-        clients.remove(0);
-    }
-    clients.push((profile.clone(), client.clone()));
-    Ok(client)
+        .build()
 }
 
 async fn bucket_context(params: &Value) -> Result<(Profile, String, Client), SidecarError> {
@@ -2769,6 +2789,10 @@ async fn bucket_context(params: &Value) -> Result<(Profile, String, Client), Sid
 }
 
 fn parse_profile(value: &Value) -> Result<Profile, SidecarError> {
+    parse_profile_inner(value, true)
+}
+
+fn parse_profile_inner(value: &Value, check_tls_options: bool) -> Result<Profile, SidecarError> {
     if value["endpointType"].as_str().unwrap_or_default().trim() == "azureBlob" {
         return Err(SidecarError::new(
             "unsupported_feature",
@@ -2802,14 +2826,13 @@ fn parse_profile(value: &Value) -> Result<Profile, SidecarError> {
             "Unknown authentication mode.",
         ));
     }
-    if value["caBundlePath"]
-        .as_str()
-        .is_some_and(|v| !v.is_empty())
-        || (value["verifyTls"] == false
-            && value["endpointUrl"]
-                .as_str()
-                .unwrap_or("")
-                .starts_with("https://"))
+    if check_tls_options
+        && (value["caBundlePath"].as_str().is_some_and(|v| !v.is_empty())
+            || (value["verifyTls"] == false
+                && value["endpointUrl"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("https://")))
     {
         return Err(SidecarError::new("unsupported_feature", "This Rust build does not support the requested custom-CA or disabled-TLS-verification option. Use Python."));
     }

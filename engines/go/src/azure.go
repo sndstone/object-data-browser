@@ -485,7 +485,7 @@ func handleAzureRequest(method string, params map[string]interface{}) (bool, map
 		for _, key := range []string{"bucket.lifecycle", "bucket.policy", "bucket.cors", "bucket.encryption", "bucket.tagging", "bucket.versioning", "object.resumable", "storage.admin", "tools.bulk-delete"} {
 			items = append(items, map[string]interface{}{"key": key, "label": key, "state": "unsupported", "reason": "Use the Python advanced storage adapter for supported Azure administration."})
 		}
-		return true, map[string]interface{}{"items": encryptionCapabilities(items)}, nil
+		return true, map[string]interface{}{"items": encryptionCapabilities(append(items, s3ConformanceCapability(false)))}, nil
 	case "runPutTestData":
 		raw, isObject := params["encryption"].(map[string]interface{})
 		if params["sourceEncryption"] == nil && (params["encryption"] == nil || (isObject && len(raw) == 1 && raw["mode"] == "bucketDefault")) {

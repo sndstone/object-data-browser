@@ -1,0 +1,177 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:s3_browser_crossplat/conformance/conformance_bytes.dart';
+import 'package:s3_browser_crossplat/conformance/conformance_export.dart';
+import 'package:s3_browser_crossplat/conformance/conformance_models.dart';
+import 'package:s3_browser_crossplat/conformance/conformance_suite.dart';
+import 'package:s3_browser_crossplat/conformance/s3_op_executor.dart';
+
+import 'conformance_fake.dart';
+
+S3ConformanceSuite _suite(FakeExecutor executor,
+        {ConformanceConfig? config, ConformanceCancellation? cancellation, String url = 'https://s3.example.test'}) =>
+    S3ConformanceSuite(
+      executor: executor,
+      config: config ?? const ConformanceConfig(baseBucketName: 'odb-test'),
+      endpoint: ConformanceEndpoint(endpointUrl: url, region: 'us-east-1', pathStyle: true),
+      cancellation: cancellation,
+      sleep: (_) async {},
+      multipartPartSize: 64 * 1024,
+    );
+
+void main() {
+  test('body generator matches the shared vectors', () {
+    final vectors = jsonDecode(File('../../contracts/vectors/s3-conformance-body.json').readAsStringSync()) as Map;
+    for (final item in (vectors['cases'] as List).cast<Map>()) {
+      final data = ConformanceBytes.generate(item['size'] as int, item['seed'] as int);
+      expect(ConformanceBytes.sha256Hex(data), item['sha256']);
+      expect(data.take(8).map((b) => b.toRadixString(16).padLeft(2, '0')).join(), item['first8Hex']);
+    }
+  });
+
+  test('checksums match known values', () {
+    final data = utf8.encode('123456789');
+    // Standard check values: CRC32 0xCBF43926, CRC32C 0xE3069283.
+    expect(ConformanceBytes.crc32Base64(data), base64.encode([0xCB, 0xF4, 0x39, 0x26]));
+    expect(ConformanceBytes.crc32cBase64(data), base64.encode([0xE3, 0x06, 0x92, 0x83]));
+  });
+
+  test('base bucket names are validated', () {
+    expect(ConformanceConfig.validateBaseName('odb-conformance'), isNull);
+    expect(ConformanceConfig.validateBaseName('Bad_Name'), isNotNull);
+    expect(ConformanceConfig.validateBaseName('a'), isNotNull);
+    expect(ConformanceConfig.validateBaseName('trailing-'), isNotNull);
+    expect(ConformanceConfig.validateBaseName('x' * 41), isNotNull);
+  });
+
+  test('stages run in order and teardown deletes every bucket', () async {
+    final executor = FakeExecutor();
+    final run = await _suite(executor).run();
+    final ops = executor.calls.map((c) => c.op).toList();
+    expect(ops.first, 'CreateBucket');
+    expect(executor.calls.first.input['Bucket'], startsWith('odb-test-std-'));
+    final enable = executor.calls.indexWhere((c) =>
+        c.op == 'PutBucketVersioning' && (c.input['VersioningConfiguration'] as Map)['Status'] == 'Enabled');
+    final lastPhaseOne = run.checks.lastIndexWhere((c) => c.phase == ConformancePhase.standard);
+    expect(enable, greaterThan(0));
+    // The gate is recorded before versioning is enabled.
+    expect(run.gatePassed, isNotNull);
+    final gateIndex = run.checks.indexWhere((c) => c.id == 'versioning.gate');
+    expect(gateIndex, greaterThan(lastPhaseOne));
+    final lockCreate = executor.calls.indexWhere((c) => c.op == 'CreateBucket' && c.input['ObjectLockEnabledForBucket'] == true);
+    expect(lockCreate, greaterThan(enable));
+    expect(executor.calls[lockCreate].input['Bucket'], startsWith('odb-test-lock-'));
+    expect(executor.buckets, isEmpty, reason: 'teardown must delete every bucket');
+    expect(run.teardown?.bucketsRetained, isEmpty);
+    expect(run.status, ConformanceRunStatus.completed);
+    expect(run.checks.length, greaterThan(100));
+    for (final check in run.checks) {
+      for (final call in check.calls) {
+        expect(call.latencyMs, 1.5);
+      }
+    }
+  });
+
+  test('cancellation stops checks but still tears down', () async {
+    final cancellation = ConformanceCancellation();
+    late FakeExecutor executor;
+    executor = FakeExecutor(onCall: (request) {
+      if (executor.calls.length == 40) cancellation.cancel();
+    });
+    final run = await _suite(executor, cancellation: cancellation).run();
+    expect(run.status, ConformanceRunStatus.cancelled);
+    expect(executor.buckets, isEmpty);
+    expect(run.checks.where((c) => c.phase == ConformancePhase.versioning), isEmpty);
+  });
+
+  test('force stop skips teardown and reports retained buckets', () async {
+    final cancellation = ConformanceCancellation();
+    late FakeExecutor executor;
+    executor = FakeExecutor(onCall: (request) {
+      if (executor.calls.length == 20) cancellation.cancel(skipTeardown: true);
+    });
+    final run = await _suite(executor, cancellation: cancellation).run();
+    expect(run.teardown?.bucketsRetained, isNotEmpty);
+    expect(executor.buckets, isNotEmpty);
+  });
+
+  test('engine without an operation reports unsupported, not failure', () async {
+    final executor = FakeExecutor(ops: {...allConformanceOps}..remove('GetObjectAttributes'));
+    final run = await _suite(executor).run();
+    expect(run.check('object.attributes')?.status, ConformanceStatus.unsupported);
+    expect(executor.calls.any((c) => c.op == 'GetObjectAttributes'), isFalse);
+  });
+
+  test('NotImplemented from the endpoint is recorded as unsupported', () async {
+    final executor = FakeExecutor(unsupportedOps: const {'PutBucketWebsite'});
+    final run = await _suite(executor).run();
+    expect(run.check('bucket.website')?.status, ConformanceStatus.unsupported);
+  });
+
+  test('an engine without the capability does not touch the endpoint', () async {
+    final executor = FakeExecutor()..capabilitySupported = false;
+    final run = await _suite(executor).run();
+    expect(run.status, ConformanceRunStatus.failed);
+    expect(executor.calls, isEmpty);
+  });
+
+  test('SSE-C runs only on HTTPS or loopback and keys never reach the report', () async {
+    final https = FakeExecutor();
+    final run = await _suite(https).run();
+    expect(https.customerKeys, isNotEmpty);
+    final report = ConformanceReport(
+        id: 'r', config: const ConformanceConfig(baseBucketName: 'odb-test'), profileName: 'p', startedAt: DateTime(2026))
+      ..engines.add(run);
+    final exported = ConformanceExport.json(report) + ConformanceExport.markdown(report, includePassing: true);
+    for (final key in https.customerKeys) {
+      expect(exported.contains(key), isFalse);
+    }
+    final plain = FakeExecutor();
+    final plainRun = await _suite(plain, url: 'http://10.0.0.5:9000').run();
+    expect(plain.customerKeys, isEmpty);
+    expect(plainRun.check('sse.c')?.status, ConformanceStatus.skipped);
+  });
+
+  test('object lock stage can be turned off', () async {
+    final executor = FakeExecutor();
+    final run = await _suite(executor,
+            config: const ConformanceConfig(baseBucketName: 'odb-test', includeObjectLock: false))
+        .run();
+    expect(executor.calls.any((c) => c.input['ObjectLockEnabledForBucket'] == true), isFalse);
+    expect(run.checks.any((c) => c.phase == ConformancePhase.objectLock), isFalse);
+  });
+
+  test('report round-trips through JSON and finds discrepancies', () async {
+    final a = await _suite(FakeExecutor()).run();
+    final b = await _suite(FakeExecutor(ops: {...allConformanceOps}..remove('ListObjects'))).run();
+    final report = ConformanceReport(
+        id: 'r', config: const ConformanceConfig(baseBucketName: 'odb-test'), profileName: 'p', startedAt: DateTime(2026))
+      ..engines.addAll([a, b]);
+    final decoded = ConformanceReport.fromJson(jsonDecode(ConformanceExport.json(report)) as Map<String, Object?>);
+    expect(decoded.engines.length, 2);
+    expect(decoded.engines.first.checks.length, a.checks.length);
+    expect(report.discrepancies(), contains('list.v1.delimiter'));
+    expect(ConformanceExport.markdown(report), contains('## Engine discrepancies'));
+  });
+
+  test('observations parse the wire result', () {
+    final o = S3OpObservation.fromJson({
+      'op': 'ListObjectsV2',
+      'outcome': 'service',
+      'httpStatus': 200,
+      'headers': {'ETag': '"x"'},
+      'output': {
+        'Contents': [
+          {'Key': 'a'}
+        ]
+      },
+      'latencyMs': 2.25,
+    });
+    expect(o.header('etag'), '"x"');
+    expect(o.field('Contents.0.Key'), 'a');
+    expect(o.list('Contents').single['Key'], 'a');
+    expect(o.isSuccess, isTrue);
+  });
+}

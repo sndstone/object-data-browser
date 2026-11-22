@@ -55,7 +55,8 @@
         "resumeBenchmark",
         "stopBenchmark",
         "exportBenchmarkResults",
-        "storageAction"
+        "storageAction",
+        "s3ConformanceOp"
       ]
     },
     "engineVersion": {
@@ -177,6 +178,61 @@
           "description": "Base64 of the 16-byte age file key. Secret; never logged or persisted."
         }
       }
+    },
+    "s3ConformanceOp": {
+      "description": "Desktop only. One S3 API operation executed through the engine SDK. See transport_contract.md, S3 API conformance.",
+      "type": "object",
+      "required": [
+        "profile",
+        "op"
+      ],
+      "properties": {
+        "profile": {
+          "type": "object"
+        },
+        "op": {
+          "type": "string"
+        },
+        "input": {
+          "type": "object"
+        },
+        "body": {
+          "type": "object",
+          "properties": {
+            "generate": {
+              "type": "object",
+              "required": [
+                "size",
+                "seed"
+              ],
+              "properties": {
+                "size": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 16777216
+                },
+                "seed": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 65535
+                }
+              }
+            },
+            "base64": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          }
+        },
+        "encryption": {
+          "$ref": "#/$defs/objectEncryption"
+        },
+        "sourceEncryption": {
+          "$ref": "#/$defs/objectEncryption"
+        }
+      }
     }
   },
   "allOf": [
@@ -252,6 +308,25 @@
             }
           }
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "s3ConformanceOp"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/s3ConformanceOp"
+          }
+        },
+        "required": [
+          "params"
+        ]
       }
     }
   ]

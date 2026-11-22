@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering as MemoryOrdering};
 
 // Binary, concurrent variant of the engine loopback fixture. Workers respond
 // independently so retries and completions really can arrive out of order.
-struct BinaryFixture {
-    endpoint: String,
+pub(crate) struct BinaryFixture {
+    pub(crate) endpoint: String,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl BinaryFixture {
-    fn new(respond: impl Fn(&FixtureRequest) -> Vec<u8> + Send + Sync + 'static) -> Self {
+    pub(crate) fn new(respond: impl Fn(&FixtureRequest) -> Vec<u8> + Send + Sync + 'static) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -67,7 +67,7 @@ impl Drop for BinaryFixture {
         self.thread.take().unwrap().join().unwrap();
     }
 }
-fn binary(status: &str, headers: &str, body: &[u8]) -> Vec<u8> {
+pub(crate) fn binary(status: &str, headers: &str, body: &[u8]) -> Vec<u8> {
     let mut output = format!(
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n",
         body.len()

@@ -110,6 +110,7 @@ Transfer notes:
 | Pause/resume/stop | Required | Required | Required | Required | Shared runtime | Shared runtime | Implemented |
 | CSV export | Required | Required | Required | Required | Shared runtime | Shared runtime | Implemented |
 | In-app charts input schema | Required | Required | Required | Required | Shared runtime | Shared runtime | Implemented |
+| S3 API conformance (`s3ConformanceOp`, see `docs/s3-api-conformance-spec.md`) | Required | Required | Required | Required | Not offered | Not offered | Implemented (desktop only) |
 
 ## Inspector Tools
 

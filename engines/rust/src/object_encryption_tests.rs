@@ -148,9 +148,9 @@ impl Fixture {
 // Keep wire framing independent of sockets so fragmented and binary bodies are
 // covered even in environments that prohibit binding a loopback listener.
 #[derive(Debug)]
-struct FixtureRequest {
+pub(crate) struct FixtureRequest {
     head: String,
-    body: Vec<u8>,
+    pub(crate) body: Vec<u8>,
 }
 impl std::ops::Deref for FixtureRequest {
     type Target = str;
@@ -252,7 +252,7 @@ fn response(status: &str, headers: &str, body: &str) -> String {
 fn ok(body: &str) -> String {
     response("200 OK", "ETag: \"fixture\"\r\n", body)
 }
-fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
     request
         .split("\r\n\r\n")
         .next()
@@ -1329,4 +1329,4 @@ async fn sdk_builds_exact_encryption_headers_without_network() {
 }
 
 #[path = "client_encryption_wire_tests.rs"]
-mod payload;
+pub(crate) mod payload;

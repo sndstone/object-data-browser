@@ -6,7 +6,11 @@ edition = "2021"
 [dependencies]
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "credentials-process", "sso", "default-https-client"] }
 aws-credential-types = "1"
-aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "http-1x"] }
+aws-smithy-checksums = "0.64"
+aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
+aws-smithy-runtime-api = "1"
+aws-smithy-xml = "0.60"
 aws-smithy-types = { version = "1", features = ["http-body-1-x"] }
 http-body = "1"
 libc = "0.2"
@@ -16,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 ring = "=0.17.14"
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 sha1 = "0.10"
 md-5 = "0.10"
 crc-fast = "1.9"
@@ -23,6 +28,9 @@ tokio = { version = "1", features = ["full"] }
 url = "2"
 urlencoding = "2"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio-rustls = { version = "0.26", default-features = false }
 
 [profile.release]
 strip = "symbols"

@@ -1,0 +1,47 @@
+{
+  "description": "Deterministic body generator for s3ConformanceOp: byte i = (seed*131 + i*7 + (i>>10)) & 0xFF. See transport_contract.md, S3 API conformance.",
+  "cases": [
+    {
+      "size": 0,
+      "seed": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "first8Hex": ""
+    },
+    {
+      "size": 1,
+      "seed": 0,
+      "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+      "first8Hex": "00"
+    },
+    {
+      "size": 16,
+      "seed": 7,
+      "sha256": "39fe0ad73991b601f667105678807a55f8e5ae033b6922e3288eb0096ebb3676",
+      "first8Hex": "959ca3aab1b8bfc6"
+    },
+    {
+      "size": 1024,
+      "seed": 1,
+      "sha256": "50a727df2ec023f6ebf4e6f45af999e278a58e86e737bf49053ee1a643fefe71",
+      "first8Hex": "838a91989fa6adb4"
+    },
+    {
+      "size": 2048,
+      "seed": 7,
+      "sha256": "2bb54b856cb76f1473770be22ea9c28c8b7d306d9d0d1cf1511cbfad178f7ef3",
+      "first8Hex": "959ca3aab1b8bfc6"
+    },
+    {
+      "size": 5242880,
+      "seed": 42,
+      "sha256": "cb8d27f359f344753717e6d009b29ab8045cc048d27ee0f5f839bb1a05651c33",
+      "first8Hex": "7e858c939aa1a8af"
+    },
+    {
+      "size": 65537,
+      "seed": 65535,
+      "sha256": "5d5191a09a8d9b1c149162b687aa588d05225a9f8a5f1699b2958bd85280edf1",
+      "first8Hex": "7d848b9299a0a7ae"
+    }
+  ]
+}

@@ -50,7 +50,7 @@ var supportedMethods = []string{
 	"cancelTransfer", "generatePresignedUrl", "runPutTestData",
 	"runDeleteAll", "cancelToolExecution", "startBenchmark",
 	"getBenchmarkStatus", "pauseBenchmark", "resumeBenchmark",
-	"stopBenchmark", "exportBenchmarkResults",
+	"stopBenchmark", "exportBenchmarkResults", "s3ConformanceOp",
 }
 
 type request struct {
@@ -188,10 +188,11 @@ func dispatchRequest(req request) (result map[string]interface{}, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			result = nil
-			err = &sidecarError{
-				Code:    "internal_error",
-				Message: fmt.Sprintf("panic recovered while handling request: %v", r),
+			message := "Panic recovered while handling S3 conformance request."
+			if req.Method != "s3ConformanceOp" {
+				message = fmt.Sprintf("panic recovered while handling request: %v", r)
 			}
+			err = &sidecarError{Code: "internal_error", Message: message}
 		}
 	}()
 	return handleRequest(req)
@@ -206,7 +207,7 @@ func handleRequest(req request) (map[string]interface{}, error) {
 	if err := validateEndpointType(asString(asMap(req.Params["profile"])["endpointType"])); err != nil {
 		return nil, err
 	}
-	if isGCSProfilePayload(asMap(req.Params["profile"])) && req.Method != "health" {
+	if isGCSProfilePayload(asMap(req.Params["profile"])) && req.Method != "health" && req.Method != "s3ConformanceOp" {
 		return handleGCSRequest(req.Method, req.Params)
 	}
 	if isAzureProfilePayload(asMap(req.Params["profile"])) {
@@ -227,7 +228,8 @@ func handleRequest(req request) (map[string]interface{}, error) {
 	case "getCapabilities":
 		state := "supported"
 		reason := "Engine implementation available; service permissions are checked per operation."
-		if asString(asMap(req.Params["profile"])["endpointType"]) != "awsS3" {
+		payload := asMap(req.Params["profile"])
+		if asString(payload["endpointType"]) != "awsS3" {
 			state = "unknown"
 			reason = "S3-compatible endpoint capabilities require an operation probe."
 		}
@@ -237,7 +239,9 @@ func handleRequest(req request) (map[string]interface{}, error) {
 		}
 		items = append(items, map[string]interface{}{"key": "benchmark", "label": "Benchmark", "state": "supported", "implementationState": "supported", "reason": "Engine benchmark runner is available; storage access is checked when the run starts."})
 		items = append(items, map[string]interface{}{"key": "object.resumable", "label": "Resumable transfer jobs", "state": "unsupported", "reason": "Durable transfer checkpoints are not implemented."}, map[string]interface{}{"key": "storage.admin", "label": "Advanced administration adapter", "state": "unsupported", "reason": "Use the Python advanced storage adapter."}, map[string]interface{}{"key": "auth.awsProfiles", "label": "AWS credential providers", "state": "supported"})
-		return map[string]interface{}{"items": encryptionCapabilities(items)}, nil
+		return map[string]interface{}{"items": encryptionCapabilities(append(items, s3ConformanceCapability(isS3ConformanceProfile(payload))))}, nil
+	case "s3ConformanceOp":
+		return s3ConformanceOp(req.Params)
 	case "testProfile":
 		return testProfile(asMap(req.Params["profile"]))
 	case "listBuckets":
@@ -385,19 +389,36 @@ func buildClient(p profile) (*s3.Client, context.Context, error) {
 	if err != nil {
 		return nil, ctx, err
 	}
-	httpClient := profileHTTPClient(p, baseTransport)
+	client, err := newProfileS3Client(ctx, p, profileHTTPClient(p, baseTransport))
+	if err != nil {
+		return nil, ctx, err
+	}
+	if len(s3ClientCache.order) >= 16 {
+		oldest := s3ClientCache.order[0]
+		s3ClientCache.order = s3ClientCache.order[1:]
+		s3ClientCache.transports[oldest].CloseIdleConnections()
+		delete(s3ClientCache.clients, oldest)
+		delete(s3ClientCache.transports, oldest)
+	}
+	s3ClientCache.order = append(s3ClientCache.order, p)
+	s3ClientCache.clients[p] = client
+	s3ClientCache.transports[p] = baseTransport
+	return client, ctx, nil
+}
+
+func newProfileS3Client(ctx context.Context, p profile, httpClient *http.Client, customize ...func(*s3.Options)) (*s3.Client, error) {
 	options := []func(*config.LoadOptions) error{config.WithRegion(p.Region), config.WithHTTPClient(httpClient), config.WithRetryMaxAttempts(p.MaxAttempts)}
 	switch p.AuthMode {
 	case "", "static":
 		options = append(options, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(p.AccessKey, p.SecretKey, p.SessionToken)))
 	case "awsProfile":
 		if p.AWSProfileName == "" {
-			return nil, ctx, &sidecarError{Code: "invalid_config", Message: "An AWS profile name is required."}
+			return nil, &sidecarError{Code: "invalid_config", Message: "An AWS profile name is required."}
 		}
 		options = append(options, config.WithSharedConfigProfile(p.AWSProfileName))
 	case "assumeRole":
 		if p.RoleARN == "" {
-			return nil, ctx, &sidecarError{Code: "invalid_config", Message: "A role ARN is required."}
+			return nil, &sidecarError{Code: "invalid_config", Message: "A role ARN is required."}
 		}
 		if p.AccessKey != "" && p.SecretKey != "" {
 			options = append(options, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(p.AccessKey, p.SecretKey, p.SessionToken)))
@@ -406,11 +427,11 @@ func buildClient(p profile) (*s3.Client, context.Context, error) {
 		}
 	case "awsDefault":
 	default:
-		return nil, ctx, &sidecarError{Code: "unsupported_feature", Message: "Authentication mode is not supported by this S3 engine."}
+		return nil, &sidecarError{Code: "unsupported_feature", Message: "Authentication mode is not supported by this S3 engine."}
 	}
 	cfg, err := config.LoadDefaultConfig(ctx, options...)
 	if err != nil {
-		return nil, ctx, err
+		return nil, err
 	}
 	if p.AuthMode == "assumeRole" {
 		cfg.Credentials = aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), p.RoleARN, func(o *stscreds.AssumeRoleOptions) {
@@ -420,7 +441,7 @@ func buildClient(p profile) (*s3.Client, context.Context, error) {
 			}
 		}))
 	}
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+	applyProfile := func(o *s3.Options) {
 		o.UsePathStyle = p.PathStyle
 		if p.EndpointType != "awsS3" {
 			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
@@ -442,18 +463,8 @@ func buildClient(p profile) (*s3.Client, context.Context, error) {
 				return next.HandleBuild(ctx, in)
 			}), middleware.Before)
 		})
-	})
-	if len(s3ClientCache.order) >= 16 {
-		oldest := s3ClientCache.order[0]
-		s3ClientCache.order = s3ClientCache.order[1:]
-		s3ClientCache.transports[oldest].CloseIdleConnections()
-		delete(s3ClientCache.clients, oldest)
-		delete(s3ClientCache.transports, oldest)
 	}
-	s3ClientCache.order = append(s3ClientCache.order, p)
-	s3ClientCache.clients[p] = client
-	s3ClientCache.transports[p] = baseTransport
-	return client, ctx, nil
+	return s3.NewFromConfig(cfg, append([]func(*s3.Options){applyProfile}, customize...)...), nil
 }
 
 func profileTransport(p profile) (*http.Transport, error) {

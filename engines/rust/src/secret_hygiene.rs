@@ -43,6 +43,21 @@ pub(super) fn collect(value: &Value) -> Vec<String> {
     result
 }
 
+pub(super) fn collect_conformance(params: &Value) -> Vec<String> {
+    let mut keys = collect(params);
+    let profile = &params["profile"];
+    // Static profile parsing trims secretKey but preserves sessionToken.
+    for key in [
+        profile["secretKey"].as_str().map(str::trim),
+        profile["sessionToken"].as_str(),
+    ] {
+        if let Some(key) = key.filter(|key| !key.is_empty()) {
+            keys.push(key.to_owned());
+        }
+    }
+    keys
+}
+
 pub(super) fn text(value: &str) -> String {
     SECRETS
         .try_with(|keys| {

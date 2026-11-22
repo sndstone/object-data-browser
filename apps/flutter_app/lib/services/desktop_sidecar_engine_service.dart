@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import '../conformance/sidecar_s3_op_executor.dart';
 import '../models/domain_models.dart';
 import 'desktop_engine_host.dart';
 import 'diagnostic_safety.dart';
@@ -20,7 +21,8 @@ class DesktopSidecarEngineService
         EngineLogSinkRegistrant,
         TransferJobSinkRegistrant,
         ListingCancellationRegistrant,
-        PerformanceOptionsRegistrant {
+        PerformanceOptionsRegistrant,
+        S3ConformanceTransport {
   DesktopSidecarEngineService({
     DesktopEngineHost? host,
     EngineService? fallback,
@@ -223,6 +225,39 @@ class DesktopSidecarEngineService
         endpointTypes: entry?.endpointTypes ?? engine.endpointTypes,
       );
     }).toList(growable: false);
+  }
+
+  /// S3 API conformance primitive (desktop only). Never falls back to the
+  /// mock service: a missing engine or method is reported as such.
+  @override
+  Future<Map<String, Object?>> conformanceRequest({
+    required String engineId,
+    required EndpointProfile profile,
+    required String method,
+    Map<String, Object?> params = const {},
+  }) async {
+    if (method != 'getCapabilities' && method != 's3ConformanceOp') {
+      throw EngineException(
+          code: ErrorCode.invalidConfig,
+          message: '$method is not a conformance request.');
+    }
+    final entry = await _tryGetEngine(engineId);
+    if (entry == null) throw _engineUnavailable(engineId, method);
+    try {
+      return await _sendSidecarRequest(
+        entry,
+        method: method,
+        params: {...params, 'profile': _profileToJson(profile)},
+      );
+    } on TimeoutException catch (error) {
+      throw EngineException(
+          code: ErrorCode.timeout,
+          message: error.message ?? 'Engine request timed out.');
+    } on ProcessException catch (error) {
+      throw EngineException(
+          code: ErrorCode.engineUnavailable,
+          message: 'The $engineId engine could not start: ${error.message}');
+    }
   }
 
   @override
