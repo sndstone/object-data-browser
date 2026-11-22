@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import hashlib
+import html
 import re
 import threading
 import time
@@ -283,9 +284,6 @@ class _Redactor:
         # Free-form diagnostics: every credential, whatever its length.
         self._diagnostic_secrets = sorted(credentials, key=len, reverse=True)
 
-    def is_credential(self, value: str) -> bool:
-        return value in self._diagnostic_secrets
-
     def diagnostic(self, value: Any) -> Any:
         """Error messages, codes and request IDs: scrub everything, then clip."""
         if not isinstance(value, str):
@@ -383,7 +381,7 @@ def _redact_result(result: dict[str, Any], redactor: _Redactor) -> dict[str, Any
         if result.get(field) is not None:
             result[field] = redactor.diagnostic(result[field])
     code = result.get('errorCode')
-    if code is not None and (not _ERROR_CODE.match(str(code)) or redactor.is_credential(str(code))):
+    if code is not None and str(code) not in KNOWN_S3_ERROR_CODES and not _HTTP_STATUS_CODE.match(str(code)):
         result['errorCode'] = redactor.diagnostic(code)
     if result['headers'].get('x-amz-request-id') is not None:
         result['headers']['x-amz-request-id'] = redactor.diagnostic(result['headers']['x-amz-request-id'])
@@ -511,10 +509,77 @@ def _strip_urls(text: str) -> str:
 _SIGNING = re.compile(
     r'((?:x-amz-)?(?:signature|credential|security-token|securitytoken)["\']?\s*[=:]\s*["\']?)[^\s&,;"\'<]+'
     r'|(authorization["\']?\s*[=:]\s*["\']?)[^\n"\'<]+', re.IGNORECASE)
-# An S3 error code is a server identifier; it is kept unless it could carry
-# text (or exactly equals a credential), so redaction never rewrites
-# "AccessDenied" into something an assertion cannot recognise.
-_ERROR_CODE = re.compile(r'^[A-Za-z][A-Za-z0-9.]{0,63}$')
+# Known S3 error codes are kept verbatim so redaction never rewrites
+# "AccessDenied" into something an assertion cannot recognise. Any other code
+# (endpoint text, SDK class names) is scrubbed like a message.
+KNOWN_S3_ERROR_CODES = frozenset({
+    'AccessDenied',
+    'AccessControlListNotSupported',
+    'AccountProblem',
+    'BadDigest',
+    'BadRequest',
+    'BucketAlreadyExists',
+    'BucketAlreadyOwnedByYou',
+    'BucketNotEmpty',
+    'ConditionalRequestConflict',
+    'EntityTooLarge',
+    'EntityTooSmall',
+    'ExpiredToken',
+    'IllegalLocationConstraintException',
+    'IncompleteBody',
+    'InternalError',
+    'InvalidAccessKeyId',
+    'InvalidArgument',
+    'InvalidBucketName',
+    'InvalidBucketState',
+    'InvalidDigest',
+    'InvalidEncryptionAlgorithmError',
+    'InvalidObjectState',
+    'InvalidPart',
+    'InvalidPartOrder',
+    'InvalidRange',
+    'InvalidRequest',
+    'InvalidStorageClass',
+    'InvalidTag',
+    'InvalidToken',
+    'KMS.DisabledException',
+    'KMS.NotFoundException',
+    'MalformedPolicy',
+    'MalformedXML',
+    'MethodNotAllowed',
+    'MissingContentLength',
+    'MissingSecurityHeader',
+    'NoSuchBucket',
+    'NoSuchBucketPolicy',
+    'NoSuchCORSConfiguration',
+    'NoSuchConfiguration',
+    'NoSuchKey',
+    'NoSuchLifecycleConfiguration',
+    'NoSuchPublicAccessBlockConfiguration',
+    'NoSuchTagSet',
+    'NoSuchUpload',
+    'NoSuchVersion',
+    'NoSuchWebsiteConfiguration',
+    'NotFound',
+    'NotImplemented',
+    'NotModified',
+    'ObjectLockConfigurationNotFoundError',
+    'OperationAborted',
+    'OwnershipControlsNotFoundError',
+    'PermanentRedirect',
+    'PreconditionFailed',
+    'Redirect',
+    'ReplicationConfigurationNotFoundError',
+    'RequestTimeTooSkewed',
+    'RequestTimeout',
+    'ServerSideEncryptionConfigurationNotFoundError',
+    'ServiceUnavailable',
+    'SignatureDoesNotMatch',
+    'SlowDown',
+    'TemporaryRedirect',
+    'XAmzContentChecksumMismatch',
+})
+_HTTP_STATUS_CODE = re.compile(r'^[1-5][0-9][0-9]$')
 
 
 def _strip_signing(text: str) -> str:
@@ -591,7 +656,11 @@ def _presigned_request(profile, kwargs: dict[str, Any], body: Any, g) -> dict[st
         code = re.search(r'<Code>([^<]{1,128})</Code>', text)
         message = re.search(r'<Message>([^<]{0,512})</Message>', text)
         error_code = code.group(1) if code else None
-        error_message = _message(g, message.group(1)) if message else None
+        # Decode XML entities first, so an escaped signature cannot slip past
+        # the scrubber as `&quot;`-quoted text.
+        error_message = _message(g, html.unescape(message.group(1))) if message else None
+        if error_code is not None:
+            error_code = html.unescape(error_code)
     else:
         digest = _digest_stream(response)
         response.release_conn()

@@ -304,7 +304,9 @@ class S3ConformanceSuite {
       // teardown reports the name for manual inspection and never purges it.
       return o;
     } on _CheckUnsupported {
-      _uncertainBuckets.remove(bucket);
+      // Only an engine that never sent the request proves nothing was
+      // created; an endpoint 501 stays uncertain (reported, never purged).
+      if (!_supportsOp('CreateBucket')) _uncertainBuckets.remove(bucket);
       rethrow;
     }
   }

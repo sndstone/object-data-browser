@@ -328,6 +328,11 @@ extension _ObjectLock on S3ConformanceSuite {
           explanation: 'After the retain-until date the version can be deleted.');
       c.status(await c.call('HeadObject', {'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id}), 404,
           explanation: 'The expired version is gone after deletion.');
+      // A check that could not send every denial is incomplete: observed
+      // failures still fail it, otherwise it is reported as skipped, not passed.
+      if (inconclusive.isNotEmpty && !c._expectations.any((e) => !e.ok)) {
+        c.skip('Inconclusive: the 5-second window closed before ${inconclusive.join(', ')} could be sent (slow endpoint).');
+      }
     });
   }
 

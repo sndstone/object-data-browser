@@ -265,11 +265,12 @@ Map<String, Object?> scrubConformanceResult(
   return {
     for (final entry in json.entries)
       entry.key: switch (entry.key) {
-        // An S3 error code is a server identifier, kept unless it could carry
-        // text or equals a credential, so assertions still recognise it.
+        // Known S3 error codes (and HTTP-status codes synthesised by SDKs) are
+        // kept verbatim so assertions recognise them; any other code is
+        // scrubbed like a message.
         'errorCode' when entry.value is String &&
-                RegExp(r'^[A-Za-z][A-Za-z0-9.]{0,63}$').hasMatch(entry.value as String) &&
-                !all.contains(entry.value) =>
+                (knownS3ErrorCodes.contains(entry.value) ||
+                    RegExp(r'^[1-5][0-9][0-9]$').hasMatch(entry.value as String)) =>
           entry.value,
         'errorMessage' || 'errorCode' || 'requestId' when entry.value is String =>
           () {
@@ -293,3 +294,72 @@ bool _urlHeader(String name) {
   final lower = name.toLowerCase();
   return lower == 'location' || lower == 'x-amz-website-redirect-location';
 }
+
+/// S3 error codes the conformance catalog may compare.
+const Set<String> knownS3ErrorCodes = {
+  'AccessDenied',
+  'AccessControlListNotSupported',
+  'AccountProblem',
+  'BadDigest',
+  'BadRequest',
+  'BucketAlreadyExists',
+  'BucketAlreadyOwnedByYou',
+  'BucketNotEmpty',
+  'ConditionalRequestConflict',
+  'EntityTooLarge',
+  'EntityTooSmall',
+  'ExpiredToken',
+  'IllegalLocationConstraintException',
+  'IncompleteBody',
+  'InternalError',
+  'InvalidAccessKeyId',
+  'InvalidArgument',
+  'InvalidBucketName',
+  'InvalidBucketState',
+  'InvalidDigest',
+  'InvalidEncryptionAlgorithmError',
+  'InvalidObjectState',
+  'InvalidPart',
+  'InvalidPartOrder',
+  'InvalidRange',
+  'InvalidRequest',
+  'InvalidStorageClass',
+  'InvalidTag',
+  'InvalidToken',
+  'KMS.DisabledException',
+  'KMS.NotFoundException',
+  'MalformedPolicy',
+  'MalformedXML',
+  'MethodNotAllowed',
+  'MissingContentLength',
+  'MissingSecurityHeader',
+  'NoSuchBucket',
+  'NoSuchBucketPolicy',
+  'NoSuchCORSConfiguration',
+  'NoSuchConfiguration',
+  'NoSuchKey',
+  'NoSuchLifecycleConfiguration',
+  'NoSuchPublicAccessBlockConfiguration',
+  'NoSuchTagSet',
+  'NoSuchUpload',
+  'NoSuchVersion',
+  'NoSuchWebsiteConfiguration',
+  'NotFound',
+  'NotImplemented',
+  'NotModified',
+  'ObjectLockConfigurationNotFoundError',
+  'OperationAborted',
+  'OwnershipControlsNotFoundError',
+  'PermanentRedirect',
+  'PreconditionFailed',
+  'Redirect',
+  'ReplicationConfigurationNotFoundError',
+  'RequestTimeTooSkewed',
+  'RequestTimeout',
+  'ServerSideEncryptionConfigurationNotFoundError',
+  'ServiceUnavailable',
+  'SignatureDoesNotMatch',
+  'SlowDown',
+  'TemporaryRedirect',
+  'XAmzContentChecksumMismatch',
+};

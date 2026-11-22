@@ -125,6 +125,9 @@ void main() {
       'headers': {'x-amz-request-id': 'req-Denied'},
     }, ['Denied']);
     expect(scrubbed['errorCode'], 'AccessDenied');
+    final unknown = scrubConformanceResult(
+        {'errorCode': 'RejectedLongCredentialValue123'}, ['LongCredentialValue123']);
+    expect(unknown['errorCode'], 'Rejected[redacted]');
     expect(scrubbed['errorMessage'], isNot(contains('abc123')));
     expect(scrubbed['errorMessage'], isNot(contains('AKID/x')));
     expect((scrubbed['headers'] as Map)['x-amz-request-id'], 'req-[redacted]');

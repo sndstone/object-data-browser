@@ -285,3 +285,9 @@ def test_short_credentials_stay_in_s3_data(engine, server):
     result = engine.handle_request({'method': 's3ConformanceOp', 'params': {
         'profile': short, 'op': 'ListObjectsV2', 'input': {'Bucket': 'b', 'MaxKeys': 1}}})
     assert result['output']['Contents'][0]['Key'] == 'a b+c'
+
+
+def test_presigned_error_text_is_unescaped_before_scrubbing(engine, server):
+    result = call(engine, server, 'PresignedRequest', {'Method': 'GET', 'Bucket': 'b', 'Key': 'signing', 'ExpiresIn': 60})
+    assert result['httpStatus'] == 403 and result['errorCode'] == 'AccessDenied'
+    assert 'quoted0' not in json.dumps(result) and 'deadbeef' not in json.dumps(result)

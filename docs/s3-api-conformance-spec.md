@@ -340,9 +340,11 @@ The suite follows `AGENTS.md`:
   holds one listing page at a time, the headless runner discards response
   frames over 64 MiB, and the Python engine drops structured output over
   4 MiB (S3 pages hold at most 1000 entries).
-- Error codes are server identifiers and are kept as returned unless they
-  could carry text, so redaction never turns `AccessDenied` into something an
-  assertion cannot recognise; request IDs are scrubbed like messages.
+- Known S3 error codes (and HTTP-status codes that SDKs synthesise for HEAD)
+  are kept verbatim, so redaction never turns `AccessDenied` into something an
+  assertion cannot recognise; any other error code, and every request ID, is
+  scrubbed like a message. Presigned error documents are XML-decoded before
+  scrubbing.
 - **Residual risk:** the response caps above apply after the SDK has read the
   response. The engines' SDKs read a structured (XML) response
   completely before parsing it, so a misbehaving endpoint that returns an
@@ -586,10 +588,10 @@ Run on 2026-11-22 against the AWS emulator 1.0.504 on the N100 host (HTTPS with 
 
 | Engine | SDK | Pass | Fail | Deviation | Unsupported | Skipped | Error | Calls | Mean ms | p50 ms | p95 ms | Wall time | Phase 1 gate | Teardown |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| python | boto3 1.43.89 (botocore 1.43.89) | 162 | 1 | 5 | 2 | 0 | 0 | 425 | 9.1 | 6.8 | 14.8 | 19 s | incomplete | clean: 2 buckets, 68 versions |
-| go | aws-sdk-go-v2 1.96.4 | 164 | 1 | 4 | 1 | 0 | 0 | 428 | 7.3 | 5.5 | 9.6 | 18 s | coverage met | clean: 2 buckets, 69 versions |
-| rust | aws-sdk-s3 1.125.0 | 164 | 1 | 4 | 1 | 0 | 0 | 428 | 7.3 | 5.2 | 9.3 | 19 s | coverage met | clean: 2 buckets, 69 versions |
-| java | aws-sdk-java-v2 2.41.29 | 161 | 1 | 7 | 1 | 0 | 0 | 428 | 10.2 | 7.4 | 16.7 | 20 s | coverage met | clean: 2 buckets, 69 versions |
+| python | boto3 1.43.89 (botocore 1.43.89) | 162 | 1 | 5 | 2 | 0 | 0 | 425 | 8.9 | 6.3 | 13.8 | 19 s | incomplete | clean: 2 buckets, 68 versions |
+| go | aws-sdk-go-v2 1.96.4 | 164 | 1 | 4 | 1 | 0 | 0 | 428 | 7.2 | 5.5 | 9.4 | 19 s | coverage met | clean: 2 buckets, 69 versions |
+| rust | aws-sdk-s3 1.125.0 | 164 | 1 | 4 | 1 | 0 | 0 | 428 | 7.6 | 5.3 | 9.5 | 19 s | coverage met | clean: 2 buckets, 69 versions |
+| java | aws-sdk-java-v2 2.41.29 | 161 | 1 | 7 | 1 | 0 | 0 | 428 | 11.4 | 8.4 | 17.7 | 21 s | coverage met | clean: 2 buckets, 69 versions |
 
 170 checks ran on every engine. The checks that did not pass on every engine:
 
@@ -611,20 +613,20 @@ Mean latency per operation in ms (call count in parentheses), for the most frequ
 
 | Operation | python | go | rust | java |
 | --- | ---: | ---: | ---: | ---: |
-| PutObject | 12.2 (80) | 7.6 (81) | 7.1 (81) | 13.0 (81) |
-| GetObject | 10.8 (65) | 10.0 (66) | 12.0 (66) | 11.9 (66) |
-| HeadObject | 6.1 (43) | 5.5 (44) | 5.2 (44) | 6.4 (44) |
-| ListObjectsV2 | 6.2 (20) | 5.3 (20) | 5.4 (20) | 7.1 (20) |
-| DeleteObject | 5.9 (16) | 6.0 (16) | 5.2 (16) | 6.4 (16) |
-| CopyObject | 6.6 (13) | 5.5 (13) | 5.8 (13) | 7.8 (13) |
-| GetObjectTagging | 6.8 (10) | 5.5 (10) | 5.2 (10) | 6.6 (10) |
-| UploadPart | 33.0 (10) | 26.9 (10) | 26.7 (10) | 31.7 (10) |
-| ListObjectVersions | 5.9 (10) | 5.3 (10) | 5.3 (10) | 6.2 (10) |
-| CreateMultipartUpload | 6.2 (8) | 5.1 (8) | 4.7 (8) | 7.0 (8) |
-| GetObjectRetention | 6.7 (7) | 5.3 (7) | 5.3 (7) | 5.9 (7) |
-| PutObjectRetention | 5.7 (6) | 6.2 (6) | 5.9 (6) | 10.1 (6) |
-| CreateBucket | 6.8 (5) | 5.0 (5) | 5.4 (5) | 6.5 (5) |
-| ListObjects | 6.7 (5) | 5.8 (5) | 7.0 (5) | 7.9 (5) |
+| PutObject | 12.3 (80) | 7.4 (81) | 7.3 (81) | 13.9 (81) |
+| GetObject | 10.4 (65) | 9.6 (66) | 12.4 (66) | 13.8 (66) |
+| HeadObject | 5.9 (43) | 5.7 (44) | 5.4 (44) | 7.0 (44) |
+| ListObjectsV2 | 6.2 (20) | 5.4 (20) | 5.4 (20) | 8.6 (20) |
+| DeleteObject | 5.9 (16) | 5.7 (16) | 6.1 (16) | 6.6 (16) |
+| CopyObject | 7.5 (13) | 5.6 (13) | 5.0 (13) | 8.1 (13) |
+| GetObjectTagging | 4.8 (10) | 5.4 (10) | 5.7 (10) | 7.1 (10) |
+| UploadPart | 36.6 (10) | 26.1 (10) | 29.1 (10) | 34.6 (10) |
+| ListObjectVersions | 5.6 (10) | 5.3 (10) | 5.6 (10) | 8.8 (10) |
+| CreateMultipartUpload | 6.5 (8) | 5.0 (8) | 6.0 (8) | 7.4 (8) |
+| GetObjectRetention | 7.1 (7) | 5.3 (7) | 5.0 (7) | 6.1 (7) |
+| PutObjectRetention | 7.1 (6) | 6.0 (6) | 6.0 (6) | 13.9 (6) |
+| CreateBucket | 5.8 (5) | 5.5 (5) | 4.6 (5) | 8.5 (5) |
+| ListObjects | 5.3 (5) | 4.4 (5) | 6.2 (5) | 7.9 (5) |
 
 ### Findings
 

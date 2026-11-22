@@ -393,13 +393,25 @@ extension _SetupAndStandard on S3ConformanceSuite {
         severity: ConformanceSeverity.informational,
         body: (c) async {
       final invalidName = 'Invalid_Name..${_newRunId()}';
-      // Like every created name, it must be confirmed unused first; ownership
-      // is recorded only if the endpoint then accepts the name.
+      // Only an affirmative 404 proves the name unused; a created bucket is then
+      // owned. Endpoints (like AWS) may answer 400 for an invalid name, which
+      // proves nothing: the check still runs, but a bucket the endpoint
+      // unexpectedly creates is reported for inspection and never purged.
       final probe = await _quiet('HeadBucket', {'Bucket': invalidName});
-      if (probe == null || !probe.isService || (probe.httpStatus != 404 && probe.httpStatus != 400)) {
-        c.skip('The invalid name could not be confirmed unused (HeadBucket ${probe == null ? 'failed' : _CheckContext.describe(probe)}).');
+      final provenUnused = probe != null && probe.isService && probe.httpStatus == 404;
+      if (!provenUnused && !(probe != null && probe.isService && probe.httpStatus == 400)) {
+        c.skip('The invalid name could not be checked (HeadBucket ${probe == null ? 'failed' : _CheckContext.describe(probe)}).');
       }
-      final o = await _createBucket(c, invalidName, input: {'Bucket': invalidName});
+      final S3OpObservation o;
+      if (provenUnused) {
+        o = await _createBucket(c, invalidName, input: {'Bucket': invalidName});
+      } else {
+        _uncertainBuckets.add(invalidName);
+        o = await c.call('CreateBucket', {'Bucket': invalidName});
+        if (o.outcome == 'sdk_validation' || (o.isService && o.httpStatus == 400)) {
+          _uncertainBuckets.remove(invalidName);
+        }
+      }
       if (o.outcome == 'sdk_validation') {
         c.note('The SDK rejected the name before sending (${o.errorCode ?? 'validation'}).');
         return;
