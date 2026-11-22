@@ -1066,9 +1066,8 @@ impl Response {
                 ),
             )
             | (401 | 403, _) => "auth_failed",
-            (_, Some("PreconditionFailed" | "ConditionalRequestConflict")) | (412, _) => {
-                "object_conflict"
-            }
+            (_, Some("PreconditionFailed" | "ConditionalRequestConflict" | "InvalidRange"))
+            | (412 | 416, _) => "object_conflict",
             (_, Some("BucketAlreadyExists" | "BucketAlreadyOwnedByYou" | "BucketNotEmpty"))
             | (409, _) => "conflict",
             (_, Some("NotImplemented" | "UnsupportedOperation")) | (501, _) => {

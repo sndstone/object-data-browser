@@ -430,17 +430,20 @@ impl Plan<'_> {
         let count = self.size.div_ceil(part) as usize;
         let etags = run_bounded(count, self.limit, |index| {
             Box::pin(async move {
-                let start = index as u64 * part;
-                let end = (start + part).min(self.size) - 1;
                 let number = (index + 1).to_string();
                 let mut headers = self.destination_customer.clone();
                 headers.extend(self.source_customer.clone());
                 set_header(&mut headers, "x-amz-copy-source", &self.source)?;
-                set_header(
-                    &mut headers,
-                    "x-amz-copy-source-range",
-                    &format!("bytes={start}-{end}"),
-                )?;
+                // S3 rejects range copies from small source objects.
+                if count > 1 {
+                    let start = index as u64 * part;
+                    let end = (start + part).min(self.size) - 1;
+                    set_header(
+                        &mut headers,
+                        "x-amz-copy-source-range",
+                        &format!("bytes={start}-{end}"),
+                    )?;
+                }
                 set_header(&mut headers, "x-amz-copy-source-if-match", self.etag)?;
                 let query = [("partNumber", number.as_str()), ("uploadId", upload)];
                 let (_, body) = call(

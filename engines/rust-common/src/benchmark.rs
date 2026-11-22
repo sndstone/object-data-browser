@@ -821,7 +821,12 @@ fn benchmark_profile_value(profile_value: &Value, config: &Map<String, Value>) -
                 .unwrap_or(5),
         ),
     );
-    let pool_limit = Value::from(config["maxPoolConnections"].as_u64().unwrap_or(10));
+    let pool_limit = Value::from(
+        config
+            .get("maxPoolConnections")
+            .and_then(Value::as_u64)
+            .unwrap_or(10),
+    );
     merged.insert("maxPoolConnections".to_owned(), pool_limit.clone());
     merged.insert("maxConcurrentRequests".to_owned(), pool_limit);
     Value::Object(merged)

@@ -91,6 +91,33 @@ configuration updates, folder creation, test-data generation, and version-aware
 delete-all. A separate run paused a benchmark, inspected its credential-free
 checkpoint, resumed in a fresh sidecar, stopped and exported CSV.
 
+### Live HTTP and HTTPS acceptance
+
+Run the opt-in emulator tests with `ENGINE_CMD_JSON` pointing at the raw binary
+and `ODB_S3_EMULATOR_URL` pointing at a disposable, authenticated AWS Emulator.
+Supply its CA certificate path through `ODB_S3_EMULATOR_CA` and its generated
+credentials through `ODB_S3_EMULATOR_ACCESS_KEY` and
+`ODB_S3_EMULATOR_SECRET_KEY`.
+
+```sh
+REQUIRE_ENGINE=1 python -m pytest tests/contract/test_rust_raw_emulator.py -q
+```
+
+The emulator listens on HTTPS. The tests run the same S3 workflows directly
+over HTTPS and with Rust Raw sending plain HTTP to a loopback forwarder. The
+forwarder keeps the signed Host and raw request target and verifies the TLS
+certificate on the emulator hop. Each workflow creates its own buckets.
+Coverage includes bucket settings, version and delete marker pagination, Object
+Lock, conditional multipart copy, upload and download, and presigned reads.
+One fault-injection case verifies that the emulator accepts an abort after
+an upload part is rejected.
+
+The same file runs loopback fault tests without emulator configuration. These
+cover invalid profiles and version delete batches, refused connections, malformed
+XML, bounded timeouts and retries, range and ETag mismatches, and interrupted
+uploads. A rejected range yields `object_conflict`. An upload that loses its
+response after sending the body yields `unknown_outcome` without replay.
+
 ## Benchmark on N100
 
 Both optimized builds targeted the same authenticated HTTPS emulator.

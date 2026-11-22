@@ -333,14 +333,17 @@ pub(super) async fn delete_object_versions(params: &Value) -> SidecarResult {
     let objects: Vec<(&str, Option<&str>)> = versions
         .iter()
         .map(|item| {
-            (
-                item["key"].as_str().unwrap_or_default(),
-                item["versionId"]
-                    .as_str()
-                    .filter(|version| !version.is_empty()),
-            )
+            let key = item["key"]
+                .as_str()
+                .filter(|key| !key.is_empty() && key.len() <= 1024)
+                .ok_or_else(|| invalid_config("An S3 object key must contain 1–1024 UTF-8 bytes."))?;
+            let version = item["versionId"]
+                .as_str()
+                .filter(|version| !version.is_empty())
+                .ok_or_else(|| invalid_config("Each version delete requires an explicit version ID, including the literal null version ID."))?;
+            Ok((key, Some(version)))
         })
-        .collect();
+        .collect::<Result<_, SidecarError>>()?;
     let client = client_for(params)?;
     delete_all(&client, &bucket, &objects, bypass_requested(params)).await
 }

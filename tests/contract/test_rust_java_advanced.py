@@ -405,8 +405,10 @@ def await_benchmark(engine, profile, run_id):
 
 @pytest.mark.parametrize('in_memory', [False, True])
 def test_native_benchmark_payload_storage_and_completion_times(native_engine, s3_fixture, tmp_path, in_memory):
-    engine, _ = native_engine; profile, fixture = s3_fixture
+    engine, name = native_engine; profile, fixture = s3_fixture
     config = benchmark_config(tmp_path, inMemoryData=in_memory)
+    if in_memory and name in ('rust', 'rust-raw'):
+        config.pop('maxPoolConnections')
     started = engine.request('startBenchmark', {'profile': profile, 'config': config})
     assert started['ok'], started
     state = await_benchmark(engine, profile, started['result']['id'])
