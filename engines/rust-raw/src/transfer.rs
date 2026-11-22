@@ -1957,7 +1957,8 @@ mod tests {
         assert_eq!(fs::read(dir.0.join("file.bin")).unwrap(), data);
         assert_eq!(server.join().unwrap(), 2);
 
-        // Server ignoring Range (200 instead of 206) must fail and leave no .part files.
+        // Use one range here so the fixture can return HTTP 200 without an
+        // unanswered concurrent request racing the expected error.
         let fail_dir = TempDir::new("download-fail");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -1974,6 +1975,11 @@ mod tests {
                     )
                     .unwrap();
                 } else {
+                    assert_eq!(req.method, "GET");
+                    assert_eq!(
+                        req.headers.get("range").map(String::as_str),
+                        Some(format!("bytes=0-{}", data_clone.len() - 1).as_str())
+                    );
                     write!(
                         stream,
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
@@ -1992,12 +1998,13 @@ mod tests {
             "keys": ["nested/file.bin"],
             "destinationPath": fail_dir.0.to_string_lossy(),
             "multipartThresholdMiB": 1,
-            "multipartChunkMiB": 1,
+            "multipartChunkMiB": 2,
         }))
         .await
         .unwrap_err();
+        server.join().unwrap();
         assert_eq!(err.code, "object_conflict");
-        let _ = server.join();
+        assert_eq!(err.details["httpStatus"], 200);
         assert!(fs::read_dir(&fail_dir.0).unwrap().next().is_none());
     }
 
