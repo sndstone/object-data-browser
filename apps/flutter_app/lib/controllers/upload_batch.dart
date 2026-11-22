@@ -1,8 +1,11 @@
+import 'dart:io';
+
+import 'package:path/path.dart' as p;
+
 import '../services/client_encryption.dart';
 import '../services/crypto/age.dart';
 import '../services/vault_name_codec.dart';
 import '../services/diagnostic_safety.dart';
-import 'dart:io';
 import 'action_scope.dart';
 import '../services/listing_cancellation.dart';
 import '../models/domain_models.dart';
@@ -32,8 +35,7 @@ class UploadBatch {
   final Map<String, String> _storedKeys = {};
   final Set<String> _nameEncryptedPaths = {};
   String storedKeyFor(String path) =>
-      _storedKeys[path] ??
-      '$prefix${objectKeys[path] ?? path.split(Platform.pathSeparator).last}';
+      _storedKeys[path] ?? '$prefix${objectKeys[path] ?? p.basename(path)}';
   final EngineService engine;
   final String engineId, bucket, prefix, id;
   final EndpointProfile profile;
@@ -65,7 +67,7 @@ class UploadBatch {
     _totalBytes = 0;
     // Validate every file before causing any external mutation.
     for (final path in paths) {
-      final name = objectKeys[path] ?? path.split(Platform.pathSeparator).last;
+      final name = objectKeys[path] ?? p.basename(path);
       final key = '$prefix$name';
       // Engines may read a name differently from how it is matched here.
       if (vaultTargetIsAmbiguous(profile.clientEncryptionRules, bucket, key,
@@ -86,8 +88,7 @@ class UploadBatch {
         }
         if (rule.encryptsNames) _nameEncryptedPaths.add(path);
         _storedKeys[path] = rule.encryptsNames
-            ? await encodeName!(rule,
-                objectKeys[path] ?? path.split(Platform.pathSeparator).last)
+            ? await encodeName!(rule, name)
             : validateStoredKey('$key.age');
       } else {
         _storedKeys[path] = validateStoredKey(key);
@@ -158,7 +159,7 @@ class UploadBatch {
         strategyLabel: 'Per-file upload · bounded part workers',
         currentItemLabel: _index < 0
             ? 'Preparing files'
-            : '${_index + 1}/${paths.length} · ${_nameEncryptedPaths.contains(paths[_index]) ? storedKeyFor(paths[_index]) : paths[_index].split(Platform.pathSeparator).last}',
+            : '${_index + 1}/${paths.length} · ${_nameEncryptedPaths.contains(paths[_index]) ? storedKeyFor(paths[_index]) : p.basename(paths[_index])}',
         itemCount: paths.length,
         itemsCompleted: _completed,
         partSizeBytes: _child?.partSizeBytes,
@@ -242,8 +243,7 @@ class UploadBatch {
               multipartThresholdMiB: settings.multipartThresholdMiB,
               multipartChunkMiB: _chunks[i],
             );
-        final key =
-            '$prefix${objectKeys[paths[i]] ?? paths[i].split(Platform.pathSeparator).last}';
+        final key = '$prefix${objectKeys[paths[i]] ?? p.basename(paths[i])}';
         final rule = matchingClientEncryptionRule(
           profile.clientEncryptionRules,
           bucket,

@@ -1264,12 +1264,16 @@ void main() {
     // Upload handlers turn backslashes into slashes and drop leading
     // slashes, and one drops a blank prefix.
     final rule = vault(names: false);
-    final backslash = await file(r'vault\payroll.txt');
     final plain = await file('payroll.csv');
     c.currentPrefix = '';
-    await c.startSampleUpload([backslash]);
-    expect(engine.uploads, isEmpty);
-    expect(c.bannerMessage, contains('backslash'));
+    // On Windows a backslash is a directory separator. The mapped names
+    // below exercise the same guard on every platform.
+    if (!Platform.isWindows) {
+      final backslash = await file(r'vault\payroll.txt');
+      await c.startSampleUpload([backslash]);
+      expect(engine.uploads, isEmpty);
+      expect(c.bannerMessage, contains('backslash'));
+    }
     for (final mapped in [r'vault\payroll.csv', '/vault/payroll.csv']) {
       c.bannerMessage = null;
       await c.startSampleUpload([plain], objectKeyByPath: {plain: mapped});
@@ -1365,16 +1369,17 @@ void main() {
     // and outside the location, and so does anything without a vault rule.
     vault(names: false);
     c.currentPrefix = '';
-    final other = await file(r'notes\today.txt');
     final leading = await file(' notes.txt');
-    await c.startSampleUpload([other]);
+    await c.startSampleUpload([plain],
+        objectKeyByPath: {plain: r'notes\today.txt'});
     await c.startSampleUpload([leading]);
     await c.startSampleUpload([plain],
         objectKeyByPath: {plain: 'photos/2024/a.jpg'});
     expect(engine.uploads, hasLength(3));
     c.selectedProfile =
         c.selectedProfile!.copyWith(clientEncryptionRules: const []);
-    await c.startSampleUpload([backslash]);
+    await c.startSampleUpload([plain],
+        objectKeyByPath: {plain: r'vault\payroll.txt'});
     expect(engine.uploads, hasLength(4));
   });
   test('an ordinary name shaped like a token is no evidence once unlocked',
@@ -1649,8 +1654,8 @@ void main() {
     await c.initialize();
     c.selectedBucket = bucket;
     final r = vault();
-    final path = await file(distinctive);
-    await c.startSampleUpload([path]);
+    final path = await file('upload.txt');
+    await c.startSampleUpload([path], objectKeyByPath: {path: distinctive});
     final stored = uploadedKey();
     var progressUpdates = 0;
     engine.afterDownloadProgress = () {

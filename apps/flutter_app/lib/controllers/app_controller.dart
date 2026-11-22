@@ -17,6 +17,7 @@ import '../services/vault_name_codec.dart';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
 
 import '../models/domain_models.dart';
 import '../services/app_state_repository.dart';
@@ -1797,8 +1798,7 @@ class AppController extends ChangeNotifier {
       await _guard('Transfers', () async {
         // Engines may read a name differently from how it is matched here.
         for (final path in filePaths) {
-          final name =
-              objectKeyByPath[path] ?? path.split(Platform.pathSeparator).last;
+          final name = objectKeyByPath[path] ?? p.basename(path);
           if (vaultTargetIsAmbiguous(
               profile.clientEncryptionRules, bucket, '$requestPrefix$name',
               uploadPrefix: requestPrefix, uploadName: name)) {
@@ -1810,7 +1810,7 @@ class AppController extends ChangeNotifier {
               matchingClientEncryptionRule(
                 profile.clientEncryptionRules,
                 bucket,
-                '$requestPrefix${objectKeyByPath[path] ?? path.split(Platform.pathSeparator).last}',
+                '$requestPrefix${objectKeyByPath[path] ?? p.basename(path)}',
               ) !=
               null,
         );
@@ -1819,15 +1819,14 @@ class AppController extends ChangeNotifier {
             final rule = matchingClientEncryptionRule(
                 profile.clientEncryptionRules,
                 bucket,
-                '$requestPrefix${objectKeyByPath[path] ?? path.split(Platform.pathSeparator).last}');
+                '$requestPrefix${objectKeyByPath[path] ?? p.basename(path)}');
             if (rule != null) {
               final nameKeys = await _uploadNameKeys(rule);
               encodeVaultObjectKey(
                   rule: rule,
                   keys: nameKeys,
                   destinationPrefix: requestPrefix,
-                  relativeName: objectKeyByPath[path] ??
-                      path.split(Platform.pathSeparator).last);
+                  relativeName: objectKeyByPath[path] ?? p.basename(path));
             }
           }
           await _requireClientEncryptionCapability(profile, requestEngine);

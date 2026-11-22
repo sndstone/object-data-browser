@@ -6,6 +6,7 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as digests;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
 import 'package:s3_browser_crossplat/services/crypto/age.dart';
 import 'package:s3_browser_crossplat/services/encryption_key_store.dart';
 
@@ -134,7 +135,7 @@ void main() {
 
   setUp(() {
     directory = Directory.systemTemp.createTempSync('encryption-key-store-');
-    file = File('${directory.path}/keys.age');
+    file = File(p.join(directory.path, 'keys.age'));
     store = open(file);
   });
   tearDown(() async {
