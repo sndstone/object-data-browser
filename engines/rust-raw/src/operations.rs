@@ -1295,16 +1295,11 @@ pub(crate) fn object_page(
             _ => {}
         }
     }
-    items.sort_by(|left, right| {
-        let left_folder = left["isFolder"].as_bool().unwrap_or(false);
-        let right_folder = right["isFolder"].as_bool().unwrap_or(false);
-        right_folder.cmp(&left_folder).then_with(|| {
-            left["key"]
-                .as_str()
-                .unwrap_or_default()
-                .to_lowercase()
-                .cmp(&right["key"].as_str().unwrap_or_default().to_lowercase())
-        })
+    items.sort_by_cached_key(|item| {
+        (
+            !item["isFolder"].as_bool().unwrap_or(false),
+            item["key"].as_str().unwrap_or_default().to_lowercase(),
+        )
     });
     let next = root
         .text_of("NextContinuationToken")

@@ -15,8 +15,11 @@ ring crypto provider. The dependency graph contains zero AWS SDK or Smithy
 crates. The profile controls the connect timeout, response inactivity timeout,
 connection limit and maximum attempts. TLS verifies the endpoint against
 platform roots by default. A profile can add a PEM CA bundle or explicitly
-disable certificate and name verification. The client does not follow HTTP
-redirects. Configure the region and endpoint for the bucket being accessed.
+disable certificate and name verification. The client reads the configured
+bundle before selecting a connection pool and uses the bundle's SHA-256
+digest in the pool key. Replacing the bundle changes the trust configuration
+for new sidecar operations. The client does not follow HTTP redirects.
+Configure the region and endpoint for the bucket being accessed.
 
 | Behavior | Raw engine |
 | --- | --- |
@@ -60,11 +63,12 @@ continue through the application's provider-aware adapter.
 
 File uploads verify the source snapshot around hashing and streaming. Multipart
 workers use at most 10,000 ordered parts and abort a failed upload after workers
-settle. Downloads discard staging on errors and publish only after the complete
-stream validates. Object moves verify the destination before deleting the
-source. A compatible endpoint whose unversioned conditional delete support is
-unproven retains the source, and the operation reports that outcome. Delete-all
-uses bounded deletion without overwriting objects to repair stale metadata.
+settle. Downloads batch staging writes with 64 KiB per stream, discard staging
+on errors, and publish only after the complete stream validates. Object moves
+verify the destination before deleting the source. A compatible endpoint
+whose unversioned conditional delete support is unproven retains the source,
+and the operation reports that outcome. Delete-all uses bounded deletion
+without overwriting objects to repair stale metadata.
 An unconfirmed upload or copy prompts the caller to reconcile the destination
 before a retry.
 
@@ -106,3 +110,23 @@ On this workload the raw engine delivered 26% higher median throughput and
 validation. Both engines completed all runs with zero errors or retries and
 produced CSV and JSON exports. The numbers characterize this endpoint,
 connection and workload.
+
+### Browser and transfer performance
+
+Four interleaved release-build runs per variant compared the optimizations
+with the previous raw engine. Values are medians across runs.
+
+| Workload | Metric | Previous | Optimized |
+| --- | --- | ---: | ---: |
+| N100 HTTPS, 120 sequential listings using a custom CA | Listing p50 | 23.4 ms | 5.8 ms |
+| Same HTTPS workload | Listing p95 | 31.7 ms | 10.6 ms |
+| Loopback, 120 listings with 1,000 entries per page | Listing p50 | 3.06 ms | 2.88 ms |
+| Loopback, one ranged and one single-stream 128 MiB download per run | Raw sidecar CPU time per run | 0.305 s | 0.205 s |
+| Same loopback transfer workload | Ranged throughput | 807 MiB/s | 893 MiB/s |
+
+Every transfer was verified by SHA-256. The 64 KiB write buffer used less
+memory than the 256 KiB candidate in the loopback test. Median peak resident
+memory was about 14 MiB for both the previous and optimized builds. N100 transfer
+rates varied between runs. The separate 3,600-operation N100 mixed workload
+showed similar throughput and latency, with 1,440 verified reads and zero
+errors or retries in each run.

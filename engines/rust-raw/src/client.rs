@@ -22,7 +22,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::Digest;
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
@@ -185,7 +185,7 @@ impl Endpoint {
 #[derive(Clone, PartialEq, Eq)]
 struct TransportOptions {
     verify_tls: bool,
-    ca_bundle: Option<PathBuf>,
+    ca_digest: Option<[u8; 32]>,
     connect_timeout: Duration,
     pool_size: usize,
 }
@@ -199,12 +199,29 @@ type TransportCache = Mutex<VecDeque<(TransportOptions, Arc<Transport>)>>;
 static TRANSPORTS: OnceLock<TransportCache> = OnceLock::new();
 static NATIVE_ROOTS: OnceLock<RootCertStore> = OnceLock::new();
 
-fn transport(options: TransportOptions) -> Result<Arc<Transport>, SidecarError> {
+fn transport(
+    verify_tls: bool,
+    ca_bundle: Option<&str>,
+    connect_timeout: Duration,
+    pool_size: usize,
+) -> Result<Arc<Transport>, SidecarError> {
+    // Read the current bundle before selecting a pool, including after rotation.
+    let ca_bundle = ca_bundle
+        .filter(|path| verify_tls && !path.is_empty())
+        .map(|path| {
+            std::fs::read(path).map_err(|_| {
+                SidecarError::new("invalid_config", "Could not read the TLS CA bundle.")
+            })
+        })
+        .transpose()?;
+    let options = TransportOptions {
+        verify_tls,
+        ca_digest: ca_bundle.as_ref().map(|pem| Sha256::digest(pem).into()),
+        connect_timeout,
+        pool_size,
+    };
     let cache = TRANSPORTS.get_or_init(Default::default);
-    // A custom CA file can be replaced between requests. Reload it so a
-    // removed trust root never survives in an idle connection pool.
-    let cacheable = options.ca_bundle.is_none();
-    if cacheable {
+    {
         let mut entries = cache.lock().unwrap();
         if let Some(index) = entries.iter().position(|(entry, _)| *entry == options) {
             let pair = entries.remove(index).unwrap();
@@ -229,11 +246,8 @@ fn transport(options: TransportOptions) -> Result<Arc<Transport>, SidecarError> 
                 native
             })
             .clone();
-        if let Some(path) = &options.ca_bundle {
-            let file = std::fs::File::open(path).map_err(|_| {
-                SidecarError::new("invalid_config", "Could not open the TLS CA bundle.")
-            })?;
-            let certificates = rustls_pemfile::certs(&mut io::BufReader::new(file))
+        if let Some(mut pem) = ca_bundle.as_deref() {
+            let certificates = rustls_pemfile::certs(&mut pem)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| {
                     SidecarError::new("invalid_config", "The TLS CA bundle is invalid.")
@@ -277,14 +291,12 @@ fn transport(options: TransportOptions) -> Result<Arc<Transport>, SidecarError> 
         client,
         active: Arc::new(Semaphore::new(options.pool_size)),
     });
-    if cacheable {
-        let mut entries = cache.lock().unwrap();
-        if let Some((_, existing)) = entries.iter().find(|(entry, _)| *entry == options) {
-            return Ok(existing.clone());
-        }
-        entries.push_front((options, pool.clone()));
-        entries.truncate(8);
+    let mut entries = cache.lock().unwrap();
+    if let Some((_, existing)) = entries.iter().find(|(entry, _)| *entry == options) {
+        return Ok(existing.clone());
     }
+    entries.push_front((options, pool.clone()));
+    entries.truncate(8);
     Ok(pool)
 }
 
@@ -417,20 +429,17 @@ impl Client {
             .or_else(|| profile["maxConcurrentRequests"].as_u64())
             .unwrap_or(10)
             .clamp(1, 128) as usize;
-        let transport = transport(TransportOptions {
-            verify_tls: profile["verifyTls"].as_bool().unwrap_or(true),
-            ca_bundle: profile["caBundlePath"]
-                .as_str()
-                .filter(|p| !p.is_empty())
-                .map(PathBuf::from),
-            connect_timeout: Duration::from_secs(
+        let transport = transport(
+            profile["verifyTls"].as_bool().unwrap_or(true),
+            profile["caBundlePath"].as_str(),
+            Duration::from_secs(
                 profile["connectTimeoutSeconds"]
                     .as_u64()
                     .unwrap_or(5)
                     .clamp(1, 600),
             ),
-            pool_size: max_connections,
-        })?;
+            max_connections,
+        )?;
         Ok(Self {
             endpoint,
             transport,
@@ -1122,6 +1131,34 @@ mod tests {
     use std::time::Instant;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn custom_ca_pool_follows_the_current_bundle_contents() {
+        const CA: &str = "-----BEGIN CERTIFICATE-----
+MIIBMTCB2AIJAOmbVs8KU4gIMAoGCCqGSM49BAMCMCExHzAdBgNVBAMMFk9iamVj
+dC1Ccm93c2VyLVRlc3QtQ0EwHhcNMjYxMTIyMjEwNDMxWhcNMzYxMTE5MjEwNDMx
+WjAhMR8wHQYDVQQDDBZPYmplY3QtQnJvd3Nlci1UZXN0LUNBMFkwEwYHKoZIzj0C
+AQYIKoZIzj0DAQcDQgAEXwYvmhXDmgXJm438e5Nfl1mEPc25DgbdasLIeXmUF8cm
+r6fjm2svOByLEFPOebFLze2Vmecbb41OtHTHY/+bEzAKBggqhkjOPQQDAgNIADBF
+AiEA0ljPbj7pLwDV9bOhEpbGGhn2LSROr4yLzUxW7it0PegCICnrirj+0DIj/2CG
+dVjtLBSdx9og5ah8oguWnbimUS8o
+-----END CERTIFICATE-----\n";
+        let path = std::env::temp_dir().join(format!("odb-raw-ca-{}", uuid::Uuid::new_v4()));
+        let pool = || transport(true, path.to_str(), Duration::from_secs(5), 1);
+        std::fs::write(&path, CA).unwrap();
+        let first = pool().unwrap();
+        let same = pool().unwrap();
+        std::fs::write(&path, format!("{CA}\n")).unwrap();
+        let changed = pool().unwrap();
+        std::fs::write(&path, "invalid bundle").unwrap();
+        let invalid = pool();
+        std::fs::remove_file(&path).unwrap();
+        let missing = pool();
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(invalid.err().unwrap().code, "invalid_config");
+        assert_eq!(missing.err().unwrap().code, "invalid_config");
+    }
 
     #[test]
     fn endpoints_preserve_the_wire_path_and_canonical_host() {

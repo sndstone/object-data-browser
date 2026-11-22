@@ -18,10 +18,11 @@ use std::io::{self, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use uuid::Uuid;
 
 const MIB: u64 = 1024 * 1024;
+const DOWNLOAD_WRITE_BUFFER: usize = 64 * 1024;
 const MIN_UPLOAD_PART_MIB: u64 = 5;
 const MAX_UPLOAD_PART_MIB: u64 = 5120;
 const DEFAULT_UPLOAD_PART_MIB: u64 = 8;
@@ -1095,7 +1096,7 @@ async fn download_object_ranged(
                         file.seek(SeekFrom::Start(start))
                             .await
                             .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
-
+                        let mut file = BufWriter::with_capacity(DOWNLOAD_WRITE_BUFFER, file);
                         let mut range_bytes = 0_u64;
                         while let Some(chunk) = response.next_chunk().await? {
                             if range_bytes.saturating_add(chunk.len() as u64) > expected_bytes {
@@ -1223,9 +1224,10 @@ async fn download_object_single(
                     ));
                 }
             }
-            let mut file = tokio::fs::File::create(target)
+            let file = tokio::fs::File::create(target)
                 .await
                 .map_err(|error| SidecarError::new("invalid_config", error.to_string()))?;
+            let mut file = BufWriter::with_capacity(DOWNLOAD_WRITE_BUFFER, file);
             let mut object_bytes = 0_u64;
             while let Some(chunk) = response.next_chunk().await? {
                 if object_bytes.saturating_add(chunk.len() as u64) > object_size {
