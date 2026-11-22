@@ -4,9 +4,12 @@ extension _Versioning on S3ConformanceSuite {
   Future<void> _versioningPhase() async {
     final phaseOne = _run.checks.where((check) =>
         check.phase == ConformancePhase.standard || check.phase == ConformancePhase.setup);
+    // The gate needs affirmative coverage: a required check that was
+    // unsupported, skipped or errored did not show the behaviour either.
     final requiredFailures = phaseOne.where((check) =>
         check.severity == ConformanceSeverity.required &&
-        (check.status == ConformanceStatus.fail || check.status == ConformanceStatus.error));
+        check.status != ConformanceStatus.pass &&
+        check.status != ConformanceStatus.warn);
     _run.gatePassed = requiredFailures.isEmpty;
     await _check('versioning.gate',
         category: 'Versioning',
@@ -14,11 +17,12 @@ extension _Versioning on S3ConformanceSuite {
         spec: 'Every required phase-1 check passes before PutBucketVersioning(Enabled). Phase 2 runs either way so versioning stays diagnosable.',
         severity: ConformanceSeverity.informational,
         body: (c) async {
-      c.isTrue('required phase-1 failures', requiredFailures.isEmpty,
+      c.isTrue('required phase-1 checks without a pass', requiredFailures.isEmpty,
           expected: '0',
           actual: requiredFailures.isEmpty
               ? '0'
-              : '${requiredFailures.length}: ${requiredFailures.take(6).map((check) => check.id).join(', ')}${requiredFailures.length > 6 ? ', …' : ''}');
+              : '${requiredFailures.length}: ${requiredFailures.take(6).map((check) => '${check.id} (${check.status.label})').join(', ')}${requiredFailures.length > 6 ? ', …' : ''}',
+          explanation: 'Failed, errored, unsupported or skipped required checks leave phase-1 coverage incomplete.');
     });
     final enable = await _check('versioning.enable',
         category: 'Versioning',
@@ -35,8 +39,37 @@ extension _Versioning on S3ConformanceSuite {
       _run.note = 'Versioning could not be enabled; remaining phase-2 checks were skipped.';
       return;
     }
-    // AWS documents a short propagation delay after the first enable.
-    await _sleep(const Duration(seconds: 1));
+    // AWS documents a propagation delay after versioning is first enabled
+    // (writes may briefly behave as unversioned). Wait until a probe write
+    // gets a real version ID that reads back, within a bounded budget.
+    await _check('versioning.ready',
+        category: 'Versioning',
+        title: 'Versioning takes effect for new writes',
+        spec: 'After PutBucketVersioning(Enabled), PutObject returns a non-"null" x-amz-version-id that GetObject accepts. AWS allows a propagation delay; the suite waits up to 60 s.',
+        severity: ConformanceSeverity.informational,
+        body: (c) async {
+      final deadline = _clock().add(const Duration(seconds: 60));
+      var attempts = 0;
+      while (true) {
+        attempts++;
+        final put = await c.call('PutObject', {'Bucket': _stdBucket, 'Key': 'p2/ready-probe.txt'}, body: S3OpBody.text('probe $attempts'));
+        final id = put.header('x-amz-version-id');
+        if (put.isSuccess && id != null && id.isNotEmpty && id != 'null') {
+          final get = await c.call('GetObject', {'Bucket': _stdBucket, 'Key': 'p2/ready-probe.txt', 'VersionId': id});
+          if (get.isSuccess) {
+            if (attempts > 1) c.note('Versioning took effect after $attempts probe writes.');
+            return;
+          }
+        }
+        if (_clock().isAfter(deadline)) {
+          c.isTrue('versioned probe write', false,
+              expected: 'version ID that reads back', actual: '${_CheckContext.describe(put)}, version ${id ?? 'absent'}',
+              explanation: 'Versioning did not take effect within 60 s; later phase-2 results may reflect propagation.');
+          return;
+        }
+        await _sleep(const Duration(seconds: 2));
+      }
+    });
     const key = 'p2/versioned.txt';
     final v1 = utf8.encode('version one');
     final v2 = utf8.encode('version two, longer');
@@ -162,6 +195,8 @@ extension _Versioning on S3ConformanceSuite {
       final get = await c.call('GetObject', {'Bucket': _stdBucket, 'Key': key, 'VersionId': marker});
       c.status(get, 405, code: 'MethodNotAllowed');
       c.header(get, 'x-amz-delete-marker', 'true');
+      c.headerPresent(get, 'last-modified', informational: true,
+          explanation: 'AWS returns the delete marker\'s Last-Modified with the 405.');
       final head = await c.call('HeadObject', {'Bucket': _stdBucket, 'Key': key, 'VersionId': marker});
       c.status(head, 405);
       c.header(head, 'x-amz-delete-marker', 'true', informational: true);
@@ -301,9 +336,8 @@ extension _Versioning on S3ConformanceSuite {
         title: 'Writes in a suspended bucket replace the "null" version',
         spec: 'After suspension, PutObject stores version "null"; a second write replaces it; earlier numbered versions remain.',
         body: (c) async {
-      // A numbered version written while versioning was enabled is needed first;
-      // write it by enabling, writing and suspending again would race, so use the
-      // existing versioned key from phase 2 and a fresh key for the null version.
+      // A fresh key gets only "null" versions; the phase-2 key keeps its
+      // numbered versions for the next check.
       final first = await c.call('PutObject', {'Bucket': _stdBucket, 'Key': key}, body: S3OpBody.text('null one'));
       c.status(first, 200);
       final header = first.header('x-amz-version-id');
@@ -354,7 +388,8 @@ extension _Versioning on S3ConformanceSuite {
       c.status(await c.call('DeleteObject', {'Bucket': _stdBucket, 'Key': 'p2/versioned.txt', 'VersionId': 'null'}), 204);
       final get = await c.call('GetObject', {'Bucket': _stdBucket, 'Key': 'p2/versioned.txt'});
       c.status(get, 200);
-      c.header(get, 'x-amz-version-id', numbered, informational: true);
+      c.header(get, 'x-amz-version-id', numbered);
+      c.body(get, utf8.encode('version two, longer'), field: 'restored numbered version');
     });
   }
 }

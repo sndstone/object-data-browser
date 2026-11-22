@@ -469,6 +469,10 @@ and the mobile UI never offers the feature.
 ```
 
 `ops` lists every operation from the table below that the engine implements.
+An engine whose SDK URL-decodes `EncodingType=url` listing responses before
+returning them (AWS SDK for Java v2) adds `"urlEncodedListings": "decodedBySdk"`
+to `client`; the host then cannot inspect the wire encoding and reports that
+instead of decoding twice.
 Azure Blob and Google Cloud Storage profiles report the key as `unsupported`.
 
 ### Request

@@ -63,7 +63,12 @@ A service response of any status is a successful observation
 sending), `sdk_decode` (a response arrived but the SDK could not parse it) and
 `transport` (connection, TLS or timeout) are reported as such. Only
 `service` outcomes are compared with the specification; an `sdk_decode`
-result is itself a finding (see the Rust notes below).
+result is itself a finding (see the Rust notes below). `httpStatus` is the wire
+status: an S3 error embedded in a `200` response (CompleteMultipartUpload,
+copies) is reported as `200` with its error code, and the host never counts a
+2xx that carries an error code as a success. `attempts` counts real HTTP sends;
+the Python engine removes botocore's S3 region redirector from its
+conformance client so one observation is always one request.
 
 Header-bound values (ETag, `x-amz-version-id`, checksums, lock headers) are
 read from the allow-listed response headers, so every SDK is judged on the same
@@ -135,9 +140,13 @@ Each engine run creates its own buckets, so engines never share state:
 | Copy peer | `<base>-xb-<run>` | Created and deleted inside `copy.cross-bucket`. |
 | Bucket 2 | `<base>-lock-<run>` | Created with `ObjectLockEnabledForBucket: true` for phase 3. |
 
-`<run>` is eight random lower-case characters. Every bucket is added to the
-teardown list **before** it is created, so a create that timed out is still
-checked and removed.
+`<run>` is eight random lower-case characters. Before anything is created the
+suite sends HeadBucket for all three names and picks new names if any of them
+exists, so an existing bucket can never become a test bucket. A bucket counts
+as **owned** only when its CreateBucket returned 2xx; only owned buckets are
+purged and deleted. A create without a definite outcome (for example a
+transport failure) is reported for manual inspection and never purged, and a
+`409` (someone else's or a pre-existing bucket) is never touched.
 
 1. **Setup.** Create bucket 1 and verify HeadBucket, GetBucketLocation,
    ListBuckets, duplicate creation and the initial (absent) versioning status.
@@ -147,11 +156,14 @@ checked and removed.
    ACLs, multipart, presigned URLs, server-side encryption, bucket
    subresources and error responses.
 3. **Gate.** `versioning.gate` records whether every *required* phase-1 check
-   passed. Phase 2 runs either way, so versioning remains diagnosable; the gate
-   result is shown in the report.
-4. **Phase 2, versioning.** `PutBucketVersioning(Enabled)`, then the
-   versioning checks, then `PutBucketVersioning(Suspended)` and the "null"
-   version checks.
+   passed. Coverage must be affirmative: a required check that failed, errored,
+   was unsupported or was skipped leaves the gate incomplete. Phase 2 runs
+   either way, so versioning remains diagnosable; the gate result is shown in
+   the report.
+4. **Phase 2, versioning.** `PutBucketVersioning(Enabled)`, then
+   `versioning.ready` (probe writes until a version ID reads back, at most 60 s,
+   because AWS documents a propagation delay), then the versioning checks,
+   then `PutBucketVersioning(Suspended)` and the "null" version checks.
 5. **Phase 3, Object Lock.** First the negative checks on bucket 1 (Object
    Lock calls on a bucket without Object Lock must fail), then bucket 2.
 6. **Teardown.** Always runs, also after Stop (unless *Stop without cleanup*).
@@ -162,10 +174,13 @@ checked and removed.
   about three minutes (`now + 120 s`, extended once by 60 s). Times are taken
   from the server's `Date` header, not the local clock.
 - The default bucket retention (`GOVERNANCE`, 1 day) is written, read back and
-  **cleared before any object is written**. If it cannot be cleared, protected
-  writes are skipped.
-- The only COMPLIANCE lock is the optional 5-second check. Teardown waits for
-  its retain-until date (at most 20 s) before deleting the version.
+  **cleared before any object is written**. Protected writes start only after
+  a successful GetObjectLockConfiguration shows Object Lock enabled with no
+  default rule; anything else (a failed clear, a failed or unreadable read)
+  skips them.
+- The only COMPLIANCE lock is the optional 5-second check. Its retain-until date
+  is recorded before the PUT is sent, so even a timed-out write is waited for:
+  teardown waits for that date (at most 20 s) before deleting the version.
 - An endpoint that rejects lock-enabled bucket creation marks the phase
   *unsupported*. One that accepts the flag but reports no lock configuration
   fails `lock.config.get`, and protected writes are skipped.
@@ -174,14 +189,21 @@ checked and removed.
 
 For each owned bucket (lock bucket first):
 
-1. HeadBucket; skip buckets that were never created.
-2. Abort every in-progress multipart upload (paginated).
+1. HeadBucket. Only a definite `404` means the bucket is already gone; an
+   engine failure or another non-service outcome leaves the bucket reported
+   as retained with an error, never silently skipped.
+2. Abort every in-progress multipart upload (paginated); a listing failure is
+   reported.
 3. On the lock bucket, set every legal hold that is ON to OFF.
-4. Delete every version and delete marker with `DeleteObjects`
-   (`BypassGovernanceRetention: true` on the lock bucket), falling back to
-   per-object `DeleteObject` for entries the batch could not remove. Repeat
-   from the first page for up to five sweeps.
+4. Delete page by page from the start of the listing (at most 1000 entries in
+   memory) with `DeleteObjects` (`BypassGovernanceRetention: true` on the lock
+   bucket), falling back to per-object `DeleteObject` for entries the batch
+   could not remove. Plain keys are used only for a bucket whose versioning
+   status is confirmed absent, so a delete can never add delete markers.
 5. DeleteBucket.
+
+*Stop without cleanup* pressed during teardown leaves the remaining buckets in
+place and lists them as retained.
 
 The result (`teardown.complete` and the teardown summary) lists deleted and
 retained buckets, removed versions, aborted uploads, cleared holds, leftovers
@@ -247,7 +269,8 @@ behaviour:
   `x-amz-bypass-governance-retention`. COMPLIANCE retention cannot be bypassed,
   shortened or switched to GOVERNANCE.
 - PutObject with Object Lock headers requires Content-MD5 or an
-  `x-amz-checksum-*` header.
+  `x-amz-checksum-*` header (required check; the engines send checksums only on
+  request, so the request really lacks one) and stores nothing when rejected.
 - `EntityTooSmall` is reported by CompleteMultipartUpload, not by UploadPart.
 - AWS buckets created since 2023 have SSE-S3 default encryption,
   BucketOwnerEnforced ownership and Block Public Access; the catalog accepts both
@@ -260,11 +283,13 @@ behaviour:
 | boto3 | Adds `EncodingType=url` to ListObjects/V2/Versions when the caller omits it, and decodes the result itself. With an explicit `EncodingType`, it returns the raw encoded values. | Listing checks without encoding compare decoded keys; the `encoding-url` checks send it explicitly and decode on the host. |
 | boto3 | CRC32C requires the optional `awscrt` package, which the bundled engine does not ship. | Reported as **unsupported by the engine** (`checksum.crc32c.valid`), not as an endpoint failure. |
 | boto3 | `CopySource` as a dict is percent-encoded once (`+` → `%2B`). | Matches the contract. |
-| AWS SDK for Java v2 | URL-decodes `EncodingType=url` listing responses before returning them, so the wire encoding cannot be inspected. | Detected; the keys are compared as returned and the check records a deviation "keys already decoded by the SDK" instead of decoding twice. |
+| boto3 | The S3 region redirector re-sends after `301`/`400` and may probe HeadBucket; an error embedded in a `200` is turned into `500`. | The conformance client removes the redirector, counts sends and reports the wire status. |
+| AWS SDK for Java v2 | URL-decodes `EncodingType=url` listing responses before returning them, so the wire encoding cannot be inspected. | The engine declares it (`client.urlEncodedListings: decodedBySdk`); the keys are compared as returned and the check records a deviation instead of decoding twice. For any other engine, unencoded keys are a failure. |
 | AWS SDK for Java v2 | CopyObject/UploadPartCopy name the destination `DestinationBucket`/`DestinationKey`. | The engine maps the contract's `Bucket`/`Key` and `CopySource` structure. |
 | aws-sdk-s3 (Rust) | Strictly checks the XML root element of every response. | An endpoint that uses the wrong root element produces `sdk_decode`; this is how the emulator's ListBucketAnalyticsConfigurations and ListBucketIntelligentTieringConfigurations root-name deviations were found. |
 | aws-sdk-s3 (Rust) | The engine's ordinary client rejects custom CA bundles. | The conformance client trusts `caBundlePath` in addition to the native roots; `verifyTls: false` remains unsupported. |
 | aws-sdk-go-v2 | Copy sources need explicit encoding; the engine reuses its proven `+`-preserving encoder. | Matches the contract. |
+| aws-sdk-s3 (Rust) | The SDK takes a pre-encoded copy source. | The engine encodes the bucket and each key segment once and keeps `/` literal, like the other engines. |
 | All | Recent SDK versions add CRC checksums by default (`when_supported`). | Disabled for conformance (`when_required`), so a checksum is sent only when a check asks for it. |
 | All | HEAD error codes differ by SDK (`404`, `NotFound`, empty). | Ignored; only the status is compared. |
 
@@ -281,14 +306,23 @@ The suite follows `AGENTS.md`:
   `DiagnosticSafety` already redact), refused inside `input`, and sent only
   to HTTPS or loopback endpoints.
 - Error messages are clipped to 256 characters by the engines and pass through
-  the engines' redaction. Presigned error documents are parsed for `Code` and
+  the engines' redaction. Profile credentials of 16 characters or more are
+  replaced wherever they appear (shorter ones, such as an emulator's `test`,
+  are ordinary words in S3 data and are not substring-replaced; customer keys
+  always are). URL-valued headers (`location`,
+  `x-amz-website-redirect-location`) lose their query string. The host
+  applies the same scrub again to every engine result before recording it. Presigned error documents are parsed for `Code` and
   `Message` only, because AWS error documents can echo the canonical request.
 - The engines' response sanitizers keep opaque pagination cursors
   (`ContinuationToken`, `NextContinuationToken`, markers, upload IDs) while
   still redacting real secrets. The Java engine's sanitizer previously
-  redacted any field containing "token"; it was narrowed for this feature.
+  redacted any field containing "token"; it now exempts exactly
+  `ContinuationToken` and `NextContinuationToken` and nothing else.
 - Records and exports are bounded (see Result model); at most five reports are
-  kept in memory and none are persisted unless the user saves them.
+  kept in memory and none are persisted unless the user saves them. Teardown
+  holds one listing page at a time, the headless runner discards response
+  frames over 64 MiB, and the Python engine drops structured output over
+  4 MiB (S3 pages hold at most 1000 entries).
 - Base bucket names covered by a client-encryption (vault) rule are refused.
 
 ## Verification
@@ -299,11 +333,25 @@ The suite follows `AGENTS.md`:
   server covering success and error observations, header allow-listing, cursor
   preservation, copy-source encoding, the unknown-operation error, refusal of
   customer keys in `input`, and presigned requests without URL leakage.
-- Host: `test/conformance_suite_test.dart` (staging order, gate, teardown,
-  cancellation with and without cleanup, unsupported mapping, SSE-C gating and
-  key leakage, JSON round trip, discrepancy detection) and
+- Host: `test/conformance_suite_test.dart` (preflight and staging order, gate,
+  teardown, a colliding bucket never purged, cancellation with and without
+  cleanup, unsupported mapping, SSE-C gating and key leakage, JSON round trip,
+  discrepancy detection) and
   `test/conformance_view_test.dart` (desktop-only visibility and layout at
-  1000, 1280 and 390 px wide, 100 % and 150 % scale, with text-size checks).
+  1000, 1280 and 390 px wide, 100 % and 150 % scale, with text-size and
+  no-clipping checks).
+
+## Council review
+
+The feature was designed, implemented and reviewed by a three-model council:
+Claude Opus 5.5 (lead, catalog, host, Python engine, UI, docs), GPT-6.2 Sol
+(Go and Rust engines, Rust custom CA support, review) and Gemini 4 Neon (Java
+engine, UI design, review). Both reviewers' Stage 3 findings were fixed before
+the reference run below, among them: teardown ownership proof and name
+preflight, fail-closed teardown and Object Lock guards, single-send Python
+observations with wire status, credential and signed-URL scrubbing, gate
+coverage, a versioning readiness probe, stricter post-rejection assertions,
+encoded listing fields, and bounded memory.
 
 ## Check catalog
 
@@ -342,7 +390,7 @@ and the AWS behaviour it expects.
 | `metadata.user` | required | PutObject, HeadObject, GetObject | PutObject Metadata is returned as lower-case x-amz-meta-* headers by HeadObject and GetObject. |
 | `checksum.crc32.valid` | required | PutObject, HeadObject, GetObject | PutObject ChecksumAlgorithm=CRC32: 200 with x-amz-checksum-crc32; HeadObject/GetObject with ChecksumMode=ENABLED return the same value. |
 | `checksum.crc32.mismatch` | required | PutObject, HeadObject | PutObject with a well-formed but wrong x-amz-checksum-crc32: 400 BadDigest; nothing is stored. |
-| `checksum.crc32c.valid` | required | — | PutObject ChecksumAlgorithm=CRC32C: 200 with x-amz-checksum-crc32c; HeadObject/GetObject with ChecksumMode=ENABLED return the same value. |
+| `checksum.crc32c.valid` | required | PutObject, HeadObject, GetObject | PutObject ChecksumAlgorithm=CRC32C: 200 with x-amz-checksum-crc32c; HeadObject/GetObject with ChecksumMode=ENABLED return the same value. |
 | `checksum.crc32c.mismatch` | required | PutObject, HeadObject | PutObject with a well-formed but wrong x-amz-checksum-crc32c: 400 BadDigest; nothing is stored. |
 | `checksum.sha1.valid` | required | PutObject, HeadObject, GetObject | PutObject ChecksumAlgorithm=SHA1: 200 with x-amz-checksum-sha1; HeadObject/GetObject with ChecksumMode=ENABLED return the same value. |
 | `checksum.sha1.mismatch` | required | PutObject, HeadObject | PutObject with a well-formed but wrong x-amz-checksum-sha1: 400 BadDigest; nothing is stored. |
@@ -393,6 +441,7 @@ and the AWS behaviour it expects.
 | `list.v2.pagination` | required | ListObjectsV2 | ListObjectsV2: IsTruncated true with NextContinuationToken until the last page; no gaps or duplicates. |
 | `list.v2.start-after` | required | ListObjectsV2 | ListObjectsV2: keys strictly after StartAfter in binary order. |
 | `list.v2.encoding-url` | required | ListObjectsV2 | ListObjectsV2: EncodingType url in the response; Key, Prefix, Delimiter and StartAfter are URL-encoded (space as +). |
+| `list.v2.encoding-url-fields` | required | PutObject, ListObjectsV2 | ListObjectsV2 EncodingType=url: Prefix, StartAfter, Key and CommonPrefixes are URL-encoded in the response. |
 | `list.v2.empty` | required | ListObjectsV2 | ListObjectsV2: 200, KeyCount 0, no Contents, IsTruncated false. |
 | `list.v1.delimiter` | required | ListObjects | ListObjects: 200; Contents and CommonPrefixes as for v2; Marker echoed. |
 | `list.v1.pagination` | required | ListObjects | ListObjects: IsTruncated; NextMarker only with a delimiter, otherwise the last key is the next Marker. |
@@ -413,9 +462,9 @@ and the AWS behaviour it expects.
 | `multipart.part-number-read` | informational | GetObject, GetObjectAttributes | GetObject partNumber=1: 206 with Content-Length of part 1 and x-amz-mp-parts-count: 2. |
 | `multipart.upload-part-copy` | required | PutObject, CreateMultipartUpload, UploadPartCopy, UploadPart, CompleteMultipartUpload, GetObject | UploadPartCopy with x-amz-copy-source-range: 200 with CopyPartResult.ETag; the completed object holds the copied range. |
 | `multipart.abort` | required | CreateMultipartUpload, UploadPart, AbortMultipartUpload, ListParts, ListMultipartUploads, HeadObject | AbortMultipartUpload: 204; afterwards ListParts returns 404 NoSuchUpload and the upload is no longer listed. |
-| `multipart.entity-too-small` | required | CreateMultipartUpload, UploadPart, CompleteMultipartUpload | CompleteMultipartUpload with a 1 KiB first part: 400 EntityTooSmall. |
-| `multipart.invalid-part` | required | CreateMultipartUpload, UploadPart, CompleteMultipartUpload | CompleteMultipartUpload with a wrong ETag: 400 InvalidPart. |
-| `multipart.invalid-part-order` | required | CreateMultipartUpload, UploadPart, CompleteMultipartUpload | CompleteMultipartUpload with descending part numbers: 400 InvalidPartOrder. |
+| `multipart.entity-too-small` | required | CreateMultipartUpload, UploadPart, CompleteMultipartUpload, HeadObject | CompleteMultipartUpload with a 1 KiB first part: 400 EntityTooSmall. |
+| `multipart.invalid-part` | required | CreateMultipartUpload, UploadPart, CompleteMultipartUpload, HeadObject | CompleteMultipartUpload with a wrong ETag: 400 InvalidPart. |
+| `multipart.invalid-part-order` | required | CreateMultipartUpload, UploadPart, CompleteMultipartUpload, HeadObject | CompleteMultipartUpload with descending part numbers: 400 InvalidPartOrder. |
 | `multipart.list-uploads.pagination` | required | CreateMultipartUpload, ListMultipartUploads | ListMultipartUploads MaxUploads=1: IsTruncated with NextKeyMarker and NextUploadIdMarker; the next page lists the other upload. |
 | `presign.get` | required | PutObject, PresignedRequest | A SigV4 query-signed GET (X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires, X-Amz-SignedHeaders, X-Amz-Signature): 200 with the payload. |
 | `presign.put` | required | PresignedRequest, GetObject | A presigned PUT with a signed Content-Type: 200 with an ETag; the object then reads back unchanged. |
@@ -442,7 +491,7 @@ and the AWS behaviour it expects.
 | `bucket.metrics` | informational | ListBucketMetricsConfigurations, PutBucketMetricsConfiguration, GetBucketMetricsConfiguration, DeleteBucketMetricsConfiguration | ListBucketMetricsConfigurations: 200 and empty; PutBucketMetricsConfiguration: 200; GetBucketMetricsConfiguration returns Id conformance; DeleteBucketMetricsConfiguration: 204. |
 | `bucket.inventory` | informational | ListBucketInventoryConfigurations, PutBucketInventoryConfiguration, GetBucketInventoryConfiguration, DeleteBucketInventoryConfiguration | ListBucketInventoryConfigurations: 200 and empty; PutBucketInventoryConfiguration: 200; GetBucketInventoryConfiguration returns Id conformance; DeleteBucketInventoryConfiguration: 204. |
 | `bucket.intelligent-tiering` | informational | ListBucketIntelligentTieringConfigurations, PutBucketIntelligentTieringConfiguration, GetBucketIntelligentTieringConfiguration, DeleteBucketIntelligentTieringConfiguration | ListBucketIntelligentTieringConfigurations: 200 and empty; PutBucketIntelligentTieringConfiguration: 200; GetBucketIntelligentTieringConfiguration returns Id conformance; DeleteBucketIntelligentTieringConfiguration: 204. |
-| `error.no-such-bucket` | required | GetObject, ListObjectsV2, HeadBucket, DeleteBucket | GetObject/ListObjectsV2: 404 NoSuchBucket; HeadBucket: 404 without a body. |
+| `error.no-such-bucket` | required | GetObject, ListObjectsV2, HeadBucket | GetObject/ListObjectsV2: 404 NoSuchBucket; HeadBucket: 404 without a body. |
 | `error.no-such-key` | required | GetObject, HeadObject, GetObjectTagging | GetObject: 404 NoSuchKey; HeadObject: 404 without a body. |
 | `error.bucket-not-empty` | required | PutObject, DeleteBucket | DeleteBucket: 409 BucketNotEmpty. |
 | `error.invalid-bucket-name` | informational | CreateBucket | CreateBucket: 400 InvalidBucketName. An SDK may refuse the name before sending. |
@@ -454,6 +503,7 @@ and the AWS behaviour it expects.
 | --- | --- | --- | --- |
 | `versioning.gate` | informational | — | Every required phase-1 check passes before PutBucketVersioning(Enabled). Phase 2 runs either way so versioning stays diagnosable. |
 | `versioning.enable` | required | PutBucketVersioning, GetBucketVersioning | PutBucketVersioning Status=Enabled: 200; GetBucketVersioning: Status Enabled. |
+| `versioning.ready` | informational | PutObject, GetObject | After PutBucketVersioning(Enabled), PutObject returns a non-"null" x-amz-version-id that GetObject accepts. AWS allows a propagation delay; the suite waits up to 60 s. |
 | `versioning.put.distinct-ids` | required | PutObject | PutObject in an Enabled bucket: 200 with a distinct, non-"null" x-amz-version-id per write. |
 | `versioning.get.by-id` | required | GetObject, HeadObject | GetObject/HeadObject versionId=<id>: 200 with that version and x-amz-version-id; without versionId the latest version. |
 | `versioning.list` | required | ListObjectVersions | ListObjectVersions: 200; versions of a key newest first; only the newest has IsLatest=true. |
@@ -483,7 +533,7 @@ and the AWS behaviour it expects.
 | `lock.versioning.auto` | required | GetBucketVersioning | GetBucketVersioning on an Object Lock bucket: Status Enabled without PutBucketVersioning. |
 | `lock.config.get` | required | GetObjectLockConfiguration | GetObjectLockConfiguration: 200, ObjectLockEnabled Enabled, no default rule. |
 | `lock.config.default-retention` | required | PutObjectLockConfiguration, GetObjectLockConfiguration | PutObjectLockConfiguration with Rule.DefaultRetention {GOVERNANCE, Days 1}: 200; Get returns it; putting ObjectLockEnabled alone clears the rule. |
-| `lock.put.requires-integrity` | informational | PutObject | PutObject with Object Lock headers and no Content-MD5/x-amz-checksum: 400 InvalidRequest. |
+| `lock.put.requires-integrity` | required | PutObject, HeadObject | PutObject with Object Lock headers and no Content-MD5/x-amz-checksum (engines send checksums only on request): 400 InvalidRequest; nothing is stored. |
 | `lock.put.governance-and-hold` | required | PutObject, HeadObject | PutObject with x-amz-object-lock-mode GOVERNANCE, retain-until date and legal hold ON (plus Content-MD5): 200 with a version ID; HeadObject reports all three. |
 | `lock.retention.get` | required | GetObjectRetention | GetObjectRetention: 200 with Retention.Mode GOVERNANCE and RetainUntilDate. |
 | `lock.retention.extend` | required | PutObjectRetention, GetObjectRetention | PutObjectRetention with a later RetainUntilDate: 200; GetObjectRetention reports the new date. |
@@ -495,7 +545,7 @@ and the AWS behaviour it expects.
 | `lock.governance.delete-denied` | required | DeleteObject | DeleteObject versionId without x-amz-bypass-governance-retention while retained: 403 AccessDenied. |
 | `lock.governance.delete-bypass` | required | DeleteObject, HeadObject | DeleteObject versionId with x-amz-bypass-governance-retention: true: 204; the version is gone. |
 | `lock.legal-hold.only` | required | PutObject, PutObjectLegalHold, DeleteObject | PutObject then PutObjectLegalHold ON: 200; deletion by version: 403 AccessDenied; after OFF: 204. |
-| `lock.compliance.short` | required | PutObject, DeleteObject, PutObjectRetention | PutObject COMPLIANCE: 200; DeleteObject with bypass and PutObjectRetention shortening or switching to GOVERNANCE: 403 AccessDenied; after the date passes deletion: 204. |
+| `lock.compliance.short` | required | PutObject, GetObjectRetention, DeleteObject, PutObjectRetention, HeadObject | PutObject COMPLIANCE: 200 with a version ID; GetObjectRetention reports COMPLIANCE and the date; DeleteObject with governance bypass, PutObjectRetention with an earlier date and PutObjectRetention to GOVERNANCE: 403 AccessDenied; after the date passes the version can be deleted. |
 
 ### Teardown
 
@@ -507,50 +557,58 @@ and the AWS behaviour it expects.
 
 Run on 2026-11-22 against the AWS emulator 1.0.504 on the N100 host (HTTPS with a self-signed CA trusted through `caBundlePath`, path-style addressing, region `us-east-1`, SigV4 authentication on), with every option enabled. Each engine created and deleted its own buckets.
 
-| Engine | SDK | Pass | Fail | Deviation | Unsupported | Skipped | Error | Calls | Mean ms | p50 ms | p95 ms | Wall time | Teardown |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| python | boto3 1.43.89 (botocore 1.43.89) | 161 | 0 | 5 | 2 | 0 | 0 | 408 | 8.7 | 6.0 | 14.5 | 18 s | clean: 2 buckets, 64 versions |
-| go | aws-sdk-go-v2 1.96.4 | 162 | 0 | 5 | 1 | 0 | 0 | 411 | 7.5 | 5.5 | 9.4 | 17 s | clean: 2 buckets, 65 versions |
-| rust | aws-sdk-s3 1.125.0 | 162 | 0 | 5 | 1 | 0 | 0 | 411 | 7.6 | 5.5 | 9.9 | 17 s | clean: 2 buckets, 65 versions |
-| java | aws-sdk-java-v2 2.41.29 | 160 | 0 | 7 | 1 | 0 | 0 | 411 | 11.3 | 7.9 | 17.6 | 19 s | clean: 2 buckets, 65 versions |
+| Engine | SDK | Pass | Fail | Deviation | Unsupported | Skipped | Error | Calls | Mean ms | p50 ms | p95 ms | Wall time | Phase 1 gate | Teardown |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| python | boto3 1.43.89 (botocore 1.43.89) | 162 | 1 | 5 | 2 | 0 | 0 | 424 | 8.9 | 6.2 | 14.5 | 17 s | incomplete | clean: 2 buckets, 68 versions |
+| go | aws-sdk-go-v2 1.96.4 | 164 | 1 | 4 | 1 | 0 | 0 | 427 | 7.9 | 5.7 | 10.4 | 17 s | passed | clean: 2 buckets, 69 versions |
+| rust | aws-sdk-s3 1.125.0 | 164 | 1 | 4 | 1 | 0 | 0 | 427 | 7.5 | 5.5 | 9.7 | 17 s | passed | clean: 2 buckets, 69 versions |
+| java | aws-sdk-java-v2 2.41.29 | 161 | 1 | 7 | 1 | 0 | 0 | 427 | 10.9 | 7.5 | 16.3 | 19 s | passed | clean: 2 buckets, 69 versions |
 
-168 checks ran on every engine. The checks that did not pass on every engine:
+170 checks ran on every engine. The checks that did not pass on every engine:
 
 | Check | python | go | rust | java |
 | --- | --- | --- | --- | --- |
 | `checksum.crc32c.valid` | Unsupported | Pass | Pass | Pass |
 | `list.v2.encoding-url` | Pass | Pass | Pass | Deviation |
+| `list.v2.encoding-url-fields` | Pass | Pass | Pass | Deviation |
 | `list.v1.encoding-url` | Pass | Pass | Pass | Deviation |
 | `sse.c.copy` | Unsupported | Unsupported | Unsupported | Unsupported |
 | `bucket.analytics` | Deviation | Deviation | Deviation | Deviation |
 | `bucket.metrics` | Deviation | Deviation | Deviation | Deviation |
 | `bucket.inventory` | Deviation | Deviation | Deviation | Deviation |
 | `bucket.intelligent-tiering` | Deviation | Deviation | Deviation | Deviation |
-| `lock.put.requires-integrity` | Deviation | Deviation | Deviation | Deviation |
+| `versioning.gate` | Deviation | Pass | Pass | Pass |
+| `lock.put.requires-integrity` | Fail | Fail | Fail | Fail |
 
-Mean latency per operation (ms), for the most frequent operations:
+Mean latency per operation in ms (call count in parentheses), for the most frequent operations:
 
-| Operation | Calls per engine | python | go | rust | java |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| PutObject | 76 | 12.2 | 7.5 | 7.5 | 13.0 |
-| GetObject | 63 | 10.4 | 11.2 | 11.3 | 13.8 |
-| HeadObject | 38 | 5.9 | 5.3 | 5.7 | 6.9 |
-| ListObjectsV2 | 19 | 5.9 | 5.8 | 5.1 | 6.5 |
-| DeleteObject | 16 | 5.5 | 5.4 | 5.5 | 6.2 |
-| CopyObject | 13 | 5.7 | 5.1 | 6.3 | 7.1 |
-| GetObjectTagging | 10 | 5.2 | 4.5 | 5.0 | 6.2 |
-| UploadPart | 10 | 34.4 | 28.5 | 30.9 | 36.2 |
-| ListObjectVersions | 10 | 5.0 | 6.0 | 5.2 | 6.7 |
-| CreateMultipartUpload | 8 | 5.9 | 6.4 | 6.5 | 6.2 |
-| CreateBucket | 5 | 9.7 | 8.7 | 11.8 | 38.1 |
-| ListObjects | 5 | 4.4 | 5.0 | 6.2 | 7.7 |
-| ListParts | 5 | 5.9 | 5.6 | 5.2 | 8.3 |
-| CompleteMultipartUpload | 5 | 14.5 | 11.7 | 12.7 | 14.0 |
+| Operation | python | go | rust | java |
+| --- | ---: | ---: | ---: | ---: |
+| PutObject | 12.1 (80) | 7.8 (81) | 7.0 (81) | 13.0 (81) |
+| GetObject | 10.6 (65) | 11.9 (66) | 11.1 (66) | 15.2 (66) |
+| HeadObject | 6.2 (44) | 6.0 (45) | 5.6 (45) | 6.6 (45) |
+| ListObjectsV2 | 5.9 (20) | 5.7 (20) | 5.6 (20) | 7.5 (20) |
+| DeleteObject | 5.5 (16) | 5.9 (16) | 5.6 (16) | 6.2 (16) |
+| CopyObject | 5.9 (13) | 6.3 (13) | 5.5 (13) | 6.8 (13) |
+| GetObjectTagging | 5.6 (10) | 5.7 (10) | 5.6 (10) | 5.7 (10) |
+| UploadPart | 33.5 (10) | 26.7 (10) | 30.1 (10) | 34.5 (10) |
+| ListObjectVersions | 6.8 (10) | 6.4 (10) | 6.1 (10) | 6.6 (10) |
+| CreateMultipartUpload | 5.7 (8) | 5.9 (8) | 6.1 (8) | 8.6 (8) |
+| PutObjectRetention | 7.5 (6) | 5.7 (6) | 6.0 (6) | 11.2 (6) |
+| GetObjectRetention | 4.8 (6) | 6.3 (6) | 5.7 (6) | 5.3 (6) |
+| CreateBucket | 5.5 (5) | 6.0 (5) | 6.6 (5) | 6.2 (5) |
+| ListObjects | 6.5 (5) | 5.1 (5) | 4.8 (5) | 6.5 (5) |
 
 ### Findings
 
-**Endpoint (AWS emulator 1.0.504).** No required check failed on any engine.
-The deviations are informational and identical on every SDK unless noted:
+**Endpoint (AWS emulator 1.0.504).** One required check fails on every
+engine, so it is an endpoint deviation, not an SDK one:
+
+- `lock.put.requires-integrity`: PutObject with Object Lock headers but neither
+  Content-MD5 nor an `x-amz-checksum-*` header is accepted (`200`) and stored.
+  AWS rejects it with `400 InvalidRequest`.
+
+The remaining deviations are informational:
 
 - `sse.c.copy`: CopyObject with copy-source SSE-C headers returns
   `501 NotImplemented`. SSE-C PutObject, HeadObject and GetObject (including
@@ -563,32 +621,37 @@ The deviations are informational and identical on every SDK unless noted:
   `ListBucketAnalyticsConfigurationResult`. ListBucketIntelligentTieringConfigurations
   answers with `ListIntelligentTieringConfigurationsResult`; AWS uses
   `ListBucketIntelligentTieringConfigurationsOutput`. boto3, Go and Java
-  accept any root element; the Rust SDK rejects both responses (`sdk_decode`).
-  On Rust these two checks therefore deviate on the list call as well.
-- `lock.put.requires-integrity`: PutObject with Object Lock headers but neither
-  Content-MD5 nor an `x-amz-checksum-*` header is accepted (`200`); AWS
-  rejects it with `400 InvalidRequest`.
+  accept any root element; the Rust SDK rejects both responses (`sdk_decode`),
+  so on Rust these two checks deviate on the list call as well.
+
+Versioning took effect immediately (`versioning.ready` passed on the first
+probe), every conditional, range, listing (including encoded Prefix and
+StartAfter), multipart, presigned, versioning and Object Lock check passed, and
+every teardown was clean.
 
 **SDK differences.**
 
-- boto3 without `awscrt` cannot compute CRC32C (`checksum.crc32c.valid` is
-  unsupported for the Python engine only). The endpoint accepts and returns
+- boto3 without `awscrt` cannot compute CRC32C, so `checksum.crc32c.valid` is
+  unsupported for the Python engine only, and Python's phase-1 gate is
+  reported as incomplete rather than passed. The endpoint accepts and returns
   CRC32C correctly through the other three SDKs.
 - AWS SDK for Java v2 decodes `EncodingType=url` listings itself, so the
-  endpoint's URL encoding is not observable through Java (`list.v2.encoding-url`,
-  `list.v1.encoding-url`); the other SDKs show it is correct (`%2B`, `%C3%BC`,
-  `+` for a space).
+  endpoint's URL encoding is not observable through Java (three listing checks
+  deviate); the other SDKs show it is correct (`%2B`, `%C3%BC`, `+` for a
+  space, encoded Prefix and StartAfter).
 - The Rust SDK is the only one that validates XML root element names, which
-  is what exposed the two list-configuration deviations above.
-- Latency is comparable across SDKs (p50 5.5–7.9 ms per call). UploadPart
-  calls are dominated by the 5 MiB payload (about 30 ms on every SDK); Java's
-  first CreateBucket includes client warm-up.
+  exposed the two list-configuration deviations above.
+- Latency is comparable across SDKs (p50 5.5–7.5 ms per call). UploadPart
+  calls are dominated by the 5 MiB payload; Java's first CreateBucket includes
+  client warm-up.
 
-**False positives fixed during the live runs.** The first runs exposed three
-suite defects, now fixed: the Python engine's error mapping referenced a
-botocore exception that is not exported (`ResponseParserError`); the SSE-C
-check mixed the round trip and the copy, so one `501` hid four conforming
-results (now `sse.c` and `sse.c.copy`); and the URL-encoding checks decoded
-Java's already-decoded keys a second time, turning `h+i.txt` into `h i.txt`.
-The fake-endpoint test also caught a teardown gap: a bucket accepted under an
-invalid name would not have been tracked for deletion.
+**Suite defects found by the live runs and the council review** (all fixed
+before this run): the Python engine's error mapping referenced a botocore
+exception that is not exported; the SSE-C round trip and copy were one check,
+so one `501` hid four conforming results; the URL-encoding checks decoded
+Java's already-decoded keys a second time; an endpoint accepting an invalid
+bucket name would not have been cleaned up; teardown could have purged a bucket
+that collided with an existing one, or reported a bucket as gone when HeadBucket
+failed; the phase-1 gate counted unsupported checks as covered; Go and Rust
+measured the presigned-URL delay as latency; and short emulator credentials
+were substring-redacted out of S3 data in the Go and Rust engines.

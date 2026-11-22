@@ -20,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 ring = "=0.17.14"
+regex-lite = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["std"] }
 sha1 = "0.10"
 md-5 = "0.10"
@@ -30,6 +31,7 @@ urlencoding = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 tokio-rustls = { version = "0.26", default-features = false }
 
 [profile.release]

@@ -141,7 +141,8 @@ func TestConformancePutGetAndServiceErrors(t *testing.T) {
 		case "/bucket/unchanged":
 			w.WriteHeader(http.StatusNotModified)
 		case "/bucket/redirect":
-			w.Header().Set("Location", "/bucket/key")
+			w.Header().Set("Location", "https://example.test/bucket/key?X-Amz-Signature=private")
+			w.Header().Set("X-Amz-Website-Redirect-Location", "/relative?private=value")
 			w.WriteHeader(http.StatusTemporaryRedirect)
 		case "/bucket/bad-redirect":
 			w.Header().Set("Location", "%")
@@ -188,7 +189,13 @@ func TestConformancePutGetAndServiceErrors(t *testing.T) {
 	input["Key"] = "unchanged"
 	assertConformanceOutcome(t, callConformance(t, profile, "GetObject", input, nil), "service", 304, 1)
 	input["Key"] = "redirect"
-	assertConformanceOutcome(t, callConformance(t, profile, "GetObject", input, nil), "service", 307, 1)
+	redirect := callConformance(t, profile, "GetObject", input, nil)
+	assertConformanceOutcome(t, redirect, "service", 307, 1)
+	headers = asMap(redirect["headers"])
+	if headers["location"] != "https://example.test/bucket/key?[query]" ||
+		headers["x-amz-website-redirect-location"] != "/relative?[query]" {
+		t.Error("redirect headers did not preserve the path and redact the query")
+	}
 	input["Key"] = "bad-redirect"
 	assertConformanceOutcome(t, callConformance(t, profile, "GetObject", input, nil), "service", 307, 1)
 	input["Key"] = "busy"
@@ -281,7 +288,7 @@ func TestConformancePresignedRequest(t *testing.T) {
 		}
 		switch r.Method {
 		case http.MethodGet:
-			if q.Get("versionId") != "private-version-value" {
+			if q.Get("versionId") != "1" {
 				t.Error("presigned GET lost its version ID")
 			}
 		case http.MethodPut:
@@ -294,8 +301,9 @@ func TestConformancePresignedRequest(t *testing.T) {
 		// A service or proxy could echo the entire original request URI.
 		w.Header().Set("Location", "http://"+r.Host+r.URL.RequestURI())
 		w.Header().Set("X-Amz-Meta-Test", q.Get("X-Amz-Signature"))
-		w.Header().Set("X-Amz-Meta-Version", "version: "+q.Get("versionId"))
 		if r.Method == http.MethodGet {
+			w.Header().Set("ETag", "\"part-1\"")
+			w.Header().Set("X-Amz-Version-Id", "1")
 			w.WriteHeader(http.StatusForbidden)
 			fmt.Fprintf(w, `<Error><Code>AccessDenied</Code><Message>expired: %s</Message></Error>`, q.Get("X-Amz-Signature"))
 			return
@@ -310,7 +318,7 @@ func TestConformancePresignedRequest(t *testing.T) {
 		input := map[string]interface{}{"Method": method, "Bucket": "bucket", "Key": "key", "ExpiresIn": 59, "DelayMs": 15}
 		var extra map[string]interface{}
 		if method == http.MethodGet {
-			input["VersionId"] = "private-version-value"
+			input["VersionId"] = "1"
 		} else {
 			input["ContentType"] = "text/x-test"
 			extra = map[string]interface{}{"body": map[string]interface{}{"text": putBody}}
@@ -344,13 +352,20 @@ func TestConformancePresignedRequest(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, prohibited := range []string{server.URL + "/", "X-Amz-Signature=", "private-version-value", "fixture-session-token", "fixture-access-key", "fixture-secret-key"} {
+		for _, prohibited := range []string{"X-Amz-Signature=", "versionId=1", "fixture-session-token", "fixture-access-key", "fixture-secret-key"} {
 			if strings.Contains(string(wire), prohibited) {
 				t.Error("a signed URL or query value escaped into the result")
 			}
 		}
-		if asMap(result["headers"])["x-amz-meta-test"] != "[redacted]" {
+		headers := asMap(result["headers"])
+		if headers["x-amz-meta-test"] != "[redacted]" {
 			t.Error("a reflected signature escaped into an allowed header")
+		}
+		if headers["location"] != server.URL+"/bucket/key?[query]" {
+			t.Error("reflected signed Location did not preserve only the path and query marker")
+		}
+		if method == http.MethodGet && (headers["etag"] != "\"part-1\"" || headers["x-amz-version-id"] != "1") {
+			t.Error("presigned GET scrubbed the short version ID from response data")
 		}
 	}
 	if sends.Load() != 2 {
@@ -399,6 +414,7 @@ func TestConformanceCapabilitiesAndRequestErrors(t *testing.T) {
 }
 
 func TestConformanceTransportAndSecretRedaction(t *testing.T) {
+	const secret = "fixture-secret-key"
 	p := conformanceTestProfile("http://127.0.0.1:1")
 	p["connectTimeoutSeconds"] = 1
 	input := map[string]interface{}{"Bucket": "bucket", "Key": "key"}
@@ -413,8 +429,8 @@ func TestConformanceTransportAndSecretRedaction(t *testing.T) {
 		w.Header().Set(sse+"Key", key)
 		w.Header().Set(sse+"Algorithm", "AES256")
 		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprintf(w, `<Error><Code>AccessDenied</Code><Message>%s %s %s</Message></Error>`,
-			key, r.Header.Get("X-Amz-Security-Token"), strings.Repeat("é", 300))
+		fmt.Fprintf(w, `<Error><Code>AccessDenied</Code><Message>%s %s %s %s %s</Message></Error>`,
+			key, secret, r.Header.Get("X-Amz-Security-Token"), r.Header.Get("Authorization"), strings.Repeat("é", 300))
 	}))
 	defer server.Close()
 	p["endpointUrl"] = server.URL
@@ -423,7 +439,7 @@ func TestConformanceTransportAndSecretRedaction(t *testing.T) {
 	}, map[string]interface{}{"encryption": map[string]interface{}{"mode": "sse-c", "customerKey": key}})
 	assertConformanceOutcome(t, result, "service", 403, 1)
 	message := result["errorMessage"].(string)
-	if strings.Contains(message, key) || strings.Contains(message, "fixture-session-token") ||
+	if !strings.HasPrefix(message, "[redacted] [redacted] [redacted] [redacted] ") ||
 		len([]rune(message)) != 256 || asMap(result["headers"])["x-amz-server-side-encryption-customer-algorithm"] != "AES256" {
 		t.Error("SSE-C response redaction or error message limit failed")
 	}
@@ -431,6 +447,49 @@ func TestConformanceTransportAndSecretRedaction(t *testing.T) {
 	_, err := s3ConformanceOp(map[string]interface{}{"profile": p, "op": "GetObject", "input": input,
 		"encryption": map[string]interface{}{"mode": "sse-c", "customerKey": key}})
 	assertConformanceRPCError(t, err, "invalid_config")
+}
+
+func TestConformanceShortCredentialsPreserveTagsAndCORS(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		switch query := r.URL.Query(); {
+		case query.Has("tagging"):
+			fmt.Fprint(w, `<Tagging><TagSet><Tag><Key>sample</Key><Value>test</Value></Tag></TagSet></Tagging>`)
+		case query.Has("cors"):
+			w.Header().Set("Access-Control-Allow-Origin", "https://example.test")
+			fmt.Fprint(w, `<CORSConfiguration><CORSRule><AllowedOrigin>https://example.test</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>`)
+		case r.URL.Path == "/bucket/key":
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprintf(w, `<Error><Code>AccessDenied</Code><Message>%s x-amz-security-token: test Signature=hidden X-Amz-Signature=private HTTPS://example.test/key?private=value</Message></Error>`, r.Header.Get("Authorization"))
+		default:
+			t.Errorf("unexpected request path %s", r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	p := conformanceTestProfile(server.URL)
+	p["accessKey"], p["secretKey"], p["sessionToken"] = "test", "test", "test"
+
+	tags := callConformance(t, p, "GetObjectTagging", map[string]interface{}{"Bucket": "bucket", "Key": "key"}, nil)
+	assertConformanceOutcome(t, tags, "service", 200, 1)
+	tag := asMap(asMap(tags["output"])["TagSet"].([]interface{})[0])
+	if tag["Value"] != "test" {
+		t.Error("short profile credentials changed the tag value")
+	}
+
+	cors := callConformance(t, p, "GetBucketCors", map[string]interface{}{"Bucket": "bucket"}, nil)
+	assertConformanceOutcome(t, cors, "service", 200, 1)
+	rule := asMap(asMap(cors["output"])["CORSRules"].([]interface{})[0])
+	if rule["AllowedOrigins"].([]interface{})[0] != "https://example.test" ||
+		asMap(cors["headers"])["access-control-allow-origin"] != "https://example.test" {
+		t.Error("short profile credentials changed the CORS origin")
+	}
+
+	denied := callConformance(t, p, "GetObject", map[string]interface{}{"Bucket": "bucket", "Key": "key"}, nil)
+	assertConformanceOutcome(t, denied, "service", 403, 1)
+	if denied["errorMessage"] != "[redacted] x-amz-security-token: [redacted] Signature=[redacted] X-Amz-Signature=[redacted] [redacted]" {
+		t.Error("diagnostic text exposed authentication material")
+	}
 }
 
 type conformanceZeroReader struct{}

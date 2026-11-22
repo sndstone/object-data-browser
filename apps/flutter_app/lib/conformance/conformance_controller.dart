@@ -164,6 +164,7 @@ class ConformanceController extends ChangeNotifier {
   }
 
   void select(ConformanceReport report) {
+    if (running) return; // the live report stays current until the run ends
     current = report;
     _notify();
   }

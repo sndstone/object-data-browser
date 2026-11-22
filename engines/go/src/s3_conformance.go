@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
@@ -260,6 +261,13 @@ type conformanceObservation struct {
 
 type conformanceTransport struct{ base http.RoundTripper }
 
+func (o *conformanceObservation) rememberCredential(value string) {
+	// Short emulator credentials can also be ordinary catalog data.
+	if utf8.RuneCountInString(value) >= 16 {
+		o.secrets = append(o.secrets, value, url.QueryEscape(value))
+	}
+}
+
 // Serve as the SDK HTTP client directly. A net/http.Client can attempt to
 // parse a redirect's Location before its CheckRedirect hook runs.
 func (t conformanceTransport) Do(req *http.Request) (*http.Response, error) {
@@ -273,7 +281,10 @@ func (t conformanceTransport) Do(req *http.Request) (*http.Response, error) {
 	_, signature, _ := strings.Cut(authorization, "Signature=")
 	_, credential, _ := strings.Cut(authorization, "Credential=")
 	accessKey, _, _ := strings.Cut(credential, "/")
-	observation.secrets = append(observation.secrets, authorization, signature, accessKey, req.Header.Get("X-Amz-Security-Token"))
+	// Remove the full Authorization value before scrubbing any credential it contains.
+	observation.secrets = slices.Insert(observation.secrets, 0, authorization, signature)
+	observation.rememberCredential(accessKey)
+	observation.rememberCredential(req.Header.Get("X-Amz-Security-Token"))
 	observation.secrets = append(observation.secrets, encryptionSecrets(req.Header)...)
 	observation.secrets = append(observation.secrets,
 		req.Header.Get("X-Amz-Server-Side-Encryption-Customer-Key-Md5"),
@@ -282,11 +293,12 @@ func (t conformanceTransport) Do(req *http.Request) (*http.Response, error) {
 	query := req.URL.Query()
 	if query.Has("X-Amz-Signature") {
 		observation.presignQuery = query
-		for _, key := range []string{"X-Amz-Credential", "X-Amz-Signature", "X-Amz-Security-Token", "versionId"} {
+		for _, key := range []string{"X-Amz-Credential", "X-Amz-Signature"} {
 			if value := query.Get(key); value != "" {
 				observation.secrets = append(observation.secrets, value, url.QueryEscape(value))
 			}
 		}
+		observation.rememberCredential(query.Get("X-Amz-Security-Token"))
 	}
 	resp, err := t.base.RoundTrip(req)
 	if resp != nil {
@@ -522,11 +534,16 @@ var conformanceHeaderNames = strings.Fields(`
 `)
 
 var conformanceURLWithQuery = regexp.MustCompile(`(?i)https?://[^\s<>"'?]*\?[^\s<>"']*`)
-var conformanceCredentialQuery = regexp.MustCompile(`(?i)(x-amz-(?:signature|security-token|credential)=)[^\s<>"'&]+`)
+var conformanceCredentialQuery = regexp.MustCompile(`(?i)(\bx-amz-(?:signature|security-token|credential)=)[^\s<>"'&,]+`)
+var conformanceSigningField = regexp.MustCompile(`(?i)(\b(?:(?:x-amz-(?:signature|security-token|credential)|signature)=|x-amz-security-token["']?\s*:\s*))(?:"[^"]*"|'[^']*'|[^\s<>"'&,]+)`)
 
 func (o *conformanceObservation) clean(text string) string {
 	text = conformanceURLWithQuery.ReplaceAllString(text, "[redacted]")
-	return o.cleanValues(text)
+	return o.cleanFields(text)
+}
+
+func (o *conformanceObservation) cleanFields(text string) string {
+	return conformanceSigningField.ReplaceAllString(o.cleanValues(text), "$1[redacted]")
 }
 
 func (o *conformanceObservation) cleanValues(text string) string {
@@ -537,9 +554,6 @@ func (o *conformanceObservation) cleanValues(text string) string {
 	for name, values := range o.presignQuery {
 		for _, value := range values {
 			escaped := url.QueryEscape(value)
-			if value != "" && (text == value || text == escaped) {
-				return "[redacted]"
-			}
 			text = strings.ReplaceAll(text, name+"="+escaped, name+"=[redacted]")
 			text = strings.ReplaceAll(text, name+"="+value, name+"=[redacted]")
 		}
@@ -566,7 +580,18 @@ func (o *conformanceObservation) responseHeaders() map[string]interface{} {
 			return
 		}
 		if values := o.headers.Values(name); len(values) > 0 {
-			result[name] = conformanceTextLimit(o.clean(strings.Join(values, ", ")), 512)
+			cleaned := make([]string, 0, len(values))
+			for _, value := range values {
+				if name == "location" || name == "x-amz-website-redirect-location" {
+					if path, _, hasQuery := strings.Cut(value, "?"); hasQuery {
+						value = path + "?[query]"
+					}
+					cleaned = append(cleaned, o.cleanFields(value))
+				} else {
+					cleaned = append(cleaned, o.clean(value))
+				}
+			}
+			result[name] = conformanceTextLimit(strings.Join(cleaned, ", "), 512)
 		}
 	}
 	for _, name := range conformanceHeaderNames {
@@ -647,7 +672,10 @@ func s3ConformanceOp(params map[string]interface{}) (map[string]interface{}, err
 		}
 		return nil, &sidecarError{Code: "invalid_config", Message: "Could not configure the S3 conformance client."}
 	}
-	observation := &conformanceObservation{secrets: []string{p.AccessKey, p.SecretKey, p.SessionToken}}
+	observation := &conformanceObservation{}
+	for _, credential := range []string{p.AccessKey, p.SecretKey, p.SessionToken} {
+		observation.rememberCredential(credential)
+	}
 	observation.secrets = append(observation.secrets, encryptionSecrets(encryption.destination.headers)...)
 	observation.secrets = append(observation.secrets, encryptionSecrets(encryption.source.headers)...)
 	ctx = context.WithValue(ctx, conformanceObservationKey{}, observation)
@@ -688,7 +716,7 @@ func cleanConformanceOutput(value interface{}, observation *conformanceObservati
 			case "Presign":
 				// Constructed locally from the URL's non-query components and query names.
 				continue
-			case "Location", "WebsiteRedirectLocation":
+			case "Location", "WebsiteRedirectLocation", "Message":
 				if text, ok := member.(string); ok {
 					item[key] = observation.clean(text)
 					continue

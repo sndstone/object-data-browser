@@ -153,8 +153,13 @@ class S3ConformanceSuite {
   late String _lockBucket;
   late String _peerBucket;
 
-  /// Buckets this run created (or attempted to create) and must tear down.
+  /// Buckets this run proved it created (CreateBucket 2xx). Only these are
+  /// purged and deleted by teardown.
   final List<String> _ownedBuckets = <String>[];
+
+  /// Buckets whose CreateBucket had no definite outcome (for example a
+  /// transport failure). Teardown reports them but never purges them.
+  final Set<String> _uncertainBuckets = <String>{};
   bool _stdReady = false;
   bool _lockReady = false;
   bool _versioningEnabled = false;
@@ -165,10 +170,8 @@ class S3ConformanceSuite {
 
   /// Runs the full catalog and teardown; never throws for endpoint behaviour.
   Future<ConformanceEngineRun> run() async {
-    final runId = _newRunId();
-    _stdBucket = '${config.baseBucketName}-std-$runId';
-    _lockBucket = '${config.baseBucketName}-lock-$runId';
-    _peerBucket = '${config.baseBucketName}-xb-$runId';
+    var runId = _newRunId();
+    _assignBuckets(runId);
     _run = ConformanceEngineRun(
       engineId: executor.engineId,
       runId: runId,
@@ -199,6 +202,28 @@ class S3ConformanceSuite {
       _run.finishedAt = _clock();
       return _run;
     }
+    // Pick names nobody uses yet: an existing bucket (ours or someone else's)
+    // must never become a test bucket.
+    for (var attempt = 0; attempt < 5 && await _anyBucketExists(); attempt++) {
+      runId = _newRunId();
+      _assignBuckets(runId);
+    }
+    _run = ConformanceEngineRun(
+      engineId: _run.engineId,
+      runId: runId,
+      startedAt: _run.startedAt,
+      sdk: _run.sdk,
+      client: _run.client,
+      endpoint: _run.endpoint,
+      region: _run.region,
+      pathStyle: _run.pathStyle,
+      note: _run.note,
+      buckets: {
+        'standard': _stdBucket,
+        if (config.includeObjectLock) 'objectLock': _lockBucket,
+        'copyPeer': _peerBucket,
+      },
+    );
     var status = ConformanceRunStatus.completed;
     try {
       await _setupPhase();
@@ -237,6 +262,35 @@ class S3ConformanceSuite {
     _run.status = status;
     _run.finishedAt = _clock();
     return _run;
+  }
+
+  void _assignBuckets(String runId) {
+    _stdBucket = '${config.baseBucketName}-std-$runId';
+    _lockBucket = '${config.baseBucketName}-lock-$runId';
+    _peerBucket = '${config.baseBucketName}-xb-$runId';
+  }
+
+  Future<bool> _anyBucketExists() async {
+    for (final bucket in [_stdBucket, _lockBucket, _peerBucket]) {
+      final head = await _quiet('HeadBucket', {'Bucket': bucket});
+      if (head != null && head.isService && head.httpStatus != 404) return true;
+    }
+    return false;
+  }
+
+  /// CreateBucket inside a check, recording ownership only on proof.
+  Future<S3OpObservation> _createBucket(_CheckContext c, String bucket,
+      {bool objectLock = false, Map<String, Object?>? input}) async {
+    _uncertainBuckets.add(bucket);
+    try {
+      final o = await c.call('CreateBucket', input ?? _createBucketInput(bucket, objectLock: objectLock));
+      _uncertainBuckets.remove(bucket);
+      if (o.isSuccess && !_ownedBuckets.contains(bucket)) _ownedBuckets.add(bucket);
+      return o;
+    } on _CheckUnsupported {
+      _uncertainBuckets.remove(bucket);
+      rethrow;
+    }
   }
 
   String _newRunId() {
@@ -474,7 +528,9 @@ class _CheckContext {
       bool informational = false,
       bool informationalCode = false,
       String? explanation}) {
-    final statusOk = o.isService && o.httpStatus == expected;
+    // A 2xx that carries an S3 error (CompleteMultipartUpload, copy) is not a success.
+    final statusOk = o.isService && o.httpStatus == expected &&
+        !(expected < 300 && o.errorCode != null);
     // HEAD responses and 304 have no body; SDK-synthesised codes are ignored.
     final hasBody = o.op != 'HeadObject' &&
         o.op != 'HeadBucket' &&

@@ -47,12 +47,11 @@ final class SecretHygiene implements AutoCloseable {
             || (lower.contains("token") && !paginationCursor(lower));
     }
 
+    /** Exact AWS S3 pagination cursor member names; every other "token" field stays sensitive. */
+    private static final Set<String> PAGINATION_CURSORS = Set.of("continuationtoken", "nextcontinuationtoken");
+
     private static boolean paginationCursor(String lower) {
-        String compact = lower.replace("_", "").replace("-", "");
-        return compact.endsWith("continuationtoken")
-            || compact.equals("nexttoken")
-            || compact.endsWith("pagetoken")
-            || compact.endsWith("rewritetoken");
+        return PAGINATION_CURSORS.contains(lower);
     }
 
     private static boolean keyField(String field) {

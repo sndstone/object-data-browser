@@ -134,9 +134,7 @@ class _ConformanceViewState extends State<ConformanceView> {
         decoration: InputDecoration(
           labelText: 'Base bucket name',
           helperText: 'Creates <base>-std-<run>, <base>-lock-<run> and a short-lived <base>-xb-<run> for each engine.',
-          helperMaxLines: 3,
-          errorText: ConformanceConfig.validateBaseName(_baseName.text),
-          errorMaxLines: 3,
+          errorText: ConformanceConfig.validateBaseName(_baseName.text.trim()),
         ),
         onChanged: (value) => conformance.updateConfig(config.copyWith(baseBucketName: value.trim())),
       ),
@@ -212,7 +210,6 @@ class _ConformanceViewState extends State<ConformanceView> {
             decoration: const InputDecoration(
               labelText: 'KMS key ID (optional)',
               helperText: 'Key ID, ARN or alias. Leave empty to use the endpoint default.',
-              helperMaxLines: 2,
             ),
             onChanged: (value) => conformance.updateConfig(config.copyWith(kmsKeyId: value.trim())),
           ),
@@ -383,7 +380,7 @@ class _ConformanceViewState extends State<ConformanceView> {
               selected: engine.engineId == engineId,
               onSelected: (_) => setState(() => _engine = engine.engineId),
             ),
-          if (conformance.history.length > 1)
+          if (conformance.history.length > 1 && !conformance.running)
             PopupMenuButton<ConformanceReport>(
               tooltip: 'Earlier runs',
               onSelected: conformance.select,
@@ -632,9 +629,15 @@ class _ConformanceViewState extends State<ConformanceView> {
     final name = 's3-conformance-${report.id}.${markdown ? 'md' : 'json'}';
     final path = await FilePicker.platform.saveFile(dialogTitle: 'Save conformance report', fileName: name);
     if (path == null) return;
-    await File(path).writeAsString(markdown ? ConformanceExport.markdown(report) : ConformanceExport.json(report));
+    String message;
+    try {
+      await File(path).writeAsString(markdown ? ConformanceExport.markdown(report) : ConformanceExport.json(report));
+      message = 'Report saved to $path';
+    } on FileSystemException catch (error) {
+      message = 'The report could not be saved: ${error.osError?.message ?? error.message}';
+    }
     if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Report saved to $path')));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
     }
   }
 

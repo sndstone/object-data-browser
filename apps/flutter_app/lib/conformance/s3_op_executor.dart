@@ -125,7 +125,8 @@ class S3OpObservation {
   final String? requestId;
 
   bool get isService => outcome == 'service';
-  bool get isSuccess => isService && httpStatus >= 200 && httpStatus < 300;
+  /// A 2xx without an embedded S3 error.
+  bool get isSuccess => isService && httpStatus >= 200 && httpStatus < 300 && errorCode == null;
   String? header(String name) => headers[name.toLowerCase()];
 
   /// Reads a path such as `Contents.0.Key` from [output].
@@ -219,4 +220,49 @@ class S3ConformanceCapability {
         'opCount': ops.length,
         if (reason != null) 'reason': reason,
       };
+}
+
+/// Host-side backstop for engine results: removes credential values and URL
+/// query strings (presigned signatures) before anything is recorded, even if
+/// an engine or endpoint echoed them.
+Map<String, Object?> scrubConformanceResult(
+    Map<String, Object?> json, Iterable<String?> secrets) {
+  final values = [
+    for (final secret in secrets)
+      // Short credentials ("test") are ordinary words in S3 data.
+      if (secret != null && secret.length >= 16) secret
+  ];
+  final query = RegExp(r"""(https?://[^\s?"']*)\?[^\s"']*""");
+  Object? visit(Object? value) {
+    if (value is String) {
+      var text = value.replaceAllMapped(query, (m) => '${m[1]}?[query]');
+      for (final secret in values) {
+        text = text.replaceAll(secret, '[redacted]');
+      }
+      return text;
+    }
+    if (value is List) return [for (final item in value) visit(item)];
+    if (value is Map) {
+      return {for (final entry in value.entries) '${entry.key}': visit(entry.value)};
+    }
+    return value;
+  }
+
+  final headers = json['headers'];
+  return {
+    for (final entry in json.entries)
+      entry.key: entry.key == 'headers' && headers is Map
+          ? {
+              for (final header in headers.entries)
+                '${header.key}': _urlHeader('${header.key}')
+                    ? visit('${header.value}'.replaceFirst(RegExp(r'\?.*$'), '?[query]'))
+                    : visit(header.value)
+            }
+          : visit(entry.value),
+  };
+}
+
+bool _urlHeader(String name) {
+  final lower = name.toLowerCase();
+  return lower == 'location' || lower == 'x-amz-website-redirect-location';
 }

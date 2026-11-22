@@ -262,20 +262,19 @@ pub(super) async fn run(params: Value) -> SidecarResult {
             "Unsupported S3 conformance operation.",
         ));
     }
-    if !is_s3_profile(&params["profile"]) {
-        return Err(SidecarError::new(
-            "unsupported_feature",
-            "S3 conformance requires an S3 profile.",
-        ));
-    }
-    // The dedicated connector below validates TLS options for conformance.
+    // Profile parsing distinguishes unknown types from supported profile types
+    // outside S3. The dedicated connector validates conformance TLS options.
     let profile = parse_profile_inner(&params["profile"], false)?;
     let ca_bundle_path = params["profile"]["caBundlePath"]
         .as_str()
         .filter(|path| !path.is_empty());
-    let input = params["input"]
-        .as_object()
-        .ok_or_else(|| invalid_request("input must be an object."))?;
+    let empty_input = Map::new();
+    let input = match params.get("input") {
+        Some(input) => input
+            .as_object()
+            .ok_or_else(|| invalid_request("input must be an object."))?,
+        None => &empty_input,
+    };
     if forbidden_sse_input(&params["input"]) {
         return Err(invalid_request(
             "Pass SSE-C keys via encryption or sourceEncryption.",
@@ -385,32 +384,17 @@ struct Wire {
     private: Vec<String>,
 }
 
-fn without_url_queries(text: &str) -> String {
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some(start) = rest
-        .find("https://")
-        .into_iter()
-        .chain(rest.find("http://"))
-        .min()
-    {
-        let (before, url) = rest.split_at(start);
-        out.push_str(before);
-        let end = url
-            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
-            .unwrap_or(url.len());
-        let (url, tail) = url.split_at(end);
-        out.push_str(url.split_once('?').map_or(url, |(path, _)| path));
-        rest = tail;
-    }
-    out.push_str(rest);
-    out
-}
-
 impl Wire {
     fn remember(&mut self, value: &str) {
         if !value.is_empty() {
             self.private.push(value.to_owned());
+        }
+    }
+
+    fn remember_credential(&mut self, value: &str) {
+        if secret_hygiene::scrub_profile_credential(value) {
+            self.remember(value);
+            self.remember(&urlencoding::encode(value));
         }
     }
 
@@ -424,11 +408,22 @@ impl Wire {
             if !(meta || name.starts_with("x-amz-checksum-") || HEADERS.contains(&name.as_str())) {
                 continue;
             }
+            let value = if matches!(
+                name.as_str(),
+                "location" | "x-amz-website-redirect-location"
+            ) {
+                let value = value
+                    .split_once('?')
+                    .map_or_else(|| value.to_owned(), |(path, _)| format!("{path}?[query]"));
+                self.redact_fields(&value)
+            } else {
+                self.redact_diagnostic(value)
+            };
             if let Some(previous) = self.headers.get_mut(&name) {
                 previous.push_str(", ");
-                previous.push_str(value);
+                previous.push_str(&value);
             } else if self.headers.len() < 48 && (!meta || metadata < 16) {
-                self.headers.insert(name, value.to_owned());
+                self.headers.insert(name, value);
                 metadata += usize::from(meta);
             }
         }
@@ -442,13 +437,43 @@ impl Wire {
     }
 
     fn redact_diagnostic(&self, value: &str) -> String {
-        without_url_queries(&self.redact(value))
+        static URL_WITH_QUERY: OnceLock<regex_lite::Regex> = OnceLock::new();
+        let url = URL_WITH_QUERY.get_or_init(|| {
+            regex_lite::Regex::new(r#"(?i)https?://[^\s<>"'?]*\?[^\s<>"']*"#).unwrap()
+        });
+        self.redact_fields(&url.replace_all(value, "[redacted]"))
+    }
+
+    fn redact_fields(&self, value: &str) -> String {
+        static SIGNING_FIELD: OnceLock<regex_lite::Regex> = OnceLock::new();
+        let field = SIGNING_FIELD.get_or_init(|| {
+            regex_lite::Regex::new(
+                r#"(?i)(\b(?:(?:x-amz-(?:signature|security-token|credential)|signature)=|x-amz-security-token["']?\s*:\s*))(?:"[^"]*"|'[^']*'|[^\s<>"'&,]+)"#,
+            )
+            .unwrap()
+        });
+        field
+            .replace_all(&self.redact(value), "$1[redacted]")
+            .into_owned()
     }
 
     fn redact_output(&self, value: &mut Value) {
         match value {
             Value::String(text) => *text = self.redact(text),
-            Value::Object(fields) => fields.values_mut().for_each(|v| self.redact_output(v)),
+            Value::Object(fields) => {
+                for (name, value) in fields {
+                    if matches!(
+                        name.as_str(),
+                        "Location" | "WebsiteRedirectLocation" | "Message"
+                    ) {
+                        if let Value::String(text) = value {
+                            *text = self.redact_diagnostic(text);
+                            continue;
+                        }
+                    }
+                    self.redact_output(value);
+                }
+            }
             Value::Array(items) => items.iter_mut().for_each(|v| self.redact_output(v)),
             _ => {}
         }
@@ -473,13 +498,6 @@ impl Capture {
             .filter_map(|(name, value)| {
                 if wire.redact(name) != *name {
                     return None;
-                }
-                let mut value = wire.redact_diagnostic(value);
-                if matches!(
-                    name.as_str(),
-                    "location" | "x-amz-website-redirect-location"
-                ) {
-                    value.truncate(value.find('?').unwrap_or(value.len()));
                 }
                 Some((
                     name.clone(),
@@ -527,9 +545,16 @@ impl Intercept for Capture {
             if let Some((_, signature)) = auth.rsplit_once("Signature=") {
                 wire.remember(signature);
             }
+            if let Some((_, credential)) = auth.split_once("Credential=") {
+                if let Some((access_key, _)) = credential.split_once('/') {
+                    wire.remember_credential(access_key);
+                }
+            }
+        }
+        if let Some(token) = headers.get("x-amz-security-token") {
+            wire.remember_credential(token);
         }
         for name in [
-            "x-amz-security-token",
             "x-amz-server-side-encryption-customer-key",
             "x-amz-copy-source-server-side-encryption-customer-key",
             "x-amz-server-side-encryption-customer-key-md5",
@@ -799,12 +824,13 @@ async fn presign(
             if key.eq_ignore_ascii_case("x-amz-signedheaders") {
                 signed_headers = value.to_string();
             }
-            if matches!(
-                key.to_ascii_lowercase().as_str(),
-                "x-amz-credential" | "x-amz-security-token" | "x-amz-signature"
-            ) {
-                wire.remember(&value);
-                wire.remember(&urlencoding::encode(&value));
+            match key.to_ascii_lowercase().as_str() {
+                "x-amz-credential" | "x-amz-signature" => {
+                    wire.remember(&value);
+                    wire.remember(&urlencoding::encode(&value));
+                }
+                "x-amz-security-token" => wire.remember_credential(&value),
+                _ => {}
             }
             wire.remember(&format!("{key}={value}"));
             wire.remember(&format!("{key}={}", urlencoding::encode(&value)));

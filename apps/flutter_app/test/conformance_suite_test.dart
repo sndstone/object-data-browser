@@ -50,8 +50,10 @@ void main() {
     final executor = FakeExecutor();
     final run = await _suite(executor).run();
     final ops = executor.calls.map((c) => c.op).toList();
-    expect(ops.first, 'CreateBucket');
-    expect(executor.calls.first.input['Bucket'], startsWith('odb-test-std-'));
+    // Preflight HEADs every planned name before anything is created.
+    expect(ops.take(3), everyElement('HeadBucket'));
+    final firstCreate = executor.calls.firstWhere((c) => c.op == 'CreateBucket');
+    expect(firstCreate.input['Bucket'], startsWith('odb-test-std-'));
     final enable = executor.calls.indexWhere((c) =>
         c.op == 'PutBucketVersioning' && (c.input['VersioningConfiguration'] as Map)['Status'] == 'Enabled');
     final lastPhaseOne = run.checks.lastIndexWhere((c) => c.phase == ConformancePhase.standard);
@@ -72,6 +74,16 @@ void main() {
         expect(call.latencyMs, 1.5);
       }
     }
+  });
+
+  test('a bucket the run did not create is never purged or deleted', () async {
+    final executor = FakeExecutor()..collideFirstCreate = true;
+    final run = await _suite(executor).run();
+    expect(run.check('bucket.create')?.status, ConformanceStatus.fail);
+    final collided = executor.collidedBucket!;
+    expect(executor.buckets, contains(collided));
+    expect(executor.objects[collided]?.keys, contains('precious.txt'));
+    expect(executor.calls.where((c) => c.input['Bucket'] == collided && c.op.startsWith('Delete')), isEmpty);
   });
 
   test('cancellation stops checks but still tears down', () async {

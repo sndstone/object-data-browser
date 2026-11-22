@@ -342,6 +342,9 @@ extension _StandardObjects on S3ConformanceSuite {
       c.fixture(first);
       c.status(await c.call('PutObject', {'Bucket': _stdBucket, 'Key': putKey, 'IfMatch': '"00000000000000000000000000000000"'},
           body: S3OpBody.text('stale')), 412, code: 'PreconditionFailed');
+      final unchanged = await c.call('GetObject', {'Bucket': _stdBucket, 'Key': putKey});
+      c.status(unchanged, 200);
+      c.body(unchanged, utf8.encode('v1'), field: 'after the rejected write');
       c.status(await c.call('PutObject', {'Bucket': _stdBucket, 'Key': putKey, 'IfMatch': first.header('etag')},
           body: S3OpBody.text('v2')), 200);
       c.body(await c.call('GetObject', {'Bucket': _stdBucket, 'Key': putKey}), utf8.encode('v2'));
@@ -513,6 +516,7 @@ extension _StandardObjects on S3ConformanceSuite {
         body: (c) async {
       c.fixture(await c.call('CopyObject', {'Bucket': _stdBucket, 'Key': 'p1/copy/tags-copy.txt', 'CopySource': copySource}));
       final copied = await c.call('GetObjectTagging', {'Bucket': _stdBucket, 'Key': 'p1/copy/tags-copy.txt'});
+      c.status(copied, 200);
       c.equals('TagSet (COPY)', [{'Key': 'stage', 'Value': 'source'}], _tags(copied));
       c.fixture(await c.call('CopyObject', {
         'Bucket': _stdBucket,
@@ -522,6 +526,7 @@ extension _StandardObjects on S3ConformanceSuite {
         'Tagging': 'stage=replaced',
       }));
       final replaced = await c.call('GetObjectTagging', {'Bucket': _stdBucket, 'Key': 'p1/copy/tags-replace.txt'});
+      c.status(replaced, 200);
       c.equals('TagSet (REPLACE)', [{'Key': 'stage', 'Value': 'replaced'}], _tags(replaced));
     });
     await _check('copy.cross-bucket',
@@ -529,8 +534,7 @@ extension _StandardObjects on S3ConformanceSuite {
         title: 'CopyObject into another bucket',
         spec: 'CopyObject between buckets: 200; the destination payload equals the source.',
         body: (c) async {
-      _ownedBuckets.add(_peerBucket);
-      c.fixture(await c.call('CreateBucket', _createBucketInput(_peerBucket)));
+      c.fixture(await _createBucket(c, _peerBucket));
       c.status(await c.call('CopyObject', {'Bucket': _peerBucket, 'Key': 'copied.txt', 'CopySource': copySource}), 200);
       c.body(await c.call('GetObject', {'Bucket': _peerBucket, 'Key': 'copied.txt'}), data);
       // Remove the peer now; teardown retries anything left.
@@ -623,6 +627,7 @@ extension _StandardObjects on S3ConformanceSuite {
           ([for (final item in o.list('Deleted')) '${item['Key']}']..sort()));
       c.equals('Errors', 0, o.list('Errors').length);
       final list = await c.call('ListObjectsV2', {'Bucket': _stdBucket, 'Prefix': 'p1/batch/'});
+      c.status(list, 200);
       c.equals('Remaining keys', 0, list.list('Contents').length);
     });
     await _check('delete.batch.quiet',
@@ -642,6 +647,7 @@ extension _StandardObjects on S3ConformanceSuite {
       c.equals('Deleted', 0, o.list('Deleted').length);
       c.equals('Errors', 0, o.list('Errors').length);
       final list = await c.call('ListObjectsV2', {'Bucket': _stdBucket, 'Prefix': 'p1/batch-quiet/'});
+      c.status(list, 200);
       c.equals('Remaining keys', 0, list.list('Contents').length);
     });
   }
@@ -655,6 +661,7 @@ extension _StandardObjects on S3ConformanceSuite {
       c.fixture(await c.call('PutObject', {'Bucket': _stdBucket, 'Key': 'p1/tags/untagged.txt'}, body: S3OpBody.text('x')));
       final o = await c.call('GetObjectTagging', {'Bucket': _stdBucket, 'Key': 'p1/tags/untagged.txt'});
       c.status(o, 200);
+      c.isTrue('TagSet element', o.isSuccess, expected: 'present (empty)', actual: _CheckContext.describe(o));
       c.equals('TagSet', const [], _tags(o));
     });
     await _check('tagging.object.crud',
@@ -666,10 +673,14 @@ extension _StandardObjects on S3ConformanceSuite {
       final tags = [{'Key': 'env', 'Value': 'test'}, {'Key': 'team', 'Value': 'storage qa'}];
       c.fixture(await c.call('PutObject', {'Bucket': _stdBucket, 'Key': key}, body: S3OpBody.text('x')));
       c.status(await c.call('PutObjectTagging', {'Bucket': _stdBucket, 'Key': key, 'Tagging': {'TagSet': tags}}), 200);
-      c.equals('TagSet', tags, _tags(await c.call('GetObjectTagging', {'Bucket': _stdBucket, 'Key': key})));
+      final tagged = await c.call('GetObjectTagging', {'Bucket': _stdBucket, 'Key': key});
+      c.status(tagged, 200);
+      c.equals('TagSet', tags, _tags(tagged));
       c.header(await c.call('HeadObject', {'Bucket': _stdBucket, 'Key': key}), 'x-amz-tagging-count', '2');
       c.status(await c.call('DeleteObjectTagging', {'Bucket': _stdBucket, 'Key': key}), 204);
-      c.equals('TagSet after delete', const [], _tags(await c.call('GetObjectTagging', {'Bucket': _stdBucket, 'Key': key})));
+      final cleared = await c.call('GetObjectTagging', {'Bucket': _stdBucket, 'Key': key});
+      c.status(cleared, 200);
+      c.equals('TagSet after delete', const [], _tags(cleared));
     });
     await _check('tagging.object.on-put',
         category: 'Object tagging',
@@ -679,8 +690,9 @@ extension _StandardObjects on S3ConformanceSuite {
       const key = 'p1/tags/on-put.txt';
       c.fixture(await c.call('PutObject', {'Bucket': _stdBucket, 'Key': key, 'Tagging': 'a=1&b=two%20words'},
           body: S3OpBody.text('x')));
-      c.equals('TagSet', [{'Key': 'a', 'Value': '1'}, {'Key': 'b', 'Value': 'two words'}],
-          _tags(await c.call('GetObjectTagging', {'Bucket': _stdBucket, 'Key': key})));
+      final tagged = await c.call('GetObjectTagging', {'Bucket': _stdBucket, 'Key': key});
+      c.status(tagged, 200);
+      c.equals('TagSet', [{'Key': 'a', 'Value': '1'}, {'Key': 'b', 'Value': 'two words'}], _tags(tagged));
     });
     await _check('tagging.object.limit',
         category: 'Object tagging',
@@ -809,8 +821,15 @@ extension _StandardObjects on S3ConformanceSuite {
         severity: ConformanceSeverity.informational,
         body: (c) async {
       c.fixture(await c.call('PutObject', {'Bucket': _stdBucket, 'Key': 'p1/presign/expiring.txt'}, body: S3OpBody.text('x')));
+      // The same request used within its lifetime succeeds, so a 403 below is
+      // caused by expiry rather than by signing or permissions.
       c.status(await c.call('PresignedRequest', {
-        'Method': 'GET', 'Bucket': _stdBucket, 'Key': 'p1/presign/expiring.txt', 'ExpiresIn': 1, 'DelayMs': 2500,
+        'Method': 'GET', 'Bucket': _stdBucket, 'Key': 'p1/presign/expiring.txt', 'ExpiresIn': 60,
+      }), 200, explanation: 'A presigned GET used within its lifetime must succeed.');
+      c.status(await c.call('PresignedRequest', {
+        'Method': 'GET', 'Bucket': _stdBucket, 'Key': 'p1/presign/expiring.txt', 'ExpiresIn': 1,
+        // Signed with the local clock: wait longer when it runs ahead of the server.
+        'DelayMs': (2500 + max(0, -_serverSkew.inMilliseconds)).clamp(2500, 5000),
       }), 403, code: 'AccessDenied');
     });
   }
@@ -876,7 +895,11 @@ extension _StandardObjects on S3ConformanceSuite {
       final data = ConformanceBytes.generate(2048, 52);
       final put = await c.call('PutObject', {'Bucket': _stdBucket, 'Key': objectKey}, body: S3OpBody.generate(2048, 52), customerKey: key);
       if (put.httpStatus == 403) {
-        c.note('The bucket blocks SSE-C writes (AWS blocks SSE-C on new buckets unless allowed).');
+        final encryption = await c.call('GetBucketEncryption', {'Bucket': _stdBucket});
+        final blocked = jsonEncode(encryption.field('ServerSideEncryptionConfiguration') ?? const {});
+        if (blocked.contains('BlockedEncryptionTypes') && blocked.contains('SSE-C')) {
+          c.skip('The bucket blocks SSE-C writes (BlockedEncryptionTypes includes SSE-C; AWS sets this on new buckets).');
+        }
       }
       c.status(put, 200);
       if (!put.isSuccess) return;
@@ -1160,6 +1183,8 @@ extension _StandardObjects on S3ConformanceSuite {
         'MultipartUpload': {'Parts': parts(etags)},
       });
       c.status(o, 400, code: code);
+      c.status(await c.call('HeadObject', {'Bucket': _stdBucket, 'Key': key}), 404,
+          explanation: 'A rejected completion must not publish the object.');
     } finally {
       await _quiet('AbortMultipartUpload', {'Bucket': _stdBucket, 'Key': key, 'UploadId': id});
     }

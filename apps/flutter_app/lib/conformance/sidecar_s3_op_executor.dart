@@ -59,5 +59,7 @@ class SidecarS3OpExecutor implements S3OpExecutor {
 
   @override
   Future<S3OpObservation> execute(S3OpRequest request) async =>
-      S3OpObservation.fromJson(await _send('s3ConformanceOp', request.toParams()));
+      S3OpObservation.fromJson(scrubConformanceResult(
+          await _send('s3ConformanceOp', request.toParams()),
+          [profile.secretKey, profile.sessionToken, profile.accessKey]));
 }

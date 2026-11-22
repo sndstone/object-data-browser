@@ -137,6 +137,16 @@ extension _BucketConfig on S3ConformanceSuite {
       c.equals('Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm', 'AES256',
           got.field('ServerSideEncryptionConfiguration.Rules.0.ApplyServerSideEncryptionByDefault.SSEAlgorithm'));
       c.status(await c.call('DeleteBucketEncryption', _b), 204);
+      final after = await c.call('GetBucketEncryption', _b);
+      if (after.httpStatus == 404) {
+        c.status(after, 404, code: 'ServerSideEncryptionConfigurationNotFoundError', informational: true,
+            explanation: 'AWS keeps SSE-S3 as the default after deletion and returns 200.');
+      } else {
+        c.status(after, 200, informational: true);
+        c.equals('default after delete', 'AES256',
+            after.field('ServerSideEncryptionConfiguration.Rules.0.ApplyServerSideEncryptionByDefault.SSEAlgorithm'),
+            informational: true);
+      }
     });
     await _check('bucket.public-access-block',
         category: 'Bucket subresources',

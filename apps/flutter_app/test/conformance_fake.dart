@@ -18,6 +18,11 @@ class FakeExecutor implements S3OpExecutor {
   final List<String> customerKeys = [];
   bool capabilitySupported = true;
 
+  /// Simulates a race: the first CreateBucket finds someone else's bucket
+  /// (409) that HeadBucket did not see during preflight.
+  bool collideFirstCreate = false;
+  String? collidedBucket;
+
   @override
   final String engineId;
 
@@ -49,6 +54,12 @@ class FakeExecutor implements S3OpExecutor {
         }, latencyMs: 1.5);
     switch (request.op) {
       case 'CreateBucket':
+        if (collideFirstCreate && collidedBucket == null) {
+          collidedBucket = bucket;
+          buckets.add(bucket);
+          objects[bucket] = {'precious.txt': (8, 'not-ours')};
+          return S3OpObservation(op: request.op, outcome: 'service', httpStatus: 409, errorCode: 'BucketAlreadyOwnedByYou', latencyMs: 1.5);
+        }
         if (!buckets.add(bucket)) return ok(409);
         objects[bucket] = {};
         return ok();

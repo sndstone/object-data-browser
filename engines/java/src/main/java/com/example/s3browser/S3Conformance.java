@@ -215,6 +215,8 @@ final class S3Conformance {
         clientSettings.put("requestChecksumCalculation", "when_required");
         clientSettings.put("responseChecksumValidation", "when_required");
         clientSettings.put("followRedirects", false);
+        // AWS SDK for Java v2 URL-decodes EncodingType=url listings before returning them.
+        clientSettings.put("urlEncodedListings", "decodedBySdk");
         item.put("client", clientSettings);
         item.put("ops", supported ? OPERATIONS : List.of());
         return item;
@@ -1130,7 +1132,12 @@ final class S3Conformance {
                 || lower.startsWith("x-amz-meta-")
                 || lower.startsWith("x-amz-checksum-");
             if (!allowed) continue;
-            grouped.computeIfAbsent(lower, k -> new ArrayList<>()).addAll(entry.getValue());
+            List<String> values = entry.getValue();
+            if (lower.equals("location") || lower.equals("x-amz-website-redirect-location")) {
+                // A URL-valued header may carry a signed query string; keep scheme, host and path only.
+                values = values.stream().map(v -> v == null ? null : v.replaceAll("\\?.*$", "?[query]")).toList();
+            }
+            grouped.computeIfAbsent(lower, k -> new ArrayList<>()).addAll(values);
         }
         Map<String, String> result = new LinkedHashMap<>();
         // Add non-meta headers first so core headers are never displaced by x-amz-meta-* headers.

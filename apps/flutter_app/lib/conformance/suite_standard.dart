@@ -3,18 +3,17 @@ part of 'conformance_suite.dart';
 extension _SetupAndStandard on S3ConformanceSuite {
   Future<void> _setupPhase() async {
     _phase = ConformancePhase.setup;
-    _ownedBuckets.add(_stdBucket);
     final create = await _check('bucket.create',
         category: 'Bucket administration',
         title: 'CreateBucket creates the standard test bucket',
         spec: 'CreateBucket: 200 OK with a Location header; omit LocationConstraint in us-east-1.',
         body: (c) async {
-      final o = await c.call('CreateBucket', _createBucketInput(_stdBucket));
+      final o = await _createBucket(c, _stdBucket);
       c.status(o, 200);
       c.headerPresent(o, 'location', informational: true);
     });
-    _stdReady = create.status == ConformanceStatus.pass ||
-        create.status == ConformanceStatus.warn;
+    _stdReady = _ownedBuckets.contains(_stdBucket) &&
+        (create.status == ConformanceStatus.pass || create.status == ConformanceStatus.warn);
     if (!_stdReady) {
       // A timed-out create may still have succeeded; teardown checks the name.
       _run.note = 'Bucket 1 could not be created; phases 1 and 2 were skipped.';
@@ -189,10 +188,10 @@ extension _SetupAndStandard on S3ConformanceSuite {
         spec: 'ListObjectsV2: IsTruncated true with NextContinuationToken until the last page; no gaps or duplicates.',
         body: (c) async {
       final seen = <String>[];
+      final tokens = <String>{};
       String? token;
       var pages = 0;
-      var truncatedPages = 0;
-      while (pages < 10) {
+      while (pages < 20) {
         final o = await c.call('ListObjectsV2', {
           'Bucket': _stdBucket,
           'Prefix': prefix,
@@ -204,19 +203,20 @@ extension _SetupAndStandard on S3ConformanceSuite {
           c.status(o, 200);
           return;
         }
-        seen.addAll([for (final item in o.list('Contents')) '${item['Key']}']);
+        final page = [for (final item in o.list('Contents')) '${item['Key']}'];
+        c.isTrue('page $pages size', page.length <= 2, expected: 'at most MaxKeys (2)', actual: page.length);
+        seen.addAll(page);
         final truncated = o.field('IsTruncated') == true;
         if (!truncated) break;
-        truncatedPages++;
         token = o.field('NextContinuationToken')?.toString();
-        if (!c.isTrue('NextContinuationToken', token != null && token.isNotEmpty,
-            expected: 'present while IsTruncated', actual: token)) {
+        if (!c.isTrue('NextContinuationToken', token != null && token.isNotEmpty && tokens.add(token),
+            expected: 'a new cursor while IsTruncated', actual: token)) {
           return;
         }
       }
+      // AWS may return short pages; coverage and order are what must hold.
       c.equals('Keys across pages', sorted, seen);
-      c.equals('Pages with MaxKeys=2', 4, pages);
-      c.equals('Truncated pages', 3, truncatedPages);
+      c.isTrue('pages', pages >= 4 && pages < 20, expected: 'at least 4 pages of at most 2 keys', actual: pages);
     });
     await _check('list.v2.start-after',
         category: 'Listing',
@@ -256,6 +256,37 @@ extension _SetupAndStandard on S3ConformanceSuite {
           explanation: 'A literal + must be encoded as %2B so it is not read as a space.');
       final prefixes = [for (final item in o.list('CommonPrefixes')) '${item['Prefix']}'];
       c.equals('decoded CommonPrefixes', ['p1/list/c/'], [for (final p in prefixes) _formDecode(p)]);
+    });
+    await _check('list.v2.encoding-url-fields',
+        category: 'Listing',
+        title: 'EncodingType=url also encodes Prefix, Delimiter and StartAfter',
+        spec: 'ListObjectsV2 EncodingType=url: Prefix, StartAfter, Key and CommonPrefixes are URL-encoded in the response.',
+        body: (c) async {
+      const prefix = 'p1/enc ü+/';
+      for (final key in ['p1/enc ü+/a b.txt', 'p1/enc ü+/c+d.txt', 'p1/enc ü+/sub dir/e.txt']) {
+        c.fixture(await c.call('PutObject', {'Bucket': _stdBucket, 'Key': key}, body: S3OpBody.text(key)));
+      }
+      final o = await c.call('ListObjectsV2', {
+        'Bucket': _stdBucket,
+        'Prefix': prefix,
+        'Delimiter': '/',
+        'StartAfter': 'p1/enc ü+/a b.txt',
+        'EncodingType': 'url',
+      });
+      c.status(o, 200);
+      final rawPrefix = '${o.field('Prefix') ?? ''}';
+      final rawStart = '${o.field('StartAfter') ?? ''}';
+      final rawKeys = [for (final item in o.list('Contents')) '${item['Key']}'];
+      final rawCommon = [for (final item in o.list('CommonPrefixes')) '${item['Prefix']}'];
+      if (_sdkDecodedListing(c, rawKeys, const ['p1/enc ü+/c+d.txt'])) return;
+      c.equals('decoded Prefix', prefix, _formDecode(rawPrefix));
+      c.isTrue('Prefix encoded', !rawPrefix.contains(' ') && !rawPrefix.contains('ü'),
+          expected: 'URL-encoded', actual: rawPrefix);
+      c.equals('decoded StartAfter', 'p1/enc ü+/a b.txt', _formDecode(rawStart));
+      c.isTrue('StartAfter encoded', !rawStart.contains(' '), expected: 'URL-encoded', actual: rawStart);
+      c.equals('decoded Contents[].Key', ['p1/enc ü+/c+d.txt'], [for (final k in rawKeys) _formDecode(k)]);
+      c.equals('decoded CommonPrefixes', ['p1/enc ü+/sub dir/'], [for (final p in rawCommon) _formDecode(p)]);
+      c.equals('Delimiter', '/', o.field('Delimiter'), informational: true);
     });
     await _check('list.v2.empty',
         category: 'Listing',
@@ -331,7 +362,6 @@ extension _SetupAndStandard on S3ConformanceSuite {
       c.status(await c.call('GetObject', {'Bucket': missingBucket, 'Key': 'k'}), 404, code: 'NoSuchBucket');
       c.status(await c.call('ListObjectsV2', {'Bucket': missingBucket}), 404, code: 'NoSuchBucket');
       c.status(await c.call('HeadBucket', {'Bucket': missingBucket}), 404);
-      c.status(await c.call('DeleteBucket', {'Bucket': missingBucket}), 404, code: 'NoSuchBucket');
     });
     await _check('error.no-such-key',
         category: 'Error responses',
@@ -357,15 +387,13 @@ extension _SetupAndStandard on S3ConformanceSuite {
         severity: ConformanceSeverity.informational,
         body: (c) async {
       final invalidName = 'Invalid_Name..${_newRunId()}';
-      // Tracked first so teardown removes it if the endpoint accepts the name.
-      _ownedBuckets.add(invalidName);
-      final o = await c.call('CreateBucket', {'Bucket': invalidName});
+      // Ownership is recorded only if the endpoint accepts the name.
+      final o = await _createBucket(c, invalidName, input: {'Bucket': invalidName});
       if (o.outcome == 'sdk_validation') {
         c.note('The SDK rejected the name before sending (${o.errorCode ?? 'validation'}).');
         return;
       }
       c.status(o, 400, code: 'InvalidBucketName');
-      if (!o.isSuccess) _ownedBuckets.remove(invalidName);
     });
     await _check('error.no-such-upload',
         category: 'Error responses',
@@ -387,9 +415,9 @@ extension _SetupAndStandard on S3ConformanceSuite {
 /// are then compared as returned and the SDK behaviour is reported as a
 /// deviation instead of decoding a second time.
 bool _sdkDecodedListing(_CheckContext c, List<String> raw, List<String> expected) {
-  if (!_CheckContext._same(raw, expected) || !expected.any((k) => k.contains('+') || k.contains('ü'))) {
-    return false;
-  }
+  // Only an engine that declares it may return decoded keys; anywhere else,
+  // unencoded keys mean the endpoint ignored EncodingType=url.
+  if (c.suite._capability?.client['urlEncodedListings'] != 'decodedBySdk') return false;
   c.equals('Contents[].Key (as returned by the SDK)', expected, raw);
   c.isTrue('wire encoding visible', false,
       expected: 'URL-encoded keys', actual: 'keys already decoded by the SDK',

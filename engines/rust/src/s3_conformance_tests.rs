@@ -3,6 +3,17 @@ use crate::object_encryption_tests::{
     header,
     payload::{binary, BinaryFixture},
 };
+use openssl::{
+    asn1::Asn1Time,
+    bn::{BigNum, MsbOption},
+    hash::MessageDigest,
+    pkey::{PKey, Private},
+    rsa::Rsa,
+    x509::{
+        extension::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName},
+        X509NameBuilder, X509,
+    },
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const ACCESS: &str = "conformance-fixture-access";
@@ -48,8 +59,45 @@ fn summary(body: &[u8]) -> Value {
     json!({"length":body.len(), "sha256":format!("{:x}", Sha256::digest(body))})
 }
 
-const LOCAL_CA: &str = include_str!("test_fixtures/s3_conformance_tls/ca.pem");
-const UNRELATED_CA: &str = include_str!("test_fixtures/s3_conformance_tls/unrelated-ca.pem");
+fn certificate(name: &str, issuer: Option<(&X509, &PKey<Private>)>) -> (X509, PKey<Private>) {
+    let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+    let mut subject = X509NameBuilder::new().unwrap();
+    subject.append_entry_by_text("CN", name).unwrap();
+    let subject = subject.build();
+    let mut serial = BigNum::new().unwrap();
+    serial.rand(128, MsbOption::ONE, false).unwrap();
+    let serial = serial.to_asn1_integer().unwrap();
+    let mut cert = X509::builder().unwrap();
+    cert.set_version(2).unwrap();
+    cert.set_serial_number(&serial).unwrap();
+    cert.set_subject_name(&subject).unwrap();
+    cert.set_pubkey(&key).unwrap();
+    cert.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    cert.set_not_after(&Asn1Time::days_from_now(1).unwrap())
+        .unwrap();
+
+    if let Some((ca, ca_key)) = issuer {
+        cert.set_issuer_name(ca.subject_name()).unwrap();
+        let names = SubjectAlternativeName::new()
+            .dns("localhost")
+            .ip("127.0.0.1")
+            .build(&cert.x509v3_context(Some(ca), None))
+            .unwrap();
+        cert.append_extension(names).unwrap();
+        cert.append_extension(ExtendedKeyUsage::new().server_auth().build().unwrap())
+            .unwrap();
+        cert.sign(ca_key, MessageDigest::sha256()).unwrap();
+    } else {
+        cert.set_issuer_name(&subject).unwrap();
+        cert.append_extension(BasicConstraints::new().critical().ca().build().unwrap())
+            .unwrap();
+        cert.append_extension(KeyUsage::new().critical().key_cert_sign().build().unwrap())
+            .unwrap();
+        cert.sign(&key, MessageDigest::sha256()).unwrap();
+    }
+    (cert.build(), key)
+}
 
 struct CaBundleFile(PathBuf);
 
@@ -65,19 +113,16 @@ impl Drop for CaBundleFile {
     }
 }
 
-async fn https_fixture() -> (String, tokio::task::JoinHandle<()>) {
-    use rustls::pki_types::PrivateKeyDer;
+async fn https_fixture(ca: &X509, ca_key: &PKey<Private>) -> (String, tokio::task::JoinHandle<()>) {
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::TcpListener;
 
-    let cert = CertificateDer::from_pem_slice(include_bytes!(
-        "test_fixtures/s3_conformance_tls/localhost.pem"
-    ))
-    .unwrap();
-    let key = PrivateKeyDer::from_pem_slice(include_bytes!(
-        "test_fixtures/s3_conformance_tls/localhost-test-key.pem"
-    ))
-    .unwrap();
+    let (cert, key) = certificate("localhost", Some((ca, ca_key)));
+    let cert = CertificateDer::from(cert.to_der().unwrap());
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        key.private_key_to_pkcs8().unwrap(),
+    ));
     let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))
@@ -117,11 +162,15 @@ async fn https_fixture() -> (String, tokio::task::JoinHandle<()>) {
 
 #[tokio::test]
 async fn sdk_and_presigned_requests_use_all_custom_ca_roots_and_reload_changes() {
-    let (endpoint, server) = https_fixture().await;
+    let (ca, ca_key) = certificate("Conformance test CA", None);
+    let (unrelated_ca, _) = certificate("Unrelated test CA", None);
+    let local_ca = ca.to_pem().unwrap();
+    let unrelated_ca = unrelated_ca.to_pem().unwrap();
+    let (endpoint, server) = https_fixture(&ca, &ca_key).await;
     let no_bundle = profile(&endpoint);
     let bundle = CaBundleFile::new();
     // Only the second root signed the fixture's leaf certificate.
-    fs::write(&bundle.0, format!("{UNRELATED_CA}{LOCAL_CA}")).unwrap();
+    fs::write(&bundle.0, [unrelated_ca.as_slice(), &local_ca].concat()).unwrap();
     let mut trusted = no_bundle.clone();
     trusted["verifyTls"] = json!(true);
     trusted["caBundlePath"] = json!(bundle.0);
@@ -151,7 +200,7 @@ async fn sdk_and_presigned_requests_use_all_custom_ca_roots_and_reload_changes()
         observation(&result, "transport", 0, 1);
     }
 
-    fs::write(&bundle.0, UNRELATED_CA).unwrap();
+    fs::write(&bundle.0, unrelated_ca).unwrap();
     let result = call(
         "s3ConformanceOp",
         json!({"profile":trusted, "op":"GetObject", "input":sdk_input}),
@@ -174,10 +223,12 @@ async fn missing_or_invalid_ca_bundle_returns_invalid_config() {
     assert_eq!(error.code, "invalid_config");
 
     // A bad PEM or bad DER after a valid root must fail the whole bundle.
+    let (ca, _) = certificate("Conformance test CA", None);
+    let local_ca = String::from_utf8(ca.to_pem().unwrap()).unwrap();
     for contents in [
         String::new(),
-        format!("{LOCAL_CA}-----BEGIN CERTIFICATE-----\ninvalid-fixture-secret\n-----END CERTIFICATE-----\n"),
-        format!("{LOCAL_CA}-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n"),
+        format!("{local_ca}-----BEGIN CERTIFICATE-----\ninvalid-fixture-secret\n-----END CERTIFICATE-----\n"),
+        format!("{local_ca}-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n"),
     ] {
         fs::write(&bundle.0, contents).unwrap();
         let error = call("s3ConformanceOp", params.clone()).await.unwrap_err();
@@ -332,7 +383,7 @@ async fn service_errors_keep_status_and_headers_without_retries_or_redirects() {
         if path.ends_with("/redirect") {
             return binary(
                 "307 Temporary Redirect",
-                "Location: /different?private=value\r\n",
+                "Location: https://example.test/different?X-Amz-Signature=private\r\nX-Amz-Website-Redirect-Location: /relative?private=value\r\n",
                 b"",
             );
         }
@@ -386,7 +437,14 @@ async fn service_errors_keep_status_and_headers_without_retries_or_redirects() {
     )
     .await;
     observation(&redirect, "service", 307, 1);
-    assert_eq!(redirect["headers"]["location"], "/different");
+    assert_eq!(
+        redirect["headers"]["location"],
+        "https://example.test/different?[query]"
+    );
+    assert_eq!(
+        redirect["headers"]["x-amz-website-redirect-location"],
+        "/relative?[query]"
+    );
     let slow = invoke(
         &fixture,
         "GetObject",
@@ -451,8 +509,70 @@ async fn list_and_delete_projections_use_aws_names_and_keep_opaque_values() {
 }
 
 #[tokio::test]
+async fn short_profile_credentials_do_not_rewrite_tags_or_cors_origins() {
+    let fixture = BinaryFixture::new(|request| {
+        let line = request.lines().next().unwrap();
+        if line.contains("?tagging") {
+            return binary("200 OK", "", b"<Tagging><TagSet><Tag><Key>sample</Key><Value>test</Value></Tag></TagSet></Tagging>");
+        }
+        if line.contains("?cors") {
+            return binary("200 OK", "Access-Control-Allow-Origin: https://example.test\r\n",
+                b"<CORSConfiguration><CORSRule><AllowedOrigin>https://example.test</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>");
+        }
+        let path = line.split_whitespace().nth(1).unwrap();
+        assert_eq!(path.split('?').next(), Some("/fixture-bucket/key"));
+        let auth = header(request, "authorization").unwrap();
+        let error = format!("<Error><Code>AccessDenied</Code><Message>{auth} x-amz-security-token: test Signature=hidden X-Amz-Signature=private HTTPS://example.test/key?private=value</Message></Error>");
+        binary("403 Forbidden", "", error.as_bytes())
+    });
+    let mut profile = profile(&fixture.endpoint);
+    profile["accessKey"] = json!("test");
+    profile["secretKey"] = json!("test");
+    profile["sessionToken"] = json!("test");
+    let tags = call("s3ConformanceOp", json!({
+        "profile":profile, "op":"GetObjectTagging", "input":{"Bucket":"fixture-bucket","Key":"key"}
+    })).await.unwrap();
+    observation(&tags, "service", 200, 1);
+    assert_eq!(tags["output"]["TagSet"][0]["Value"], "test");
+
+    let cors = call(
+        "s3ConformanceOp",
+        json!({
+            "profile":profile, "op":"GetBucketCors", "input":{"Bucket":"fixture-bucket"}
+        }),
+    )
+    .await
+    .unwrap();
+    observation(&cors, "service", 200, 1);
+    assert_eq!(
+        cors["output"]["CORSRules"][0]["AllowedOrigins"][0],
+        "https://example.test"
+    );
+    assert_eq!(
+        cors["headers"]["access-control-allow-origin"],
+        "https://example.test"
+    );
+
+    let denied = call(
+        "s3ConformanceOp",
+        json!({"profile":profile, "op":"GetObject", "input":{"Bucket":"fixture-bucket","Key":"key"}}),
+    )
+    .await
+    .unwrap();
+    observation(&denied, "service", 403, 1);
+    assert_eq!(denied["errorMessage"], "[redacted] x-amz-security-token: [redacted] Signature=[redacted] X-Amz-Signature=[redacted] [redacted]");
+}
+
+#[tokio::test]
 async fn preflight_rpc_and_sdk_errors_are_distinct() {
-    let fixture = BinaryFixture::new(|_| {
+    let fixture = BinaryFixture::new(|request| {
+        if request.starts_with("GET /?x-id=ListBuckets") {
+            return binary(
+                "200 OK",
+                "",
+                b"<ListAllMyBucketsResult><Buckets/></ListAllMyBucketsResult>",
+            );
+        }
         binary(
             "200 OK",
             "X-Amz-Request-Id: malformed\r\n",
@@ -478,15 +598,35 @@ async fn preflight_rpc_and_sdk_errors_are_distinct() {
     .unwrap_err();
     assert_eq!(forbidden.code, "invalid_request");
     assert!(!forbidden.message.contains(SSE));
-    let gcs = call(
+    for (endpoint_type, code) in [
+        ("madeUpStorage", "invalid_config"),
+        ("azureBlob", "unsupported_feature"),
+        ("googleCloudStorage", "unsupported_feature"),
+    ] {
+        let error = call(
+            "s3ConformanceOp",
+            json!({"profile":{"endpointType":endpoint_type},"op":"ListBuckets"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, code);
+    }
+    let omitted = call(
         "s3ConformanceOp",
-        json!({
-            "profile":{"endpointType":"googleCloudStorage"},"op":"ListBuckets","input":{}
-        }),
+        json!({"profile":profile,"op":"ListBuckets"}),
     )
     .await
-    .unwrap_err();
-    assert_eq!(gcs.code, "unsupported_feature");
+    .unwrap();
+    observation(&omitted, "service", 200, 1);
+    for input in [Value::Null, json!([]), json!("invalid")] {
+        let error = call(
+            "s3ConformanceOp",
+            json!({"profile":profile,"op":"ListBuckets","input":input}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+    }
     let capability = call("getCapabilities", json!({"profile":profile}))
         .await
         .unwrap();
@@ -516,7 +656,7 @@ async fn copy_source_is_encoded_once_and_sse_keys_are_scoped() {
     let fixture = BinaryFixture::new(move |request| {
         assert_eq!(
             header(request, "x-amz-copy-source"),
-            Some("source%2Ffolder%2Fa%2B%20%25%C3%A9?versionId=v%2B%20%25")
+            Some("source/a%2Bb%20c%25/%C3%BC/d?versionId=v%2B%20%25")
         );
         assert!(header(request, "x-amz-server-side-encryption-customer-key") == Some(SSE));
         assert!(
@@ -544,7 +684,7 @@ async fn copy_source_is_encoded_once_and_sse_keys_are_scoped() {
                 json!({
                     "profile":profile(&fixture.endpoint),"op":"CopyObject",
                     "input":{"Bucket":"fixture-bucket","Key":"dest",
-                        "CopySource":{"Bucket":"source","Key":"folder/a+ %é","VersionId":"v+ %"}},
+                        "CopySource":{"Bucket":"source","Key":"a+b c%/ü/d","VersionId":"v+ %"}},
                     "encryption":{"mode":"sse-c","customerKey":SSE},
                     "sourceEncryption":{"mode":"sse-c","customerKey":SOURCE_SSE},
                 }),
@@ -620,6 +760,10 @@ async fn presigned_get_and_put_send_signed_requests_without_exposing_query_value
     observation(&get, "service", 403, 1);
     assert_eq!(get["errorCode"], "AccessDenied");
     assert_eq!(get["errorMessage"], "[redacted] [redacted]");
+    assert_eq!(
+        get["headers"]["location"],
+        format!("{}/fixture-bucket/key?[query]", fixture.endpoint)
+    );
     let presign = &get["output"]["Presign"];
     assert_eq!(presign["Scheme"], "http");
     assert_eq!(

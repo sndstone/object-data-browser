@@ -1,5 +1,8 @@
 part of 'conformance_suite.dart';
 
+/// One page of versions: (key, versionId, isDeleteMarker).
+typedef _VersionEntry = (String, String?, bool);
+
 extension _Teardown on S3ConformanceSuite {
   Future<void> _teardownPhase() async {
     final failures = _run.checks.any((check) =>
@@ -12,17 +15,33 @@ extension _Teardown on S3ConformanceSuite {
     var uploads = 0;
     var holds = 0;
     var leftovers = 0;
+    // A bucket whose CreateBucket outcome is unknown is never purged: the run
+    // cannot prove it created it. It is reported for manual inspection.
+    for (final bucket in _uncertainBuckets) {
+      final head = await _quiet('HeadBucket', {'Bucket': bucket});
+      if (head != null && head.isService && (head.httpStatus == 404 || head.httpStatus == 400)) continue;
+      retained.add(bucket);
+      errors.add('CreateBucket $bucket had no definite outcome; it was not deleted automatically. Check it manually.');
+    }
     // Lock bucket first: its protections are the slowest to clear.
-    final order = [
+    final order = <String>{
       ..._ownedBuckets.where((b) => b == _lockBucket),
       ..._ownedBuckets.where((b) => b != _lockBucket),
-    ];
-    for (final bucket in order.toSet()) {
-      final exists = await _quiet('HeadBucket', {'Bucket': bucket});
-      if (exists == null || exists.httpStatus == 404 || exists.httpStatus == 400) {
-        // Never created (or an invalid name the endpoint refused).
+    };
+    for (final bucket in order) {
+      if (cancellation.skipTeardown) {
+        // "Stop without cleanup" pressed during teardown.
+        retained.add(bucket);
+        errors.add('Teardown stopped by the user before $bucket was cleaned up.');
         continue;
       }
+      final head = await _quiet('HeadBucket', {'Bucket': bucket});
+      if (head == null || !head.isService) {
+        retained.add(bucket);
+        errors.add('HeadBucket $bucket: ${head == null ? 'engine error' : _CheckContext.describe(head)}; bucket state unknown.');
+        continue;
+      }
+      if (head.httpStatus == 404) continue; // already deleted by its check
       uploads += await _abortUploads(bucket, errors);
       if (bucket == _lockBucket) holds += await _releaseHolds(bucket, errors);
       if (retain) {
@@ -54,7 +73,7 @@ extension _Teardown on S3ConformanceSuite {
     );
     await _check('teardown.complete',
         category: 'Teardown',
-        title: retain ? 'Buckets retained for inspection (failures and "retain buckets" on)' : 'Every test bucket was emptied and deleted',
+        title: retain ? 'Buckets retained for inspection (failures and "keep buckets" on)' : 'Every test bucket was emptied and deleted',
         spec: 'Abort uploads, clear legal holds, delete every version and delete marker (bypassing GOVERNANCE), then DeleteBucket: 204.',
         severity: ConformanceSeverity.informational,
         body: (c) async {
@@ -79,7 +98,10 @@ extension _Teardown on S3ConformanceSuite {
         if (keyMarker != null) 'KeyMarker': keyMarker,
         if (uploadMarker != null) 'UploadIdMarker': uploadMarker,
       });
-      if (list == null || !list.isSuccess) break;
+      if (list == null || !list.isSuccess) {
+        errors.add('ListMultipartUploads $bucket: ${list == null ? 'engine error' : _CheckContext.describe(list)}; uploads may remain.');
+        break;
+      }
       for (final upload in list.list('Uploads')) {
         final o = await _quiet('AbortMultipartUpload',
             {'Bucket': bucket, 'Key': upload['Key'], 'UploadId': upload['UploadId']});
@@ -98,115 +120,118 @@ extension _Teardown on S3ConformanceSuite {
 
   Future<int> _releaseHolds(String bucket, List<String> errors) async {
     var released = 0;
-    for (final version in await _allVersions(bucket)) {
-      if (version.$3) continue; // delete markers carry no hold
-      final hold = await _quiet('GetObjectLegalHold', {'Bucket': bucket, 'Key': version.$1, 'VersionId': version.$2});
-      if (hold == null || hold.field('LegalHold.Status') != 'ON') continue;
-      final off = await _quiet('PutObjectLegalHold',
-          {'Bucket': bucket, 'Key': version.$1, 'VersionId': version.$2, 'LegalHold': {'Status': 'OFF'}});
-      if (off != null && off.isSuccess) {
-        released++;
-      } else {
-        errors.add('PutObjectLegalHold OFF ${version.$1}: ${off == null ? 'engine error' : _CheckContext.describe(off)}');
-      }
-    }
-    return released;
-  }
-
-  /// (key, versionId, isDeleteMarker) for every version, or the keys of an
-  /// endpoint without ListObjectVersions.
-  Future<List<(String, String?, bool)>> _allVersions(String bucket) async {
-    final result = <(String, String?, bool)>[];
     Object? keyMarker;
     Object? versionMarker;
-    for (var page = 0; page < 200; page++) {
+    for (var page = 0; page < 50; page++) {
       final list = await _quiet('ListObjectVersions', {
         'Bucket': bucket,
         if (keyMarker != null) 'KeyMarker': keyMarker,
         if (versionMarker != null) 'VersionIdMarker': versionMarker,
       });
       if (list == null || !list.isSuccess) {
-        return _allKeys(bucket);
+        errors.add('ListObjectVersions $bucket: ${list == null ? 'engine error' : _CheckContext.describe(list)}; legal holds may remain.');
+        return released;
       }
       for (final v in list.list('Versions')) {
-        result.add(('${v['Key']}', v['VersionId']?.toString(), false));
-      }
-      for (final m in list.list('DeleteMarkers')) {
-        result.add(('${m['Key']}', m['VersionId']?.toString(), true));
+        final key = '${v['Key']}';
+        final id = v['VersionId'];
+        final hold = await _quiet('GetObjectLegalHold', {'Bucket': bucket, 'Key': key, 'VersionId': id});
+        if (hold == null || hold.field('LegalHold.Status') != 'ON') continue;
+        final off = await _quiet('PutObjectLegalHold',
+            {'Bucket': bucket, 'Key': key, 'VersionId': id, 'LegalHold': {'Status': 'OFF'}});
+        if (off != null && off.isSuccess) {
+          released++;
+        } else {
+          errors.add('PutObjectLegalHold OFF $key: ${off == null ? 'engine error' : _CheckContext.describe(off)}');
+        }
       }
       if (list.field('IsTruncated') != true) break;
       keyMarker = list.field('NextKeyMarker');
       versionMarker = list.field('NextVersionIdMarker');
     }
-    return result;
+    return released;
   }
 
-  Future<List<(String, String?, bool)>> _allKeys(String bucket) async {
-    final result = <(String, String?, bool)>[];
-    Object? token;
-    for (var page = 0; page < 200; page++) {
-      final list = await _quiet('ListObjectsV2', {
-        'Bucket': bucket,
-        if (token != null) 'ContinuationToken': token,
-      });
-      if (list == null || !list.isSuccess) break;
-      for (final item in list.list('Contents')) {
-        result.add(('${item['Key']}', null, false));
-      }
-      token = list.field('NextContinuationToken');
-      if (list.field('IsTruncated') != true || token == null) break;
+  /// The first page (at most 1000 entries) of what remains, or null when it
+  /// cannot be listed. Plain keys are used only for a bucket that has never
+  /// had versioning, where deleting a key cannot create a delete marker.
+  Future<(List<_VersionEntry>, bool)?> _remainingPage(String bucket, List<String> errors) async {
+    final list = await _quiet('ListObjectVersions', {'Bucket': bucket, 'MaxKeys': 1000});
+    if (list != null && list.isSuccess) {
+      return (
+        <_VersionEntry>[
+          for (final v in list.list('Versions')) ('${v['Key']}', v['VersionId']?.toString(), false),
+          for (final m in list.list('DeleteMarkers')) ('${m['Key']}', m['VersionId']?.toString(), true),
+        ],
+        list.field('IsTruncated') == true,
+      );
     }
-    return result;
+    final versioning = await _quiet('GetBucketVersioning', {'Bucket': bucket});
+    if (versioning == null || !versioning.isSuccess || versioning.field('Status') != null) {
+      errors.add('ListObjectVersions $bucket: ${list == null ? 'engine error' : _CheckContext.describe(list)}; versions cannot be enumerated.');
+      return null;
+    }
+    final keys = await _quiet('ListObjectsV2', {'Bucket': bucket, 'MaxKeys': 1000});
+    if (keys == null || !keys.isSuccess) {
+      errors.add('ListObjectsV2 $bucket: ${keys == null ? 'engine error' : _CheckContext.describe(keys)}');
+      return null;
+    }
+    return (
+      <_VersionEntry>[for (final item in keys.list('Contents')) ('${item['Key']}', null, false)],
+      keys.field('IsTruncated') == true,
+    );
   }
 
-  /// Deletes every version and marker; returns (deleted, left over).
+  /// Deletes page by page from the start of the listing; returns
+  /// (deleted, left over). Memory stays bounded to one page.
   Future<(int, int)> _purge(String bucket,
       {required bool bypass, required List<String> errors}) async {
     var deleted = 0;
-    var remaining = 0;
-    for (var sweep = 0; sweep < 5; sweep++) {
-      final versions = await _allVersions(bucket);
-      remaining = versions.length;
-      if (versions.isEmpty) break;
-      for (var start = 0; start < versions.length; start += 500) {
-        final batch = versions.skip(start).take(500).toList();
-        final o = await _quiet('DeleteObjects', {
-          'Bucket': bucket,
-          if (bypass) 'BypassGovernanceRetention': true,
-          'Delete': {
-            'Objects': [
-              for (final v in batch) {'Key': v.$1, if (v.$2 != null) 'VersionId': v.$2}
-            ],
-            'Quiet': true,
-          },
-        });
-        final failed = <String>{};
-        if (o != null && o.isSuccess) {
-          for (final error in o.list('Errors')) {
-            failed.add('${error['Key']}\u0000${error['VersionId'] ?? ''}');
-          }
-          deleted += batch.length - failed.length;
+    for (var round = 0; round < 200; round++) {
+      final page = await _remainingPage(bucket, errors);
+      if (page == null) return (deleted, 1);
+      final (entries, truncated) = page;
+      if (entries.isEmpty) return (deleted, 0);
+      final o = await _quiet('DeleteObjects', {
+        'Bucket': bucket,
+        if (bypass) 'BypassGovernanceRetention': true,
+        'Delete': {
+          'Objects': [
+            for (final v in entries) {'Key': v.$1, if (v.$2 != null) 'VersionId': v.$2}
+          ],
+          'Quiet': true,
+        },
+      });
+      final failed = <String>{};
+      var progress = 0;
+      if (o != null && o.isSuccess) {
+        for (final error in o.list('Errors')) {
+          failed.add('${error['Key']}\u0000${error['VersionId'] ?? ''}');
         }
-        // Per-object fallback for an endpoint without DeleteObjects or
-        // without batch governance bypass.
-        for (final v in batch) {
-          if (o != null && o.isSuccess && !failed.contains('${v.$1}\u0000${v.$2 ?? ''}')) continue;
-          final single = await _quiet('DeleteObject', {
-            'Bucket': bucket,
-            'Key': v.$1,
-            if (v.$2 != null) 'VersionId': v.$2,
-            if (bypass) 'BypassGovernanceRetention': true,
-          });
-          if (single != null && single.isSuccess) {
-            deleted++;
-          } else if (sweep == 4) {
-            errors.add('DeleteObject ${v.$1}: ${single == null ? 'engine error' : _CheckContext.describe(single)}');
-          }
+        progress += entries.length - failed.length;
+      }
+      // Per-object fallback for an endpoint without DeleteObjects, without
+      // batch governance bypass, or for entries the batch refused.
+      for (final v in entries) {
+        if (o != null && o.isSuccess && !failed.contains('${v.$1}\u0000${v.$2 ?? ''}')) continue;
+        final single = await _quiet('DeleteObject', {
+          'Bucket': bucket,
+          'Key': v.$1,
+          if (v.$2 != null) 'VersionId': v.$2,
+          if (bypass) 'BypassGovernanceRetention': true,
+        });
+        if (single != null && single.isSuccess) {
+          progress++;
+        } else if (errors.length < 20) {
+          errors.add('DeleteObject ${v.$1}: ${single == null ? 'engine error' : _CheckContext.describe(single)}');
         }
       }
+      deleted += progress;
+      if (progress == 0) {
+        return (deleted, entries.length + (truncated ? 1 : 0));
+      }
     }
-    final left = await _allVersions(bucket);
-    remaining = left.length;
-    return (deleted, remaining);
+    final last = await _remainingPage(bucket, errors);
+    return (deleted, last == null ? 1 : last.$1.length);
   }
 }

@@ -140,9 +140,7 @@ public final class S3ConformanceTest {
     private static void secretHygienePaginationCursors() throws Exception {
         // Pagination cursors survive both SecretHygiene.sensitive/clean and SecretHygiene.text.
         for (String cursorField : List.of(
-                "ContinuationToken", "NextContinuationToken", "continuation_token",
-                "next_continuation_token", "NextToken", "next_token",
-                "pageToken", "nextPageToken", "rewriteToken", "Marker", "NextMarker")) {
+                "ContinuationToken", "NextContinuationToken", "Marker", "NextMarker")) {
             check(!SecretHygiene.sensitive(cursorField), "Cursor field must not be sensitive: " + cursorField);
             Map<String, Object> cleaned = castMap(SecretHygiene.clean(Map.of(cursorField, "opaque-cursor-value-1234567890")));
             check("opaque-cursor-value-1234567890".equals(cleaned.get(cursorField)),
@@ -156,6 +154,8 @@ public final class S3ConformanceTest {
         for (String secretField : List.of(
                 "sessionToken", "x-amz-security-token", "accessToken", "refreshToken",
                 "sasToken", "token", "authorization", "secretKey", "customerKey", "fileKey",
+                // Only the exact S3 cursor names are exempt; other *Token fields stay sensitive.
+                "X-Auth-Page-Token", "nextPageToken", "rewriteToken", "NextToken", "continuation_token",
                 "x-amz-server-side-encryption-customer-key",
                 "x-amz-copy-source-server-side-encryption-customer-key")) {
             check(SecretHygiene.sensitive(secretField), "Secret field must stay sensitive: " + secretField);

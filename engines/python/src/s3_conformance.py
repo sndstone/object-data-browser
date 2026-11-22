@@ -86,6 +86,9 @@ _MAX_BODY_READ = 32 * 1024 * 1024
 
 _CLIENTS: OrderedDict = OrderedDict()
 _CLIENTS_LOCK = threading.Lock()
+# Per-call wire facts, recorded by client event handlers on the calling thread.
+_WIRE = threading.local()
+_URL_HEADERS = frozenset({'location', 'x-amz-website-redirect-location'})
 
 
 _BLOCK = bytes((j * 7) & 0xFF for j in range(1024))
@@ -222,12 +225,84 @@ def _client(profile, g):
         if cached is not None:
             _CLIENTS.move_to_end(profile)
             return cached
-    client = g._new_client(profile, conformance=True)
+    client = _prepare_client(g._new_client(profile, conformance=True))
     with _CLIENTS_LOCK:
         _CLIENTS[profile] = client
         while len(_CLIENTS) > 8:
             _CLIENTS.popitem(last=False)
     return client
+
+
+def _prepare_client(client):
+    """One observation must be one S3 request with its wire status.
+
+    botocore's S3 region redirector re-sends a request after a 301/400 and may
+    probe HeadBucket; it is removed from this dedicated client. Every send is
+    counted, and the raw status is recorded before botocore turns an error
+    embedded in a 200 response into a 500.
+    """
+    from botocore import handlers as bh  # noqa: PLC0415
+    from botocore.utils import S3RegionRedirectorv2  # noqa: PLC0415
+    events = client.meta.events
+    emitter = getattr(events, '_emitter', events)
+    for event in ('needs-retry.s3', 'before-parameter-build.s3', 'before-endpoint-resolution.s3'):
+        try:
+            handlers = list(emitter._handlers.prefix_search(event + '.GetObject'))
+        except Exception:  # noqa: BLE001
+            handlers = []
+        for handler in handlers:
+            if isinstance(getattr(handler, '__self__', None), S3RegionRedirectorv2):
+                events.unregister(event, handler)
+
+    def count_send(**_):
+        _WIRE.sends = getattr(_WIRE, 'sends', 0) + 1
+
+    def record_status(response_dict=None, **_):
+        if response_dict is not None and getattr(_WIRE, 'status', None) is None:
+            _WIRE.status = response_dict.get('status_code')
+
+    events.register('before-send.s3', count_send)
+    handle_200 = getattr(bh, '_handle_200_error', None)
+    if handle_200 is not None:
+        events.unregister('before-parse.s3.*', handle_200)
+    events.register_first('before-parse.s3.*', record_status)
+    if handle_200 is not None:
+        events.register_first('before-parse.s3.*', handle_200)
+    return client
+
+
+class _Redactor:
+    """Removes this profile's credentials and URL query strings from text."""
+
+    def __init__(self, profile, g):
+        self._g = g
+        # Like the Java engine: short credentials ("test") are ordinary words in
+        # S3 data and are not substring-replaced; customer keys always are.
+        self._secrets = [value for value in (profile.secret_key, profile.session_token, profile.access_key)
+                         if value and len(value) >= 16]
+
+    def text(self, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        value = _strip_urls(self._g._redact_customer_text(value))
+        for secret in self._secrets:
+            value = value.replace(secret, '[redacted]')
+        return value
+
+    def deep(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: self.deep(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.deep(item) for item in value]
+        return self.text(value)
+
+    def headers(self, headers: dict[str, str]) -> dict[str, str]:
+        result = {}
+        for name, value in headers.items():
+            if name in _URL_HEADERS:
+                value = value.split('?', 1)[0] + ('?[query]' if '?' in value else '')
+            result[name] = self.text(value)
+        return result
 
 
 def _sdk_name() -> str:
@@ -280,6 +355,21 @@ def _result(op, outcome, status, *, error_code=None, error_message=None, headers
     return result
 
 
+_MAX_OUTPUT_JSON = 4 * 1024 * 1024
+
+
+def _redact_result(result: dict[str, Any], redactor: _Redactor) -> dict[str, Any]:
+    import json  # noqa: PLC0415
+    if len(json.dumps(result.get('output') or {}, default=str)) > _MAX_OUTPUT_JSON:
+        # S3 pages hold at most 1000 entries; anything larger is not projected.
+        result['output'] = {'truncated': True}
+    result['headers'] = redactor.headers(result.get('headers') or {})
+    if result.get('errorMessage') is not None:
+        result['errorMessage'] = redactor.text(result['errorMessage'])[:_MAX_ERROR_MESSAGE]
+    result['output'] = redactor.deep(result.get('output') or {})
+    return result
+
+
 def _apply_encryption(op: str, params: dict[str, Any], profile, kwargs: dict[str, Any], g) -> None:
     encryption = g._parse_object_encryption(params.get('encryption'), profile)
     source = g._parse_object_encryption(params.get('sourceEncryption'), profile, source=True)
@@ -319,14 +409,14 @@ def handle(params: dict[str, Any], g) -> dict[str, Any]:
     if op == 'PresignedRequest':
         if params.get('encryption') or params.get('sourceEncryption'):
             raise g.SidecarError('unsupported_feature', 'Customer-key encrypted objects cannot use presigned URLs.')
-        return _presigned_request(profile, kwargs, params.get('body'), g)
+        return _redact_result(_presigned_request(profile, kwargs, params.get('body'), g), _Redactor(profile, g))
     if op in _BODY_OPERATIONS:
         kwargs['Body'] = _body_bytes(params.get('body'), g)
     elif params.get('body') is not None:
         raise g.SidecarError('invalid_request', f'{op} does not take a body.')
     _apply_encryption(op, params, profile, kwargs, g)
     client = _client(profile, g)
-    return _invoke(client, op, kwargs, g)
+    return _redact_result(_invoke(client, op, kwargs, g), _Redactor(profile, g))
 
 
 def _invoke(client, op: str, kwargs: dict[str, Any], g) -> dict[str, Any]:
@@ -334,6 +424,8 @@ def _invoke(client, op: str, kwargs: dict[str, Any], g) -> dict[str, Any]:
     from botocore import xform_name  # noqa: PLC0415
 
     method = getattr(client, xform_name(op))
+    _WIRE.sends = 0
+    _WIRE.status = None
     started = time.perf_counter()
     try:
         response = method(**kwargs)
@@ -342,20 +434,21 @@ def _invoke(client, op: str, kwargs: dict[str, Any], g) -> dict[str, Any]:
             output['Body'] = _digest_stream(output['Body'])
         latency = (time.perf_counter() - started) * 1000
         meta = response.get('ResponseMetadata') or {}
-        return _result(op, 'service', meta.get('HTTPStatusCode'),
+        return _result(op, 'service', _WIRE.status or meta.get('HTTPStatusCode'),
                        headers=filter_headers(meta.get('HTTPHeaders') or {}),
                        output=normalize_output(output), latency_ms=latency,
-                       attempts=int(meta.get('RetryAttempts') or 0) + 1, request_id=meta.get('RequestId'))
+                       attempts=_WIRE.sends or 1, request_id=meta.get('RequestId'))
     except bce.ClientError as error:
         latency = (time.perf_counter() - started) * 1000
         response = error.response or {}
         meta = response.get('ResponseMetadata') or {}
         err = response.get('Error') or {}
-        status = meta.get('HTTPStatusCode') or 0
+        # The wire status: an error embedded in a 200 response stays a 200.
+        status = _WIRE.status or meta.get('HTTPStatusCode') or 0
         return _result(op, 'service' if status else 'sdk_decode', status,
                        error_code=err.get('Code'), error_message=_message(g, err.get('Message')),
                        headers=filter_headers(meta.get('HTTPHeaders') or {}), latency_ms=latency,
-                       attempts=int(meta.get('RetryAttempts') or 0) + 1, request_id=meta.get('RequestId'))
+                       attempts=_WIRE.sends or 1, request_id=meta.get('RequestId'))
     except (bce.ParamValidationError, bce.NoCredentialsError, bce.PartialCredentialsError) as error:
         latency = (time.perf_counter() - started) * 1000
         return _result(op, 'sdk_validation', 0, error_code=type(error).__name__,

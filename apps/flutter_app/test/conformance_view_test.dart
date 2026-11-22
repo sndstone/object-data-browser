@@ -69,6 +69,7 @@ void _checkText(WidgetTester tester, {required bool checkSize}) {
       final text = object.text.toPlainText();
       if (text.trim().isNotEmpty && !(style.fontFamily ?? '').toLowerCase().contains('icons')) {
         checked++;
+        expect(object.didExceedMaxLines, isFalse, reason: 'Clipped conformance text: "$text"');
         if (checkSize) {
           expect(object.textScaler.scale(style.fontSize ?? 14) * paintScale, greaterThanOrEqualTo(12 - 0.01),
               reason: 'Small conformance text: "$text"');
@@ -140,7 +141,9 @@ void main() {
             scrollable: find
                 .descendant(of: find.byKey(const ValueKey('conformance-results-list')), matching: find.byType(Scrollable))
                 .first);
-        await tester.tap(find.byKey(const ValueKey('conformance-check-bucket.create')));
+        await tester.ensureVisible(find.text('CreateBucket creates the standard test bucket'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('CreateBucket creates the standard test bucket'));
         await tester.pumpAndSettle();
         expect(tester.takeException(), isNull);
         _checkText(tester, checkSize: scale == 100);

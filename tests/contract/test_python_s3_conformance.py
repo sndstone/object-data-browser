@@ -66,6 +66,13 @@ class FakeS3(BaseHTTPRequestHandler):
                     '<LastModified>2026-01-02T03:04:05.000Z</LastModified><StorageClass>STANDARD</StorageClass></Contents>'
                     '</ListBucketResult>').encode()
             return self._send(200, body)
+        if key == 'redirect':
+            return self._send(301, b'<Error><Code>PermanentRedirect</Code><Message>elsewhere</Message></Error>',
+                              {'x-amz-bucket-region': 'eu-west-1'})
+        if key == 'echo':
+            return self._send(403, ('<Error><Code>AccessDenied</Code><Message>token ' + SESSION + ' rejected</Message></Error>').encode())
+        if key == 'location':
+            return self._send(200, b'x', {'Location': 'https://elsewhere.example/b/k?X-Amz-Signature=abc&X-Amz-Credential=def'})
         if key == 'deleted':
             return self._send(404, b'<Error><Code>NoSuchKey</Code><Message>gone</Message></Error>',
                               {'x-amz-delete-marker': 'true', 'x-amz-version-id': 'dm1'})
@@ -86,6 +93,8 @@ class FakeS3(BaseHTTPRequestHandler):
         bucket, key, query = self._route()
         length = int(self.headers.get('Content-Length') or 0)
         self.rfile.read(length)
+        if 'uploadId' in query:
+            return self._send(200, b'<?xml version="1.0"?><Error><Code>InternalError</Code><Message>try again</Message></Error>')
         if 'delete' in query:
             body = (b'<DeleteResult><Deleted><Key>a</Key></Deleted><Deleted><Key>b</Key><DeleteMarker>true</DeleteMarker>'
                     b'<DeleteMarkerVersionId>dm</DeleteMarkerVersionId></Deleted>'
@@ -230,3 +239,23 @@ def test_customer_key_never_reaches_output(engine, server):
     result = call(engine, server, 'PutObject', {'Bucket': 'b', 'Key': 'sse'}, body={'text': 'x'},
                   encryption={'mode': 'sse-c', 'customerKey': key})
     assert result['httpStatus'] == 200 and key not in json.dumps(result)
+
+
+def test_one_observation_is_one_request(engine, server):
+    FakeS3.requests.clear()
+    result = call(engine, server, 'GetObject', {'Bucket': 'b', 'Key': 'redirect'})
+    assert (result['httpStatus'], result['errorCode'], result['attempts']) == (301, 'PermanentRedirect', 1)
+    assert len([r for r in FakeS3.requests if r[0] == 'GET']) == 1
+
+
+def test_error_embedded_in_200_keeps_the_wire_status(engine, server):
+    result = call(engine, server, 'CompleteMultipartUpload', {
+        'Bucket': 'b', 'Key': 'k', 'UploadId': 'u', 'MultipartUpload': {'Parts': [{'PartNumber': 1, 'ETag': '"e"'}]}})
+    assert (result['httpStatus'], result['errorCode']) == (200, 'InternalError')
+
+
+def test_echoed_credentials_and_signed_locations_are_redacted(engine, server):
+    echoed = call(engine, server, 'GetObject', {'Bucket': 'b', 'Key': 'echo'})
+    assert SESSION not in json.dumps(echoed) and '[redacted]' in echoed['errorMessage']
+    located = call(engine, server, 'GetObject', {'Bucket': 'b', 'Key': 'location'})
+    assert located['headers']['location'] == 'https://elsewhere.example/b/k?[query]'

@@ -3,13 +3,12 @@ part of 'conformance_suite.dart';
 extension _ObjectLock on S3ConformanceSuite {
   Future<void> _objectLockPhase() async {
     if (_stdReady) await _lockNegativeChecks();
-    _ownedBuckets.add(_lockBucket);
     final create = await _check('lock.bucket.create',
         category: 'Object Lock',
         title: 'CreateBucket with Object Lock enabled',
         spec: 'CreateBucket x-amz-bucket-object-lock-enabled: true: 200. Endpoints without Object Lock reject it (recorded as unsupported).',
         body: (c) async {
-      final o = await c.call('CreateBucket', _createBucketInput(_lockBucket, objectLock: true));
+      final o = await _createBucket(c, _lockBucket, objectLock: true);
       if (!o.isSuccess && (o.errorCode == 'InvalidRequest' || o.errorCode == 'NotImplemented') &&
           (o.errorMessage ?? '').toLowerCase().contains('lock')) {
         c.unsupported('The endpoint does not support Object Lock: ${conformanceClip(o.errorMessage, 120)}');
@@ -66,19 +65,20 @@ extension _ObjectLock on S3ConformanceSuite {
       final cleared = await c.call('GetObjectLockConfiguration', {'Bucket': _lockBucket});
       c.equals('Rule after clearing', null, cleared.field('ObjectLockConfiguration.Rule'));
     });
-    if (_run.check('lock.config.default-retention')?.status == ConformanceStatus.fail) {
-      // A default that could not be cleared would lock every fixture for a day.
-      final got = await _quiet('GetObjectLockConfiguration', {'Bucket': _lockBucket});
-      if (got?.field('ObjectLockConfiguration.Rule') != null) {
-        _run.note = 'The default retention could not be cleared; protected writes were skipped.';
-        return;
-      }
+    // A default that was not cleared would lock every fixture for a day. Only a
+    // successful read that shows no default rule allows fixture writes.
+    final verified = await _quiet('GetObjectLockConfiguration', {'Bucket': _lockBucket});
+    if (verified == null ||
+        !verified.isSuccess ||
+        verified.field('ObjectLockConfiguration.ObjectLockEnabled') != 'Enabled' ||
+        verified.field('ObjectLockConfiguration.Rule') != null) {
+      _run.note = 'The lock bucket\'s default retention could not be confirmed absent; protected writes were skipped.';
+      return;
     }
     await _check('lock.put.requires-integrity',
         category: 'Object Lock',
         title: 'Retention on PutObject requires Content-MD5 or a checksum',
-        spec: 'PutObject with Object Lock headers and no Content-MD5/x-amz-checksum: 400 InvalidRequest.',
-        severity: ConformanceSeverity.informational,
+        spec: 'PutObject with Object Lock headers and no Content-MD5/x-amz-checksum (engines send checksums only on request): 400 InvalidRequest; nothing is stored.',
         body: (c) async {
       final until = _isoSeconds(_serverNow().add(const Duration(seconds: 60)));
       final o = await c.call('PutObject', {
@@ -87,7 +87,10 @@ extension _ObjectLock on S3ConformanceSuite {
         'ObjectLockMode': 'GOVERNANCE',
         'ObjectLockRetainUntilDate': until,
       }, body: S3OpBody.text('x'));
-      c.status(o, 400, code: 'InvalidRequest');
+      c.status(o, 400, code: 'InvalidRequest', informationalCode: true,
+          explanation: 'AWS requires Content-MD5 or an x-amz-checksum header when Object Lock headers are present.');
+      c.status(await c.call('HeadObject', {'Bucket': _lockBucket, 'Key': 'lock/no-integrity.txt'}), 404,
+          explanation: 'The rejected write must not create the object.');
     });
     const key = 'lock/governed.txt';
     final payload = utf8.encode('governed object');
@@ -252,12 +255,15 @@ extension _ObjectLock on S3ConformanceSuite {
     });
     await _check('lock.compliance.short',
         category: 'Object Lock',
-        title: 'COMPLIANCE retention cannot be bypassed (5-second lock)',
-        spec: 'PutObject COMPLIANCE: 200; DeleteObject with bypass and PutObjectRetention shortening or switching to GOVERNANCE: 403 AccessDenied; after the date passes deletion: 204.',
+        title: 'COMPLIANCE retention cannot be bypassed, shortened or relaxed (5-second lock)',
+        spec: 'PutObject COMPLIANCE: 200 with a version ID; GetObjectRetention reports COMPLIANCE and the date; DeleteObject with governance bypass, '
+            'PutObjectRetention with an earlier date and PutObjectRetention to GOVERNANCE: 403 AccessDenied; after the date passes the version can be deleted.',
         body: (c) async {
       if (!config.includeShortCompliance) c.skip('The short COMPLIANCE check is turned off.');
       const complianceKey = 'lock/compliance.txt';
       final until = _serverNow().add(const Duration(seconds: 5));
+      // Recorded before the write: a timed-out PUT may still have locked a version.
+      _complianceUntil = until.add(const Duration(seconds: 1));
       final put = await c.call('PutObject', {
         'Bucket': _lockBucket,
         'Key': complianceKey,
@@ -267,19 +273,35 @@ extension _ObjectLock on S3ConformanceSuite {
       }, body: S3OpBody.text('compliance'));
       c.status(put, 200);
       if (!put.isSuccess) return;
-      // Teardown waits for this date before deleting the bucket.
-      _complianceUntil = until.add(const Duration(seconds: 1));
       final id = put.header('x-amz-version-id');
-      c.status(await c.call('DeleteObject', {
+      if (!c.isTrue('x-amz-version-id', id != null && id.isNotEmpty && id != 'null', expected: 'version ID', actual: id)) {
+        return;
+      }
+      final retention = await c.call('GetObjectRetention', {'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id});
+      c.status(retention, 200);
+      c.equals('Retention.Mode', 'COMPLIANCE', retention.field('Retention.Mode'));
+      _sameSecond(c, 'Retention.RetainUntilDate', until, retention.field('Retention.RetainUntilDate'));
+      final deleteAttempt = await c.call('DeleteObject', {
         'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id, 'BypassGovernanceRetention': true,
-      }), 403, code: 'AccessDenied');
-      c.status(await c.call('PutObjectRetention', {
+      });
+      c.status(deleteAttempt, 403, code: 'AccessDenied');
+      final shorten = await c.call('PutObjectRetention', {
+        'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id, 'BypassGovernanceRetention': true,
+        'Retention': {'Mode': 'COMPLIANCE', 'RetainUntilDate': _isoSeconds(until.subtract(const Duration(seconds: 2)))},
+      });
+      c.status(shorten, 403, code: 'AccessDenied', explanation: 'COMPLIANCE retention cannot be shortened, even with bypass.');
+      final relax = await c.call('PutObjectRetention', {
         'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id, 'BypassGovernanceRetention': true,
         'Retention': {'Mode': 'GOVERNANCE', 'RetainUntilDate': _isoSeconds(until)},
-      }), 403, code: 'AccessDenied');
+      });
+      c.status(relax, 403, code: 'AccessDenied', explanation: 'COMPLIANCE cannot be switched to GOVERNANCE.');
+      final still = await c.call('HeadObject', {'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id});
+      c.status(still, 200, explanation: 'The protected version must still exist.');
       await _waitUntilServer(until.add(const Duration(seconds: 2)));
       c.status(await c.call('DeleteObject', {'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id}), 204,
           explanation: 'After the retain-until date the version can be deleted.');
+      c.status(await c.call('HeadObject', {'Bucket': _lockBucket, 'Key': complianceKey, 'VersionId': id}), 404,
+          explanation: 'The expired version is gone after deletion.');
     });
   }
 

@@ -116,9 +116,13 @@ fn copy_source(value: &Value) -> Parsed<String> {
         member(input, "Bucket", string)?.ok_or_else(|| shape_error("a CopySource bucket"))?;
     let key = member(input, "Key", string)?.ok_or_else(|| shape_error("a CopySource key"))?;
     let version = member(input, "VersionId", string)?;
-    // The Rust SDK takes an already encoded header string. Match server_copy
-    // and encode each value exactly once, leaving the version delimiter intact.
-    let mut source = urlencoding::encode(&format!("{bucket}/{key}")).into_owned();
+    // The Rust SDK takes an already encoded header string. Preserve path
+    // separators while encoding the bucket, key segments, and version once.
+    let mut source = urlencoding::encode(&bucket).into_owned();
+    for segment in key.split('/') {
+        source.push('/');
+        source.push_str(&urlencoding::encode(segment));
+    }
     if let Some(version) = version {
         source.push_str("?versionId=");
         source.push_str(&urlencoding::encode(&version));
