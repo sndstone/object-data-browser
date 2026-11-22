@@ -10,7 +10,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -493,6 +493,25 @@ def fixture_profile(url, **overrides):
         "secretKey": "fixture-secret", "maxAttempts": 2, "maxPoolConnections": 1,
         "readTimeoutSeconds": 1, "connectTimeoutSeconds": 1,
     }, **overrides)
+
+
+def test_version_sharing_is_advertised_and_signs_the_exact_version(raw_engine):
+    profile = fixture_profile("http://127.0.0.1:1")
+    version = "version +%/雪"
+    shared = result(rpc(raw_engine, "storageAction", action="presignVersion",
+                        profile=profile, bucketName="bucket", key="folder/file.txt",
+                        versionId=version, expirationSeconds=900))
+    url = urlsplit(shared["url"])
+    assert url.netloc == "127.0.0.1:1"
+    assert url.path == "/bucket/folder/file.txt"
+    query = parse_qs(url.query)
+    assert query["versionId"] == [version]
+    assert query["X-Amz-Expires"] == ["900"]
+    assert len(query["X-Amz-Signature"][0]) == 64
+
+    info = result(rpc(raw_engine, "storageAction", action="providerInfo",
+                      profile=profile))
+    assert "presignVersion" in info["actions"]
 
 
 @pytest.mark.parametrize("overrides", [

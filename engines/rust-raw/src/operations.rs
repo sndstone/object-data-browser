@@ -79,6 +79,7 @@ pub const STORAGE_ACTIONS: &[&str] = &[
     "getBucketProtection",
     "setBucketProtection",
     "deleteVersion",
+    "presignVersion",
 ];
 
 async fn storage_action(params: &Value) -> SidecarResult {
@@ -94,6 +95,7 @@ async fn storage_action(params: &Value) -> SidecarResult {
         "getObjectProtection" => object_protection(params, false).await,
         "setObjectProtection" => object_protection(params, true).await,
         "deleteVersion" => delete_version(params).await,
+        "presignVersion" => crate::presign(params),
         _ => Err(SidecarError::new(
             "unsupported_feature",
             format!("Unknown storage action: {action}"),

@@ -218,11 +218,7 @@ async fn dispatch(method: &str, params: Value) -> SidecarResult {
             "nativeSdk":"hyper-rustls-raw","endpointTypes":["s3Compatible","awsS3"]
         })),
         "getCapabilities" => Ok(capabilities()),
-        "generatePresignedUrl" | "storageAction"
-            if method == "generatePresignedUrl" || params["action"] == "presignVersion" =>
-        {
-            presign(&params)
-        }
+        "generatePresignedUrl" => presign(&params),
         "startUpload" => transfer::start_upload(params).await,
         "startDownload" => transfer::start_download(params).await,
         "runPutTestData" => tools::put_test_data(params).await,
