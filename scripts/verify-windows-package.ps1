@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)][string]$MsiPath,
-    [Parameter(Mandatory = $true)][string]$PreviousMsiPath
+    [string]$PreviousMsiPath = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,12 +53,44 @@ try {
 Invoke-Check 'rust-unit' 'cargo.exe' @('test','--locked','--release','--target','x86_64-pc-windows-msvc','--manifest-path','engines/rust/Cargo.toml')
 Invoke-Check 'java-unit' (Join-Path $RootDir 'apps\flutter_app\android\gradlew.bat') @('-p','engines/java','build','test','--no-daemon')
 
-Install-Msi -Path $PreviousMsiPath -Name 'install-2.3.1'
-$Installed = Join-Path $env:ProgramFiles 'Object Data Browser'
+$Installed = Join-Path $env:LOCALAPPDATA 'Programs\Object Data Browser'
 $Exe = Join-Path $Installed 's3_browser_crossplat.exe'
-if ((Get-Item $Exe).VersionInfo.ProductVersion -notlike '2.3.1*') { throw 'Previous MSI did not install version 2.3.1' }
-Install-Msi -Path $MsiPath -Name "upgrade-$ExpectedVersion"
-if ((Get-Item $Exe).VersionInfo.ProductVersion -ne $ExpectedProductVersion) { throw "Upgrade did not install version $ExpectedProductVersion" }
+$MachineInstalled = Join-Path $env:ProgramFiles 'Object Data Browser'
+
+# Verify MSI metadata enforces strictly per-user (no admin/UAC) installation.
+$InstallerCom = New-Object -ComObject WindowsInstaller.Installer
+$ResolvedMsi = (Resolve-Path -LiteralPath $MsiPath).Path
+$Db = $InstallerCom.OpenDatabase($ResolvedMsi, 0)
+$Summary = $Db.SummaryInformation(0)
+$WordCount = [int]$Summary.Property(15)
+if (($WordCount -band 8) -eq 0) {
+    throw "MSI Word Count ($WordCount) does not set the UAC-compliant / limited-privileges bit (0x8)."
+}
+$PropView = $Db.OpenView("SELECT Value FROM Property WHERE Property='ALLUSERS'")
+$PropView.Execute()
+$AllUsersRec = $PropView.Fetch()
+if ($null -ne $AllUsersRec -and -not [string]::IsNullOrWhiteSpace($AllUsersRec.StringData(1))) {
+    throw "Per-user MSI must not set ALLUSERS (got '$($AllUsersRec.StringData(1))')."
+}
+$PropView.Close()
+$DirView = $Db.OpenView("SELECT Directory FROM Directory WHERE Directory='ProgramFiles64Folder' OR Directory='ProgramFilesFolder'")
+$DirView.Execute()
+if ($null -ne $DirView.Fetch()) {
+    throw "Per-user MSI must not reference ProgramFilesFolder/ProgramFiles64Folder."
+}
+$DirView.Close()
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($Db) | Out-Null
+[System.Runtime.InteropServices.Marshal]::ReleaseComObject($InstallerCom) | Out-Null
+
+if (-not [string]::IsNullOrWhiteSpace($PreviousMsiPath)) {
+    Install-Msi -Path $PreviousMsiPath -Name 'install-previous'
+}
+$HadMachineInstall = Test-Path -LiteralPath $MachineInstalled
+Install-Msi -Path $MsiPath -Name "install-$ExpectedVersion"
+if ((-not $HadMachineInstall) -and (Test-Path -LiteralPath $MachineInstalled)) {
+    throw "Per-user MSI unexpectedly installed into per-machine path: $MachineInstalled"
+}
+if ((Get-Item $Exe).VersionInfo.ProductVersion -ne $ExpectedProductVersion) { throw "Install did not place version $ExpectedProductVersion at $Exe" }
 $Staged = Join-Path $RootDir 'apps\flutter_app\build\windows\x64\runner\Release'
 $FileCount = 0
 foreach ($File in (Get-ChildItem $Staged -File -Recurse)) {

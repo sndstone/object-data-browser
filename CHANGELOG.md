@@ -4,6 +4,9 @@
 
 ### Engines
 - Added a desktop-only **Rust Raw HTTP Engine** (`rust-raw`, built on Hyper 1 + rustls + custom SigV4, with zero AWS SDK dependency) for S3 and S3-compatible profiles. Bundled alongside Rust AWS SDK, Go, Python and Java engines on desktop; mobile builds do not include it.
+
+### Packaging
+- Windows MSI installers (x64 and ARM64) now install strictly in userspace (`%LOCALAPPDATA%\Programs\Object Data Browser`, `perUser` / `InstallPrivileges="limited"`) so installing or updating never requires Administrator / UAC elevation.
 - New desktop engine method `s3ConformanceOp` performs one S3 operation through the Python, Go, Rust AWS SDK and Java engines with one attempt, checksums only on request and no redirect following.
 - The Java engine no longer redacts pagination cursors whose field names contain "token", such as `NextContinuationToken`; credential fields remain redacted.
 - The Rust AWS SDK engine's conformance client trusts a profile's CA bundle.

@@ -20,6 +20,7 @@
 - iOS uses the Data Protection Keychain only. Keep credentials in the consolidated `profiles.credentials.v2` item and preserve the same secure-recovery boundaries used on macOS.
 - Public iOS builds require a provisioned Apple signing identity and the stable `TEAM_ID.com.example.s3BrowserCrossplat` Keychain group. Unsigned builds are compile-verification artifacts only.
 - Keep iOS cleartext access limited to local-network endpoints through `NSAllowsLocalNetworking`; do not enable global arbitrary loads without an explicit App Review and security decision.
+- Windows MSI installers must always be strictly per-user (`Scope="perUser"` in WiX v4, `InstallScope="perUser" InstallPrivileges="limited"` in WiX v3) so installation and updates never require Administrator/UAC elevation. Install under `LocalAppDataFolder` (`%LOCALAPPDATA%\Programs\Object Data Browser`), use `HKCU` `<RegistryValue KeyPath="yes">` key paths (never per-machine `ProgramFiles64Folder` or `ALLUSERS`), and include `<RemoveFolder On="uninstall">` for every created user-profile directory.
 
 ## Encryption (optional features)
 

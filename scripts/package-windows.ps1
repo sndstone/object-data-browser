@@ -76,6 +76,23 @@ function New-WixId {
     return "$Prefix$Sanitized"
 }
 
+function New-DeterministicGuid {
+    param([string]$Seed)
+
+    $Bytes = [System.Text.Encoding]::UTF8.GetBytes("odb-peruser-msi:$Seed")
+    $Sha1 = [System.Security.Cryptography.SHA1]::Create()
+    try {
+        $Hash = $Sha1.ComputeHash($Bytes)
+    } finally {
+        $Sha1.Dispose()
+    }
+    $GuidBytes = New-Object byte[] 16
+    [Array]::Copy($Hash, 0, $GuidBytes, 0, 16)
+    $GuidBytes[6] = ($GuidBytes[6] -band 0x0F) -bor 0x50
+    $GuidBytes[8] = ($GuidBytes[8] -band 0x3F) -bor 0x80
+    return ([System.Guid]::new($GuidBytes)).ToString("D").ToUpperInvariant()
+}
+
 function Escape-Xml {
     param([string]$Value)
 
@@ -248,9 +265,25 @@ function Emit-DirectoryTree {
     return $Lines
 }
 
-$DirectoryTree = (Emit-DirectoryTree -ParentRel '' -Indent '        ') -join "`r`n"
+$DirectoryTree = (Emit-DirectoryTree -ParentRel '' -Indent '          ') -join "`r`n"
 
 $ComponentLines = New-Object System.Collections.Generic.List[string]
+# Per-user MSIs must register directory cleanup for every user-profile folder
+# created during installation (ICE64) and use HKCU RegistryValue key paths
+# rather than File key paths (ICE38). Components combining a registry keypath
+# with a File require an explicit deterministic GUID (WiX CNDL0230).
+$CleanupGuid = New-DeterministicGuid -Seed "$Arch|CMP_InstallDirCleanup"
+$ComponentLines.Add("      <Component Id=""CMP_InstallDirCleanup"" Directory=""INSTALLFOLDER"" Guid=""$CleanupGuid"">")
+$ComponentLines.Add("        <RegistryValue Root=""HKCU"" Key=""Software\ObjectDataBrowser\Components"" Name=""CMP_InstallDirCleanup"" Type=""integer"" Value=""1"" KeyPath=""yes"" />")
+$ComponentLines.Add("        <RemoveFolder Id=""RMV_ProgramsDir"" Directory=""ProgramsDir"" On=""uninstall"" />")
+$ComponentLines.Add("        <RemoveFolder Id=""RMV_INSTALLFOLDER"" Directory=""INSTALLFOLDER"" On=""uninstall"" />")
+foreach ($DirRel in ($DirectoryRels | Sort-Object)) {
+    $DirId = $DirIds[$DirRel]
+    $RemoveId = New-WixId -Prefix "RMV_" -Value $DirRel
+    $ComponentLines.Add("        <RemoveFolder Id=""$RemoveId"" Directory=""$DirId"" On=""uninstall"" />")
+}
+$ComponentLines.Add("      </Component>")
+
 foreach ($File in $Files) {
     $RelativePath = $File.FullName.Substring($AppReleaseDir.Length).TrimStart('\')
     $RelativeDir = Split-Path -Parent $RelativePath
@@ -259,11 +292,13 @@ foreach ($File in $Files) {
     }
     $DirectoryId = $DirIds[$RelativeDir]
     $ComponentId = New-WixId -Prefix "CMP_" -Value $RelativePath
+    $ComponentGuid = New-DeterministicGuid -Seed "$Arch|$RelativePath"
     $FileId = New-WixId -Prefix "FIL_" -Value $RelativePath
     $Source = Escape-Xml $File.FullName
     $Name = Escape-Xml $File.Name
-    $ComponentLines.Add("      <Component Id=""$ComponentId"" Directory=""$DirectoryId"" Guid=""*"">")
-    $ComponentLines.Add("        <File Id=""$FileId"" Name=""$Name"" Source=""$Source"" KeyPath=""yes"" />")
+    $ComponentLines.Add("      <Component Id=""$ComponentId"" Directory=""$DirectoryId"" Guid=""$ComponentGuid"">")
+    $ComponentLines.Add("        <RegistryValue Root=""HKCU"" Key=""Software\ObjectDataBrowser\Components"" Name=""$ComponentId"" Type=""integer"" Value=""1"" KeyPath=""yes"" />")
+    $ComponentLines.Add("        <File Id=""$FileId"" Name=""$Name"" Source=""$Source"" />")
     $ComponentLines.Add("      </Component>")
 }
 $ComponentBlock = $ComponentLines -join "`r`n"
