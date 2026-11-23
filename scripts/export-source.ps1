@@ -25,7 +25,7 @@ if (-not $OutputPath) {
     $OutputPath = Join-Path $ParentDir "object-data-browser-$Version-source.zip"
 }
 
-$ExcludePattern = '\\\.agents\\|\\\.claude\\|\\\.codex\\|\\\.gradle\\|\\\.pytest_cache\\|\\\.tmp\\|\\dist\\|__pycache__\\|\\apps\\flutter_app\\build\\|\\apps\\flutter_app\\\.dart_tool\\|\\apps\\flutter_app\\windows\\flutter\\ephemeral\\|\\engines\\rust\\target\\|\\engines\\go\\bin\\|\\engines\\go\\build\\|\\engines\\java\\build\\|\\engines\\java\\target\\|\\apps\\flutter_app\\\.idea\\|\\packaging\\windows\\Product\.generated\.wxs'
+$ExcludePattern = '\\\.agents\\|\\\.claude\\|\\\.codex\\|\\\.gradle\\|\\\.pytest_cache\\|\\\.tmp\\|\\dist\\|__pycache__\\|\\apps\\flutter_app\\build\\|\\apps\\flutter_app\\\.dart_tool\\|\\apps\\flutter_app\\windows\\flutter\\ephemeral\\|\\engines\\rust(?:-raw)?\\target\\|\\engines\\go\\bin\\|\\engines\\go\\build\\|\\engines\\java\\build\\|\\engines\\java\\target\\|\\apps\\flutter_app\\\.idea\\|\\packaging\\windows\\Product\.generated\.wxs'
 $ExcludedNames = @(
     'local.properties',
     '.flutter-plugins-dependencies'

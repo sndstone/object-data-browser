@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
 import 'package:s3_browser_crossplat/models/domain_models.dart';
 import 'package:s3_browser_crossplat/services/crypto/age.dart';
 import 'package:s3_browser_crossplat/services/diagnostic_safety.dart';
@@ -79,7 +80,7 @@ void main() {
           expect(object.length, vector['objectLength']);
           expect(objectDigest(object), vector['objectSha256']);
           final result = await fixture.download(vector);
-          expect((result['path'] as String).split('/').last, 'report.pdf');
+          expect(p.basename(result['path'] as String), 'report.pdf');
           final plaintext = await File(result['path'] as String).readAsBytes();
           expect(plaintext, orderedEquals(vectorPlaintext(vector)));
           expect(fixture.events.last['totalBytes'], vector['objectLength']);
@@ -242,7 +243,7 @@ void main() {
                   .having(
                       (e) => e.userMessage, 'message', contains('integrity'))));
           final remaining = await fixture.directory.list().toList();
-          expect(remaining.map((f) => f.path.split('/').last), ['source']);
+          expect(remaining.map((f) => p.basename(f.path)), ['source']);
         });
       }
 
@@ -258,10 +259,10 @@ void main() {
         ]) {
           fixture.objects[pair.$1] = fixture.objects['report.pdf.age']!;
           final result = await fixture.download(vector, key: pair.$1);
-          expect((result['path'] as String).split('/').last, pair.$2);
+          expect(p.basename(result['path'] as String), pair.$2);
         }
         final result = await fixture.download(vector);
-        expect((result['path'] as String).split('/').last, 'report.pdf (1)');
+        expect(p.basename(result['path'] as String), 'report.pdf (1)');
         expect(await File('${fixture.directory.path}/report.pdf').readAsBytes(),
             vectorPlaintext(vector));
       });
@@ -285,12 +286,11 @@ void main() {
               }
             });
         final first = await download();
-        expect((first['path'] as String).split('/').last, 'hidden-report.pdf');
+        expect(p.basename(first['path'] as String), 'hidden-report.pdf');
         expect(await File(first['path'] as String).readAsBytes(),
             vectorPlaintext(vector));
         final second = await download();
-        expect((second['path'] as String).split('/').last,
-            'hidden-report.pdf (1)');
+        expect(p.basename(second['path'] as String), 'hidden-report.pdf (1)');
         final replaced = await download(policy: 'replace');
         expect(replaced['path'], first['path']);
         expect(await File(first['path'] as String).readAsBytes(),
@@ -401,7 +401,7 @@ void main() {
           'key': 'report.pdf.age',
           'destinationPath': fixture.directory.path
         });
-        expect((result['path'] as String).split('/').last, 'report.pdf.age');
+        expect(p.basename(result['path'] as String), 'report.pdf.age');
         expect(await File(result['path'] as String).readAsBytes(),
             vectorPlaintext(vector));
       });

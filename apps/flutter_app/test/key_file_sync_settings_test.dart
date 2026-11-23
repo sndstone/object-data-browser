@@ -303,6 +303,11 @@ void main() {
       expect(state.controller.settings.keyFileSync!.objectKey,
           defaultKeyFileSyncObjectKey);
       expect(state.server.versioning, isTrue);
+      await until(
+          tester,
+          () =>
+              state.controller.keyFileSync!.status ==
+              KeyFileSyncStatus.upToDate);
       expect(tester.takeException(), isNull);
     });
 

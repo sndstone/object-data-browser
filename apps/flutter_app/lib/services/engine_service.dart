@@ -3,8 +3,18 @@ import '../models/domain_models.dart';
 typedef EngineLogCallback = void Function(EngineLogRecord entry);
 typedef TransferJobCallback = void Function(TransferJob job);
 
-/// Routes the browser's basic copy workflow through a native provider's core
-/// methods on the chosen engine, rather than the Python advanced S3 adapter.
+const rustRawStorageActions = {
+  'getBucketProtection',
+  'setBucketProtection',
+  'getObjectProtection',
+  'setObjectProtection',
+  'objectDetails',
+  'listObjectVersions',
+  'deleteVersion',
+  'presignVersion',
+};
+
+/// Routes native provider operations to the engine selected in the browser.
 abstract interface class NativeProviderActions {
   Future<Map<String, Object?>> nativeProviderAction({
     required String engineId,

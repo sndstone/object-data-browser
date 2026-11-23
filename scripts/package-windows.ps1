@@ -135,7 +135,7 @@ if (-not (Test-Path $EngineManifestPath)) {
 }
 
 $EngineManifest = Get-Content -Path $EngineManifestPath -Raw | ConvertFrom-Json
-$ExpectedEngineIds = @("python", "go", "rust", "java")
+$ExpectedEngineIds = @("python", "go", "rust", "rust-raw", "java")
 foreach ($EngineId in $ExpectedEngineIds) {
     $Engine = $EngineManifest.engines | Where-Object { $_.id -eq $EngineId } | Select-Object -First 1
     if ($null -eq $Engine) {

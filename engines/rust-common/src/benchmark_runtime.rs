@@ -1,12 +1,15 @@
 use super::*;
-use aws_sdk_s3::config::interceptors::{
-    BeforeSerializationInterceptorContextRef, BeforeTransmitInterceptorContextRef,
-    FinalizerInterceptorContextRef,
-};
-use aws_smithy_types::config_bag::{Storable, StoreReplace};
-use std::collections::VecDeque;
-use std::sync::atomic::AtomicU64;
+use crate::benchmark::benchmark_payload;
+use bytes::Bytes;
 use sha2::Digest;
+use std::collections::VecDeque;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::Mutex;
+use std::{fs, io};
+use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
 
 pub enum SelectedDigest {
     Sha256(sha2::Sha256),
@@ -29,7 +32,9 @@ impl SelectedDigest {
             Self::Sha256(hash) => hash.update(bytes),
             Self::Sha1(hash) => hash.update(bytes),
             Self::Md5(hash) => hash.update(bytes),
-            Self::Crc(hash) => { hash.update(bytes); },
+            Self::Crc(hash) => {
+                hash.update(bytes);
+            }
         }
     }
     pub fn finish(self) -> String {
@@ -44,60 +49,11 @@ impl SelectedDigest {
 }
 
 pub const HISTORY_LIMIT: usize = 10_000;
-#[derive(Clone, Debug)]
-struct AttemptCount(u64);
-impl Storable for AttemptCount {
-    type Storer = StoreReplace<Self>;
-}
 #[derive(Debug, Default)]
 pub struct Metrics {
     pub retries: AtomicU64,
     pub errors: AtomicU64,
 }
-#[derive(Debug, Clone)]
-pub struct MetricsInterceptor(pub Arc<Metrics>);
-impl Intercept for MetricsInterceptor {
-    fn name(&self) -> &'static str {
-        "BenchmarkMetrics"
-    }
-    fn read_before_execution(
-        &self,
-        _: &BeforeSerializationInterceptorContextRef<'_>,
-        cfg: &mut ConfigBag,
-    ) -> Result<(), BoxError> {
-        cfg.interceptor_state().store_put(AttemptCount(0));
-        Ok(())
-    }
-    fn read_before_transmit(
-        &self,
-        _: &BeforeTransmitInterceptorContextRef<'_>,
-        _: &RuntimeComponents,
-        cfg: &mut ConfigBag,
-    ) -> Result<(), BoxError> {
-        let attempts = cfg.load::<AttemptCount>().map(|v| v.0).unwrap_or(0);
-        if attempts > 0 {
-            self.0.retries.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-        cfg.interceptor_state()
-            .store_put(AttemptCount(attempts + 1));
-        Ok(())
-    }
-    fn read_after_execution(
-        &self,
-        context: &FinalizerInterceptorContextRef<'_>,
-        _: &RuntimeComponents,
-        _: &mut ConfigBag,
-    ) -> Result<(), BoxError> {
-        if context
-            .output_or_error()
-            .is_some_and(|result| result.is_err())
-        {
-            self.0.errors.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-        Ok(())
-    }
-}
-
 #[derive(Default)]
 struct Cache {
     entries: VecDeque<(String, Bytes)>,
@@ -202,19 +158,6 @@ pub enum Payload {
     Memory(Bytes),
     File(PathBuf),
 }
-impl Payload {
-    pub async fn body(&self) -> Result<ByteStream, SidecarError> {
-        match self {
-            Self::Memory(bytes) => Ok(ByteStream::from(bytes.clone())),
-            Self::File(path) => ByteStream::read_from()
-                .path(path)
-                .buffer_size(UPLOAD_FILE_BUFFER_BYTES)
-                .build()
-                .await
-                .map_err(io_error),
-        }
-    }
-}
 impl Drop for Payload {
     fn drop(&mut self) {
         if let Self::File(path) = self {
@@ -241,8 +184,14 @@ pub fn fill(bytes: &mut [u8], pattern: &[u8], offset: usize) {
     }
 }
 pub fn validate(config: &Value) -> Result<(), SidecarError> {
-    if !matches!(config["checksumAlgorithm"].as_str().unwrap_or("sha256"), "sha256" | "sha1" | "md5" | "crc32" | "crc32c") {
-        return Err(SidecarError::new("invalid_config", "Choose SHA256, SHA1, MD5, CRC32 or CRC32C for benchmark checksum validation."));
+    if !matches!(
+        config["checksumAlgorithm"].as_str().unwrap_or("sha256"),
+        "sha256" | "sha1" | "md5" | "crc32" | "crc32c"
+    ) {
+        return Err(SidecarError::new(
+            "invalid_config",
+            "Choose SHA256, SHA1, MD5, CRC32 or CRC32C for benchmark checksum validation.",
+        ));
     }
     if !(1..=100_000).contains(&config["objectCount"].as_u64().unwrap_or(100))
         || !(1..=64).contains(&config["concurrentThreads"].as_u64().unwrap_or(1))
@@ -280,15 +229,8 @@ mod tests {
         };
         let expected = benchmark_payload("run", "key", 524301, true);
         for _ in 0..2 {
-            let bytes = payload
-                .body()
-                .await
-                .unwrap()
-                .collect()
-                .await
-                .unwrap()
-                .into_bytes();
-            assert_eq!(bytes.as_ref(), expected.as_slice());
+            let bytes = tokio::fs::read(&path).await.unwrap();
+            assert_eq!(bytes, expected);
         }
         assert_eq!(resources.cache_bytes(), 0);
         drop(payload);

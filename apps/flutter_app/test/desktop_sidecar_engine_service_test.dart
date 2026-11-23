@@ -31,6 +31,38 @@ void main() {
     expect(engines, everyElement(hasUnavailableStatus));
   });
 
+  test('discovers and routes versioned raw S3 protection on desktop', () async {
+    await File('${emptyEngineRoot.path}/manifest.json')
+        .writeAsString(jsonEncode({
+      'engines': [
+        {'id': 'rust', 'executable': 'sdk-fixture'},
+        {'id': 'rust-raw', 'executable': 'fixture'}
+      ]
+    }));
+    final host = ProfilePayloadHost();
+    service.shutdown();
+    service = DesktopSidecarEngineService(
+        host: host, engineRoot: emptyEngineRoot.path);
+    final engines = await service.listEngines();
+    final sdk = engines.singleWhere((e) => e.id == 'rust');
+    final raw = engines.singleWhere((e) => e.id == 'rust-raw');
+    expect(sdk.label, 'Rust AWS SDK Engine');
+    expect(sdk.available, isTrue);
+    expect(raw.label, 'Rust Raw HTTP Engine');
+    expect(raw.available, isTrue);
+    expect(raw.desktopSupported, isTrue);
+    expect(raw.mobileSupported, isFalse);
+    expect(raw.endpointTypes, ['s3Compatible', 'awsS3']);
+
+    await service.nativeProviderAction(
+      engineId: raw.id,
+      profile: profile,
+      action: 'getObjectProtection',
+      arguments: {'bucketName': 'bucket', 'key': '+%雪', 'versionId': 'null'},
+    );
+    expect(host.profiles.single['endpointType'], 's3Compatible');
+  });
+
   test('does not silently substitute mock bucket data', () async {
     await expectLater(
       service.listBuckets(engineId: 'python', profile: profile),

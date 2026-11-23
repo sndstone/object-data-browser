@@ -63,6 +63,20 @@ class DesktopSidecarEngineService
     required Map<String, Object?> arguments,
     EndpointProfile? destinationProfile,
   }) async {
+    if (engineId == 'rust-raw' &&
+        rustRawStorageActions.contains(action) &&
+        destinationProfile == null &&
+        (profile.endpointType == EndpointProfileType.s3Compatible ||
+            profile.endpointType == EndpointProfileType.awsS3)) {
+      final entry = await _tryGetEngine(engineId);
+      if (entry == null) throw _engineUnavailable(engineId, 'storageAction');
+      final resolved = await encryptionArguments(profile, null, arguments);
+      return _sendSidecarRequest(entry, method: 'storageAction', params: {
+        ...resolved,
+        'action': action,
+        'profile': _profileToJson(profile),
+      });
+    }
     if (!profile.endpointType.isGoogleCloudStorage ||
         (destinationProfile != null && destinationProfile.id != profile.id)) {
       throw const EngineException(
@@ -210,7 +224,9 @@ class DesktopSidecarEngineService
   Future<List<EngineDescriptor>> listEngines() async {
     final fallbackEngines = await _fallback.listEngines();
     final manifest = await _loadManifest();
-    return fallbackEngines.map((engine) {
+    return fallbackEngines
+        .where((engine) => engine.desktopSupported)
+        .map((engine) {
       final entry = manifest[engine.id];
       return EngineDescriptor(
         id: engine.id,
@@ -652,6 +668,11 @@ class DesktopSidecarEngineService
     VersionBrowserOptions? options,
     ListCursor? cursor,
   }) {
+    final storageOptions = engineId == 'rust-raw'
+        ? key == null && options?.filterMode == BrowserFilterMode.prefix
+            ? VersionBrowserOptions(filterValue: options!.filterValue)
+            : null
+        : options;
     return _sendWithFallback(
       engineId: engineId,
       method: 'listObjectVersions',
@@ -659,7 +680,7 @@ class DesktopSidecarEngineService
         'profile': _profileToJson(profile),
         'bucketName': bucketName,
         'key': key,
-        'options': _versionOptionsToJson(options),
+        'options': _versionOptionsToJson(storageOptions),
         'cursor': cursor == null
             ? null
             : {

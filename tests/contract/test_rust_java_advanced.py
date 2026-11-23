@@ -1,4 +1,4 @@
-"""Rust/Java advanced regressions, exercised with ENGINE_CMD and a disposable S3 fixture."""
+"""Rust and Java advanced regressions, exercised with ENGINE_CMD and a disposable S3 fixture."""
 import hashlib
 import json
 import tempfile
@@ -18,9 +18,16 @@ import pytest
 @pytest.fixture
 def native_engine(engine):
     name = engine.request('health')['result']['engine']
-    if name not in ('rust', 'java'):
-        pytest.skip('Native Rust/Java regression suite; use ENGINE_CMD.')
+    if name not in ('rust', 'rust-raw', 'java'):
+        pytest.skip('Native Rust and Java regression suite; use ENGINE_CMD.')
     return engine, name
+
+
+@pytest.fixture
+def repair_engine(native_engine):
+    if native_engine[1] == 'rust-raw':
+        pytest.skip('The raw engine uses delete-all without metadata rewrite recovery.')
+    return native_engine
 
 
 @pytest.fixture
@@ -39,6 +46,8 @@ def s3_fixture():
         deny_inspector = False
         slow_put = 0
         fail_puts = 0
+        fail_put_code = "InternalError"
+        copied_keys = set()
         corrupt_get = False
         put_attempts = 0
         head_delay = 0
@@ -117,18 +126,19 @@ def s3_fixture():
             if Handler.head_delay: time.sleep(Handler.head_delay)
             self.send_response(200)
             self.send_header('Content-Length', str(Handler.copy_size if Handler.copy_size is not None else len(Handler.objects.get(key, b'original'))))
-            self.send_header('ETag', '"original"')
+            self.send_header('ETag', '"copied"' if key in Handler.copied_keys else '"original"')
             self.send_header('Content-Type', 'application/octet-stream')
             if Handler.mode == 'retained': self.send_header('x-amz-object-lock-mode', 'COMPLIANCE')
             self.end_headers()
         def do_POST(self):
             data = self.body()
-            _, q = self.path_info()
+            key, q = self.path_info()
             if 'uploads' in q:
                 Handler.events.append(('INIT',))
                 return self.reply('<InitiateMultipartUploadResult><Bucket>fixture</Bucket><Key>dest</Key><UploadId>upload-fixture</UploadId></InitiateMultipartUploadResult>')
             if 'uploadId' in q:
                 Handler.events.append(('COMPLETE',))
+                Handler.copied_keys.add(key)
                 return self.reply('<CompleteMultipartUploadResult><ETag>copied</ETag></CompleteMultipartUploadResult>')
             assert 'delete' in q
             root = ET.fromstring(data)
@@ -155,6 +165,7 @@ def s3_fixture():
             key, q = self.path_info(); data = self.body()
             if self.headers.get('x-amz-copy-source'):
                 Handler.events.append(('COPY', self.headers.get('x-amz-copy-source'), self.headers.get('x-amz-copy-source-range'), self.headers.get('x-amz-copy-source-if-match')))
+                if 'uploadId' not in q: Handler.copied_keys.add(key)
                 return self.reply('<CopyPartResult><ETag>copied</ETag></CopyPartResult>' if 'uploadId' in q else '<CopyObjectResult><ETag>copied</ETag></CopyObjectResult>')
             if 'lifecycle' in q:
                 Handler.lifecycle = data
@@ -165,7 +176,7 @@ def s3_fixture():
                 Handler.put_attempts += 1
                 fail = Handler.fail_puts > 0
                 if fail: Handler.fail_puts -= 1
-            if fail: return self.error('InternalError')
+            if fail: return self.error(Handler.fail_put_code, 503 if Handler.fail_put_code == "SlowDown" else 500)
             with Handler.lock:
                 Handler.puts += 1; Handler.active += 1; Handler.parallel = max(Handler.parallel, Handler.active)
             if Handler.slow_put: time.sleep(Handler.slow_put)
@@ -186,8 +197,8 @@ def delete(engine, profile, retries=1):
 
 
 @pytest.mark.parametrize('mode', ['stale', 'phantom'])
-def test_delete_recovers_only_after_normal_and_individual_retries(native_engine, s3_fixture, mode):
-    engine, _ = native_engine; profile, fixture = s3_fixture; fixture.mode = mode
+def test_delete_recovers_only_after_normal_and_individual_retries(repair_engine, s3_fixture, mode):
+    engine, _ = repair_engine; profile, fixture = s3_fixture; fixture.mode = mode
     response = delete(engine, profile)
     assert response['ok'], response
     assert response['result']['exitCode'] == 0, response
@@ -201,8 +212,8 @@ def test_delete_recovers_only_after_normal_and_individual_retries(native_engine,
 
 
 @pytest.mark.parametrize('versioning,kind,mode', [('', 'awsS3', 'stale'), ('Enabled','s3Compatible','stale'), ('Suspended','s3Compatible','stale'), ('unknown','s3Compatible','stale'), ('','s3Compatible','denied')])
-def test_delete_never_overwrites_ineligible_keys(native_engine, s3_fixture, versioning, kind, mode):
-    engine, _ = native_engine; profile, fixture = s3_fixture
+def test_delete_never_overwrites_ineligible_keys(repair_engine, s3_fixture, versioning, kind, mode):
+    engine, _ = repair_engine; profile, fixture = s3_fixture
     fixture.versioning, fixture.mode, profile['endpointType'] = versioning, mode, kind
     response = delete(engine, profile)
     assert response['ok'], response
@@ -219,8 +230,8 @@ def test_delete_normal_success_never_puts(native_engine, s3_fixture):
     assert fixture.puts == 0
 
 
-def test_delete_final_failure_reports_empty_object(native_engine, s3_fixture):
-    engine, _ = native_engine; profile, fixture = s3_fixture; fixture.mode = 'final-failure'
+def test_delete_final_failure_reports_empty_object(repair_engine, s3_fixture):
+    engine, _ = repair_engine; profile, fixture = s3_fixture; fixture.mode = 'final-failure'
     response = delete(engine, profile)
     assert response['ok'], response
     assert response['result']['exitCode'] != 0
@@ -281,24 +292,24 @@ def test_benchmark_progresses_without_polling_and_never_persists_profile(native_
     assert 'profile' not in json.loads(saved)
 
 
-def test_individual_delete_success_does_not_overwrite(native_engine, s3_fixture):
-    engine, _ = native_engine; profile, fixture = s3_fixture; fixture.mode = 'individual-success'
+def test_individual_delete_success_does_not_overwrite(repair_engine, s3_fixture):
+    engine, _ = repair_engine; profile, fixture = s3_fixture; fixture.mode = 'individual-success'
     result = delete(engine, profile)
     assert result['ok'] and result['result']['exitCode'] == 0, result
     assert fixture.puts == 0 and [e[0] for e in fixture.events] == ['BATCH', 'BATCH', 'DELETE']
 
 
 @pytest.mark.parametrize('changed,mode', [(True, 'stale'), (False, 'retained')])
-def test_changed_or_retained_object_is_never_overwritten(native_engine, s3_fixture, changed, mode):
-    engine, _ = native_engine; profile, fixture = s3_fixture
+def test_changed_or_retained_object_is_never_overwritten(repair_engine, s3_fixture, changed, mode):
+    engine, _ = repair_engine; profile, fixture = s3_fixture
     fixture.changed_list, fixture.mode = changed, mode
     result = delete(engine, profile)
     assert result['ok'] and result['result']['exitCode'] != 0, result
     assert fixture.puts == 0
 
 
-def test_cancellation_reaches_the_pre_overwrite_checkpoint(native_engine, s3_fixture):
-    engine, _ = native_engine; profile, fixture = s3_fixture
+def test_cancellation_reaches_the_pre_overwrite_checkpoint(repair_engine, s3_fixture):
+    engine, _ = repair_engine; profile, fixture = s3_fixture
     fixture.mode = 'stale'; fixture.head_delay = .4
     engine.send({'requestId':'delete-running','method':'runDeleteAll','params':{'jobId':'cancel-fixture','profile':profile,'config':{'bucketName':'fixture','maxRetries':0}}})
     assert fixture.head_started.wait(5)
@@ -394,8 +405,10 @@ def await_benchmark(engine, profile, run_id):
 
 @pytest.mark.parametrize('in_memory', [False, True])
 def test_native_benchmark_payload_storage_and_completion_times(native_engine, s3_fixture, tmp_path, in_memory):
-    engine, _ = native_engine; profile, fixture = s3_fixture
+    engine, name = native_engine; profile, fixture = s3_fixture
     config = benchmark_config(tmp_path, inMemoryData=in_memory)
+    if in_memory and name in ('rust', 'rust-raw'):
+        config.pop('maxPoolConnections')
     started = engine.request('startBenchmark', {'profile': profile, 'config': config})
     assert started['ok'], started
     state = await_benchmark(engine, profile, started['result']['id'])
@@ -412,8 +425,9 @@ def test_native_benchmark_payload_storage_and_completion_times(native_engine, s3
 
 
 @pytest.mark.parametrize('failures,attempts,expected_status,retries,errors', [(1, 2, 'completed', 1, 0), (3, 1, 'failed', 0, 1)])
-def test_native_benchmark_reports_real_sdk_retries_and_failures(native_engine, s3_fixture, tmp_path, failures, attempts, expected_status, retries, errors):
-    engine, _ = native_engine; profile, fixture = s3_fixture; fixture.fail_puts = failures
+def test_native_benchmark_reports_real_retries_and_failures(native_engine, s3_fixture, tmp_path, failures, attempts, expected_status, retries, errors):
+    engine, name = native_engine; profile, fixture = s3_fixture; fixture.fail_puts = failures
+    if name == 'rust-raw': fixture.fail_put_code = 'SlowDown'
     config = benchmark_config(tmp_path, operationCount=1, maxAttempts=attempts)
     started = engine.request('startBenchmark', {'profile': profile, 'config': config})
     assert started['ok'], started
@@ -494,3 +508,19 @@ def test_native_benchmark_resume_retains_exact_totals_with_bounded_recent_histor
         assert sum(w['opsPerSecond'] for w in summary['throughputSeries']) == 10002
         assert len(Path(state['config']['csvOutputPath']).read_text().splitlines()) == 3
     finally: state_path.unlink(missing_ok=True)
+
+
+def test_raw_benchmark_keeps_fields_that_match_credentials(native_engine, s3_fixture, tmp_path):
+    engine, name = native_engine
+    if name != 'rust-raw':
+        pytest.skip('Raw engine credential redaction regression.')
+    profile, _ = s3_fixture
+    profile = {**profile, 'accessKey': 'fixture', 'secretKey': 'running', 'sessionToken': 'id'}
+    config = benchmark_config(tmp_path, operationCount=1, prefix='fixture/running')
+    response = engine.request('startBenchmark', {'profile': profile, 'config': config})
+    assert response['ok'] and response['result']['status'] == 'running', response
+    state = await_benchmark(engine, profile, response['result']['id'])
+    assert state['status'] == 'completed'
+    assert state['config']['bucketName'] == 'fixture'
+    assert state['config']['prefix'] == 'fixture/running'
+    assert 'profile' not in state

@@ -17,6 +17,7 @@ import '../services/vault_name_codec.dart';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
 
 import '../models/domain_models.dart';
 import '../services/app_state_repository.dart';
@@ -686,6 +687,9 @@ class AppController extends ChangeNotifier {
         source: 'app',
       );
       engines = await _engineService.listEngines();
+      if (AppPlatform.isMobile) {
+        engines = engines.where((engine) => engine.mobileSupported).toList();
+      }
       selectedProfile = _selectBootstrapProfile();
       final preferredEngineId = settings.defaultEngineId;
       final preferredEngineAvailable = engines.any(
@@ -1794,8 +1798,7 @@ class AppController extends ChangeNotifier {
       await _guard('Transfers', () async {
         // Engines may read a name differently from how it is matched here.
         for (final path in filePaths) {
-          final name =
-              objectKeyByPath[path] ?? path.split(Platform.pathSeparator).last;
+          final name = objectKeyByPath[path] ?? p.basename(path);
           if (vaultTargetIsAmbiguous(
               profile.clientEncryptionRules, bucket, '$requestPrefix$name',
               uploadPrefix: requestPrefix, uploadName: name)) {
@@ -1807,7 +1810,7 @@ class AppController extends ChangeNotifier {
               matchingClientEncryptionRule(
                 profile.clientEncryptionRules,
                 bucket,
-                '$requestPrefix${objectKeyByPath[path] ?? path.split(Platform.pathSeparator).last}',
+                '$requestPrefix${objectKeyByPath[path] ?? p.basename(path)}',
               ) !=
               null,
         );
@@ -1816,15 +1819,14 @@ class AppController extends ChangeNotifier {
             final rule = matchingClientEncryptionRule(
                 profile.clientEncryptionRules,
                 bucket,
-                '$requestPrefix${objectKeyByPath[path] ?? path.split(Platform.pathSeparator).last}');
+                '$requestPrefix${objectKeyByPath[path] ?? p.basename(path)}');
             if (rule != null) {
               final nameKeys = await _uploadNameKeys(rule);
               encodeVaultObjectKey(
                   rule: rule,
                   keys: nameKeys,
                   destinationPrefix: requestPrefix,
-                  relativeName: objectKeyByPath[path] ??
-                      path.split(Platform.pathSeparator).last);
+                  relativeName: objectKeyByPath[path] ?? p.basename(path));
             }
           }
           await _requireClientEncryptionCapability(profile, requestEngine);
@@ -3084,6 +3086,12 @@ class AppController extends ChangeNotifier {
       }
       return const {'python', 'go'}.contains(engine);
     }
+    if (AppPlatform.isMobile && engine == 'rust-raw') {
+      return false;
+    }
+    if (engine == 'rust-raw' && profile.connection.authMode != 'static') {
+      return false;
+    }
     if (AppPlatform.isMobile &&
         !const {'static', 'azureSas'}.contains(profile.connection.authMode)) {
       return false;
@@ -3093,6 +3101,13 @@ class AppController extends ChangeNotifier {
   }
 
   String profileSupportReason(EndpointProfile profile) {
+    if (activeEngineId == 'rust-raw' &&
+        !AppPlatform.isMobile &&
+        profile.connection.authMode != 'static' &&
+        (profile.endpointType == EndpointProfileType.s3Compatible ||
+            profile.endpointType == EndpointProfileType.awsS3)) {
+      return 'Rust Raw HTTP Engine requires an access key and secret key.';
+    }
     final engine =
         engines.where((item) => item.id == activeEngineId).firstOrNull;
     return profile.endpointType.isGoogleCloudStorage &&
@@ -5357,7 +5372,22 @@ class AppController extends ChangeNotifier {
         }
       }
     }
-    final result = await _engineService.storageAction(
+    final service = _engineService;
+    if (!AppPlatform.isMobile &&
+        activeEngineId == 'rust-raw' &&
+        destinationProfile == null &&
+        rustRawStorageActions.contains(action) &&
+        service is NativeProviderActions &&
+        (source.endpointType == EndpointProfileType.s3Compatible ||
+            source.endpointType == EndpointProfileType.awsS3)) {
+      return (service as NativeProviderActions).nativeProviderAction(
+        engineId: activeEngineId,
+        profile: source,
+        action: action,
+        arguments: arguments,
+      );
+    }
+    final result = await service.storageAction(
         profile: source,
         action: action,
         arguments: arguments,

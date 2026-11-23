@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:s3_browser_crossplat/controllers/app_controller.dart';
 import 'package:s3_browser_crossplat/models/domain_models.dart';
@@ -203,9 +204,10 @@ void main() {
       'vault upload while locked sends one file valid header fresh key and nonce per retry',
       () async {
     vault(provider: true);
-    final paths = [await file('a.txt'), await file('b.txt')];
+    final a = await file('a.txt');
+    final b = await file('b.txt');
     engine.fail = true;
-    await controller.startSampleUpload(paths);
+    await controller.startSampleUpload([a, b]);
     // A definite failure does not stop queued files; both are attempted.
     expect(engine.uploads, hasLength(2));
     final failedTask = controller.browserTasks
@@ -215,10 +217,12 @@ void main() {
     await controller.retryTask(failedTask);
     expect(engine.uploads, hasLength(4));
     final keys = <String>{}, nonces = <String>{};
+    final expectedKeys = {a: 'a.txt.age', b: 'b.txt.age'};
     for (final request in engine.uploads) {
       expect(request['paths'], hasLength(1));
       final path = (request['paths'] as List<String>).single;
-      expect((request['keys'] as Map)[path], '${path.split('/').last}.age');
+      expect(expectedKeys, contains(path));
+      expect((request['keys'] as Map)[path], expectedKeys[path]);
       expect(request['encryption'], {'mode': 'sse-s3'});
       final params = request['clientEncryption'] as Map;
       final opened = await ageReadHeader(

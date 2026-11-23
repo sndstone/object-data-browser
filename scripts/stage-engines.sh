@@ -202,15 +202,15 @@ stage_go_engine() {
 
 stage_rust_engine() {
   ensure_command cargo
-  local rust_source="$ENGINE_SOURCE_DIR/rust"
-  local rust_dest="$STAGE_ROOT/rust"
+  local engine_id="$1"
+  local rust_source="$ENGINE_SOURCE_DIR/$engine_id"
+  local rust_dest="$STAGE_ROOT/$engine_id"
+  local binary="s3-browser-$engine_id-engine"
   remove_directory_if_exists "$rust_dest"
   mkdir -p "$rust_dest"
-  (
-    cd "$rust_source"
-    cargo build --release
-  )
-  cp "$rust_source/target/release/s3-browser-rust-engine" "$rust_dest/s3-browser-rust-engine"
+  local target_dir="${CARGO_TARGET_DIR:-$rust_source/target}"
+  cargo build --release --locked --manifest-path "$rust_source/Cargo.toml" --target-dir "$target_dir"
+  cp "$target_dir/release/$binary" "$rust_dest/$binary"
 }
 
 stage_java_engine() {
@@ -333,6 +333,17 @@ manifest = {
             ],
         },
         {
+            "id": "rust-raw",
+            "version": app_version,
+            "executable": "rust-raw/s3-browser-rust-raw-engine",
+            "arguments": [],
+            "workingDirectory": "rust-raw",
+            "endpointTypes": ["s3Compatible", "awsS3"],
+            "requiredFiles": [
+                "rust-raw/s3-browser-rust-raw-engine",
+            ],
+        },
+        {
             "id": "java",
             "version": app_version,
             "executable": "java/run-java-engine.sh",
@@ -353,7 +364,8 @@ PY
 
 stage_python_engine
 stage_go_engine
-stage_rust_engine
+stage_rust_engine rust
+stage_rust_engine rust-raw
 stage_java_engine
 write_manifest
 "$TOOLS_DIR/python/bin/python3" "$ROOT_DIR/scripts/verify-staged-engines.py" "$STAGE_ROOT"
