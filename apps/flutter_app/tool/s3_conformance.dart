@@ -92,7 +92,9 @@ Future<void> main(List<String> args) async {
   await out.create(recursive: true);
   await File('${out.path}/s3-conformance-report.json').writeAsString(ConformanceExport.json(report));
   await File('${out.path}/s3-conformance-report.md').writeAsString(ConformanceExport.markdown(report));
-  stdout.writeln('Reports written to ${out.path}');
+  await File('${out.path}/s3-compatibility-matrix.csv').writeAsString(ConformanceExport.matrixCsv(report));
+  await File('${out.path}/s3-compatibility-matrix.md').writeAsString(ConformanceExport.matrixMarkdown(report));
+  stdout.writeln('Reports and compatibility matrix written to ${out.path}');
 }
 
 Map<String, List<String>> _parse(List<String> args) {

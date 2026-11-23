@@ -1,16 +1,19 @@
 # Changelog
 
-## Unreleased — S3 API conformance (desktop)
-
-### Benchmark
-- The desktop Benchmark workspace has an **S3 API conformance** mode beside the performance benchmark. It checks an S3 endpoint against the AWS S3 API specification through the Python, Go, Rust and Java engines, one engine or several for comparison, and records the latency of every call. Mobile builds do not include it.
-- Checks run in stages on temporary buckets: a standard bucket before and after versioning is enabled, then an Object Lock bucket with short GOVERNANCE retention, legal holds and an optional 5-second COMPLIANCE lock. Teardown releases holds, bypasses governance retention, aborts uploads, deletes every version and removes the buckets, unless you keep them for inspection after failures.
-- Each check shows the AWS expectation and every Expected-versus-Actual comparison. Reports save as JSON or Markdown and never contain credentials, customer keys or presigned URLs. A headless runner (`tool/s3_conformance.dart`) runs the same suite from a terminal. See `docs/s3-api-conformance-spec.md`.
+## 2.4.0 (Build 5) — Rust Raw HTTP S3 Engine & Desktop S3 API Conformance Suite
 
 ### Engines
-- New desktop engine method `s3ConformanceOp` performs one S3 operation through the engine's SDK with one attempt, checksums only on request and no redirect following.
+- Added a desktop-only **Rust Raw HTTP Engine** (`rust-raw`, built on Hyper 1 + rustls + custom SigV4, with zero AWS SDK dependency) for S3 and S3-compatible profiles. Bundled alongside Rust AWS SDK, Go, Python and Java engines on desktop; mobile builds do not include it.
+- New desktop engine method `s3ConformanceOp` performs one S3 operation through the Python, Go, Rust AWS SDK and Java engines with one attempt, checksums only on request and no redirect following.
 - The Java engine no longer redacts pagination cursors whose field names contain "token", such as `NextContinuationToken`; credential fields remain redacted.
-- The Rust engine's conformance client trusts a profile's CA bundle.
+- The Rust AWS SDK engine's conformance client trusts a profile's CA bundle.
+
+### Benchmark & S3 API Conformance
+- The desktop Benchmark workspace has an **S3 API conformance** mode beside the performance benchmark. It checks an S3 endpoint against the AWS S3 API specification through the Python, Go, Rust AWS SDK and Java engines, one engine or several for comparison, and records the latency of every call. Mobile builds do not include it.
+- Live status updates stream across all tabs during a run with elapsed time, overall and per-engine progress, queued/running/completed engine status chips, and live streaming into both the Results view and the Compatibility Matrix.
+- Added a **Compatibility matrix** view (for one or more engines) with an engine summary table (Pass/Fail/Deviation/Unsupported/Skipped/Error, Phase 1 gate, mean/p50/p95 ms, teardown), Check × Engine status matrix with phase/discrepancy/problem filters, and direct **Export CSV**, **Export Markdown**, **Export JSON** (with `compatibilityMatrix`) and **Copy Matrix** actions.
+- Checks run in stages on temporary buckets: a standard bucket before and after versioning is enabled, then an Object Lock bucket with short GOVERNANCE retention, legal holds and an optional 5-second COMPLIANCE lock. Teardown releases holds, bypasses governance retention, aborts uploads, deletes every version and removes the buckets, unless you keep them for inspection after failures.
+- Each check shows the AWS expectation and every Expected-vs-Actual comparison. Reports and matrices never contain credentials, customer keys or presigned URLs. A headless runner (`tool/s3_conformance.dart`) runs the same suite and writes JSON, Markdown and CSV matrix files. See `docs/s3-api-conformance-spec.md`.
 
 ## 2.4.0 — review fixes, provider templates, encryption and Google Cloud Storage
 

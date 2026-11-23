@@ -94,6 +94,155 @@ abstract final class ConformanceExport {
     return out.toString();
   }
 
+  /// Exports the Check × Engine compatibility matrix as RFC-4180 CSV.
+  static String matrixCsv(
+    ConformanceReport report, {
+    bool onlyDifferences = false,
+  }) {
+    final out = StringBuffer();
+    final header = <String>[
+      'check_id',
+      'phase',
+      'category',
+      'severity',
+      'title',
+      'discrepancy',
+      for (final engine in report.engines) ...[
+        '${engine.engineId}_status',
+        '${engine.engineId}_calls',
+        '${engine.engineId}_latency_ms',
+        '${engine.engineId}_detail',
+      ],
+    ];
+    out.writeln(header.map(_csvCell).join(','));
+    final diffSet = report.discrepancies().toSet();
+    final ids = onlyDifferences
+        ? report.checkIds().where(diffSet.contains).toList()
+        : report.checkIds();
+    for (final id in ids) {
+      final sample = report.sampleCheck(id)!;
+      final row = <String>[
+        id,
+        sample.phase.label,
+        sample.category,
+        sample.severity.name,
+        sample.title,
+        diffSet.contains(id) ? 'true' : 'false',
+        for (final engine in report.engines) ...() {
+          final check = engine.check(id);
+          if (check == null) return const ['not_run', '0', '', ''];
+          return [
+            check.status.label,
+            '${check.calls.length}',
+            check.callLatencyMs.toStringAsFixed(1),
+            check.status == ConformanceStatus.pass
+                ? check.headline
+                : _detail(check),
+          ];
+        }(),
+      ];
+      out.writeln(row.map(_csvCell).join(','));
+    }
+    return out.toString();
+  }
+
+  /// Exports a standalone Compatibility Matrix Markdown report (summary table +
+  /// full Check × Engine matrix, or differences only).
+  static String matrixMarkdown(
+    ConformanceReport report, {
+    bool onlyDifferences = false,
+  }) {
+    final out = StringBuffer()
+      ..writeln('# S3 API compatibility matrix')
+      ..writeln()
+      ..writeln('- Profile: ${_cell(report.profileName)}')
+      ..writeln('- Started: ${report.startedAt.toUtc().toIso8601String()}')
+      ..writeln(
+          '- Engines: ${report.engines.map((e) => '${e.engineId} (${_cell(e.sdk)})').join(', ')}')
+      ..writeln('- Base bucket name: `${report.config.baseBucketName}`')
+      ..writeln(
+          '- Object Lock stage: ${report.config.includeObjectLock ? 'on' : 'off'}'
+          '${report.config.includeObjectLock && report.config.includeShortCompliance ? ' (with a 5-second COMPLIANCE check)' : ''}')
+      ..writeln();
+    out
+      ..writeln('## Engine summary')
+      ..writeln()
+      ..writeln(
+          '| Engine | SDK | Phase 1 gate | Pass | Fail | Deviation | Unsupported | Skipped | Error | Calls | Mean ms | p50 ms | p95 ms | Teardown |')
+      ..writeln(
+          '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |');
+    for (final engine in report.engines) {
+      final counts = engine.counts;
+      final p50 = engine.percentileCallLatencyMs(50);
+      final p95 = engine.percentileCallLatencyMs(95);
+      final gate = engine.gatePassed == null
+          ? 'not reached'
+          : engine.gatePassed!
+              ? 'met'
+              : 'incomplete';
+      final teardown = engine.teardown;
+      out.writeln('| ${engine.engineId} | ${_cell(engine.sdk)} | $gate | '
+          '${counts[ConformanceStatus.pass]} | ${counts[ConformanceStatus.fail]} | '
+          '${counts[ConformanceStatus.warn]} | ${counts[ConformanceStatus.unsupported]} | '
+          '${counts[ConformanceStatus.skipped]} | ${counts[ConformanceStatus.error]} | '
+          '${engine.callCount} | ${engine.meanCallLatencyMs.toStringAsFixed(1)} | '
+          '${p50 == null ? '—' : p50.toStringAsFixed(1)} | '
+          '${p95 == null ? '—' : p95.toStringAsFixed(1)} | '
+          '${teardown == null ? (engine.status == ConformanceRunStatus.running ? 'running' : 'not run') : teardown.clean ? 'clean' : 'see notes'} |');
+    }
+
+    final diffSet = report.discrepancies().toSet();
+    final ids = onlyDifferences
+        ? report.checkIds().where(diffSet.contains).toList()
+        : report.checkIds();
+    out
+      ..writeln()
+      ..writeln(onlyDifferences
+          ? '## Engine discrepancies (${ids.length})'
+          : '## Compatibility matrix (${ids.length} checks)')
+      ..writeln();
+    if (ids.isEmpty) {
+      out.writeln(onlyDifferences
+          ? 'All engines produced the same status for every check.'
+          : 'No checks recorded.');
+    } else {
+      out
+        ..writeln(
+            '| Check | Phase | Severity | ${report.engines.map((e) => e.engineId).join(' | ')} |')
+        ..writeln('| --- | --- | --- |${' --- |' * report.engines.length}');
+      for (final id in ids) {
+        final sample = report.sampleCheck(id)!;
+        final cells = [
+          for (final engine in report.engines)
+            () {
+              final check = engine.check(id);
+              if (check == null) return '—';
+              final latency = '${check.callLatencyMs.toStringAsFixed(1)} ms';
+              if (check.status == ConformanceStatus.pass) {
+                return '${check.status.label} ($latency)';
+              }
+              return '${check.status.label} ($latency): ${_cell(check.headline)}';
+            }()
+        ];
+        out.writeln(
+            '| `$id` | ${sample.phase.label} | ${sample.severity.name} | ${cells.join(' | ')} |');
+      }
+    }
+    if (!onlyDifferences && report.engines.length > 1) {
+      out
+        ..writeln()
+        ..writeln('## Cross-engine discrepancies')
+        ..writeln();
+      if (diffSet.isEmpty) {
+        out.writeln('All engines produced the same status for every check.');
+      } else {
+        out.writeln(
+            '${diffSet.length} check(s) differed across engines: ${diffSet.map((id) => '`$id`').join(', ')}.');
+      }
+    }
+    return out.toString();
+  }
+
   static String _detail(ConformanceCheckResult check) {
     final mismatches = check.mismatches.take(3).map((m) =>
         '${m.field}: expected ${m.expected}, got ${m.actual}${m.explanation == null ? '' : ' (${m.explanation})'}');
@@ -104,5 +253,14 @@ abstract final class ConformanceExport {
     return parts.isEmpty ? check.title : parts.join('; ');
   }
 
-  static String _cell(String value) => value.replaceAll('|', r'\|').replaceAll('\n', ' ');
+  static String _cell(String value) =>
+      value.replaceAll('|', r'\|').replaceAll('\n', ' ').replaceAll('\r', ' ');
+
+  static String _csvCell(String value) {
+    final normalized = value.replaceAll('\r\n', ' ').replaceAll('\n', ' ').replaceAll('\r', ' ');
+    if (normalized.contains(',') || normalized.contains('"')) {
+      return '"${normalized.replaceAll('"', '""')}"';
+    }
+    return normalized;
+  }
 }

@@ -241,16 +241,61 @@ void main() {
   });
 
   test('report round-trips through JSON and finds discrepancies', () async {
-    final a = await _suite(FakeExecutor()).run();
-    final b = await _suite(FakeExecutor(ops: {...allConformanceOps}..remove('ListObjects'))).run();
+    final a = await _suite(FakeExecutor(engineId: 'python')).run();
+    final b = await _suite(FakeExecutor(engineId: 'go', ops: {...allConformanceOps}..remove('ListObjects'))).run();
     final report = ConformanceReport(
-        id: 'r', config: const ConformanceConfig(baseBucketName: 'odb-test'), profileName: 'p', startedAt: DateTime(2026))
+        id: 'r', config: const ConformanceConfig(baseBucketName: 'odb-test', engineIds: ['python', 'go']), profileName: 'p', startedAt: DateTime(2026))
       ..engines.addAll([a, b]);
-    final decoded = ConformanceReport.fromJson(jsonDecode(ConformanceExport.json(report)) as Map<String, Object?>);
+    final jsonMap = jsonDecode(ConformanceExport.json(report)) as Map<String, Object?>;
+    final decoded = ConformanceReport.fromJson(jsonMap);
     expect(decoded.engines.length, 2);
     expect(decoded.engines.first.checks.length, a.checks.length);
     expect(report.discrepancies(), contains('list.v1.delimiter'));
     expect(ConformanceExport.markdown(report), contains('## Engine discrepancies'));
+
+    // JSON includes structured compatibilityMatrix.
+    final matrix = (jsonMap['compatibilityMatrix'] as List).cast<Map>();
+    expect(matrix.length, report.checkIds().length);
+    final diffRow = matrix.firstWhere((row) => row['id'] == 'list.v1.delimiter');
+    expect(diffRow['discrepancy'], isTrue);
+    expect((diffRow['engines'] as Map)['go']['status'], 'unsupported');
+
+    // CSV matrix export (full and differences-only) escapes commas/quotes cleanly.
+    final csvFull = ConformanceExport.matrixCsv(report);
+    final csvLines = csvFull.trim().split('\n');
+    expect(csvLines.first, startsWith('check_id,phase,category,severity,title,discrepancy,python_status,python_calls,python_latency_ms,python_detail,go_status,'));
+    expect(csvLines.length, report.checkIds().length + 1);
+    final csvDiff = ConformanceExport.matrixCsv(report, onlyDifferences: true);
+    expect(csvDiff, contains('list.v1.delimiter'));
+    expect(csvDiff.trim().split('\n').length, report.discrepancies().length + 1);
+
+    // Markdown matrix export includes engine summary + compatibility matrix.
+    final matrixMd = ConformanceExport.matrixMarkdown(report);
+    expect(matrixMd, contains('# S3 API compatibility matrix'));
+    expect(matrixMd, contains('## Engine summary'));
+    expect(matrixMd, contains('| Check | Phase | Severity | python | go |'));
+    expect(matrixMd, contains('`list.v1.delimiter`'));
+    final diffMd = ConformanceExport.matrixMarkdown(report, onlyDifferences: true);
+    expect(diffMd, contains('## Engine discrepancies'));
+    expect(diffMd, contains('`list.v1.delimiter`'));
+  });
+
+  test('compatibility matrix CSV escapes special characters and leaks no customer keys', () async {
+    final https = FakeExecutor(engineId: 'python');
+    final run = await _suite(https).run();
+    final report = ConformanceReport(
+      id: 'sec',
+      config: const ConformanceConfig(baseBucketName: 'odb-test'),
+      profileName: 'Profile, "quoted"',
+      startedAt: DateTime(2026),
+      engines: [run],
+    );
+    final exported = ConformanceExport.matrixCsv(report) + ConformanceExport.matrixMarkdown(report);
+    for (final key in https.customerKeys) {
+      expect(exported.contains(key), isFalse);
+    }
+    expect(ConformanceExport.matrixMarkdown(report), contains('## Engine summary'));
+    expect(ConformanceExport.matrixCsv(report), contains('bucket.create,'));
   });
 
   test('observations parse the wire result', () {

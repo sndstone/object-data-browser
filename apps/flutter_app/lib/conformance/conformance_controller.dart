@@ -5,6 +5,14 @@ import 'conformance_models.dart';
 import 'conformance_suite.dart';
 import 'sidecar_s3_op_executor.dart';
 
+enum ConformanceEngineQueueState {
+  queued,
+  running,
+  completed,
+  cancelled,
+  failed,
+}
+
 /// Desktop-only state for the Benchmark workspace's S3 API conformance view.
 ///
 /// Runs the selected engines one after another against the active profile.
@@ -36,6 +44,12 @@ class ConformanceController extends ChangeNotifier {
 
   static const int maxHistory = 5;
 
+  /// Desktop engines that do not implement the `s3ConformanceOp` SDK harness.
+  static const Set<String> unsupportedEngineIds = {'rust-raw'};
+
+  static bool supportsEngine(EngineDescriptor engine) =>
+      engine.desktopSupported && !unsupportedEngineIds.contains(engine.id);
+
   ConformanceConfig config = const ConformanceConfig(baseBucketName: 'odb-conformance');
   ConformanceReport? current;
   final List<ConformanceReport> history = <ConformanceReport>[];
@@ -47,10 +61,92 @@ class ConformanceController extends ChangeNotifier {
   /// Live results of the engine being run.
   final List<ConformanceCheckResult> liveChecks = <ConformanceCheckResult>[];
   String? liveEngine;
+  DateTime? liveEngineStartedAt;
+  ConformanceEndpoint? _liveEndpoint;
+  String? _liveEngineLabel;
 
   bool get available => isDesktop && transport != null;
   bool get running => _cancellation != null;
   bool get stopping => _cancellation?.isCancelled ?? false;
+
+  /// In-progress snapshot for the currently running engine, or null when idle.
+  ConformanceEngineRun? get liveEngineRun {
+    final engineId = liveEngine;
+    if (!running || engineId == null) return null;
+    if (current?.engines.any((e) => e.engineId == engineId) ?? false) {
+      return null;
+    }
+    return ConformanceEngineRun(
+      engineId: engineId,
+      runId: current?.id ?? 'live',
+      startedAt: liveEngineStartedAt ?? current?.startedAt ?? DateTime.now(),
+      sdk: _liveEngineLabel ?? 'running…',
+      endpoint: _liveEndpoint?.displayHost ?? '',
+      region: _liveEndpoint?.region ?? '',
+      pathStyle: _liveEndpoint?.pathStyle ?? false,
+      checks: List<ConformanceCheckResult>.unmodifiable(liveChecks),
+      status: ConformanceRunStatus.running,
+    );
+  }
+
+  /// Completed engine runs plus the active live engine run (when running).
+  List<ConformanceEngineRun> get displayEngines {
+    final report = current;
+    if (report == null) return const [];
+    final live = liveEngineRun;
+    return [
+      ...report.engines,
+      if (live != null) live,
+    ];
+  }
+
+  /// Report view that includes live streaming checks during an active run.
+  ConformanceReport? get displayReport {
+    final report = current;
+    if (report == null) return null;
+    final live = liveEngineRun;
+    if (live == null) return report;
+    return ConformanceReport(
+      id: report.id,
+      config: report.config,
+      profileName: report.profileName,
+      startedAt: report.startedAt,
+      finishedAt: report.finishedAt,
+      engines: [...report.engines, live],
+    );
+  }
+
+  /// Aggregate progress across all queued engines (0.0..1.0), or null if idle.
+  double? get overallProgress {
+    if (!running) return null;
+    final totalEngines = current?.config.engineIds.length ?? 0;
+    if (totalEngines <= 0) return null;
+    final completedEngines = current?.engines.length ?? 0;
+    final currentFraction = progress == null
+        ? 0.0
+        : (progress!.completed / conformanceEstimatedChecks).clamp(0.0, 0.99);
+    return ((completedEngines + currentFraction) / totalEngines).clamp(0.0, 1.0);
+  }
+
+  ConformanceEngineQueueState engineQueueState(String engineId) {
+    final finished =
+        current?.engines.where((e) => e.engineId == engineId).firstOrNull;
+    if (finished != null) {
+      return switch (finished.status) {
+        ConformanceRunStatus.completed => ConformanceEngineQueueState.completed,
+        ConformanceRunStatus.cancelled => ConformanceEngineQueueState.cancelled,
+        ConformanceRunStatus.failed => ConformanceEngineQueueState.failed,
+        ConformanceRunStatus.running => ConformanceEngineQueueState.running,
+      };
+    }
+    if (running && liveEngine == engineId) {
+      return ConformanceEngineQueueState.running;
+    }
+    if (!running && current != null) {
+      return ConformanceEngineQueueState.cancelled;
+    }
+    return ConformanceEngineQueueState.queued;
+  }
 
   void updateConfig(ConformanceConfig value) {
     config = value;
@@ -74,8 +170,12 @@ class ConformanceController extends ChangeNotifier {
     if (vault != null) {
       return 'A client-encryption rule covers bucket "${vault.bucket}"; choose another base bucket name.';
     }
-    final selected = config.engineIds.where((id) => engines.any((e) => e.id == id && e.available));
-    if (selected.isEmpty) return 'Select at least one installed desktop engine.';
+    final selected = config.engineIds.where(
+      (id) => engines.any((e) => e.id == id && e.available && supportsEngine(e)),
+    );
+    if (selected.isEmpty) {
+      return 'Select at least one installed SDK engine (Python, Go, Rust or Java).';
+    }
     return null;
   }
 
@@ -95,7 +195,7 @@ class ConformanceController extends ChangeNotifier {
     lastError = null;
     final engineIds = [
       for (final id in config.engineIds)
-        if (engines.any((e) => e.id == id && e.available)) id
+        if (engines.any((e) => e.id == id && e.available && supportsEngine(e))) id
     ];
     final report = ConformanceReport(
       id: DateTime.now().toUtc().millisecondsSinceEpoch.toRadixString(36),
@@ -104,17 +204,23 @@ class ConformanceController extends ChangeNotifier {
       startedAt: DateTime.now(),
     );
     current = report;
-    _notify();
     final endpoint = ConformanceEndpoint(
       endpointUrl: profile.endpointUrl,
       region: profile.region,
       pathStyle: profile.pathStyle,
       endpointType: profile.endpointType == EndpointProfileType.awsS3 ? 'awsS3' : 's3Compatible',
     );
+    _liveEndpoint = endpoint;
+    _notify();
     try {
       for (final engineId in engineIds) {
         if (cancellation.isCancelled) break;
+        final descriptor = engines.where((e) => e.id == engineId).firstOrNull;
         liveEngine = engineId;
+        liveEngineStartedAt = DateTime.now();
+        _liveEngineLabel = descriptor == null
+            ? 'running…'
+            : '${descriptor.label} (running…)';
         liveChecks.clear();
         progress = null;
         _notify();
@@ -144,6 +250,9 @@ class ConformanceController extends ChangeNotifier {
       }
       _cancellation = null;
       liveEngine = null;
+      liveEngineStartedAt = null;
+      _liveEndpoint = null;
+      _liveEngineLabel = null;
       liveChecks.clear();
       progress = null;
       _notify();

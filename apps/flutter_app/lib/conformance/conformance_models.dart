@@ -424,6 +424,23 @@ class ConformanceEngineRun {
 
   int get callCount => checks.fold(0, (sum, check) => sum + check.calls.length);
 
+  double get meanCallLatencyMs =>
+      callCount == 0 ? 0.0 : totalCallLatencyMs / callCount;
+
+  /// Returns the [percentile] (0..100) call latency in milliseconds, or null
+  /// when no calls have been recorded yet.
+  double? percentileCallLatencyMs(double percentile) {
+    final latencies = <double>[
+      for (final check in checks)
+        for (final call in check.calls) call.latencyMs,
+    ];
+    if (latencies.isEmpty) return null;
+    latencies.sort();
+    final clamped = percentile.clamp(0.0, 100.0);
+    final index = ((clamped / 100.0) * (latencies.length - 1)).round();
+    return latencies[index];
+  }
+
   ConformanceCheckResult? check(String id) =>
       checks.where((check) => check.id == id).firstOrNull;
 
@@ -495,22 +512,85 @@ class ConformanceReport {
           'finishedAt': finishedAt!.toUtc().toIso8601String(),
         'config': config.toJson(),
         'engines': [for (final engine in engines) engine.toJson()],
+        'compatibilityMatrix': compatibilityMatrix(),
       };
 
-  /// Check IDs whose status differs between engines that ran them.
-  List<String> discrepancies() {
+  /// Ordered distinct check IDs across [runs] (defaults to [engines]).
+  List<String> checkIds({List<ConformanceEngineRun>? runs}) {
+    final source = runs ?? engines;
     final ids = <String>[];
     final seen = <String>{};
-    for (final engine in engines) {
+    for (final engine in source) {
       for (final check in engine.checks) {
-        if (!seen.add(check.id)) continue;
-        final statuses = {
-          for (final other in engines) other.check(check.id)?.status
-        }..remove(null);
-        if (statuses.length > 1) ids.add(check.id);
+        if (seen.add(check.id)) ids.add(check.id);
       }
     }
     return ids;
+  }
+
+  /// First recorded metadata sample for [checkId] across [runs].
+  ConformanceCheckResult? sampleCheck(String checkId,
+      {List<ConformanceEngineRun>? runs}) {
+    for (final engine in runs ?? engines) {
+      final found = engine.check(checkId);
+      if (found != null) return found;
+    }
+    return null;
+  }
+
+  /// Check IDs whose status differs between engines that ran them.
+  List<String> discrepancies({List<ConformanceEngineRun>? runs}) {
+    final source = runs ?? engines;
+    final ids = <String>[];
+    for (final id in checkIds(runs: source)) {
+      final statuses = {
+        for (final other in source) other.check(id)?.status
+      }..remove(null);
+      if (statuses.length > 1) ids.add(id);
+    }
+    return ids;
+  }
+
+  /// Structured Check × Engine compatibility matrix for exports and UI tables.
+  List<Map<String, Object?>> compatibilityMatrix({
+    List<ConformanceEngineRun>? runs,
+    bool onlyDifferences = false,
+  }) {
+    final source = runs ?? engines;
+    final diffSet = discrepancies(runs: source).toSet();
+    final ids = onlyDifferences
+        ? checkIds(runs: source).where(diffSet.contains).toList()
+        : checkIds(runs: source);
+    return [
+      for (final id in ids)
+        () {
+          final sample = sampleCheck(id, runs: source)!;
+          return <String, Object?>{
+            'id': id,
+            'phase': sample.phase.name,
+            'phaseLabel': sample.phase.label,
+            'category': sample.category,
+            'severity': sample.severity.name,
+            'title': sample.title,
+            'discrepancy': diffSet.contains(id),
+            'engines': {
+              for (final engine in source)
+                engine.engineId: () {
+                  final check = engine.check(id);
+                  if (check == null) return null;
+                  return <String, Object?>{
+                    'status': check.status.name,
+                    'statusLabel': check.status.label,
+                    'calls': check.calls.length,
+                    'latencyMs':
+                        double.parse(check.callLatencyMs.toStringAsFixed(3)),
+                    'headline': check.headline,
+                  };
+                }(),
+            },
+          };
+        }(),
+    ];
   }
 }
 

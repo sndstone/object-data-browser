@@ -264,6 +264,7 @@ fn capabilities() -> Value {
         ("object.clientEncryption", "Client-side encryption", false),
         ("tools.bulk-delete", "Delete-all maintenance tool", true),
         ("benchmark", "Integrated benchmark mode", true),
+        ("conformance.s3", "S3 API conformance harness", false),
     ].into_iter().map(|(key, label, supported)| {
         json!({"key":key,"label":label,"state":if supported {"supported"} else {"unsupported"}})
     }).collect();
