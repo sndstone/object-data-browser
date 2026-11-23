@@ -3,7 +3,7 @@ param(
     [string]$Platform = "windows",
     [ValidateSet("x64", "arm64")]
     [string]$Arch = "x64",
-    [ValidateSet("none", "msi")]
+    [ValidateSet("none", "msi", "portable", "all")]
     [string]$Installer = "msi",
     [switch]$IncludeEngineToolchains,
     [switch]$OpenDeveloperSettings,
@@ -250,7 +250,7 @@ if ($Help) {
     Write-Host "  android  Build the sideloadable arm64 APK and the secondary App Bundle"
     Write-Host ""
     Write-Host "Switches:"
-    Write-Host "  -Installer msi|none       Build a Windows MSI after the desktop app build (default: msi)"
+    Write-Host "  -Installer msi|portable|all|none  Build a Windows MSI and/or single-file portable .exe (default: msi)"
     Write-Host "  -IncludeEngineToolchains  Also download Python, Go, Java, and Rust toolchains for non-Windows targets"
     Write-Host "  -OpenDeveloperSettings    Open the Windows Developer Mode settings page before building"
     Write-Host ""
@@ -271,7 +271,7 @@ if ($Platform -eq "android") {
 if ($IncludeEngineToolchains) {
     $BootstrapComponents += @("python", "go", "java", "rust")
 }
-if ($Platform -eq "windows" -and $Installer -eq "msi") {
+if ($Platform -eq "windows" -and ($Installer -eq "msi" -or $Installer -eq "all")) {
     $BootstrapComponents += "wix"
 }
 $BootstrapComponents = $BootstrapComponents | Select-Object -Unique
@@ -561,7 +561,7 @@ if ($Platform -eq "windows") {
         Write-Host "Engine staging completed without writing $EngineManifestPath." -ForegroundColor Red
         Exit-Build 1
     }
-    if ($Installer -eq "msi") {
+    if ($Installer -eq "msi" -or $Installer -eq "all") {
         Write-Host "Building MSI installer..."
         $PackageArgs = @{ Arch = $Arch }
         try {
@@ -574,6 +574,22 @@ if ($Platform -eq "windows") {
             Write-Host "package-windows.ps1 error: $_" -ForegroundColor Red
             Exit-Build 1
         }
+    }
+    if ($Installer -eq "portable" -or $Installer -eq "all") {
+        Write-Host "Building single-file portable Windows executable..."
+        $AppVersion = Get-AppVersion
+        $PortableOut = Join-Path $RootDir "dist\windows\object-data-browser-windows-$AppVersion-$Arch-portable.exe"
+        $PythonExe = Join-Path $ToolsDir "python-embed\python.exe"
+        if (-not (Test-Path $PythonExe)) {
+            $PythonExe = "python.exe"
+        }
+        & $PythonExe (Join-Path $RootDir "scripts\package-windows-portable.py") --release-dir $ReleaseDir --arch $Arch --output $PortableOut
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "package-windows-portable.py failed with exit code $LASTEXITCODE." -ForegroundColor Red
+            Exit-Build $LASTEXITCODE
+        }
+    }
+    if ($Installer -ne "none") {
         Exit-Build 0
     }
     Write-Host "Windows desktop app staged at $ReleaseDir"

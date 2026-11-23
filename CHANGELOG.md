@@ -7,6 +7,7 @@
 
 ### Packaging
 - Windows MSI installers (x64 and ARM64) now install strictly in userspace (`%LOCALAPPDATA%\Programs\Object Data Browser`, `perUser` / `InstallPrivileges="limited"`) so installing or updating never requires Administrator / UAC elevation.
+- Added a standalone single-file portable Windows x64 executable (`object-data-browser-windows-2.4.0-build5-x64-portable.exe`) built with a zero-dependency Go GUI launcher (`packaging/windows/portable-launcher/`) that extracts into a verified userspace cache (`%LOCALAPPDATA%\ObjectDataBrowserPortable\`) on first launch and starts immediately on subsequent runs with no admin privileges required.
 - New desktop engine method `s3ConformanceOp` performs one S3 operation through the Python, Go, Rust AWS SDK and Java engines with one attempt, checksums only on request and no redirect following.
 - The Java engine no longer redacts pagination cursors whose field names contain "token", such as `NextContinuationToken`; credential fields remain redacted.
 - The Rust AWS SDK engine's conformance client trusts a profile's CA bundle.
