@@ -445,7 +445,7 @@ func gcsCapabilities() map[string]interface{} {
 	for _, key := range []string{"bucket.lifecycle", "bucket.policy", "bucket.cors", "bucket.encryption", "bucket.tagging", "object.encryption.sse-s3", "object.encryption.sse-kms", "object.encryption.dsse-kms", "object.encryption.sse-c", "object.encryption.azure-scope", "object.encryption.azure-cpk", "object.resumable", "benchmark", "tools.bulk-delete", "tools", "storage.admin", "auth.awsProfiles"} {
 		items = append(items, map[string]interface{}{"key": key, "label": key, "state": "unsupported", "implementationState": "unsupported", "reason": "Not implemented for native Cloud Storage profiles. Resumable upload sessions do not provide durable transfer checkpoints."})
 	}
-	return map[string]interface{}{"items": items}
+	return map[string]interface{}{"items": append(items, s3ConformanceCapability(false))}
 }
 
 func handleGCSRequest(method string, params map[string]interface{}) (result map[string]interface{}, err error) {

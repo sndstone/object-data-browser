@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — S3 API conformance (desktop)
+
+### Benchmark
+- The desktop Benchmark workspace has an **S3 API conformance** mode beside the performance benchmark. It checks an S3 endpoint against the AWS S3 API specification through the Python, Go, Rust and Java engines, one engine or several for comparison, and records the latency of every call. Mobile builds do not include it.
+- Checks run in stages on temporary buckets: a standard bucket before and after versioning is enabled, then an Object Lock bucket with short GOVERNANCE retention, legal holds and an optional 5-second COMPLIANCE lock. Teardown releases holds, bypasses governance retention, aborts uploads, deletes every version and removes the buckets, unless you keep them for inspection after failures.
+- Each check shows the AWS expectation and every Expected-versus-Actual comparison. Reports save as JSON or Markdown and never contain credentials, customer keys or presigned URLs. A headless runner (`tool/s3_conformance.dart`) runs the same suite from a terminal. See `docs/s3-api-conformance-spec.md`.
+
+### Engines
+- New desktop engine method `s3ConformanceOp` performs one S3 operation through the engine's SDK with one attempt, checksums only on request and no redirect following.
+- The Java engine no longer redacts pagination cursors whose field names contain "token", such as `NextContinuationToken`; credential fields remain redacted.
+- The Rust engine's conformance client trusts a profile's CA bundle.
+
 ## 2.4.0 — review fixes, provider templates, encryption and Google Cloud Storage
 
 ### Fixes

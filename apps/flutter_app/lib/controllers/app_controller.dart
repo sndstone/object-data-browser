@@ -22,6 +22,8 @@ import 'package:path/path.dart' as p;
 import '../models/domain_models.dart';
 import '../services/app_state_repository.dart';
 import '../services/app_platform.dart';
+import '../conformance/conformance_controller.dart';
+import '../conformance/sidecar_s3_op_executor.dart';
 import '../services/engine_service.dart';
 import '../services/object_encryption.dart';
 import '../services/encryption_key_store.dart';
@@ -457,6 +459,15 @@ class AppController extends ChangeNotifier {
   AppSettings settings;
   List<EndpointProfile> profiles;
   List<EngineDescriptor> engines = const [];
+
+  /// S3 API conformance (Benchmark workspace). Available only in the desktop
+  /// app, whose sidecar engine service implements [S3ConformanceTransport].
+  late final ConformanceController conformance = ConformanceController(
+    transport: AppPlatform.isDesktop && _engineService is S3ConformanceTransport
+        ? _engineService as S3ConformanceTransport
+        : null,
+    isDesktop: AppPlatform.isDesktop,
+  );
   List<BucketSummary> buckets = const [];
   List<ObjectEntry> objects = const [];
   List<ObjectVersionEntry> _versions = const [];
@@ -4874,6 +4885,7 @@ class AppController extends ChangeNotifier {
     _versionQuery.dispose();
     _cancelTextPreview();
     _busyLineNotifyTimer?.cancel();
+    conformance.dispose();
     shutdownEngines();
     super.dispose();
   }

@@ -43,6 +43,30 @@ pub(super) fn collect(value: &Value) -> Vec<String> {
     result
 }
 
+pub(super) fn collect_conformance(params: &Value) -> Vec<String> {
+    let mut keys = collect(params);
+    let profile = &params["profile"];
+    // Static profile parsing trims accessKey and secretKey but preserves sessionToken.
+    for key in [
+        profile["accessKey"].as_str().map(str::trim),
+        profile["secretKey"].as_str().map(str::trim),
+        profile["sessionToken"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|key| scrub_profile_credential(key))
+    {
+        keys.push(key.to_owned());
+        keys.push(urlencoding::encode(key).into_owned());
+    }
+    keys
+}
+
+pub(super) fn scrub_profile_credential(key: &str) -> bool {
+    // Short emulator credentials can also be ordinary catalog data.
+    key.chars().take(16).count() == 16
+}
+
 pub(super) fn text(value: &str) -> String {
     SECRETS
         .try_with(|keys| {

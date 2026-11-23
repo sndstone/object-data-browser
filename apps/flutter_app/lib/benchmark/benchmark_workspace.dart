@@ -1,6 +1,7 @@
 import '../widgets/controller_content_frame.dart';
 import 'benchmark_metrics.dart';
 import 'operation_mix_bar.dart';
+import 'conformance_view.dart';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -19,6 +20,10 @@ import '../widgets/compact_selector.dart';
 import '../widgets/edge_fade_scroll.dart';
 
 enum _BenchmarkSection { configure, run, results, history }
+
+/// Desktop only: the S3 API conformance view sits beside the performance
+/// benchmark and never appears on mobile.
+enum _BenchmarkMode { performance, conformance }
 
 enum _BenchmarkPreviewSection {
   latency,
@@ -191,6 +196,7 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
   final Set<String> _enabledOperations = <String>{};
 
   late _BenchmarkSection _section;
+  _BenchmarkMode _mode = _BenchmarkMode.performance;
 
   @override
   void initState() {
@@ -216,11 +222,48 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
     super.dispose();
   }
 
+  bool get _showConformance => controller.conformance.available;
+
+  Widget _modeSelector() => CompactSelector<_BenchmarkMode>(
+        key: const ValueKey('benchmark-mode-selector'),
+        selected: _mode,
+        onChanged: (value) {
+          _flushBenchmarkEditors();
+          setState(() => _mode = value);
+        },
+        options: const [
+          CompactSelectorOption(
+              value: _BenchmarkMode.performance,
+              label: 'Performance',
+              icon: Icons.speed),
+          CompactSelectorOption(
+              value: _BenchmarkMode.conformance,
+              label: 'S3 API conformance',
+              icon: Icons.fact_check_outlined),
+        ],
+      );
+
   @override
   Widget build(BuildContext context) {
+    if (_showConformance && _mode == _BenchmarkMode.conformance) {
+      return Padding(
+        padding: const EdgeInsets.all(10),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          _modeSelector(),
+          const SizedBox(height: 8),
+          Expanded(child: ConformanceView(controller: controller)),
+        ]),
+      );
+    }
     if (!controller.profileCapability('benchmark')) {
       return Center(
-        child: Text(controller.profileCapabilityReason('benchmark')),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          if (_showConformance) ...[
+            _modeSelector(),
+            const SizedBox(height: 12),
+          ],
+          Text(controller.profileCapabilityReason('benchmark')),
+        ]),
       );
     }
     return LayoutBuilder(builder: (context, constraints) {
@@ -269,6 +312,10 @@ class _BenchmarkWorkspaceState extends State<BenchmarkWorkspace> {
           padding: const EdgeInsets.all(10),
           child:
               Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            if (_showConformance) ...[
+              _modeSelector(),
+              const SizedBox(height: 8),
+            ],
             CompactSelector<_BenchmarkSection>(
                 selected: _section,
                 onChanged: (value) {

@@ -460,16 +460,20 @@ def _build_client(profile: Profile):
         return client
 
 
-def _new_client(profile: Profile):
+def _new_client(profile: Profile, conformance: bool = False):
     imports = _lazy_boto_imports()
+    # S3 API conformance (s3_conformance.py) uses one attempt and checksums only
+    # where the operation requires them, so every test controls what is sent.
+    checksum_mode = "when_required" if conformance or profile.endpoint_type != "awsS3" else "when_supported"
     config = imports["Config"](
         signature_version="s3v4",
-        request_checksum_calculation="when_required" if profile.endpoint_type != "awsS3" else "when_supported",
-        response_checksum_validation="when_required" if profile.endpoint_type != "awsS3" else "when_supported",
+        request_checksum_calculation=checksum_mode,
+        response_checksum_validation=checksum_mode,
         region_name=profile.region,
         connect_timeout=profile.connect_timeout_seconds,
         read_timeout=profile.read_timeout_seconds,
-        retries={"total_max_attempts": profile.max_attempts, "mode": "adaptive"},
+        retries=({"total_max_attempts": 1, "mode": "standard"} if conformance
+                 else {"total_max_attempts": profile.max_attempts, "mode": "adaptive"}),
         max_pool_connections=profile.max_pool_connections,
         s3={"addressing_style": "path" if profile.path_style else "virtual"},
     )
@@ -2502,6 +2506,7 @@ def _health() -> dict[str, Any]:
             "resumeBenchmark",
             "stopBenchmark",
             "exportBenchmarkResults",
+            "s3ConformanceOp",
         ],
     }
 
@@ -2526,6 +2531,7 @@ def _get_capabilities(_: dict[str, Any]) -> dict[str, Any]:
     result['items'].extend({'key': 'object.encryption.' + mode, 'label': 'Object encryption: ' + mode,
                             'state': 'supported'}
                            for mode in ('sse-s3', 'sse-kms', 'dsse-kms', 'sse-c', 'azure-scope', 'azure-cpk'))
+    result['items'].append(_conformance_module().capability(_.get('profile'), SimpleNamespace(**globals())))
     if _is_azure_profile(_.get('profile')):
         for item in result['items']:
             if item['key'].startswith('bucket.'):
@@ -5911,6 +5917,20 @@ def _gcs_module():
     return _GCS_MODULE
 
 
+_CONFORMANCE_MODULE = None
+
+
+def _conformance_module():
+    global _CONFORMANCE_MODULE
+    with _CLIENT_CACHE_LOCK:
+        if _CONFORMANCE_MODULE is None:
+            spec = importlib.util.spec_from_file_location('object_browser_s3_conformance', Path(__file__).with_name('s3_conformance.py'))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _CONFORMANCE_MODULE = module
+    return _CONFORMANCE_MODULE
+
+
 def _advanced_module():
     global _ADVANCED_MODULE
     if _ADVANCED_MODULE is None:
@@ -6680,6 +6700,8 @@ def _handle_request_impl(payload: dict[str, Any]) -> dict[str, Any]:
         if azure_result is not None:
             return azure_result
 
+    if method == "s3ConformanceOp":
+        return _conformance_module().handle(dict(params), SimpleNamespace(**globals()))
     if method == "storageAction":
         return _storage_action(dict(params))
     if method == "health":

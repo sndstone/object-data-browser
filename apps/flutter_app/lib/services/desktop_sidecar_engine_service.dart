@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import '../conformance/sidecar_s3_op_executor.dart';
 import '../models/domain_models.dart';
 import 'desktop_engine_host.dart';
 import 'diagnostic_safety.dart';
@@ -20,7 +21,8 @@ class DesktopSidecarEngineService
         EngineLogSinkRegistrant,
         TransferJobSinkRegistrant,
         ListingCancellationRegistrant,
-        PerformanceOptionsRegistrant {
+        PerformanceOptionsRegistrant,
+        S3ConformanceTransport {
   DesktopSidecarEngineService({
     DesktopEngineHost? host,
     EngineService? fallback,
@@ -239,6 +241,40 @@ class DesktopSidecarEngineService
         endpointTypes: entry?.endpointTypes ?? engine.endpointTypes,
       );
     }).toList(growable: false);
+  }
+
+  /// S3 API conformance primitive (desktop only). Never falls back to the
+  /// mock service: a missing engine or method is reported as such.
+  @override
+  Future<Map<String, Object?>> conformanceRequest({
+    required String engineId,
+    required EndpointProfile profile,
+    required String method,
+    Map<String, Object?> params = const {},
+  }) async {
+    if (method != 'getCapabilities' && method != 's3ConformanceOp') {
+      throw EngineException(
+          code: ErrorCode.invalidConfig,
+          message: '$method is not a conformance request.');
+    }
+    final entry = await _tryGetEngine(engineId);
+    if (entry == null) throw _engineUnavailable(engineId, method);
+    try {
+      return await _sendSidecarRequest(
+        entry,
+        method: method,
+        params: {...params, 'profile': _profileToJson(profile)},
+        traceBodies: false,
+      );
+    } on TimeoutException catch (error) {
+      throw EngineException(
+          code: ErrorCode.timeout,
+          message: error.message ?? 'Engine request timed out.');
+    } on ProcessException catch (error) {
+      throw EngineException(
+          code: ErrorCode.engineUnavailable,
+          message: 'The $engineId engine could not start: ${error.message}');
+    }
   }
 
   @override
@@ -1469,6 +1505,7 @@ class DesktopSidecarEngineService
     Map<String, Object?>? params,
     void Function(Map<String, Object?> event)? onEvent,
     ListingCancellation? cancellation,
+    bool traceBodies = true,
   }) async {
     ActionScope.current?.check();
     cancellation ??= ActionScope.current;
@@ -1496,8 +1533,12 @@ class DesktopSidecarEngineService
         'method': method,
         'requestId': requestId,
       };
-      final requestBody = _sanitizeForLogging(
-          DiagnosticSafety.forNameEncryptedRequest(request['params'], params));
+      // Conformance results can echo endpoint text verbatim; their bodies are
+      // never traced (the head, status and latency still are).
+      final requestBody = traceBodies
+          ? _sanitizeForLogging(
+              DiagnosticSafety.forNameEncryptedRequest(request['params'], params))
+          : const {'omitted': 'S3 conformance request'};
       _log(
         level: 'API',
         category: 'EngineRequest',
@@ -1558,8 +1599,10 @@ class DesktopSidecarEngineService
         'ok': response.payload['ok'],
         'requestId': requestId,
       };
-      final responseBody = _sanitizeForLogging(
-          DiagnosticSafety.forNameEncryptedRequest(response.payload, params));
+      final responseBody = traceBodies
+          ? _sanitizeForLogging(
+              DiagnosticSafety.forNameEncryptedRequest(response.payload, params))
+          : const {'omitted': 'S3 conformance result'};
       _log(
         level: 'API',
         category: 'EngineResponse',
@@ -1596,8 +1639,9 @@ class DesktopSidecarEngineService
       _log(
         level: 'ERROR',
         category: 'EngineError',
-        message:
-            '${entry.id}.$method ${(error['message'] as String?) ?? 'Unknown engine error.'}$detailSuffix',
+        message: traceBodies
+            ? '${entry.id}.$method ${(error['message'] as String?) ?? 'Unknown engine error.'}$detailSuffix'
+            : '${entry.id}.$method failed (${_parseErrorCode(error['code'] as String?).name}).',
         source: 'engine-error',
         params: params,
       );

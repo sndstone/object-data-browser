@@ -28,6 +28,16 @@ func redactedEndpoint(raw string) string {
 	}
 	return redactedURL(u)
 }
+func encodedS3CopySource(sourceBucket, sourceKey, version string) string {
+	// Preserve path separators and escape literal plus signs for x-amz-copy-source.
+	escapedSource := url.QueryEscape(sourceBucket + "/" + sourceKey)
+	source := strings.NewReplacer("+", "%20", "%2F", "/").Replace(escapedSource)
+	if version != "" {
+		source += "?versionId=" + url.QueryEscape(version)
+	}
+	return source
+}
+
 func loadBenchmarkState(params map[string]interface{}) (map[string]interface{}, error) {
 	state, err := readBenchmarkState(asString(params["runId"]))
 	if err != nil {
@@ -390,12 +400,7 @@ func copyObjectAdvanced(params map[string]interface{}) (map[string]interface{}, 
 		return nil, &sidecarError{Code: "unsupported_feature", Message: "Source has no validator; a consistent copy cannot be guaranteed."}
 	}
 	version := nonEmpty(asString(params["sourceVersionId"]), aws.ToString(head.VersionId))
-	// Preserve path separators and escape literal plus signs for x-amz-copy-source.
-	escapedSource := url.QueryEscape(sourceBucket + "/" + sourceKey)
-	source := strings.NewReplacer("+", "%20", "%2F", "/").Replace(escapedSource)
-	if version != "" {
-		source += "?versionId=" + url.QueryEscape(version)
-	}
+	source := encodedS3CopySource(sourceBucket, sourceKey, version)
 	size := aws.ToInt64(head.ContentLength)
 	strategy := "server-side copy"
 	var destinationVersion *string

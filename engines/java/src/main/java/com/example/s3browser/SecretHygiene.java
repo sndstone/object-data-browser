@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -14,7 +15,7 @@ import java.util.regex.Pattern;
 final class SecretHygiene implements AutoCloseable {
     private static final Map<String, Integer> ACTIVE = new ConcurrentHashMap<>();
     private static final String SECRET = "(?:fileName|fileKey|customerKey|x-amz-(?:copy-source-)?server-side-encryption-customer-key|x-ms-encryption-key|authorization|[^\\s\"':=,]*secret[^\\s\"':=,]*|[^\\s\"':=,]*token[^\\s\"':=,]*)";
-    private static final Pattern FIELD = Pattern.compile("(?i)([\"']?" + SECRET + "[\"']?\\s*[:=]\\s*)(\\\"[^\\\"]*\\\"|'[^']*'|[^\\s,}\\]]+)");
+    private static final Pattern FIELD = Pattern.compile("(?i)([\"']?(" + SECRET + ")[\"']?\\s*[:=]\\s*)(\\\"[^\\\"]*\\\"|'[^']*'|[^\\s,}\\]]+)");
     private static final int MIN_SCRUBBED_LENGTH = 16;
     private final Set<String> keys = new HashSet<>();
 
@@ -42,7 +43,15 @@ final class SecretHygiene implements AutoCloseable {
     static boolean sensitive(String field) {
         String lower = field.toLowerCase(Locale.ROOT);
         return lower.equals("filename") || keyField(lower) || lower.contains("authorization")
-            || lower.contains("secret") || lower.contains("token") || lower.contains("access-key");
+            || lower.contains("secret") || lower.contains("access-key")
+            || (lower.contains("token") && !paginationCursor(lower));
+    }
+
+    /** Exact AWS S3 pagination cursor member names; every other "token" field stays sensitive. */
+    private static final Set<String> PAGINATION_CURSORS = Set.of("continuationtoken", "nextcontinuationtoken");
+
+    private static boolean paginationCursor(String lower) {
+        return PAGINATION_CURSORS.contains(lower);
     }
 
     private static boolean keyField(String field) {
@@ -54,7 +63,10 @@ final class SecretHygiene implements AutoCloseable {
     /** Diagnostic text: hides active key values and anything written as a sensitive field. */
     static String text(String text) {
         if (text == null) return null;
-        return FIELD.matcher(values(text)).replaceAll("$1\"[REDACTED]\"");
+        return FIELD.matcher(values(text)).replaceAll(match ->
+            sensitive(match.group(2))
+                ? Matcher.quoteReplacement(match.group(1) + "\"[REDACTED]\"")
+                : Matcher.quoteReplacement(match.group(0)));
     }
 
     /** Response data: hides active key values only and never rewrites by pattern. */
